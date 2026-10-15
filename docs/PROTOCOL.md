@@ -21,7 +21,7 @@ Three rules carry the design:
         fleet hub  (one process: SQLite log, reducer, HTTP + SSE, the only sequencer)
            ▲  events / SSE
            │
-   fleet host (one per machine) ── herdr socket ──▶ agent panes
+   fleet host (one per machine and herdr session) ── herdr socket ──▶ agent panes
            ▲
    fleet CLI (agents) ── local spool when the hub is unreachable
 ```
@@ -57,8 +57,12 @@ means degraded visibility, not stopped work.
 Ids are stable strings: `agent:<host>/<session>/<name>`, `host:<name>`, `human:<handle>`,
 `task:<project>/<name>`. `<host>` is `FLEET_HOST` (default: the system hostname); `fleet host`
 and the CLI on one machine read the same setting, so an agent's writes and its presence carry
-the same id. `fleet api schema` prints the full JSON Schema; it is committed as
+the same id. `actor.id` must start with its kind (`agent:`, `host:`).
+
+`fleet api schema` prints the JSON Schema of every event and of the state; it is committed as
 [`schema/fleet.schema.json`](../schema/fleet.schema.json) and a test fails when it goes stale.
+The schema describes the shape. The rules below are stricter: required envelope fields per type,
+allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 
 ## Types (v1)
 
@@ -85,31 +89,37 @@ Task states follow the A2A task lifecycle names, so tools that know A2A read the
 ## Rules the hub enforces
 
 - **Strict on write.** `POST /events` accepts only known types at `v: 1`, with no unknown fields
-  in the envelope or in `data`, with the envelope fields the type needs, and from an allowed
-  actor kind. A malformed event is `400`; a forbidden actor (any `human`, any `hub`, or a kind
-  not in the table) is `403`.
+  in the envelope or in `data`, with the envelope fields the type needs, at most 64 KiB, and from
+  an allowed actor kind. A malformed or oversized event is `400`; a forbidden actor (any `human`,
+  any `hub`, or a kind not in the table) is `403`. Clients apply the same rules before sending,
+  so an invalid event is refused locally and never spooled.
 - **Exclusive assignment.** `task.assigned` for a task that already has an owner and is not
   finished (`completed`, `failed`, `canceled`) is `409`. The check and the append happen under
   one lock. Release with `task.unassigned` or finish the task to free it. Claiming a finished
-  task reopens it (`working`), so it is exclusive again.
+  task reopens it (`working`), so it is exclusive again. Reopening it through `task.state`
+  clears the old owner.
 - **Idempotent append.** An event whose `id` is already in the log is acknowledged as
-  `{"duplicate": true}` and not appended again, before any other check. Replay is always safe.
+  `{"duplicate": true}` and not appended again, before any other check, so replaying an
+  accepted event never fails, even after the rules tighten.
+- **A readable log.** The hub refuses to start on a log holding events it cannot fold: that
+  means the binary and the log drifted apart, and a skipped `task.assigned` would let a task be
+  granted twice.
 - **Bearer token.** Every endpoint needs `Authorization: Bearer <token>`. The hub creates a
   random token file (mode 0600) on first start; clients read the same file.
 
 ## Tolerant on read
 
-A reader keeps an event of a type it does not know (or a newer version of a known one) verbatim,
+A reader keeps an event of a type it does not know, or of a known type at a newer `v`, verbatim,
 skips it in the fold, and counts it in `state.unknown`. It never crashes on it and never drops it
-from the log, so the hub and the CLIs upgrade independently.
+from the log, so host agents and CLIs upgrade independently of the hub.
 
 ## HTTP API
 
 | Method | Path | |
 |---|---|---|
-| `POST` | `/events` | append one event; `200 {"id", "duplicate"}` or `400/401/403/409` with `{"error"}` |
-| `GET` | `/events?after=<id>&limit=<n>` | the log in arrival order after the given event |
-| `GET` | `/events/stream?after=<id>` | SSE: the backlog after the cursor, then live events |
+| `POST` | `/events` | append one event; `200 {"id", "duplicate"}`, or `400/401/403/409/500` with `{"error"}` |
+| `GET` | `/events?after=<id>&limit=<n>` | the log in arrival order after the given event, at most `limit` (default 1000); `410` if the cursor is not in the log |
+| `GET` | `/events/stream?after=<id>` | SSE: the backlog after the cursor, then live events; `410` for an unknown cursor |
 | `GET` | `/state` | the folded state |
 | `GET` | `/schema` | the same document as `fleet api schema` |
 
@@ -119,7 +129,7 @@ ULID that arrives late is still returned after the cursor, so a follower never m
 ## State
 
 `GET /state` returns `hosts`, `agents` (state + since), `tasks` (state + since, owner, lead,
-blocked_by, handoffs), open `blockers` and `asks` keyed by their raising event id, undelivered
+blocked_by, handoffs), open `blockers` and `asks` (with their context link) keyed by their raising event id, undelivered
 `msgs` keyed by their `msg.sent` id, the id of the `last` event folded, and the `unknown` count.
 
 ## Doorbells
@@ -135,19 +145,25 @@ The `[fleet` prefix marks the turn as machine-sent, so it is never mistaken for 
 instruction. The host agent rings only an `idle` or `done` agent, never a busy or blocked one. It
 writes `msg.delivered` only after it has itself observed and logged the agent turning `working`
 after the prompt. A prompt that was merely submitted proves nothing. A failed ring is retried at
-most once a minute.
+most once a minute; if `msg.delivered` itself cannot be written, the message stays pending.
 
 ## Presence (herdr)
 
 The host agent talks to herdr over its socket API (newline-delimited JSON, herdr protocol 22).
-It checks the protocol at connect and disables presence on a mismatch rather than misread events.
+It checks the protocol at connect. On a mismatch, or when herdr is down or restarts, presence
+retries with backoff instead of misreading events; replica sync and delivery keep running.
 
-- `agent.list` at start gives `agent.up` for every agent. Agents that the log believes are up in
-  this session but herdr no longer has are marked `agent.down`.
-- `events.subscribe` to `pane.agent_detected`, `pane.closed`, `pane.exited`,
-  `workspace.created` and `workspace.closed` drives `agent.up` and `agent.down`.
-- One `pane.agent_status_changed` subscription per agent pane drives `agent.state`, on change
-  only. Presence is push, not polling.
+- `agent.list` gives `agent.up` for every agent. Agents the hub believes are up in this session
+  but herdr no longer has are marked `agent.down`.
+- `events.subscribe` to `pane.agent_detected` drives `agent.up`; `pane.closed`, `pane.exited`
+  and `workspace.closed` drive `agent.down`.
+- One `pane.agent_status_changed` subscription per agent drives `agent.state`, on change only.
+  Right after subscribing it reads the agent's current state, so a change made before the
+  subscription existed is not missed. A dropped subscription is re-armed with backoff.
+  Presence is push, not polling.
+
+If any of the host agent's loops stops (a panic, a poisoned lock), the process exits, so a
+supervisor restarts it rather than leaving a host that looks healthy and no longer delivers.
 
 ## Spool and replica
 
@@ -156,19 +172,24 @@ It checks the protocol at connect and disables presence on a mismatch rather tha
   directory. The next write from any `fleet` process on that machine, and the host agent's sync
   loop, replay it in order before anything new. One process replays at a time; the spool is
   rewritten by write-then-rename, and replay is idempotent, so a crash mid-replay is harmless.
-  Only a verdict (400, 403, 409) or an unreadable line moves an event to `spool.rejected.jsonl`.
+  Only a verdict (400, 403, 409, 413, 415, 422 with the hub's error body) or an unreadable line
+  moves an event to `spool.rejected.jsonl`. While events wait, every later write says why.
 - **Exclusive writes never spool.** `fleet task add` with the hub unreachable fails: two
-  partitioned copies cannot both grant the same task.
+  partitioned copies cannot both grant the same task. It also waits for the spool to drain, so
+  it never overtakes a spooled release.
 - **Replica.** The host agent pulls `GET /events?after=<cursor>` and then follows the SSE feed
-  into its own SQLite copy. Its own writes go into the replica at once, unless the hub refused
-  them. Copies merge by event id,
-  with no conflicts. Read commands (`ps`, `task ls/show`, `state`, `ui`) ask the hub and fall
-  back to the replica when it is unreachable.
+  into its own SQLite copy. Its own writes go into the replica at once, unless they could not
+  be written. Copies merge by event id, with no conflicts. If the hub answers `410` (its log was
+  replaced), the host re-reads the whole log. Read commands (`ps`, `task ls/show`, `state`,
+  `ui`) ask the hub and fall back to the replica only when the hub is unreachable, saying how
+  old the replica's last event is.
 
 ## Files
 
 Everything lives in one data directory: `FLEET_HOME`, or the platform data directory
-(`directories` crate). `hub.db`, `replica.db`, `spool.jsonl`, `token`.
+(`directories` crate): `hub.db`, `replica.db`, `spool.jsonl`, `spool.rejected.jsonl`, `token`,
+and the lock files `spool.lock` and `spool.flush`. `FLEET_TOKEN_FILE` and `fleet hub --db` move
+the token and the hub database elsewhere.
 
 ## Not in v1
 

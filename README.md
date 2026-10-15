@@ -8,7 +8,7 @@ One Rust binary, no runtime. Linux and macOS. Agents run in [herdr](https://herd
 
 ```
 fleet hub                 the log, the fold, the sequencer (HTTP + SSE on 127.0.0.1)
-fleet host                one per machine: presence from herdr, disk, a replica, doorbells
+fleet host                one per machine and herdr session: presence from herdr, disk, a replica, doorbells
 fleet ps                  what every agent is doing
 fleet task add|rm|ls|show claim (exclusive: 409 if taken), cancel or release, list, inspect
 fleet dep add|rm          task A is blocked by task B
@@ -36,7 +36,7 @@ fleet api schema          JSON Schema of events and state (schema/fleet.schema.j
 2. **The hub keeps the log.** It checks each event, appends it to a SQLite log, and folds the log
    into one state: who is up, who owns which task, what is blocked, which messages are not yet
    delivered. `fleet ps` and `fleet ui --text` print that state.
-3. **One host agent per machine watches herdr.** herdr pushes a status change when an agent turns
+3. **One host agent per machine (and herdr session) watches herdr.** herdr pushes a status change when an agent turns
    idle, working or blocked. `fleet host` turns each change into an event, so the hub always knows
    what every agent is doing, with no polling.
 4. **Messages are doorbells.** `fleet tell` writes a `msg.sent` event. The host agent on the
