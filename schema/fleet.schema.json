@@ -732,6 +732,12 @@
             "by": {
               "type": "string"
             },
+            "context": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "options": {
               "items": {
                 "type": "string"
@@ -986,7 +992,7 @@
           "type": "object"
         },
         "unknown": {
-          "description": "Events of types this binary does not know: kept in the log, skipped here.",
+          "description": "Events this binary cannot fold (an unknown type, or a known type at a newer `v`): kept in\nthe log, skipped here.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

@@ -13,6 +13,8 @@ pub const PROTOCOL: u32 = 1;
 pub const SCHEMA_VERSION: u32 = 1;
 /// Per-type schema version every v1 core type carries in `v`.
 pub const TYPE_VERSION: u32 = 1;
+/// Largest serialized event the hub accepts. Big content belongs in a file the event links to.
+pub const MAX_EVENT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -86,7 +88,9 @@ pub type Event = Envelope<Body>;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Body {
     Known(Known),
-    /// `{"type": …, "data": …}` of a type this binary does not know (or a newer version of one).
+    /// `{"type": …, "data": …}` that does not parse as a core type: an unknown type, or a known
+    /// type whose `data` this binary cannot read. A newer `v` with readable `data` stays `Known`;
+    /// `State::apply` skips it.
     Unknown(Value),
 }
 
@@ -411,6 +415,12 @@ pub fn parse_strict(raw: &Value) -> Result<Envelope<Known>, Reject> {
     {
         return Err(Reject::BadRequest(format!("unknown envelope field `{k}`")));
     }
+    let size = raw.to_string().len();
+    if size > MAX_EVENT_BYTES {
+        return Err(Reject::BadRequest(format!(
+            "event is {size} bytes; the limit is {MAX_EVENT_BYTES} (put large content in a file and link it)"
+        )));
+    }
     let e: Envelope<Known> =
         serde_json::from_value(raw.clone()).map_err(|err| Reject::BadRequest(err.to_string()))?;
     if ulid::Ulid::from_string(&e.id).is_err() {
@@ -428,6 +438,17 @@ pub fn parse_strict(raw: &Value) -> Result<Envelope<Known>, Reject> {
             "actor.kind={:?} may not write {}",
             e.actor.kind,
             e.body.type_name()
+        )));
+    }
+    let kind = serde_json::to_value(e.actor.kind).unwrap_or_default();
+    if !e
+        .actor
+        .id
+        .starts_with(&format!("{}:", kind.as_str().unwrap_or("?")))
+    {
+        return Err(Reject::BadRequest(format!(
+            "actor.id {:?} does not match actor.kind {kind}",
+            e.actor.id
         )));
     }
     if e.project.is_empty() || e.actor.id.is_empty() {
@@ -549,6 +570,18 @@ mod tests {
         let mut v = created();
         v["v"] = 2.into();
         assert!(matches!(parse_strict(&v), Err(Reject::BadRequest(_))));
+        let mut v = created();
+        v["actor"]["id"] = "host:h".into();
+        assert!(
+            matches!(parse_strict(&v), Err(Reject::BadRequest(_))),
+            "id must match kind"
+        );
+        let mut v = created();
+        v["data"]["title"] = "x".repeat(MAX_EVENT_BYTES).into();
+        assert!(
+            matches!(parse_strict(&v), Err(Reject::BadRequest(_))),
+            "oversized"
+        );
     }
 
     #[test]

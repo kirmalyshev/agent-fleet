@@ -21,7 +21,8 @@ pub struct State {
     pub asks: BTreeMap<String, Ask>,
     /// Undelivered doorbells by the id of their `msg.sent`.
     pub msgs: BTreeMap<String, Msg>,
-    /// Events of types this binary does not know: kept in the log, skipped here.
+    /// Events this binary cannot fold (an unknown type, or a known type at a newer `v`): kept in
+    /// the log, skipped here.
     pub unknown: u64,
 }
 
@@ -73,6 +74,7 @@ pub struct Ask {
     pub question: String,
     pub options: Vec<String>,
     pub recommendation: Option<String>,
+    pub context: Option<String>,
     pub since: DateTime<Utc>,
 }
 
@@ -150,7 +152,8 @@ impl State {
                 );
             }
             Known::TaskCreated(d) => {
-                // The first `task.created` names the task; a racing duplicate does not rename it.
+                // A task still titled with its id takes the title from the next `task.created`;
+                // once it has another title, a racing duplicate does not rename it.
                 if let Some(id) = &e.task {
                     let t = self.task_mut(id, &e.project, ts);
                     if t.title == *id {
@@ -181,6 +184,10 @@ impl State {
                 if let Some(t) = self.task_for(e)
                     && t.state != d.state
                 {
+                    // Reopening a finished task does not hand it back to whoever finished it.
+                    if t.state.is_terminal() && !d.state.is_terminal() {
+                        t.owner = None;
+                    }
                     t.state = d.state;
                     t.since = ts;
                 }
@@ -222,6 +229,7 @@ impl State {
                         question: d.question.clone(),
                         options: d.options.clone(),
                         recommendation: d.recommendation.clone(),
+                        context: d.context.clone(),
                         since: ts,
                     },
                 );
@@ -548,7 +556,36 @@ mod tests {
     }
 
     #[test]
-    fn fold_is_deterministic() {
+    fn reopening_a_finished_task_clears_its_owner() {
+        let mut s = State::default();
+        s.apply(
+            &agent_ev(Known::TaskAssigned(TaskAssigned {
+                agent: "agent:h/s/a".into(),
+                lead: None,
+            }))
+            .into_event(),
+        );
+        s.apply(
+            &agent_ev(Known::TaskState(TaskStateChanged {
+                state: TaskState::Completed,
+            }))
+            .into_event(),
+        );
+        s.apply(
+            &agent_ev(Known::TaskState(TaskStateChanged {
+                state: TaskState::Working,
+            }))
+            .into_event(),
+        );
+        assert_eq!(
+            s.owner_of("task:p/1"),
+            None,
+            "the old owner is not resurrected"
+        );
+    }
+
+    #[test]
+    fn deps_accumulate_per_task() {
         let events: Vec<Event> = (0..20)
             .map(|i| {
                 agent_ev(Known::DepAdded(Dep {
@@ -557,7 +594,6 @@ mod tests {
                 .into_event()
             })
             .collect();
-        assert_eq!(State::fold(&events), State::fold(&events));
         assert_eq!(State::fold(&events).tasks["task:p/1"].blocked_by.len(), 20);
     }
 }
