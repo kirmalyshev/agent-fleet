@@ -192,8 +192,14 @@ impl Host {
         epoch
     }
 
+    /// Forgets `pane`. `agent.down` is published only if that agent is not alive in another pane
+    /// (a moved pane, or herdr restored with the agent elsewhere).
     async fn agent_down(&self, pane: &str, reason: &str) {
-        let gone = self.panes.lock().unwrap().remove(pane);
+        let gone = {
+            let mut panes = self.panes.lock().unwrap();
+            let gone = panes.remove(pane);
+            gone.filter(|l| !panes.values().any(|o| o.agent == l.agent))
+        };
         if let Some(l) = gone {
             self.publish(self.presence(Known::AgentDown(AgentDown {
                 agent: l.agent,
@@ -834,6 +840,22 @@ mod tests {
         let new = host.agent_up("w:1", &info).await;
         assert!(new > old);
         assert!(!host.current("w:1", old) && host.current("w:1", new));
+    }
+
+    #[tokio::test]
+    async fn closing_an_old_pane_does_not_down_the_agent_alive_in_a_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, _fake, _) = host_on_fake(dir.path(), "working").await;
+        let info = json!({ "name": "a", "agent": "claude", "agent_status": "idle" });
+        host.agent_up("w:2", &info).await; // the same agent, now in another pane
+        host.agent_down("w:1", "gone from herdr").await;
+        assert!(
+            !types(&host).contains(&"agent.down".to_string()),
+            "{:?}",
+            types(&host)
+        );
+        host.agent_down("w:2", "pane closed").await;
+        assert!(types(&host).contains(&"agent.down".to_string()));
     }
 
     #[tokio::test]
