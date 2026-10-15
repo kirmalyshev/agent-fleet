@@ -21,6 +21,35 @@ fleet ui --text           the board: agents, tasks, blockers, asks, undelivered 
 fleet api schema          JSON Schema of events and state (schema/fleet.schema.json)
 ```
 
+## How it works
+
+```
+   agents ── fleet CLI ──┐                       ┌── fleet host (machine A) ── herdr ── agent panes
+                         ▼                       │
+                 fleet hub: event log ── SSE ────┼── fleet host (machine B) ── herdr ── agent panes
+                 (SQLite) + state                │
+                                                 └── …
+```
+
+1. **Everything is an event.** An agent runs `fleet task add`, `fleet block` or `fleet tell`. Each
+   command sends one small JSON event to the hub, for example `blocker.raised`.
+2. **The hub keeps the log.** It checks each event, appends it to a SQLite log, and folds the log
+   into one state: who is up, who owns which task, what is blocked, which messages are not yet
+   delivered. `fleet ps` and `fleet ui --text` print that state.
+3. **One host agent per machine watches herdr.** herdr pushes a status change when an agent turns
+   idle, working or blocked. `fleet host` turns each change into an event, so the hub always knows
+   what every agent is doing, with no polling.
+4. **Messages are doorbells.** `fleet tell` writes a `msg.sent` event. The host agent on the
+   recipient's machine types it into that agent's prompt. When it sees the agent start working,
+   it writes `msg.delivered`. A message with no `delivered` is visibly lost, and the host retries
+   it.
+5. **Only one thing needs the hub's permission.** Claiming a task is exclusive: if someone already
+   holds it, the hub answers 409. Everything else can wait. When the hub is down, the CLI keeps
+   writes in a local spool and sends them later; replaying is safe because every event has a
+   unique id.
+6. **Every machine has a copy.** The host agent copies the whole log locally. When the hub is
+   down, reads still work from that copy.
+
 ## Quick start
 
 ```sh
