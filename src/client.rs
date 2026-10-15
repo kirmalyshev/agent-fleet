@@ -2,7 +2,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -98,9 +98,12 @@ pub struct Flushed {
     pub sent: usize,
     pub rejected: usize,
     pub left: usize,
+    /// Why replay stopped with events left, so callers can say it instead of guessing.
+    pub stuck: Option<String>,
 }
 
-/// The hub refused the event itself (400, 403, 409). Not retried.
+/// A non-success answer from the hub. On POST it is a verdict on the event (400, 403, 409, 413,
+/// 415, 422 with an error body) and is not retried; on GET it is any non-2xx status.
 #[derive(Debug)]
 pub struct Refused {
     pub status: StatusCode,
@@ -164,8 +167,15 @@ impl Client {
             }
         } else if matches!(
             status,
-            StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN | StatusCode::CONFLICT
-        ) {
+            StatusCode::BAD_REQUEST
+                | StatusCode::FORBIDDEN
+                | StatusCode::CONFLICT
+                | StatusCode::PAYLOAD_TOO_LARGE
+                | StatusCode::UNSUPPORTED_MEDIA_TYPE
+                | StatusCode::UNPROCESSABLE_ENTITY
+        ) && (body["error"].is_string() || status == StatusCode::PAYLOAD_TOO_LARGE)
+        {
+            // A verdict needs the hub's own error body: a bare 403 from a proxy is not one.
             Post::Refused(Refused {
                 status,
                 message: body["error"].as_str().unwrap_or("").to_string(),
@@ -177,11 +187,22 @@ impl Client {
 
     /// An ordinary write: sent if the hub is reachable, otherwise spooled for a later replay.
     /// Spooled events go first, so the hub sees writes in the order they were made.
+    /// The event is checked here first, so nothing the hub would refuse is ever spooled.
     pub async fn write(&self, e: &Envelope<Known>) -> Result<Sent> {
-        let raw = serde_json::to_value(e)?;
-        if self.flush_spool().await?.left > 0 {
+        let raw = self.check(e)?;
+        if let Known::TaskAssigned(_) = e.body {
+            bail!("task.assigned is exclusive: use write_exclusive, it is never spooled");
+        }
+        let f = self.flush_spool().await?;
+        if f.left > 0 {
             self.spool_append(&raw)?;
-            return Ok(Sent::Spooled("earlier writes are still spooled".into()));
+            let why = f
+                .stuck
+                .unwrap_or_else(|| "another process is replaying".into());
+            return Ok(Sent::Spooled(format!(
+                "{} earlier writes still spooled: {why}",
+                f.left
+            )));
         }
         match self.post(&raw).await {
             Post::Ok { duplicate } => Ok(Sent::Accepted { duplicate }),
@@ -194,9 +215,20 @@ impl Client {
     }
 
     /// An exclusive write needs the sequencer: with the hub unreachable it fails instead of spooling.
+    /// It also waits for the spool: overtaking a spooled release would earn a false 409.
     pub async fn write_exclusive(&self, e: &Envelope<Known>) -> Result<bool> {
-        self.flush_spool().await?;
-        match self.post(&serde_json::to_value(e)?).await {
+        let raw = self.check(e)?;
+        let f = self.flush_spool().await?;
+        if f.left > 0 {
+            bail!(
+                "{} earlier writes are still spooled ({}); {} waits for them",
+                f.left,
+                f.stuck
+                    .unwrap_or_else(|| "another process is replaying".into()),
+                e.body.type_name()
+            );
+        }
+        match self.post(&raw).await {
             Post::Ok { duplicate } => Ok(duplicate),
             Post::Refused(r) => Err(r.into()),
             Post::Transient(why) => {
@@ -206,6 +238,15 @@ impl Client {
                 )
             }
         }
+    }
+
+    /// The hub's own write rules, applied locally.
+    fn check(&self, e: &Envelope<Known>) -> Result<Value> {
+        let raw = serde_json::to_value(e)?;
+        if let Err(r) = crate::event::parse_strict(&raw) {
+            bail!("invalid event, not sent: {r:?}");
+        }
+        Ok(raw)
     }
 
     /// Runs `f` holding the spool lock. Held only for local file work, never across a request.
@@ -234,9 +275,23 @@ impl Client {
         self.locked(|| {
             let mut f = OpenOptions::new()
                 .create(true)
+                .read(true)
                 .append(true)
                 .open(&self.spool)?;
-            writeln!(f, "{}", serde_json::to_string(raw)?)?;
+            // A writer killed mid-line leaves a tail with no newline; start on a fresh line so
+            // this event is not glued onto it.
+            let mut line = String::new();
+            let len = f.metadata()?.len();
+            if len > 0 {
+                let mut last = [0u8; 1];
+                f.read_exact_at(&mut last, len - 1)?;
+                if last[0] != b'\n' {
+                    line.push('\n');
+                }
+            }
+            line.push_str(&serde_json::to_string(raw)?);
+            line.push('\n');
+            f.write_all(line.as_bytes())?;
             Ok(())
         })
     }
@@ -264,11 +319,15 @@ impl Client {
             .create(true)
             .append(true)
             .open(self.spool.with_extension("flush"))?;
-        if flock(&flusher, FlockOperation::NonBlockingLockExclusive).is_err() {
-            return Ok(Flushed {
-                left: pending,
-                ..Flushed::default()
-            });
+        match flock(&flusher, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {}
+            Err(e) if e == rustix::io::Errno::WOULDBLOCK => {
+                return Ok(Flushed {
+                    left: pending,
+                    ..Flushed::default()
+                });
+            }
+            Err(e) => return Err(e.into()),
         }
         let lines = self.locked(|| self.spool_lines())?;
         let mut out = Flushed::default();
@@ -285,7 +344,10 @@ impl Client {
                         self.reject(line, &format!("{} {r}", raw["id"]))?;
                         out.rejected += 1;
                     }
-                    Post::Transient(_) => break,
+                    Post::Transient(why) => {
+                        out.stuck = Some(why);
+                        break;
+                    }
                 },
             }
             done += 1;
@@ -438,21 +500,17 @@ mod tests {
         assert!(
             matches!(wrong.write(&b1).await.unwrap(), Sent::Spooled(why) if why.contains("401"))
         );
-        assert_eq!(
-            wrong.flush_spool().await.unwrap(),
-            Flushed {
-                sent: 0,
-                rejected: 0,
-                left: 1
-            }
-        );
+        let f = wrong.flush_spool().await.unwrap();
+        assert_eq!((f.sent, f.rejected, f.left), (0, 0, 1));
+        assert!(f.stuck.unwrap().contains("401"), "the reason is kept");
 
-        // A torn line (a writer killed mid-line) goes to the rejected file; the rest replays.
+        // A torn tail (a writer killed mid-line, no newline) goes to the rejected file on its
+        // own; the next append starts a fresh line instead of being glued onto it.
         std::fs::OpenOptions::new()
             .append(true)
             .open(&spool)
             .unwrap()
-            .write_all(b"{\"id\":\n")
+            .write_all(b"{\"id\":")
             .unwrap();
         let mut human = block(2);
         human.actor.kind = ActorKind::Human;
@@ -460,14 +518,8 @@ mod tests {
             .spool_append(&serde_json::to_value(&human).unwrap())
             .unwrap();
         let c = Client::new(&base, "tok".into(), spool.clone());
-        assert_eq!(
-            c.flush_spool().await.unwrap(),
-            Flushed {
-                sent: 1,
-                rejected: 2,
-                left: 0
-            }
-        );
+        let f = c.flush_spool().await.unwrap();
+        assert_eq!((f.sent, f.rejected, f.left), (1, 2, 0));
         let rejected = std::fs::read_to_string(spool.with_extension("rejected.jsonl")).unwrap();
         assert_eq!(
             rejected.lines().count(),
@@ -514,18 +566,15 @@ mod tests {
         )
         .task("task:p/1");
         let err = c.write_exclusive(&assign).await.unwrap_err();
-        assert!(err.to_string().contains("refused, not spooled"), "{err}");
+        assert!(err.to_string().contains("still spooled"), "{err}");
+        assert!(
+            c.write(&assign).await.is_err(),
+            "task.assigned never goes to the spool"
+        );
 
         let hub = start_hub(tokio::net::TcpListener::bind(addr).await.unwrap(), &db).await;
         let f = c.flush_spool().await.unwrap();
-        assert_eq!(
-            f,
-            Flushed {
-                sent: 2,
-                rejected: 0,
-                left: 0
-            }
-        );
+        assert_eq!((f.sent, f.rejected, f.left), (2, 0, 0));
         assert_eq!(
             c.flush_spool().await.unwrap(),
             Flushed::default(),
@@ -576,11 +625,19 @@ mod tests {
             StatusCode::CONFLICT
         );
 
+        // Invalid events are refused locally, never sent or spooled.
         let mut human = block(1);
         human.actor.kind = ActorKind::Human;
-        assert_eq!(
-            status(c.write_exclusive(&human).await),
-            StatusCode::FORBIDDEN
+        let err = c.write(&human).await.unwrap_err().to_string();
+        assert!(err.contains("Forbidden"), "{err}");
+        let mut big = block(4);
+        if let Known::BlockerRaised(b) = &mut big.body {
+            b.what = "x".repeat(MAX_EVENT_BYTES);
+        }
+        assert!(c.write(&big).await.is_err());
+        assert!(
+            !dir.path().join("spool.jsonl").exists(),
+            "nothing was spooled"
         );
 
         let bad = Client::new(&base, "wrong".into(), dir.path().join("spool2.jsonl"));
@@ -591,10 +648,16 @@ mod tests {
             .to_string();
         assert!(err.contains("401"), "{err}");
 
-        // The feed: backlog first, then live.
+        // The feed: backlog first, then live. The live write waits until the backlog event has
+        // arrived, so the stream is subscribed and the event must come from the broadcast.
         let mut seen = Vec::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut tx = Some(tx);
         let follow = c.follow(None, |e| {
             seen.push(e.id);
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(());
+            }
             if seen.len() == 2 {
                 Err(anyhow!("enough"))
             } else {
@@ -603,7 +666,7 @@ mod tests {
         });
         let live = block(3);
         let (r, _) = tokio::join!(follow, async {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            rx.await.unwrap();
             c.write(&live).await.unwrap()
         });
         assert!(r.is_err());
