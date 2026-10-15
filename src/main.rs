@@ -110,7 +110,7 @@ enum Cmd {
         #[arg(long)]
         context: Option<String>,
     },
-    /// Ring an agent's doorbell: `[fleet <from>→<to>] TYPE ref: text`.
+    /// Ring an agent's doorbell: `[fleet <from>→<to>] TYPE ref: text (event <id>)`.
     Tell {
         agent: String,
         #[arg(value_name = "TYPE")]
@@ -235,11 +235,16 @@ impl Ctx {
             std::env::var("HERDR_SESSION"),
             std::env::var("HERDR_SOCKET_PATH"),
         ) {
-            let got = host::herdr_call(sock.as_ref(), "agent.get", json!({ "target": pane })).await;
-            let name = got
-                .ok()
-                .and_then(|r| r["agent"]["name"].as_str().map(str::to_string))
-                .unwrap_or(pane);
+            // The pane id stands in only for an agent herdr knows to be unnamed, as `fleet host`
+            // does; a failed lookup must not quietly give this agent a second identity.
+            let got = host::herdr_call(sock.as_ref(), "agent.get", json!({ "target": pane }))
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "could not ask herdr which agent this pane holds ({err:#}); pass --as or set FLEET_AGENT"
+                    )
+                })?;
+            let name = got["agent"]["name"].as_str().map_or(pane, str::to_string);
             return Ok(Actor {
                 kind: ActorKind::Agent,
                 id: format!("agent:{}/{session}/{name}", self.host_name()),
@@ -250,11 +255,23 @@ impl Ctx {
 
     /// The hub's state, or the local replica's when the hub is unreachable.
     async fn state(&self) -> Result<State> {
+        let unreachable = |err: &anyhow::Error| {
+            err.downcast_ref::<reqwest::Error>()
+                .is_some_and(|e| e.is_connect() || e.is_timeout())
+        };
         match self.client()?.state().await {
             Ok(s) => Ok(s),
-            Err(err) if self.paths.replica().exists() => {
-                eprintln!("fleet: hub unreachable ({err}); reading the local replica");
-                Ok(State::fold(&Store::open(&self.paths.replica())?.all()?))
+            // Only an unreachable hub falls back; a 401 or a 500 is a problem to see, not hide.
+            Err(err) if unreachable(&err) && self.paths.replica().exists() => {
+                let s = State::fold(&Store::open(&self.paths.replica())?.all()?);
+                let age = s
+                    .last
+                    .as_deref()
+                    .and_then(|id| ulid::Ulid::from_string(id).ok())
+                    .map(|u| ui::ago(Utc::now(), chrono::DateTime::<Utc>::from(u.datetime())))
+                    .unwrap_or_else(|| "?".into());
+                eprintln!("fleet: hub unreachable ({err}); local replica, last event {age} ago");
+                Ok(s)
             }
             Err(err) => Err(err),
         }
