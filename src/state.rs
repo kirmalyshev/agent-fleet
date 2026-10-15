@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::event::{AgentState, Body, Event, Known, TaskState};
+use crate::event::{AgentState, Body, Event, Known, TYPE_VERSION, TaskState};
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct State {
@@ -107,7 +107,8 @@ impl State {
 
     pub fn apply(&mut self, e: &Event) {
         self.last = Some(e.id.clone());
-        let Body::Known(k) = &e.body else {
+        // A newer version of a known type may mean something else: skip it like an unknown type.
+        let (Body::Known(k), TYPE_VERSION) = (&e.body, e.v) else {
             self.unknown += 1;
             return;
         };
@@ -126,14 +127,10 @@ impl State {
                 );
             }
             Known::AgentState(d) => {
-                let a = self.agents.entry(d.agent.clone()).or_insert_with(|| Agent {
-                    host: e.actor.id.trim_start_matches("host:").to_string(),
-                    kind: None,
-                    pane: None,
-                    state: d.state,
-                    since: ts,
-                });
-                if a.state != d.state {
+                // Only `agent.up` brings an agent in: a late state change never revives a downed one.
+                if let Some(a) = self.agents.get_mut(&d.agent)
+                    && a.state != d.state
+                {
                     a.state = d.state;
                     a.since = ts;
                 }
@@ -153,10 +150,13 @@ impl State {
                 );
             }
             Known::TaskCreated(d) => {
+                // The first `task.created` names the task; a racing duplicate does not rename it.
                 if let Some(id) = &e.task {
                     let t = self.task_mut(id, &e.project, ts);
-                    t.title = d.title.clone();
-                    t.url = d.url.clone().or(t.url.take());
+                    if t.title == *id {
+                        t.title = d.title.clone();
+                    }
+                    t.url = t.url.take().or(d.url.clone());
                 }
             }
             Known::TaskAssigned(d) => {
@@ -165,7 +165,8 @@ impl State {
                     if d.lead.is_some() {
                         t.lead = d.lead.clone();
                     }
-                    if t.state == TaskState::Submitted {
+                    // Claiming a new or finished task (re)opens it, so the next claim is a 409.
+                    if t.state == TaskState::Submitted || t.state.is_terminal() {
                         t.state = TaskState::Working;
                         t.since = ts;
                     }
@@ -462,6 +463,88 @@ mod tests {
         assert_eq!(s.unknown, 1);
         assert!(s.tasks.is_empty());
         assert_eq!(s.last.as_deref(), Some(e.id.as_str()));
+    }
+
+    #[test]
+    fn newer_version_of_a_known_type_is_skipped() {
+        let mut e = agent_ev(Known::TaskAssigned(TaskAssigned {
+            agent: "agent:h/s/a".into(),
+            lead: None,
+        }))
+        .into_event();
+        e.v = 2;
+        let s = State::fold([&e]);
+        assert_eq!(s.unknown, 1);
+        assert_eq!(s.owner_of("task:p/1"), None);
+    }
+
+    #[test]
+    fn reclaiming_a_finished_task_reopens_it() {
+        let mut s = State::default();
+        s.apply(
+            &agent_ev(Known::TaskAssigned(TaskAssigned {
+                agent: "agent:h/s/a".into(),
+                lead: None,
+            }))
+            .into_event(),
+        );
+        s.apply(
+            &agent_ev(Known::TaskState(TaskStateChanged {
+                state: TaskState::Completed,
+            }))
+            .into_event(),
+        );
+        s.apply(
+            &agent_ev(Known::TaskAssigned(TaskAssigned {
+                agent: "agent:h/s/b".into(),
+                lead: None,
+            }))
+            .into_event(),
+        );
+        assert_eq!(s.tasks["task:p/1"].state, TaskState::Working);
+        assert_eq!(s.owner_of("task:p/1"), Some("agent:h/s/b"));
+    }
+
+    #[test]
+    fn late_state_change_does_not_revive_a_downed_agent() {
+        let a = "agent:h/s/a".to_string();
+        let mut s = State::default();
+        s.apply(
+            &ev(
+                ActorKind::Host,
+                Known::AgentDown(AgentDown {
+                    agent: a.clone(),
+                    reason: None,
+                }),
+            )
+            .into_event(),
+        );
+        s.apply(
+            &ev(
+                ActorKind::Host,
+                Known::AgentState(AgentStateChanged {
+                    agent: a,
+                    state: AgentState::Working,
+                }),
+            )
+            .into_event(),
+        );
+        assert!(s.agents.is_empty());
+    }
+
+    #[test]
+    fn first_task_created_names_the_task() {
+        let mut s = State::default();
+        let created = |title: &str| {
+            agent_ev(Known::TaskCreated(TaskCreated {
+                title: title.into(),
+                url: None,
+            }))
+            .into_event()
+        };
+        s.apply(&created("winner"));
+        s.apply(&created("loser"));
+        assert_eq!(s.tasks["task:p/1"].title, "winner");
     }
 
     #[test]
