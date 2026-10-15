@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::event::{Body, Event};
@@ -10,6 +10,18 @@ use crate::event::{Body, Event};
 pub struct Store {
     conn: Connection,
 }
+
+/// The cursor names an event this log does not have (e.g. the hub's log was replaced).
+#[derive(Debug)]
+pub struct UnknownCursor(pub String);
+
+impl std::fmt::Display for UnknownCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown cursor {}", self.0)
+    }
+}
+
+impl std::error::Error for UnknownCursor {}
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
@@ -63,7 +75,7 @@ impl Store {
             None => 0,
             Some(id) => match self.seq_of(id)? {
                 Some(seq) => seq,
-                None => bail!("unknown cursor {id}"),
+                None => return Err(UnknownCursor(id.to_string()).into()),
             },
         };
         let mut stmt = self

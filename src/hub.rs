@@ -21,7 +21,7 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::event::{self, Known, Reject};
 use crate::state::State;
-use crate::store::Store;
+use crate::store::{Store, UnknownCursor};
 
 pub struct Hub {
     store: Store,
@@ -38,6 +38,14 @@ pub struct Accepted {
 impl Hub {
     pub fn new(store: Store) -> Result<Self> {
         let state = State::fold(&store.all()?);
+        // The hub only ever appends events it validated. One it cannot fold now means the binary
+        // and the log drifted apart, and a skipped `task.assigned` would let a task be granted twice.
+        if state.unknown > 0 {
+            bail!(
+                "the log holds {} events this hub cannot read; run the build that wrote them",
+                state.unknown
+            );
+        }
         Ok(Self {
             store,
             state,
@@ -48,14 +56,18 @@ impl Hub {
     /// Validates and appends one event. Runs under the hub lock, so the 409 check and the append
     /// are one step: this is the sequencer.
     pub fn submit(&mut self, raw: &Value) -> Result<Accepted, Reject> {
-        let e = event::parse_strict(raw)?;
         let internal = |err: anyhow::Error| Reject::Internal(err.to_string());
-        if self.store.contains(&e.id).map_err(internal)? {
+        // A known id is acknowledged before anything else, so replaying an event this hub
+        // already accepted never fails, even if the rules have tightened since.
+        if let Some(id) = raw["id"].as_str()
+            && self.store.contains(id).map_err(internal)?
+        {
             return Ok(Accepted {
-                id: e.id,
+                id: id.to_string(),
                 duplicate: true,
             });
         }
+        let e = event::parse_strict(raw)?;
         if let (Known::TaskAssigned(_), Some(task)) = (&e.body, &e.task)
             && let Some(owner) = self.state.owner_of(task)
         {
@@ -125,6 +137,16 @@ fn error(status: StatusCode, msg: &str) -> Response {
     (status, Json(json!({ "error": msg }))).into_response()
 }
 
+/// 410 for a cursor this log does not have (the follower should start over), 500 otherwise.
+fn read_error(e: anyhow::Error) -> Response {
+    let status = if e.is::<UnknownCursor>() {
+        StatusCode::GONE
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    error(status, &e.to_string())
+}
+
 async fn post_event(AxState(hub): AxState<Shared>, Json(raw): Json<Value>) -> Response {
     let result = hub.lock().unwrap().submit(&raw);
     match result {
@@ -150,7 +172,7 @@ async fn get_events(AxState(hub): AxState<Shared>, Query(q): Query<Cursor>) -> R
         .after(q.after.as_deref(), q.limit.unwrap_or(1000));
     match events {
         Ok(v) => Json(v).into_response(),
-        Err(e) => error(StatusCode::BAD_REQUEST, &e.to_string()),
+        Err(e) => read_error(e),
     }
 }
 
@@ -166,7 +188,7 @@ async fn stream(AxState(hub): AxState<Shared>, Query(q): Query<Cursor>) -> Respo
         let rx = hub.tx.subscribe();
         match hub.store.after(q.after.as_deref(), usize::MAX >> 1) {
             Ok(backlog) => (backlog, rx),
-            Err(e) => return error(StatusCode::BAD_REQUEST, &e.to_string()),
+            Err(e) => return read_error(e),
         }
     };
     let backlog = backlog
@@ -273,6 +295,25 @@ mod tests {
             h.submit(&assign("agent:h/s/c")),
             Err(Reject::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn a_known_id_is_a_duplicate_before_any_validation() {
+        let mut h = hub();
+        let mut a = assign("agent:h/s/a");
+        h.submit(&a).unwrap();
+        a["v"] = 2.into(); // would now be a 400
+        assert!(h.submit(&a).unwrap().duplicate);
+    }
+
+    #[test]
+    fn refuses_to_start_on_a_log_it_cannot_read() {
+        let store = Store::memory().unwrap();
+        let mut v = assign("agent:h/s/a");
+        v["type"] = "task.assigned.v9".into();
+        store.append(&serde_json::from_value(v).unwrap()).unwrap();
+        let err = Hub::new(store).err().unwrap();
+        assert!(err.to_string().contains("cannot read"), "{err}");
     }
 
     #[test]
