@@ -109,11 +109,16 @@ async fn auth(AxState(token): AxState<Arc<String>>, req: Request, next: Next) ->
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|t| t == token.as_str());
+        .is_some_and(|t| same(t.as_bytes(), token.as_bytes()));
     if !ok {
         return error(StatusCode::UNAUTHORIZED, "missing or wrong bearer token");
     }
     next.run(req).await
+}
+
+/// Constant-time comparison, so response timing does not leak how much of a guess was right.
+fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn error(status: StatusCode, msg: &str) -> Response {
@@ -245,6 +250,36 @@ mod tests {
         h.submit(&serde_json::to_value(release).unwrap()).unwrap();
         h.submit(&assign("agent:h/s/b")).unwrap();
         assert_eq!(h.state.owner_of("task:p/1"), Some("agent:h/s/b"));
+    }
+
+    #[test]
+    fn a_reclaimed_finished_task_is_exclusive_again() {
+        let mut h = hub();
+        h.submit(&assign("agent:h/s/a")).unwrap();
+        let done = Envelope::new(
+            Actor {
+                kind: ActorKind::Agent,
+                id: "agent:h/s/a".into(),
+            },
+            "p",
+            Known::TaskState(TaskStateChanged {
+                state: TaskState::Completed,
+            }),
+        )
+        .task("task:p/1");
+        h.submit(&serde_json::to_value(done).unwrap()).unwrap();
+        h.submit(&assign("agent:h/s/b")).unwrap();
+        assert!(matches!(
+            h.submit(&assign("agent:h/s/c")),
+            Err(Reject::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn token_check() {
+        assert!(same(b"abc", b"abc"));
+        assert!(!same(b"abc", b"abd"));
+        assert!(!same(b"", b"abc"));
     }
 
     #[test]
