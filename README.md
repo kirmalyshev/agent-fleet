@@ -63,7 +63,8 @@ fleet ui --text
 ```
 
 `herdr session list` shows each session's socket. Settings come from flags or the environment:
-`FLEET_HUB`, `FLEET_HOME`, `FLEET_TOKEN_FILE`, `FLEET_AGENT`, `FLEET_PROJECT`.
+`FLEET_HUB`, `FLEET_HOME`, `FLEET_TOKEN_FILE`, `FLEET_AGENT`, `FLEET_PROJECT`, `FLEET_HOST`
+(this machine's name in ids, default the hostname).
 
 When the hub is down, ordinary writes go to a local spool and replay later. `task add` refuses
 instead, because only the hub can decide who owns a task. Reads fall back to the host's replica.

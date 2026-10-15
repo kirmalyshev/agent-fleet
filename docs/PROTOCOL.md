@@ -55,7 +55,9 @@ means degraded visibility, not stopped work.
 ```
 
 Ids are stable strings: `agent:<host>/<session>/<name>`, `host:<name>`, `human:<handle>`,
-`task:<project>/<name>`. `fleet api schema` prints the full JSON Schema; it is committed as
+`task:<project>/<name>`. `<host>` is `FLEET_HOST` (default: the system hostname); `fleet host`
+and the CLI on one machine read the same setting, so an agent's writes and its presence carry
+the same id. `fleet api schema` prints the full JSON Schema; it is committed as
 [`schema/fleet.schema.json`](../schema/fleet.schema.json) and a test fails when it goes stale.
 
 ## Types (v1)
@@ -88,7 +90,8 @@ Task states follow the A2A task lifecycle names, so tools that know A2A read the
   not in the table) is `403`.
 - **Exclusive assignment.** `task.assigned` for a task that already has an owner and is not
   finished (`completed`, `failed`, `canceled`) is `409`. The check and the append happen under
-  one lock. Release with `task.unassigned` or finish the task to free it.
+  one lock. Release with `task.unassigned` or finish the task to free it. Claiming a finished
+  task reopens it (`working`), so it is exclusive again.
 - **Idempotent append.** An event whose `id` is already in the log is acknowledged as
   `{"duplicate": true}` and not appended again, before any other check. Replay is always safe.
 - **Bearer token.** Every endpoint needs `Authorization: Bearer <token>`. The hub creates a
@@ -148,15 +151,17 @@ It checks the protocol at connect and disables presence on a mismatch rather tha
 
 ## Spool and replica
 
-- **Spool.** When the hub is unreachable (or answers 5xx), an ordinary write is appended to
-  `spool.jsonl` in the data directory. The next write from any `fleet` process on that machine,
-  and the host agent's sync loop, replay it in order before anything new. Replay is idempotent,
-  so a crash mid-replay is harmless. An event the hub refuses during replay is moved to
-  `spool.rejected.jsonl`.
+- **Spool.** When the hub is unreachable, or answers with anything that is not a verdict on the
+  event (401, 404, 429, 5xx…), an ordinary write is appended to `spool.jsonl` in the data
+  directory. The next write from any `fleet` process on that machine, and the host agent's sync
+  loop, replay it in order before anything new. One process replays at a time; the spool is
+  rewritten by write-then-rename, and replay is idempotent, so a crash mid-replay is harmless.
+  Only a verdict (400, 403, 409) or an unreadable line moves an event to `spool.rejected.jsonl`.
 - **Exclusive writes never spool.** `fleet task add` with the hub unreachable fails: two
   partitioned copies cannot both grant the same task.
 - **Replica.** The host agent pulls `GET /events?after=<cursor>` and then follows the SSE feed
-  into its own SQLite copy. Its own writes go into the replica at once. Copies merge by event id,
+  into its own SQLite copy. Its own writes go into the replica at once, unless the hub refused
+  them. Copies merge by event id,
   with no conflicts. Read commands (`ps`, `task ls/show`, `state`, `ui`) ask the hub and fall
   back to the replica when it is unreachable.
 
