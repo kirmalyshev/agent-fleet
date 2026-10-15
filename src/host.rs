@@ -1,19 +1,21 @@
-//! `fleet host`: one per machine. Presence from herdr, disk health, a local replica of the log,
+//! `fleet host`: one per machine and herdr session. Presence from herdr, disk health, a local replica of the log,
 //! and doorbell delivery into herdr agents.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Notify;
 
-use crate::client::{Client, Sent};
+use crate::client::{Client, Refused, Sent};
 use crate::event::*;
 use crate::state::State;
 use crate::store::Store;
@@ -80,8 +82,10 @@ pub struct Config {
 struct Local {
     agent: String,
     state: AgentState,
-    /// How many times this host has published the agent turning `working`.
+    /// How many times this host has logged the agent turning `working`.
     working: u64,
+    /// Bumped each time an agent is (re)detected in the pane. A watcher serves one generation.
+    epoch: u64,
 }
 
 struct Host {
@@ -90,15 +94,30 @@ struct Host {
     replica: Mutex<Store>,
     /// herdr pane id → the agent in it.
     panes: Mutex<HashMap<String, Local>>,
+    next_epoch: AtomicU64,
     /// Wakes the delivery loop.
     wake: Notify,
-    /// Fires after an `agent.state` is published.
+    /// Fires after an `agent.state` is recorded.
     seen: Notify,
-    /// Panes with a live status watcher, so a pane is never watched twice.
-    watched: Mutex<HashSet<String>>,
+}
+
+fn backoff(d: Duration) -> Duration {
+    (d * 2).min(Duration::from_secs(60))
 }
 
 impl Host {
+    fn new(cfg: Config, client: Client, replica: Store) -> Self {
+        Self {
+            cfg,
+            client,
+            replica: Mutex::new(replica),
+            panes: Mutex::default(),
+            next_epoch: AtomicU64::new(1),
+            wake: Notify::new(),
+            seen: Notify::new(),
+        }
+    }
+
     fn actor(&self) -> Actor {
         Actor {
             kind: ActorKind::Host,
@@ -112,43 +131,65 @@ impl Host {
 
     /// Writes to the hub (or the spool) and to the local replica, so this host sees its own
     /// writes even while the hub is down. Copies merge by id, so the later echo is a no-op.
-    /// An event the hub refused stays out of the replica.
-    async fn publish(&self, e: Envelope<Known>) {
+    /// Returns whether the event was written. One that was not stays out of the replica.
+    async fn publish(&self, e: Envelope<Known>) -> bool {
         let ty = e.body.type_name();
         match self.client.write(&e).await {
             Ok(Sent::Spooled(why)) => eprintln!("fleet host: {ty} spooled ({why})"),
             Ok(Sent::Accepted { .. }) => {}
-            Err(err) => return eprintln!("fleet host: {ty} refused: {err}"),
+            Err(err) => {
+                eprintln!("fleet host: {ty} NOT written: {err:#}");
+                return false;
+            }
         }
         if let Err(err) = self.replica.lock().unwrap().append(&e.into_event()) {
             eprintln!("fleet host: replica append: {err}");
         }
+        true
     }
 
     fn presence(&self, body: Known) -> Envelope<Known> {
         Envelope::new(self.actor(), self.cfg.session.clone(), body)
     }
 
-    async fn agent_up(&self, pane: &str, info: &Value) {
-        let name = info["name"].as_str().unwrap_or(pane);
-        let local = Local {
-            agent: self.agent_id(name),
-            state: agent_state(&info["agent_status"]),
-            working: 0,
-        };
+    fn current(&self, pane: &str, epoch: u64) -> bool {
         self.panes
             .lock()
             .unwrap()
-            .insert(pane.to_string(), local.clone());
+            .get(pane)
+            .is_some_and(|l| l.epoch == epoch)
+    }
+
+    /// Records the agent in `pane` and publishes `agent.up`. Returns the generation to watch.
+    async fn agent_up(&self, pane: &str, info: &Value) -> u64 {
+        let agent = self.agent_id(info["name"].as_str().unwrap_or(pane));
+        let state = agent_state(&info["agent_status"]);
+        let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut panes = self.panes.lock().unwrap();
+            // The same agent re-detected keeps its counter, so a delivery in flight still sees it.
+            let working = panes
+                .get(pane)
+                .filter(|l| l.agent == agent)
+                .map_or(0, |l| l.working);
+            let local = Local {
+                agent: agent.clone(),
+                state,
+                working,
+                epoch,
+            };
+            panes.insert(pane.to_string(), local);
+        }
         self.publish(self.presence(Known::AgentUp(AgentUp {
-            agent: local.agent,
+            agent,
             host: self.cfg.host.clone(),
             kind: info["agent"].as_str().map(str::to_string),
-            state: local.state,
+            state,
             pane: Some(pane.to_string()),
         })))
         .await;
         self.wake.notify_one();
+        epoch
     }
 
     async fn agent_down(&self, pane: &str, reason: &str) {
@@ -162,16 +203,33 @@ impl Host {
         }
     }
 
-    /// Initial inventory, then reconcile: agents the log thinks are up on this session but herdr
-    /// no longer has are marked down.
-    async fn inventory(self: &Arc<Self>) -> Result<Vec<String>> {
+    /// herdr's current list, reconciled against what the hub believes about this session: agents
+    /// it has but herdr does not are marked down. Returns the panes to watch.
+    async fn inventory(&self) -> Result<Vec<(String, u64)>> {
         let list = herdr_call(&self.cfg.herdr_socket, "agent.list", json!({})).await?;
-        let mut panes = Vec::new();
+        let mut watch = Vec::new();
         for a in list["agents"].as_array().into_iter().flatten() {
             let pane = a["pane_id"].as_str().unwrap_or_default().to_string();
-            self.agent_up(&pane, a).await;
-            panes.push(pane);
+            let epoch = self.agent_up(&pane, a).await;
+            watch.push((pane, epoch));
         }
+        let listed: Vec<&str> = watch.iter().map(|(p, _)| p.as_str()).collect();
+        let vanished: Vec<String> = self
+            .panes
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|p| !listed.contains(&p.as_str()))
+            .cloned()
+            .collect();
+        for pane in vanished {
+            self.agent_down(&pane, "gone from herdr").await;
+        }
+        // The hub's view, not the replica's: at start the replica may not have synced yet.
+        let known = match self.client.state().await {
+            Ok(s) => s,
+            Err(_) => State::fold(&self.replica.lock().unwrap().all()?),
+        };
         let live: Vec<String> = self
             .panes
             .lock()
@@ -180,85 +238,126 @@ impl Host {
             .map(|l| l.agent.clone())
             .collect();
         let prefix = self.agent_id("");
-        let stale: Vec<String> = {
-            let replica = self.replica.lock().unwrap();
-            State::fold(&replica.all()?)
-                .agents
-                .into_keys()
-                .filter(|a| a.starts_with(&prefix) && !live.contains(a))
-                .collect()
-        };
-        for agent in stale {
-            self.publish(self.presence(Known::AgentDown(AgentDown {
-                agent,
-                reason: Some("gone at host start".into()),
-            })))
-            .await;
+        for agent in known.agents.into_keys() {
+            if agent.starts_with(&prefix) && !live.contains(&agent) {
+                self.publish(self.presence(Known::AgentDown(AgentDown {
+                    agent,
+                    reason: Some("gone from herdr".into()),
+                })))
+                .await;
+            }
         }
-        Ok(panes)
+        Ok(watch)
     }
 
-    /// One subscription per agent pane: herdr scopes `pane.agent_status_changed` to a pane.
-    fn watch_pane(self: &Arc<Self>, pane: String) {
-        if !self.watched.lock().unwrap().insert(pane.clone()) {
-            return;
-        }
+    /// One status watcher per agent generation (herdr scopes `pane.agent_status_changed` to a
+    /// pane). It re-subscribes with backoff whenever herdr drops it, and stops once the pane
+    /// closes or holds a newer agent.
+    fn watch_pane(self: &Arc<Self>, pane: String, epoch: u64) {
         let host = self.clone();
         tokio::spawn(async move {
-            host.watch(&pane).await;
-            host.watched.lock().unwrap().remove(&pane);
+            let mut wait = Duration::from_secs(1);
+            while host.current(&pane, epoch) {
+                match host.watch(&pane, epoch).await {
+                    Ok(()) => return,
+                    Err(why) => {
+                        eprintln!("fleet host: watch {pane}: {why:#}; again in {wait:?}");
+                        tokio::time::sleep(wait).await;
+                        wait = backoff(wait);
+                    }
+                }
+            }
         });
     }
 
-    async fn watch(&self, pane: &str) {
+    /// `Ok` when the watch is over for good (agent gone, or superseded); `Err` when it was lost.
+    async fn watch(&self, pane: &str, epoch: u64) -> Result<()> {
         let sub = json!([{ "type": "pane.agent_status_changed", "pane_id": pane }]);
-        let mut sub = match herdr_subscribe(&self.cfg.herdr_socket, sub).await {
-            Ok(s) => s,
-            Err(err) => return eprintln!("fleet host: watch {pane}: {err}"),
-        };
-        while let Ok(Some(line)) = sub.lines.next_line().await {
+        let mut sub = herdr_subscribe(&self.cfg.herdr_socket, sub).await?;
+        // Catch up on whatever changed before the subscription existed.
+        let info = herdr_call(
+            &self.cfg.herdr_socket,
+            "agent.get",
+            json!({ "target": pane }),
+        )
+        .await?;
+        self.observe(pane, epoch, agent_state(&info["agent"]["agent_status"]))
+            .await;
+        while let Some(line) = sub.lines.next_line().await? {
+            if !self.current(pane, epoch) {
+                return Ok(());
+            }
             let Ok(ev) = serde_json::from_str::<Value>(&line) else {
+                eprintln!("fleet host: unreadable herdr event: {line}");
                 continue;
             };
-            let data = &ev["data"];
-            if data["agent"].is_null() {
-                return self.agent_down(pane, "agent left the pane").await;
+            if ev["event"] != "pane.agent_status_changed" {
+                continue;
             }
-            let state = agent_state(&data["agent_status"]);
-            let agent = match self.panes.lock().unwrap().get(pane) {
-                Some(l) if l.state != state => l.agent.clone(),
-                _ => continue,
-            };
-            // Publish first, then record: whatever waits on the record sees the event in the log.
-            self.publish(self.presence(Known::AgentState(AgentStateChanged { agent, state })))
+            if ev["data"]["agent"].is_null() {
+                self.agent_down(pane, "agent left the pane").await;
+                return Ok(());
+            }
+            self.observe(pane, epoch, agent_state(&ev["data"]["agent_status"]))
                 .await;
-            if let Some(l) = self.panes.lock().unwrap().get_mut(pane) {
-                l.state = state;
-                l.working += u64::from(state == AgentState::Working);
+        }
+        bail!("herdr ended the subscription")
+    }
+
+    /// Publishes a state change, then records it: a waiter that sees the record can rely on the
+    /// event being in the log.
+    async fn observe(&self, pane: &str, epoch: u64, state: AgentState) {
+        let agent = match self.panes.lock().unwrap().get(pane) {
+            Some(l) if l.epoch == epoch && l.state != state => l.agent.clone(),
+            _ => return,
+        };
+        let logged = self
+            .publish(self.presence(Known::AgentState(AgentStateChanged { agent, state })))
+            .await;
+        if let Some(l) = self.panes.lock().unwrap().get_mut(pane)
+            && l.epoch == epoch
+        {
+            l.state = state;
+            l.working += u64::from(logged && state == AgentState::Working);
+        }
+        self.seen.notify_waiters();
+        self.wake.notify_one();
+    }
+
+    /// Presence is push. If herdr goes away, restarts or speaks another protocol, presence
+    /// retries with backoff; replica sync and delivery keep running meanwhile.
+    async fn presence_loop(self: Arc<Self>) {
+        let mut wait = Duration::from_secs(1);
+        loop {
+            let started = Instant::now();
+            if let Err(err) = self.presence_once().await {
+                eprintln!("fleet host: presence: {err:#}; again in {wait:?}");
             }
-            self.seen.notify_waiters();
-            self.wake.notify_one();
+            if started.elapsed() > Duration::from_secs(60) {
+                wait = Duration::from_secs(1);
+            }
+            tokio::time::sleep(wait).await;
+            wait = backoff(wait);
         }
     }
 
-    /// Presence is push: lifecycle events from herdr, plus a status watcher per agent pane.
-    async fn presence_loop(self: Arc<Self>) -> Result<()> {
+    async fn presence_once(self: &Arc<Self>) -> Result<()> {
         let pong = herdr_call(&self.cfg.herdr_socket, "ping", json!({})).await?;
         if pong["protocol"].as_u64() != Some(HERDR_PROTOCOL) {
             bail!(
-                "herdr speaks protocol {} but this fleet build knows {HERDR_PROTOCOL}: presence disabled",
+                "herdr speaks protocol {} but this fleet build knows {HERDR_PROTOCOL}; presence is off",
                 pong["protocol"]
             );
         }
         let subs = json!([
-            { "type": "workspace.created" }, { "type": "workspace.closed" },
-            { "type": "pane.agent_detected" }, { "type": "pane.closed" }, { "type": "pane.exited" }
+            { "type": "pane.agent_detected" }, { "type": "pane.closed" },
+            { "type": "pane.exited" }, { "type": "workspace.closed" }
         ]);
         let mut sub = herdr_subscribe(&self.cfg.herdr_socket, subs).await?;
-        for pane in self.inventory().await? {
-            self.watch_pane(pane);
+        for (pane, epoch) in self.inventory().await? {
+            self.watch_pane(pane, epoch);
         }
-        // One bad line or one failed lookup is logged and skipped; it never stops the host.
+        // One bad line or one failed lookup is logged and skipped.
         while let Some(line) = sub.lines.next_line().await? {
             let Ok(ev) = serde_json::from_str::<Value>(&line) else {
                 eprintln!("fleet host: unreadable herdr event: {line}");
@@ -271,8 +370,8 @@ impl Host {
                     let target = json!({ "target": pane });
                     match herdr_call(&self.cfg.herdr_socket, "agent.get", target).await {
                         Ok(info) => {
-                            self.agent_up(&pane, &info["agent"]).await;
-                            self.watch_pane(pane);
+                            let epoch = self.agent_up(&pane, &info["agent"]).await;
+                            self.watch_pane(pane, epoch);
                         }
                         Err(err) => eprintln!("fleet host: agent in {pane}: {err}"),
                     }
@@ -322,19 +421,53 @@ impl Host {
 
     /// Keeps the replica current: pull from the cursor, then follow the SSE feed. Reconnects forever.
     async fn sync_loop(self: Arc<Self>) {
+        let mut wait = Duration::from_secs(1);
         loop {
+            let started = Instant::now();
             if let Err(err) = self.sync_once().await {
-                eprintln!("fleet host: sync: {err:#}");
+                eprintln!("fleet host: sync: {err:#}; again in {wait:?}");
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            if started.elapsed() > Duration::from_secs(60) {
+                wait = Duration::from_secs(1);
+            }
+            tokio::time::sleep(wait).await;
+            wait = backoff(wait);
         }
     }
 
     async fn sync_once(&self) -> Result<()> {
-        self.client.flush_spool().await?;
-        let mut cursor = self.replica.lock().unwrap().meta("cursor")?;
+        let f = self.client.flush_spool().await?;
+        if f.rejected > 0 {
+            eprintln!(
+                "fleet host: {} spooled events were refused by the hub; see spool.rejected.jsonl",
+                f.rejected
+            );
+        }
+        let mut cursor = self
+            .replica
+            .lock()
+            .unwrap()
+            .meta("cursor")?
+            .filter(|c| !c.is_empty());
         loop {
-            let page = self.client.events_after(cursor.as_deref()).await?;
+            let page = match self.client.events_after(cursor.as_deref()).await {
+                Ok(page) => page,
+                // The hub no longer has our cursor (its log was replaced): start over. Appends
+                // are idempotent, so re-reading everything is safe.
+                Err(err)
+                    if err
+                        .downcast_ref::<Refused>()
+                        .is_some_and(|r| r.status == StatusCode::GONE) =>
+                {
+                    eprintln!(
+                        "fleet host: the hub does not know cursor {cursor:?}; re-reading its whole log"
+                    );
+                    self.replica.lock().unwrap().set_meta("cursor", "")?;
+                    cursor = None;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             let Some(last) = page.last() else { break };
             cursor = Some(last.id.clone());
             self.ingest(&page, cursor.as_deref())?;
@@ -362,10 +495,12 @@ impl Host {
         Ok(())
     }
 
-    /// Rings doorbells for this host's agents. `msg.delivered` is written only after herdr reports
-    /// the agent `working` following the prompt: a submitted prompt alone proves nothing.
+    /// Rings doorbells for this host's agents. `msg.delivered` is written only after this host
+    /// has itself logged the agent turning `working` after the prompt; herdr accepting the
+    /// prompt proves nothing.
     async fn delivery_loop(self: Arc<Self>) {
         let mut tried: HashMap<String, Instant> = HashMap::new();
+        let mut waiting: HashSet<String> = HashSet::new();
         loop {
             tokio::select! {
                 _ = self.wake.notified() => {}
@@ -379,6 +514,8 @@ impl Host {
                     continue;
                 }
             };
+            tried.retain(|id, _| pending.contains_key(id));
+            waiting.retain(|id| pending.contains_key(id));
             for (id, msg) in pending {
                 let target = {
                     let panes = self.panes.lock().unwrap();
@@ -392,6 +529,9 @@ impl Host {
                 };
                 // Never type into a busy or blocked agent; retry a failed ring at most once a minute.
                 if !matches!(state, AgentState::Idle | AgentState::Done) {
+                    if waiting.insert(id.clone()) {
+                        eprintln!("fleet host: {id} waits: {} is {state:?}", msg.to);
+                    }
                     continue;
                 }
                 if tried
@@ -412,16 +552,21 @@ impl Host {
                 let params = json!({ "target": pane, "text": text, "wait": { "until": ["working"], "timeout_ms": 20000 } });
                 match herdr_call(&self.cfg.herdr_socket, "agent.prompt", params).await {
                     Ok(_) if self.saw_working(&pane, before).await => {
-                        self.publish(
-                            self.presence(Known::MsgDelivered(MsgDelivered {
-                                to: msg.to.clone(),
-                                observed: AgentState::Working,
-                            }))
-                            .re(&id),
-                        )
-                        .await;
-                        tried.remove(&id);
-                        eprintln!("fleet host: delivered {id} to {}", msg.to);
+                        let delivered = MsgDelivered {
+                            to: msg.to.clone(),
+                            observed: AgentState::Working,
+                        };
+                        if self
+                            .publish(self.presence(Known::MsgDelivered(delivered)).re(&id))
+                            .await
+                        {
+                            eprintln!("fleet host: delivered {id} to {}", msg.to);
+                        } else {
+                            eprintln!(
+                                "fleet host: {id} reached {} but msg.delivered was not written; will retry",
+                                msg.to
+                            );
+                        }
                     }
                     Ok(_) => {
                         eprintln!("fleet host: {id}: prompted, but no `working` seen; will retry")
@@ -432,7 +577,7 @@ impl Host {
         }
     }
 
-    /// Waits up to 20 s for this host to publish the agent in `pane` turning `working` again.
+    /// Waits up to 20 s for this host to log the agent in `pane` turning `working` again.
     async fn saw_working(&self, pane: &str, before: u64) -> bool {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
@@ -461,6 +606,9 @@ pub fn doorbell(from: &str, to: &str, kind: &str, reference: &str, text: &str, i
     )
 }
 
+/// Runs until one of its loops stops. They are meant to run forever, so any stop (a panic, a
+/// poisoned lock) ends the process, for a supervisor to restart, instead of leaving a host that
+/// looks healthy and no longer syncs or delivers.
 pub async fn run(cfg: Config, client: Client) -> Result<()> {
     let replica = Store::open(&cfg.replica)?;
     eprintln!(
@@ -471,24 +619,19 @@ pub async fn run(cfg: Config, client: Client) -> Result<()> {
         cfg.replica.display(),
         replica.len()?
     );
-    let host = Arc::new(Host {
-        cfg,
-        client,
-        replica: Mutex::new(replica),
-        panes: Mutex::default(),
-        wake: Notify::new(),
-        seen: Notify::new(),
-        watched: Mutex::default(),
-    });
-    tokio::spawn(host.clone().sync_loop());
-    tokio::spawn(host.clone().health_loop());
-    tokio::spawn(host.clone().delivery_loop());
-    host.presence_loop().await
+    let host = Arc::new(Host::new(cfg, client, replica));
+    tokio::select! {
+        r = tokio::spawn(host.clone().sync_loop()) => bail!("replica sync stopped: {r:?}"),
+        r = tokio::spawn(host.clone().health_loop()) => bail!("health reports stopped: {r:?}"),
+        r = tokio::spawn(host.clone().delivery_loop()) => bail!("doorbell delivery stopped: {r:?}"),
+        r = tokio::spawn(host.clone().presence_loop()) => bail!("presence stopped: {r:?}"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::UnixListener;
 
     #[test]
     fn doorbell_is_prefixed() {
@@ -504,5 +647,235 @@ mod tests {
             d,
             "[fleet lead→impl] REVIEW task:p/7: please look (event 01ABC)"
         );
+    }
+
+    /// A herdr stand-in: one pane `w:1` with one agent `a`, speaking the same NDJSON socket API.
+    #[derive(Default)]
+    struct FakeHerdr {
+        status: Mutex<String>,
+        prompts: Mutex<Vec<String>>,
+        subs: tokio::sync::Mutex<Vec<OwnedWriteHalf>>,
+    }
+
+    impl FakeHerdr {
+        async fn set(&self, status: &str) {
+            *self.status.lock().unwrap() = status.into();
+            let ev = json!({ "event": "pane.agent_status_changed", "data": {
+                "agent": "claude", "agent_status": status, "pane_id": "w:1", "workspace_id": "w" } });
+            for w in self.subs.lock().await.iter_mut() {
+                let _ = w.write_all(format!("{ev}\n").as_bytes()).await;
+            }
+        }
+
+        async fn serve(self: Arc<Self>, listener: UnixListener) {
+            loop {
+                let (s, _) = listener.accept().await.unwrap();
+                let fake = self.clone();
+                tokio::spawn(async move {
+                    let (rd, mut wr) = s.into_split();
+                    let Ok(Some(line)) = BufReader::new(rd).lines().next_line().await else {
+                        return;
+                    };
+                    let req: Value = serde_json::from_str(&line).unwrap();
+                    let reply =
+                        |result: Value| format!("{}\n", json!({ "id": "fleet", "result": result }));
+                    match req["method"].as_str().unwrap() {
+                        "events.subscribe" => {
+                            wr.write_all(
+                                reply(json!({ "type": "subscription_started" })).as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                            fake.subs.lock().await.push(wr);
+                        }
+                        "agent.get" => {
+                            let status = fake.status.lock().unwrap().clone();
+                            let agent = json!({ "name": "a", "agent": "claude", "agent_status": status, "pane_id": "w:1" });
+                            wr.write_all(reply(json!({ "agent": agent })).as_bytes())
+                                .await
+                                .unwrap();
+                        }
+                        "agent.prompt" => {
+                            fake.prompts
+                                .lock()
+                                .unwrap()
+                                .push(req["params"]["text"].as_str().unwrap().into());
+                            wr.write_all(
+                                reply(json!({ "agent": { "agent_status": "working" } })).as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                        }
+                        m => panic!("unexpected herdr call {m}"),
+                    }
+                });
+            }
+        }
+    }
+
+    /// A host on a fake herdr, with a hub that is down: its writes go to the spool and replica.
+    async fn host_on_fake(dir: &Path, status: &str) -> (Arc<Host>, Arc<FakeHerdr>, u64) {
+        let sock = dir.join("herdr.sock");
+        let fake = Arc::new(FakeHerdr::default());
+        *fake.status.lock().unwrap() = status.into();
+        tokio::spawn(fake.clone().serve(UnixListener::bind(&sock).unwrap()));
+        let cfg = Config {
+            host: "h".into(),
+            session: "s".into(),
+            herdr_socket: sock,
+            replica: dir.join("replica.db"),
+            data_dir: dir.to_path_buf(),
+        };
+        let client = Client::new("http://127.0.0.1:1", "t".into(), dir.join("spool.jsonl"));
+        let host = Arc::new(Host::new(
+            cfg,
+            client,
+            Store::open(&dir.join("replica.db")).unwrap(),
+        ));
+        let info = json!({ "name": "a", "agent": "claude", "agent_status": status });
+        let epoch = host.agent_up("w:1", &info).await;
+        host.watch_pane("w:1".into(), epoch);
+        for _ in 0..100 {
+            if !fake.subs.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let msg = Envelope::new(
+            Actor {
+                kind: ActorKind::Agent,
+                id: "agent:h/s/lead".into(),
+            },
+            "p",
+            Known::MsgSent(MsgSent {
+                to: "agent:h/s/a".into(),
+                kind: "FYI".into(),
+                reference: "x".into(),
+                text: "hi".into(),
+            }),
+        );
+        host.replica
+            .lock()
+            .unwrap()
+            .append(&msg.into_event())
+            .unwrap();
+        tokio::spawn(host.clone().delivery_loop());
+        host.wake.notify_one();
+        (host, fake, epoch)
+    }
+
+    fn types(host: &Host) -> Vec<String> {
+        host.replica
+            .lock()
+            .unwrap()
+            .all()
+            .unwrap()
+            .iter()
+            .map(|e| match &e.body {
+                Body::Known(k) => k.type_name().to_string(),
+                Body::Unknown(_) => "?".into(),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_idle_agent_is_rung_once_and_delivery_follows_logged_working() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, fake, _) = host_on_fake(dir.path(), "idle").await;
+        let delivered = || types(&host).contains(&"msg.delivered".to_string());
+        for _ in 0..200 {
+            if !fake.prompts.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // Prompted, but the agent has not turned working: no delivery may be claimed yet.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!delivered(), "delivered before working was observed");
+        fake.set("working").await;
+        for _ in 0..200 {
+            if delivered() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let t = types(&host);
+        let working = t
+            .iter()
+            .position(|t| t == "agent.state")
+            .expect("working logged");
+        let delivered = t
+            .iter()
+            .position(|t| t == "msg.delivered")
+            .expect("delivered");
+        assert!(working < delivered, "{t:?}");
+        let prompts = fake.prompts.lock().unwrap().clone();
+        assert_eq!(prompts.len(), 1);
+        assert!(
+            prompts[0].starts_with("[fleet lead→a] FYI x: hi"),
+            "{prompts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_busy_agent_is_not_rung() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, fake, _) = host_on_fake(dir.path(), "working").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(fake.prompts.lock().unwrap().is_empty());
+        assert!(!types(&host).contains(&"msg.delivered".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_newer_agent_in_the_pane_retires_the_old_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, _fake, old) = host_on_fake(dir.path(), "working").await;
+        let info = json!({ "name": "a", "agent": "claude", "agent_status": "working" });
+        let new = host.agent_up("w:1", &info).await;
+        assert!(new > old);
+        assert!(!host.current("w:1", old) && host.current("w:1", new));
+    }
+
+    #[tokio::test]
+    async fn sync_starts_over_when_the_hub_forgot_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = crate::hub::router(
+            crate::hub::Hub::new(Store::open(&dir.path().join("hub.db")).unwrap()).unwrap(),
+            "t".into(),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::new(&base, "t".into(), dir.path().join("spool.jsonl"));
+        for n in 0..2 {
+            let e = Envelope::new(
+                Actor {
+                    kind: ActorKind::Agent,
+                    id: "agent:h/s/a".into(),
+                },
+                "p",
+                Known::BlockerRaised(BlockerRaised {
+                    what: format!("b{n}"),
+                    owner: None,
+                    unblocks_when: None,
+                }),
+            )
+            .task("task:p/1");
+            client.write(&e).await.unwrap();
+        }
+        let cfg = Config {
+            host: "h".into(),
+            session: "s".into(),
+            herdr_socket: dir.path().join("none.sock"),
+            replica: dir.path().join("replica.db"),
+            data_dir: dir.path().to_path_buf(),
+        };
+        let replica = Store::open(&cfg.replica).unwrap();
+        replica
+            .set_meta("cursor", "01J00000000000000000000000")
+            .unwrap();
+        let host = Host::new(cfg, client, replica);
+        let _ = tokio::time::timeout(Duration::from_secs(1), host.sync_once()).await;
+        assert_eq!(host.replica.lock().unwrap().len().unwrap(), 2);
     }
 }
