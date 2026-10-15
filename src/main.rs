@@ -1,0 +1,488 @@
+mod client;
+mod event;
+mod host;
+mod hub;
+mod state;
+mod store;
+mod ui;
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use anyhow::{Result, bail};
+use chrono::Utc;
+use clap::{Parser, Subcommand};
+use serde_json::json;
+
+use client::{Client, Paths, Sent};
+use event::*;
+use state::State;
+use store::Store;
+
+/// One event log for a fleet of coding agents: presence, tasks, blockers, asks and doorbells.
+#[derive(Parser)]
+#[command(version, about)]
+struct Cli {
+    /// Hub URL.
+    #[arg(
+        long,
+        global = true,
+        env = "FLEET_HUB",
+        default_value = "http://127.0.0.1:7710"
+    )]
+    hub: String,
+    /// Bearer token file [default: <data dir>/token].
+    #[arg(long, global = true, env = "FLEET_TOKEN_FILE")]
+    token_file: Option<PathBuf>,
+    /// Who is writing: `agent:<host>/<session>/<name>`. Derived from herdr when run inside a pane.
+    #[arg(long = "as", global = true, env = "FLEET_AGENT")]
+    me: Option<String>,
+    /// Project for events that do not name one through a task id.
+    #[arg(long, global = true, env = "FLEET_PROJECT", default_value = "default")]
+    project: String,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Run the hub: the log, the fold and the sequencer, over HTTP + SSE.
+    Hub {
+        #[arg(long, default_value = "127.0.0.1:7710")]
+        listen: SocketAddr,
+        /// [default: <data dir>/hub.db]
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Run the host agent for one herdr session: presence, disk, replica, doorbell delivery.
+    Host {
+        #[arg(long, env = "HERDR_SOCKET_PATH")]
+        herdr_socket: PathBuf,
+        #[arg(long, env = "HERDR_SESSION")]
+        session: String,
+        /// [default: the system hostname]
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Protocol metadata.
+    Api {
+        #[command(subcommand)]
+        cmd: ApiCmd,
+    },
+    /// What every agent is doing.
+    Ps,
+    /// Tasks: `add` claims (exclusive), `rm` cancels or releases.
+    Task {
+        #[command(subcommand)]
+        cmd: TaskCmd,
+    },
+    /// Dependencies between tasks: <task> is blocked by <on>.
+    Dep {
+        #[command(subcommand)]
+        cmd: DepCmd,
+    },
+    /// Raise a blocker on a task. Prints the blocker id.
+    Block {
+        task: String,
+        what: String,
+        /// Who or what has to act.
+        #[arg(long)]
+        owner: Option<String>,
+        /// The condition that clears it.
+        #[arg(long)]
+        until: Option<String>,
+    },
+    /// Resolve a blocker by its id.
+    Unblock {
+        blocker: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Raise a question for an operator.
+    Ask {
+        task: String,
+        question: String,
+        #[arg(long = "option")]
+        options: Vec<String>,
+        #[arg(long = "rec")]
+        recommendation: Option<String>,
+        #[arg(long)]
+        context: Option<String>,
+    },
+    /// Ring an agent's doorbell: `[fleet <from>→<to>] TYPE ref: text`.
+    Tell {
+        agent: String,
+        #[arg(value_name = "TYPE")]
+        kind: String,
+        #[arg(value_name = "REF")]
+        reference: String,
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        text: Vec<String>,
+    },
+    /// The folded state.
+    State {
+        #[arg(long, required = true)]
+        json: bool,
+    },
+    /// The board: agents, tasks, blockers, asks, undelivered doorbells, hosts.
+    Ui {
+        #[arg(long, required = true)]
+        text: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApiCmd {
+    /// Print the JSON Schema of events and state.
+    Schema,
+}
+
+#[derive(Subcommand)]
+enum TaskCmd {
+    /// Create a task if new and assign it. Refused (409) if someone holds it; never spooled.
+    Add {
+        task: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+        /// Assignee [default: you].
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        lead: Option<String>,
+    },
+    /// Cancel a task, or with --release only give it up.
+    Rm {
+        task: String,
+        #[arg(long)]
+        release: bool,
+    },
+    Ls {
+        /// Include completed, failed and canceled tasks.
+        #[arg(long)]
+        all: bool,
+    },
+    Show {
+        task: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DepCmd {
+    Add { task: String, on: String },
+    Rm { task: String, on: String },
+}
+
+fn hostname() -> String {
+    rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn short(id: &str) -> &str {
+    id.rsplit('/').next().unwrap_or(id)
+}
+
+struct Ctx {
+    cli: Cli,
+    paths: Paths,
+}
+
+impl Ctx {
+    fn client(&self) -> Result<Client> {
+        let token_file = self
+            .cli
+            .token_file
+            .clone()
+            .unwrap_or_else(|| self.paths.token());
+        Ok(Client::new(
+            &self.cli.hub,
+            client::read_token(&token_file)?,
+            self.paths.spool(),
+        ))
+    }
+
+    /// `task:<project>/<n>`; a bare name is put in the current project.
+    fn task_id(&self, t: &str) -> String {
+        if t.starts_with("task:") {
+            t.to_string()
+        } else {
+            format!("task:{}/{t}", self.cli.project)
+        }
+    }
+
+    fn project_of(&self, task: &str) -> String {
+        task.strip_prefix("task:")
+            .and_then(|t| t.split_once('/'))
+            .map_or(self.cli.project.clone(), |(p, _)| p.to_string())
+    }
+
+    async fn me(&self) -> Result<Actor> {
+        if let Some(id) = &self.cli.me {
+            return Ok(Actor {
+                kind: ActorKind::Agent,
+                id: id.clone(),
+            });
+        }
+        if let (Ok("1"), Ok(pane), Ok(session), Ok(sock)) = (
+            std::env::var("HERDR_ENV").as_deref(),
+            std::env::var("HERDR_PANE_ID"),
+            std::env::var("HERDR_SESSION"),
+            std::env::var("HERDR_SOCKET_PATH"),
+        ) {
+            let got = host::herdr_call(sock.as_ref(), "agent.get", json!({ "target": pane })).await;
+            let name = got
+                .ok()
+                .and_then(|r| r["agent"]["name"].as_str().map(str::to_string))
+                .unwrap_or(pane);
+            return Ok(Actor {
+                kind: ActorKind::Agent,
+                id: format!("agent:{}/{session}/{name}", hostname()),
+            });
+        }
+        bail!("who is writing? pass --as agent:<host>/<session>/<name> or set FLEET_AGENT")
+    }
+
+    /// The hub's state, or the local replica's when the hub is unreachable.
+    async fn state(&self) -> Result<State> {
+        match self.client()?.state().await {
+            Ok(s) => Ok(s),
+            Err(err) if self.paths.replica().exists() => {
+                eprintln!("fleet: hub unreachable ({err}); reading the local replica");
+                Ok(State::fold(&Store::open(&self.paths.replica())?.all()?))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// A full agent id from a short name, among the agents that are up.
+    async fn resolve_agent(&self, name: &str) -> Result<String> {
+        if name.contains(':') {
+            return Ok(name.to_string());
+        }
+        let s = self.state().await?;
+        let found: Vec<&String> = s.agents.keys().filter(|a| short(a) == name).collect();
+        match found.as_slice() {
+            [one] => Ok((*one).clone()),
+            [] => bail!("no agent named {name} is up (see `fleet ps`)"),
+            many => bail!(
+                "{name} is ambiguous: {}",
+                many.iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
+    async fn write(&self, e: Envelope<Known>) -> Result<String> {
+        let (ty, id) = (e.body.type_name(), e.id.clone());
+        match self.client()?.write(&e).await? {
+            Sent::Accepted { duplicate: false } => println!("{ty} {id}"),
+            Sent::Accepted { duplicate: true } => println!("{ty} {id} (already in the log)"),
+            Sent::Spooled => {
+                println!("{ty} {id} spooled: hub unreachable, replays on the next write")
+            }
+        }
+        Ok(id)
+    }
+
+    async fn task_event(&self, task: &str, body: Known) -> Result<String> {
+        let task = self.task_id(task);
+        self.write(Envelope::new(self.me().await?, self.project_of(&task), body).task(task))
+            .await
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    if let Cmd::Api {
+        cmd: ApiCmd::Schema,
+    } = cli.cmd
+    {
+        println!("{}", serde_json::to_string_pretty(&api_schema())?);
+        return Ok(());
+    }
+    let ctx = Ctx {
+        paths: Paths::from_env()?,
+        cli,
+    };
+    let now = Utc::now();
+    match &ctx.cli.cmd {
+        Cmd::Api { .. } => unreachable!(),
+        Cmd::Hub { listen, db } => {
+            let token_file = ctx
+                .cli
+                .token_file
+                .clone()
+                .unwrap_or_else(|| ctx.paths.token());
+            let token = client::read_or_create_token(&token_file)?;
+            hub::serve(*listen, db.as_ref().unwrap_or(&ctx.paths.hub_db()), token).await?;
+        }
+        Cmd::Host {
+            herdr_socket,
+            session,
+            name,
+        } => {
+            let cfg = host::Config {
+                host: name.clone().unwrap_or_else(hostname),
+                session: session.clone(),
+                herdr_socket: herdr_socket.clone(),
+                replica: ctx.paths.replica(),
+                data_dir: ctx.paths.dir.clone(),
+            };
+            host::run(cfg, ctx.client()?).await?;
+        }
+        Cmd::Ps => print!("{}", ui::ps(&ctx.state().await?, now)),
+        Cmd::State { .. } => println!("{}", serde_json::to_string_pretty(&ctx.state().await?)?),
+        Cmd::Ui { .. } => print!("{}", ui::board(&ctx.state().await?, now)),
+        Cmd::Task { cmd } => match cmd {
+            TaskCmd::Add {
+                task,
+                title,
+                url,
+                to,
+                lead,
+            } => {
+                let task = ctx.task_id(task);
+                let project = ctx.project_of(&task);
+                let me = ctx.me().await?;
+                let agent = match to {
+                    Some(a) => ctx.resolve_agent(a).await?,
+                    None => me.id.clone(),
+                };
+                let client = ctx.client()?;
+                let known = client.state().await.map_err(|err| {
+                    anyhow::anyhow!("hub unreachable ({err}); task add is exclusive, so it is refused, not spooled")
+                })?;
+                if !known.tasks.contains_key(&task) {
+                    let title = title.clone().unwrap_or_else(|| task.clone());
+                    let created = Envelope::new(
+                        me.clone(),
+                        &project,
+                        Known::TaskCreated(TaskCreated {
+                            title,
+                            url: url.clone(),
+                        }),
+                    );
+                    client.write_exclusive(&created.task(&task)).await?;
+                }
+                let assigned = Envelope::new(
+                    me,
+                    &project,
+                    Known::TaskAssigned(TaskAssigned {
+                        agent: agent.clone(),
+                        lead: lead.clone(),
+                    }),
+                );
+                let id = assigned.id.clone();
+                client.write_exclusive(&assigned.task(&task)).await?;
+                println!("task.assigned {id}: {task} → {agent}");
+            }
+            TaskCmd::Rm {
+                task,
+                release: true,
+            } => {
+                ctx.task_event(task, Known::TaskUnassigned(TaskUnassigned { reason: None }))
+                    .await?;
+            }
+            TaskCmd::Rm {
+                task,
+                release: false,
+            } => {
+                ctx.task_event(
+                    task,
+                    Known::TaskState(TaskStateChanged {
+                        state: TaskState::Canceled,
+                    }),
+                )
+                .await?;
+            }
+            TaskCmd::Ls { all } => print!("{}", ui::tasks(&ctx.state().await?, *all, now)),
+            TaskCmd::Show { task } => {
+                let id = ctx.task_id(task);
+                match ui::task(&ctx.state().await?, &id, now) {
+                    Some(text) => print!("{text}"),
+                    None => bail!("no task {id}"),
+                }
+            }
+        },
+        Cmd::Dep { cmd } => {
+            let (task, body) = match cmd {
+                DepCmd::Add { task, on } => (
+                    task,
+                    Known::DepAdded(Dep {
+                        on: ctx.task_id(on),
+                    }),
+                ),
+                DepCmd::Rm { task, on } => (
+                    task,
+                    Known::DepRemoved(Dep {
+                        on: ctx.task_id(on),
+                    }),
+                ),
+            };
+            ctx.task_event(task, body).await?;
+        }
+        Cmd::Block {
+            task,
+            what,
+            owner,
+            until,
+        } => {
+            let body = BlockerRaised {
+                what: what.clone(),
+                owner: owner.clone(),
+                unblocks_when: until.clone(),
+            };
+            ctx.task_event(task, Known::BlockerRaised(body)).await?;
+        }
+        Cmd::Unblock { blocker, note } => {
+            let e = Envelope::new(
+                ctx.me().await?,
+                &ctx.cli.project,
+                Known::BlockerResolved(BlockerResolved { note: note.clone() }),
+            );
+            ctx.write(e.re(blocker)).await?;
+        }
+        Cmd::Ask {
+            task,
+            question,
+            options,
+            recommendation,
+            context,
+        } => {
+            let body = AskRaised {
+                question: question.clone(),
+                options: options.clone(),
+                recommendation: recommendation.clone(),
+                context: context.clone(),
+            };
+            ctx.task_event(task, Known::AskRaised(body)).await?;
+        }
+        Cmd::Tell {
+            agent,
+            kind,
+            reference,
+            text,
+        } => {
+            let to = ctx.resolve_agent(agent).await?;
+            let body = MsgSent {
+                to,
+                kind: kind.clone(),
+                reference: reference.clone(),
+                text: text.join(" "),
+            };
+            ctx.write(Envelope::new(
+                ctx.me().await?,
+                &ctx.cli.project,
+                Known::MsgSent(body),
+            ))
+            .await?;
+        }
+    }
+    Ok(())
+}
