@@ -40,6 +40,10 @@ struct Cli {
     /// Project for events that do not name one through a task id.
     #[arg(long, global = true, env = "FLEET_PROJECT", default_value = "default")]
     project: String,
+    /// This machine's name in agent and host ids; `fleet host` and the CLI must agree on it
+    /// [default: the system hostname].
+    #[arg(long, global = true, env = "FLEET_HOST")]
+    host_name: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -60,9 +64,6 @@ enum Cmd {
         herdr_socket: PathBuf,
         #[arg(long, env = "HERDR_SESSION")]
         session: String,
-        /// [default: the system hostname]
-        #[arg(long)]
-        name: Option<String>,
     },
     /// Protocol metadata.
     Api {
@@ -174,13 +175,6 @@ enum DepCmd {
     Rm { task: String, on: String },
 }
 
-fn hostname() -> String {
-    rustix::system::uname()
-        .nodename()
-        .to_string_lossy()
-        .into_owned()
-}
-
 fn short(id: &str) -> &str {
     id.rsplit('/').next().unwrap_or(id)
 }
@@ -191,6 +185,15 @@ struct Ctx {
 }
 
 impl Ctx {
+    fn host_name(&self) -> String {
+        self.cli.host_name.clone().unwrap_or_else(|| {
+            rustix::system::uname()
+                .nodename()
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+
     fn client(&self) -> Result<Client> {
         let token_file = self
             .cli
@@ -239,7 +242,7 @@ impl Ctx {
                 .unwrap_or(pane);
             return Ok(Actor {
                 kind: ActorKind::Agent,
-                id: format!("agent:{}/{session}/{name}", hostname()),
+                id: format!("agent:{}/{session}/{name}", self.host_name()),
             });
         }
         bail!("who is writing? pass --as agent:<host>/<session>/<name> or set FLEET_AGENT")
@@ -282,8 +285,8 @@ impl Ctx {
         match self.client()?.write(&e).await? {
             Sent::Accepted { duplicate: false } => println!("{ty} {id}"),
             Sent::Accepted { duplicate: true } => println!("{ty} {id} (already in the log)"),
-            Sent::Spooled => {
-                println!("{ty} {id} spooled: hub unreachable, replays on the next write")
+            Sent::Spooled(why) => {
+                println!("{ty} {id} spooled ({why}); replays on the next write")
             }
         }
         Ok(id)
@@ -325,10 +328,9 @@ async fn main() -> Result<()> {
         Cmd::Host {
             herdr_socket,
             session,
-            name,
         } => {
             let cfg = host::Config {
-                host: name.clone().unwrap_or_else(hostname),
+                host: ctx.host_name(),
                 session: session.clone(),
                 herdr_socket: herdr_socket.clone(),
                 replica: ctx.paths.replica(),
