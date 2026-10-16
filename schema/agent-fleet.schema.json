@@ -121,7 +121,10 @@
               "description": "CPU since the previous sample, in percent of one core.",
               "format": "uint32",
               "minimum": 0,
-              "type": "integer"
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "cwd": {
               "description": "Where the agent works.",
@@ -133,19 +136,23 @@
             "procs": {
               "format": "uint32",
               "minimum": 0,
-              "type": "integer"
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "rss_kb": {
+              "description": "Memory, CPU and process count are measured on Linux only; elsewhere just `cwd` is sent.",
               "format": "uint64",
               "minimum": 0,
-              "type": "integer"
+              "type": [
+                "integer",
+                "null"
+              ]
             }
           },
           "required": [
-            "agent",
-            "rss_kb",
-            "cpu_pct",
-            "procs"
+            "agent"
           ],
           "type": "object"
         },
@@ -1301,7 +1308,10 @@
             "cpu_pct": {
               "format": "uint32",
               "minimum": 0,
-              "type": "integer"
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "cwd": {
               "type": [
@@ -1312,12 +1322,18 @@
             "procs": {
               "format": "uint32",
               "minimum": 0,
-              "type": "integer"
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "rss_kb": {
               "format": "uint64",
               "minimum": 0,
-              "type": "integer"
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "ts": {
               "format": "date-time",
@@ -1325,9 +1341,6 @@
             }
           },
           "required": [
-            "rss_kb",
-            "cpu_pct",
-            "procs",
             "ts"
           ],
           "type": "object"

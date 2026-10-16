@@ -153,14 +153,48 @@ pub async fn serve(listen: SocketAddr, db: &Path, hub_file: &Path, token: String
 
 pub fn router(hub: Hub, token: String) -> Router {
     let hub: Shared = Arc::new(Mutex::new(hub));
-    Router::new()
+    let api = Router::new()
         .route("/events", post(post_event).get(get_events))
         .route("/events/stream", get(stream))
         .route("/state", get(get_state))
         .route("/stats", get(get_stats))
+        .route("/board", get(get_board))
         .route("/schema", get(|| async { Json(event::api_schema()) }))
-        .layer(middleware::from_fn_with_state(Arc::new(token), auth))
+        .layer(middleware::from_fn_with_state(Arc::new(token), auth));
+    // The board page holds no data: it asks for the token and reads `/board` with it.
+    Router::new()
+        .route("/", get(board_page))
+        .merge(api)
         .with_state(hub)
+}
+
+async fn board_page() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        include_str!("board.html"),
+    )
+        .into_response()
+}
+
+/// What the board shows: the state, `doctor`'s findings, and which worktree each agent is in.
+async fn get_board(AxState(hub): AxState<Shared>) -> Response {
+    let hub = hub.lock().unwrap();
+    let (s, now) = (&hub.state, chrono::Utc::now());
+    let worktree_of: BTreeMap<&String, &String> = s
+        .agents
+        .iter()
+        .filter_map(|(id, a)| Some((id, crate::doctor::worktree_of(s, a)?.0)))
+        .collect();
+    Json(json!({
+        "now": now,
+        "state": s,
+        "findings": crate::doctor::findings(s, now),
+        "worktree_of": worktree_of,
+    }))
+    .into_response()
 }
 
 async fn auth(AxState(token): AxState<Arc<String>>, req: Request, next: Next) -> Response {
@@ -388,6 +422,30 @@ mod tests {
         store.append(&serde_json::from_value(v).unwrap()).unwrap();
         let err = Hub::new(store).err().unwrap();
         assert!(err.to_string().contains("cannot read"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_board_page_is_open_and_its_data_is_not() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = router(hub(), "tok".into());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = reqwest::Client::new();
+        let page = http.get(format!("{base}/")).send().await.unwrap();
+        assert_eq!(page.status(), 200);
+        assert!(page.text().await.unwrap().contains("agent-fleet board"));
+        let anon = http.get(format!("{base}/board")).send().await.unwrap();
+        assert_eq!(anon.status(), 401);
+        let board: Value = http
+            .get(format!("{base}/board"))
+            .bearer_auth("tok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(board["state"]["agents"].is_object() && board["findings"].is_array());
     }
 
     #[test]

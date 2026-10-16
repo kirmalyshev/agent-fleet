@@ -226,10 +226,14 @@ pub struct HostStats {
 #[serde(deny_unknown_fields)]
 pub struct AgentUsage {
     pub agent: String,
-    pub rss_kb: u64,
+    /// Memory, CPU and process count are measured on Linux only; elsewhere just `cwd` is sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rss_kb: Option<u64>,
     /// CPU since the previous sample, in percent of one core.
-    pub cpu_pct: u32,
-    pub procs: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_pct: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub procs: Option<u32>,
     /// Where the agent works.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,

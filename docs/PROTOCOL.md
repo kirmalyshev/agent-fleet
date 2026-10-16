@@ -72,7 +72,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `agent.state` | agent, state (`idle` `working` `blocked` `done` `unknown`) | | host |
 | | `agent.down` | agent, reason? | | host |
 | | `host.health` | host, disk_free, disk_total, agents, stats? (every minute) | | host |
-| | `agent.usage` | agent, rss_kb, cpu_pct, procs, cwd? (each scan) | | host |
+| | `agent.usage` | agent, rss_kb?, cpu_pct?, procs?, cwd? (each scan; the numbers on Linux only) | | host |
 | machine | `worktree.state` | host, path, repo, branch?, head, unpushed, dirty, files[], last_commit (on change) | | host |
 | | `worktree.gone` | host, path | | host |
 | | `worktree.procs` | host, path, procs, rss_kb, cpu_pct, names[], pids[], orphaned (each scan; `procs: 0` once when they end) | | host |
@@ -127,6 +127,8 @@ from the log, so host agents and CLIs upgrade independently of the hub.
 | `GET` | `/events/stream?after=<id>` | SSE: the backlog after the cursor, then live events; `410` for an unknown cursor |
 | `GET` | `/state` | the folded state |
 | `GET` | `/schema` | the same document as `agent-fleet api schema` |
+| `GET` | `/board` | the state, `doctor`'s findings and the worktree each agent is in: what the board page reads |
+| `GET` | `/` | the board page itself, without a token: it holds no data and reads `/board` with the token it is given |
 | `GET` | `/stats?since=<s>` | the hub's vitals and numbers read off the last `s` seconds of the log (see Metrics) |
 
 The cursor is an event id, but order is **arrival** order at the hub. A spooled event with an old
@@ -253,6 +255,16 @@ left in one (only those still running there, so a reused pid is never hit).
 simulators a worktree holds, and how its stack stops. If its main checkout has an executable
 `.agent-fleet/hook`, removing a worktree runs `.agent-fleet/hook retire <path>` instead of
 `git worktree remove`; the hook does the repository's own teardown and exits non-zero to refuse.
+
+## The board
+
+`agent-fleet ui` opens the hub's page in the default browser, already signed in: the token rides
+in the URL fragment, which a browser never sends to a server, and the page keeps it in local
+storage and drops it from the address bar. `--url` prints the address without the token;
+anyone else opening it pastes the token once. The page refreshes every 3 s. Its first tab is a
+tree: each repository, its worktrees with unpushed and dirty work, what they run and their
+findings, the agents in them with state, CPU and memory, and the tasks those agents hold with
+their blockers; then agents outside a known worktree, and open tasks with no agent up, by project.
 
 ## Instances
 

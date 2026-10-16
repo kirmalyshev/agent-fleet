@@ -53,9 +53,9 @@ pub struct Agent {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Usage {
-    pub rss_kb: u64,
-    pub cpu_pct: u32,
-    pub procs: u32,
+    pub rss_kb: Option<u64>,
+    pub cpu_pct: Option<u32>,
+    pub procs: Option<u32>,
     pub cwd: Option<String>,
     pub ts: DateTime<Utc>,
 }
