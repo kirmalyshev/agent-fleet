@@ -319,11 +319,13 @@ Use `agent-fleet kill <pid>...` (find pids with pgrep): it refuses agents, their
 everything above them, your own ancestors and other agents' processes, and kills your own \
 processes and orphans `agent-fleet doctor` proved, TERM then KILL. `kill -0` passes.";
 
-/// The Claude Code PreToolUse hook: the tool call on stdin, refused with exit 2 when it is a Bash
-/// command running a raw kill. Anything it cannot read passes.
+/// The PreToolUse hook for Claude Code and Devin CLI (same format): the tool call on stdin,
+/// refused with exit 2 when it is a shell command running a raw kill. Anything it cannot read
+/// passes.
 pub fn hook(stdin: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(stdin).ok()?;
-    if v["tool_name"] != "Bash" {
+    // Claude Code's shell tool is `Bash`, Devin CLI's is `exec`; both put the line in `command`.
+    if !matches!(v["tool_name"].as_str(), Some("Bash" | "exec")) {
         return None;
     }
     let hit = raw_kill(v["tool_input"]["command"].as_str()?)?;
