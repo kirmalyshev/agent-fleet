@@ -254,7 +254,12 @@ function indexes(s) {
   for (const [id, k] of Object.entries(data.worktree_of)) (inWt[k] = inWt[k] || []).push(id);
   return { flags, tasksOf, blockers, inWt };
 }
-const findingBadges = (ix, subj) => (ix.flags[subj] || []).map(f => badge("k-" + f.kind, f.kind, f.detail)).join("");
+// One badge per kind, counted; every finding's detail is in its tooltip.
+function findingBadges(ix, subj) {
+  const by = {};
+  for (const f of ix.flags[subj] || []) (by[f.kind] = by[f.kind] || []).push(f.detail);
+  return Object.entries(by).map(([kind, ds]) => badge("k-" + kind, ds.length > 1 ? `${kind} ×${ds.length}` : kind, ds.join("\n"))).join("");
+}
 const usage = u => u?.cpu_pct != null ? `${u.cpu_pct}% · ${mb(u.rss_kb)}` : "";
 
 /* ---------- tree ---------- */
