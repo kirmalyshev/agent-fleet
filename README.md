@@ -18,6 +18,8 @@ fleet ask                 a question for an operator
 fleet tell <agent> <TYPE> <ref> <text>
                           ring an agent's doorbell; delivered = it was seen working afterwards
 fleet state --json        the folded state
+fleet tui                 the fleet on one screen, live: agents, worktrees, tasks, findings,
+                          with tell, focus, task done/release/cancel, remove a worktree, kill orphans
 fleet ui --text           the board: agents, tasks, blockers, asks, undelivered doorbells, hosts
 fleet stats               doorbell latency and loss, event lag, host and hub vitals
 fleet doctor              stale, hung or heavy agents, duplicate work, forgotten worktrees,
