@@ -1,8 +1,10 @@
+mod bench;
 mod client;
 mod event;
 mod host;
 mod hub;
 mod state;
+mod stats;
 mod store;
 mod ui;
 
@@ -120,6 +122,21 @@ enum Cmd {
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         text: Vec<String>,
     },
+    /// Numbers about the fleet: doorbell latency and loss, event lag, host and hub vitals.
+    Stats {
+        /// Window back from now: `90s`, `30m`, `24h`, `7d`.
+        #[arg(long, default_value = "24h", value_parser = parse_window)]
+        since: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Load-test a throwaway in-process hub: post latency, throughput, follower lag, 409 races.
+    Bench {
+        #[arg(long, default_value_t = 1000)]
+        events: usize,
+        #[arg(long, default_value_t = 8)]
+        concurrency: usize,
+    },
     /// The folded state.
     State {
         #[arg(long, required = true)]
@@ -130,6 +147,18 @@ enum Cmd {
         #[arg(long, required = true)]
         text: bool,
     },
+}
+
+fn parse_window(s: &str) -> Result<i64, String> {
+    let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let n: i64 = n.parse().map_err(|_| format!("not a window: {s}"))?;
+    match unit {
+        "" | "s" => Ok(n),
+        "m" => Ok(n * 60),
+        "h" => Ok(n * 3600),
+        "d" => Ok(n * 86400),
+        _ => Err(format!("unknown unit in {s}; use s, m, h or d")),
+    }
 }
 
 #[derive(Subcommand)]
@@ -356,6 +385,18 @@ async fn main() -> Result<()> {
             host::run(cfg, ctx.client()?).await?;
         }
         Cmd::Ps => print!("{}", ui::ps(&ctx.state().await?, now)),
+        Cmd::Stats { since, json } => {
+            let v = ctx.client()?.stats(*since).await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                print!("{}", ui::stats(&v)?);
+            }
+        }
+        Cmd::Bench {
+            events,
+            concurrency,
+        } => print!("{}", bench::run(*events, *concurrency).await?),
         Cmd::State { .. } => println!("{}", serde_json::to_string_pretty(&ctx.state().await?)?),
         Cmd::Ui { .. } => print!("{}", ui::board(&ctx.state().await?, now)),
         Cmd::Task { cmd } => match cmd {

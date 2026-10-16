@@ -187,6 +187,30 @@ pub struct HostHealth {
     pub disk_free: u64,
     pub disk_total: u64,
     pub agents: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<HostStats>,
+}
+
+/// The host agent's own vitals. Counters run from the host's start, so a drop in `uptime_s`
+/// between two reports is a restart.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostStats {
+    pub uptime_s: u64,
+    /// Peak resident memory of the host process.
+    pub max_rss_kb: u64,
+    /// User + system CPU time of the host process.
+    pub cpu_ms: u64,
+    /// Doorbells typed into an agent.
+    pub rings: u64,
+    /// Rings that failed or were not followed by `working`.
+    pub ring_failures: u64,
+    /// Failed herdr calls and dropped herdr subscriptions.
+    pub herdr_errors: u64,
+    /// Events this host could neither send nor spool.
+    pub write_failures: u64,
+    /// Events this host sent to the spool instead of the hub.
+    pub spooled: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -277,6 +301,12 @@ pub struct MsgSent {
 pub struct MsgDelivered {
     pub to: String,
     pub observed: AgentState,
+    /// When the ring that worked was typed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rung: Option<DateTime<Utc>>,
+    /// Rings it took, this one included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

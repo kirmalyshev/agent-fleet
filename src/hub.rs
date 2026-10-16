@@ -1,9 +1,11 @@
 //! `fleet hub`: the log, the fold, and the one sequencer for exclusive writes, over HTTP + SSE.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Result, bail};
 use axum::extract::{Query, Request, State as AxState};
@@ -21,12 +23,21 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::event::{self, Known, Reject};
 use crate::state::State;
+use crate::stats::{self, Dist};
 use crate::store::{Store, UnknownCursor};
+
+/// How many recent `POST /events` timings the hub keeps for its percentiles.
+const TIMINGS: usize = 1000;
 
 pub struct Hub {
     store: Store,
     state: State,
     tx: broadcast::Sender<(String, String)>,
+    started: Instant,
+    /// Lock wait + validation + append of recent posts, µs.
+    post_us: VecDeque<u64>,
+    /// Posts by outcome since start: `accepted`, `duplicate`, or the status code.
+    outcomes: BTreeMap<&'static str, u64>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -50,7 +61,37 @@ impl Hub {
             store,
             state,
             tx: broadcast::channel(4096).0,
+            started: Instant::now(),
+            post_us: VecDeque::with_capacity(TIMINGS),
+            outcomes: BTreeMap::new(),
         })
+    }
+
+    fn record(&mut self, outcome: &'static str, started: Instant) {
+        if self.post_us.len() == TIMINGS {
+            self.post_us.pop_front();
+        }
+        self.post_us.push_back(started.elapsed().as_micros() as u64);
+        *self.outcomes.entry(outcome).or_default() += 1;
+    }
+
+    /// The hub's own vitals plus `stats::compute` over the last `window`.
+    pub fn stats(&self, window: chrono::Duration) -> anyhow::Result<Value> {
+        let (max_rss_kb, cpu_ms) = stats::self_usage();
+        let log = stats::compute(&self.store.all_with_arrival()?, chrono::Utc::now(), window);
+        Ok(json!({
+            "hub": {
+                "uptime_s": self.started.elapsed().as_secs(),
+                "max_rss_kb": max_rss_kb,
+                "cpu_ms": cpu_ms,
+                "events": self.store.len()?,
+                "db_bytes": self.store.bytes()?,
+                "followers": self.tx.receiver_count(),
+                "post_us": Dist::of(self.post_us.iter().copied().collect()),
+                "outcomes": self.outcomes,
+            },
+            "log": log,
+        }))
     }
 
     /// Validates and appends one event. Runs under the hub lock, so the 409 check and the append
@@ -110,6 +151,7 @@ pub fn router(hub: Hub, token: String) -> Router {
         .route("/events", post(post_event).get(get_events))
         .route("/events/stream", get(stream))
         .route("/state", get(get_state))
+        .route("/stats", get(get_stats))
         .route("/schema", get(|| async { Json(event::api_schema()) }))
         .layer(middleware::from_fn_with_state(Arc::new(token), auth))
         .with_state(hub)
@@ -148,7 +190,19 @@ fn read_error(e: anyhow::Error) -> Response {
 }
 
 async fn post_event(AxState(hub): AxState<Shared>, Json(raw): Json<Value>) -> Response {
-    let result = hub.lock().unwrap().submit(&raw);
+    let started = Instant::now();
+    let mut h = hub.lock().unwrap();
+    let result = h.submit(&raw);
+    let outcome = match &result {
+        Ok(a) if a.duplicate => "duplicate",
+        Ok(_) => "accepted",
+        Err(Reject::BadRequest(_)) => "400",
+        Err(Reject::Forbidden(_)) => "403",
+        Err(Reject::Conflict(_)) => "409",
+        Err(Reject::Internal(_)) => "500",
+    };
+    h.record(outcome, started);
+    drop(h);
     match result {
         Ok(a) => Json(json!({ "id": a.id, "duplicate": a.duplicate })).into_response(),
         Err(Reject::BadRequest(m)) => error(StatusCode::BAD_REQUEST, &m),
@@ -178,6 +232,20 @@ async fn get_events(AxState(hub): AxState<Shared>, Query(q): Query<Cursor>) -> R
 
 async fn get_state(AxState(hub): AxState<Shared>) -> Response {
     Json(hub.lock().unwrap().state.clone()).into_response()
+}
+
+#[derive(Deserialize)]
+struct Window {
+    /// Seconds back from now; a day by default.
+    since: Option<i64>,
+}
+
+async fn get_stats(AxState(hub): AxState<Shared>, Query(q): Query<Window>) -> Response {
+    let window = chrono::Duration::seconds(q.since.unwrap_or(86_400));
+    match hub.lock().unwrap().stats(window) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
 }
 
 /// The backlog after the cursor, then live events. Subscribing and reading the backlog happen
