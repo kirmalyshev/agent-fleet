@@ -19,6 +19,8 @@ agent-fleet resource limit|unlimit
                           a capacity rule over the locks hosts report (host --lock name=dir)
 agent-fleet tell <agent> <TYPE> <ref> <text>
                           ring an agent's doorbell; delivered = it was seen working afterwards
+agent-fleet kill <pid>...       stop your own processes or proved orphans; refuses agents and their ancestors
+agent-fleet hook bash           Claude Code PreToolUse hook: blocks raw kill/pkill/killall
 agent-fleet state --json        the folded state
 agent-fleet tui                 the fleet on one screen, live: agents, worktrees, tasks, findings,
                           with tell, focus, task done/release/cancel, remove a worktree, kill orphans
@@ -27,7 +29,7 @@ agent-fleet ui                  the board in the browser, live: a tree of reposi
 agent-fleet ui --text           the board: agents, tasks, blockers, asks, undelivered doorbells, hosts
 agent-fleet stats               doorbell latency and loss, event lag, host and hub vitals
 agent-fleet doctor              stale, hung or heavy agents, duplicate work, forgotten worktrees,
-                          unpushed commits, orphaned processes, capacity breaches, long queues
+                          unpushed commits, orphaned processes, capacity breaches, long queues, refused kills
 agent-fleet instances           one fleet per project or product: each has its own hub, log and token
 agent-fleet bench               load-test a throwaway hub: latency, throughput, follower lag, 409 races
 agent-fleet api schema          JSON Schema of events and state (schema/agent-fleet.schema.json)

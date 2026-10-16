@@ -106,7 +106,7 @@ fn agent_color(s: AgentState) -> Color {
 fn kind_color(kind: &str) -> Color {
     match kind {
         "hung" | "orphan" | "duplicate" | "breach" => Color::Red,
-        "heavy" | "unpushed" | "forgotten" => Color::Yellow,
+        "heavy" | "unpushed" | "forgotten" | "queued" | "refused" => Color::Yellow,
         _ => DIM,
     }
 }

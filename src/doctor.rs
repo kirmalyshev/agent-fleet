@@ -20,6 +20,8 @@ pub const HEAVY_CPU_PCT: u32 = 200;
 pub const UNPUSHED: Duration = Duration::hours(1);
 /// A clean worktree nobody works in, untouched this long, is clutter.
 pub const ABANDONED: Duration = Duration::days(3);
+/// A refused kill stays a finding this long.
+pub const REFUSED: Duration = Duration::hours(1);
 /// Queued this long for a resource: worth a look at who holds it.
 pub const QUEUED: Duration = Duration::minutes(10);
 /// Files every branch touches; sharing them is not duplicate work.
@@ -35,7 +37,7 @@ const SHARED_BY_ALL: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Finding {
     /// `stale`, `hung`, `heavy`, `duplicate`, `forgotten`, `unpushed`, `orphan`, `breach`,
-    /// `queued`.
+    /// `queued`, `refused`.
     pub kind: &'static str,
     /// The agent id or `<host>:<path>` it is about.
     pub subject: String,
@@ -310,6 +312,20 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
                 ),
             ));
         }
+    }
+    for k in s.refused_kills.iter().filter(|k| now - k.ts < REFUSED) {
+        out.push(finding(
+            "refused",
+            &k.by,
+            format!(
+                "tried to kill pid {} ({}) on {} {} ago: {}",
+                k.pid,
+                k.name,
+                k.host,
+                ago(now, k.ts),
+                k.reason
+            ),
+        ));
     }
     for (key, r) in &s.resources {
         for w in r.waiting.iter().filter(|w| now - w.since >= QUEUED) {

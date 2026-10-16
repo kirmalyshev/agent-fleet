@@ -34,6 +34,9 @@ pub struct State {
     /// Capacity rules by `<host>:<name>`.
     #[serde(default)]
     pub limits: BTreeMap<String, ResourceLimit>,
+    /// The latest kills `agent-fleet kill` refused, oldest first; at most `MAX_REFUSED`.
+    #[serde(default)]
+    pub refused_kills: Vec<RefusedKill>,
     /// Events this binary cannot fold (an unknown type, or a known type at a newer `v`): kept in
     /// the log, skipped here.
     pub unknown: u64,
@@ -106,6 +109,18 @@ impl From<&ResourceHold> for Hold {
             since: d.since,
         }
     }
+}
+
+pub const MAX_REFUSED: usize = 20;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RefusedKill {
+    pub by: String,
+    pub host: String,
+    pub pid: u32,
+    pub name: String,
+    pub reason: String,
+    pub ts: DateTime<Utc>,
 }
 
 pub fn worktree_key(host: &str, path: &str) -> String {
@@ -274,6 +289,18 @@ impl State {
                 } else {
                     self.limits.insert(key, d.clone());
                 }
+            }
+            Known::KillRefused(d) => {
+                self.refused_kills.push(RefusedKill {
+                    by: e.actor.id.clone(),
+                    host: d.host.clone(),
+                    pid: d.pid,
+                    name: d.name.clone(),
+                    reason: d.reason.clone(),
+                    ts,
+                });
+                let over = self.refused_kills.len().saturating_sub(MAX_REFUSED);
+                self.refused_kills.drain(..over);
             }
             Known::WorktreeGone(d) => {
                 self.worktrees.remove(&worktree_key(&d.host, &d.path));
@@ -537,6 +564,24 @@ mod tests {
             fold(reset).resources.is_empty(),
             "a release without pid clears it"
         );
+    }
+
+    #[test]
+    fn refused_kills_keep_the_latest() {
+        let events: Vec<Event> = (0..MAX_REFUSED as u32 + 3)
+            .map(|pid| {
+                agent_ev(Known::KillRefused(KillRefused {
+                    host: "h".into(),
+                    pid,
+                    name: "zsh".into(),
+                    reason: "your own ancestor".into(),
+                }))
+                .into_event()
+            })
+            .collect();
+        let s = State::fold(&events);
+        assert_eq!(s.refused_kills.len(), MAX_REFUSED);
+        assert_eq!(s.refused_kills[0].pid, 3);
     }
 
     #[test]

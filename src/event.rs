@@ -140,6 +140,8 @@ pub enum Known {
     ResourceReleased(ResourceReleased),
     #[serde(rename = "resource.limit")]
     ResourceLimit(ResourceLimit),
+    #[serde(rename = "kill.refused")]
+    KillRefused(KillRefused),
     #[serde(rename = "task.created")]
     TaskCreated(TaskCreated),
     #[serde(rename = "task.assigned")]
@@ -333,6 +335,16 @@ pub struct ResourceLimit {
     pub until: Option<DateTime<Utc>>,
 }
 
+/// `agent-fleet kill` refused to signal `pid` on `host`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KillRefused {
+    pub host: String,
+    pub pid: u32,
+    pub name: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorktreeGone {
@@ -466,6 +478,7 @@ impl Known {
             Self::ResourceWaiting(_) => "resource.waiting",
             Self::ResourceReleased(_) => "resource.released",
             Self::ResourceLimit(_) => "resource.limit",
+            Self::KillRefused(_) => "kill.refused",
             Self::TaskCreated(_) => "task.created",
             Self::TaskAssigned(_) => "task.assigned",
             Self::TaskUnassigned(_) => "task.unassigned",
