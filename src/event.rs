@@ -257,6 +257,10 @@ pub struct WorktreeState {
     /// Files changed against the default branch, plus dirty ones; at most `MAX_FILES`.
     pub files: Vec<String>,
     pub last_commit: DateTime<Utc>,
+    /// Everything this branch changed is already in the default branch (merged, squashed or
+    /// never started): it holds no work of its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub in_main: bool,
 }
 
 /// Most files a `worktree.state` lists.

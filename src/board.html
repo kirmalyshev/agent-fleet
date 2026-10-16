@@ -293,6 +293,7 @@ function treeTab(s) {
   const wtNode = ([k, w]) => {
     const t = w.state, p = s.worktree_procs[k]?.procs, ags = ix.inWt[k] || [];
     const right = [
+      t.in_main ? badge("b-dim", "in main", "Everything this branch changed is already in the default branch.") : "",
       t.unpushed ? badge("b-warn", `${t.unpushed} unpushed`) : "",
       t.dirty ? badge("b-warn", `${t.dirty} dirty`) : "",
       p ? badge("b-dim", `runs ${p.procs} · ${mb(p.rss_kb)}`, p.names.join(", ")) : "",
