@@ -73,7 +73,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `agent.down` | agent, reason? | | host |
 | | `host.health` | host, disk_free, disk_total, agents, stats? (every minute) | | host |
 | | `agent.usage` | agent, rss_kb?, cpu_pct?, procs?, cwd? (each scan; the numbers on Linux only) | | host |
-| machine | `worktree.state` | host, path, repo, branch?, head, unpushed, dirty, files[], last_commit (on change) | | host |
+| machine | `worktree.state` | host, path, repo, branch?, head, unpushed, dirty, files[] (only what still differs from the default branch), last_commit, in_main? (on change) | | host |
 | | `worktree.gone` | host, path | | host |
 | | `worktree.procs` | host, path, procs, rss_kb, cpu_pct, names[], pids[], orphaned (each scan; `procs: 0` once when they end) | | host |
 | task | `task.created` | title, url? | task | agent, host |

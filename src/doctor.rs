@@ -240,7 +240,12 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
                     "forgotten",
                     key,
                     format!(
-                        "no agent, nothing unsaved, last commit {} ago{running}{what}",
+                        "no agent, nothing unsaved{}, last commit {} ago{running}{what}",
+                        if st.in_main {
+                            ", all of it in main"
+                        } else {
+                            ""
+                        },
                         ago(now, st.last_commit)
                     ),
                 ));
@@ -302,6 +307,7 @@ mod tests {
                 dirty,
                 files: files.iter().map(|f| f.to_string()).collect(),
                 last_commit: since,
+                in_main: false,
             },
             since,
         }

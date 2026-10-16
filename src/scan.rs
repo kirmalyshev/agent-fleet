@@ -306,11 +306,23 @@ pub async fn worktrees(host: &str, repo: &str) -> Vec<WorktreeState> {
             .lines()
             .filter_map(|l| l.split_whitespace().nth(1).map(str::to_string))
             .collect();
-        let files: BTreeSet<String> = changed
+        // Of what the branch changed, only what still differs from the default branch is its own
+        // work: a merged or squashed branch differs in nothing it changed.
+        let differs: BTreeSet<String> = git(&path, &["diff", "--name-only", &base, "HEAD"])
+            .await
+            .unwrap_or_default()
             .lines()
             .map(str::to_string)
-            .chain(dirty.iter().cloned())
-            .filter(|f| !submodules.contains(f))
+            .collect();
+        let own: BTreeSet<String> = changed
+            .lines()
+            .filter(|f| differs.contains(*f) && !submodules.iter().any(|s| s == f))
+            .map(str::to_string)
+            .collect();
+        let in_main = own.is_empty();
+        let files: BTreeSet<String> = own
+            .into_iter()
+            .chain(dirty.iter().filter(|&f| !submodules.contains(f)).cloned())
             .collect();
         out.push(WorktreeState {
             host: host.to_string(),
@@ -322,6 +334,7 @@ pub async fn worktrees(host: &str, repo: &str) -> Vec<WorktreeState> {
             dirty: dirty.len() as u32,
             files: files.into_iter().take(MAX_FILES).collect(),
             last_commit: last_commit.with_timezone(&Utc),
+            in_main,
         });
     }
     out
@@ -464,6 +477,45 @@ mod tests {
             (2, proc(1, 300, "/", false)),
         ]));
         assert_eq!(after.cpu_pct(&before, &[1, 2], 1000), 80);
+    }
+
+    #[tokio::test]
+    async fn a_squash_merged_branch_holds_no_work_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = |cmd: &str| {
+            let ok = std::process::Command::new("sh")
+                .args(["-c", cmd])
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "{cmd}");
+        };
+        sh(
+            "git init -q --bare o.git && git init -q -b main r && cd r && git remote add origin ../o.git \
+            && git commit -q --allow-empty -m base && git push -q origin main \
+            && git worktree add -q ../sq -b sq && cd ../sq && echo v > c.txt && git add c.txt && git commit -q -m feature \
+            && cd ../r && git worktree add -q ../wip -b wip && cd ../wip && echo w > d.txt && git add d.txt && git commit -q -m wip \
+            && cd ../r && echo v > c.txt && git add c.txt && git commit -q -m 'feature (#1)' && git push -q origin main",
+        );
+        let r = dir.path().join("r");
+        let wts = worktrees("h", r.to_str().unwrap()).await;
+        let by = |b: &str| wts.iter().find(|w| w.branch.as_deref() == Some(b)).unwrap();
+        assert!(
+            by("sq").in_main && by("sq").files.is_empty(),
+            "{:?}",
+            by("sq")
+        );
+        assert!(
+            !by("wip").in_main && by("wip").files == vec!["d.txt".to_string()],
+            "{:?}",
+            by("wip")
+        );
     }
 
     #[tokio::test]

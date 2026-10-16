@@ -616,6 +616,10 @@
             "host": {
               "type": "string"
             },
+            "in_main": {
+              "description": "Everything this branch changed is already in the default branch (merged, squashed or\nnever started): it holds no work of its own.",
+              "type": "boolean"
+            },
             "last_commit": {
               "format": "date-time",
               "type": "string"
@@ -1448,6 +1452,10 @@
             },
             "host": {
               "type": "string"
+            },
+            "in_main": {
+              "description": "Everything this branch changed is already in the default branch (merged, squashed or\nnever started): it holds no work of its own.",
+              "type": "boolean"
             },
             "last_commit": {
               "format": "date-time",
