@@ -240,6 +240,19 @@ Every 5 minutes the host agent scans its machine. It writes facts, never verdict
 | `unpushed` | an agent's worktree holding commits no remote has for an hour |
 | `orphan` | processes running in a deleted worktree, with their pids |
 
+## The operator's screen
+
+`fleet tui` shows the state live (every 2 s): agents with their CPU, memory, task and branch;
+worktrees with unpushed and dirty work and what they run; tasks; findings. Writes go through the
+same events as the CLI (`msg.sent`, `task.state`, `task.unassigned`). Two actions are local to
+the machine and ask first: removing a worktree no agent works in, and killing the processes
+left in one (only those still running there, so a reused pid is never hit).
+
+**Repository hook.** A repository knows what fleet cannot: which database, caches and
+simulators a worktree holds, and how its stack stops. If its main checkout has an executable
+`.fleet/hook`, removing a worktree runs `.fleet/hook retire <path>` instead of
+`git worktree remove`; the hook does the repository's own teardown and exits non-zero to refuse.
+
 ## Instances
 
 One machine can run several fleets, one per project or product. `--instance <name>` (or

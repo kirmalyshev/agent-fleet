@@ -8,6 +8,7 @@ mod scan;
 mod state;
 mod stats;
 mod store;
+mod tui;
 mod ui;
 
 use std::net::SocketAddr;
@@ -80,6 +81,8 @@ enum Cmd {
     Ps,
     /// The fleet instances on this machine and the hub each one uses.
     Instances,
+    /// The fleet on one screen, live: agents, worktrees, tasks, findings, and the actions on them.
+    Tui,
     /// Tasks: `add` claims (exclusive), `done` finishes, `rm` cancels or releases.
     Task {
         #[command(subcommand)]
@@ -159,6 +162,43 @@ enum Cmd {
         #[arg(long, required = true)]
         text: bool,
     },
+}
+
+impl tui::Fleet for Ctx {
+    async fn snapshot(&self) -> Result<(State, Option<String>)> {
+        self.snapshot_state().await
+    }
+
+    async fn task(&self, task: &str, body: Known) -> Result<String> {
+        self.task_event(task, body).await
+    }
+
+    async fn tell(&self, agent: &str, text: &str) -> Result<String> {
+        let body = MsgSent {
+            to: agent.to_string(),
+            kind: "NOTE".into(),
+            reference: "tui".into(),
+            text: text.to_string(),
+        };
+        self.write(Envelope::new(
+            self.me().await?,
+            &self.cli.project,
+            Known::MsgSent(body),
+        ))
+        .await
+    }
+
+    fn instance(&self) -> &str {
+        &self.cli.instance
+    }
+
+    fn hub(&self) -> String {
+        self.cli.hub.clone().unwrap_or_else(|| self.paths.hub_url())
+    }
+
+    fn host(&self) -> String {
+        self.host_name()
+    }
 }
 
 fn parse_window(s: &str) -> Result<i64, String> {
@@ -302,12 +342,21 @@ impl Ctx {
 
     /// The hub's state, or the local replica's when the hub is unreachable.
     async fn state(&self) -> Result<State> {
+        let (s, note) = self.snapshot_state().await?;
+        if let Some(note) = note {
+            eprintln!("fleet: {note}");
+        }
+        Ok(s)
+    }
+
+    /// The hub's state, or the local replica's with a note saying so when the hub is unreachable.
+    async fn snapshot_state(&self) -> Result<(State, Option<String>)> {
         let unreachable = |err: &anyhow::Error| {
             err.downcast_ref::<reqwest::Error>()
                 .is_some_and(|e| e.is_connect() || e.is_timeout())
         };
         match self.client()?.state().await {
-            Ok(s) => Ok(s),
+            Ok(s) => Ok((s, None)),
             // Only an unreachable hub falls back; a 401 or a 500 is a problem to see, not hide.
             Err(err) if unreachable(&err) && self.paths.replica().exists() => {
                 let s = State::fold(&Store::open(&self.paths.replica())?.all()?);
@@ -317,8 +366,8 @@ impl Ctx {
                     .and_then(|id| ulid::Ulid::from_string(id).ok())
                     .map(|u| ui::ago(Utc::now(), chrono::DateTime::<Utc>::from(u.datetime())))
                     .unwrap_or_else(|| "?".into());
-                eprintln!("fleet: hub unreachable ({err}); local replica, last event {age} ago");
-                Ok(s)
+                let note = format!("hub unreachable ({err}); local replica, last event {age} ago");
+                Ok((s, Some(note)))
             }
             Err(err) => Err(err),
         }
@@ -405,6 +454,7 @@ async fn main() -> Result<()> {
             };
             host::run(cfg, ctx.client()?).await?;
         }
+        Cmd::Tui => tui::run(&ctx).await?,
         Cmd::Instances => {
             for (name, hub) in Paths::instances()? {
                 let mark = if name == ctx.cli.instance { "*" } else { " " };

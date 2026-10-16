@@ -48,7 +48,7 @@ fn finding(kind: &'static str, subject: impl Into<String>, detail: String) -> Fi
 }
 
 /// The worktree an agent works in: the deepest one on its host containing its cwd.
-fn worktree_of<'a>(s: &'a State, a: &Agent) -> Option<(&'a String, &'a Worktree)> {
+pub fn worktree_of<'a>(s: &'a State, a: &Agent) -> Option<(&'a String, &'a Worktree)> {
     let cwd = a.usage.as_ref()?.cwd.as_deref()?;
     s.worktrees
         .iter()

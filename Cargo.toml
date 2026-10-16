@@ -13,6 +13,7 @@ clap = { version = "4", features = ["derive", "env"] }
 directories = "6"
 futures-util = "0.3"
 libc = "0.2"
+ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 rustix = { version = "1", features = ["fs", "system"] }
