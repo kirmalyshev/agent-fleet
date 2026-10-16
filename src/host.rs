@@ -590,7 +590,7 @@ impl Host {
                 (w.path, linked)
             }));
         }
-        let groups = scan::by_worktree(&procs, &agent_pids, &all);
+        let groups = scan::by_worktree(&procs, &agent_pids, &all, |d| Path::new(d).exists());
         for (path, g) in &groups {
             let (rss_kb, _) = procs.sum(&g.pids);
             let names: BTreeSet<&str> = g

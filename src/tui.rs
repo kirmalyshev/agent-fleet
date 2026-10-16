@@ -425,15 +425,24 @@ async fn act(fleet: &impl Fleet, pending: Pending) -> String {
         Pending::Kill(pids, dir) => {
             let mut out = Vec::new();
             for pid in pids {
-                // A pid may have been reused since the scan: kill only what still runs in `dir`.
-                let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).map(|p| {
-                    p.to_string_lossy()
-                        .trim_end_matches(" (deleted)")
-                        .to_string()
-                });
-                let here = cwd
-                    .as_deref()
-                    .is_ok_and(|c| c == dir || c.starts_with(&format!("{dir}/")));
+                // A pid may have been reused since the scan. Kill only a process whose own
+                // directory is deleted, inside `dir`, which is itself gone; never herdr or a
+                // pane's shell.
+                let link = std::fs::read_link(format!("/proc/{pid}/cwd"))
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let comm =
+                    |p: u32| std::fs::read_to_string(format!("/proc/{p}/comm")).unwrap_or_default();
+                let ppid = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|s| crate::scan::parse_stat(&s))
+                    .map_or(0, |(ppid, ..)| ppid);
+                let terminal = comm(pid).trim() == "herdr" || comm(ppid).trim() == "herdr";
+                let here = !terminal
+                    && !Path::new(&dir).exists()
+                    && link
+                        .strip_suffix(" (deleted)")
+                        .is_some_and(|c| c == dir || c.starts_with(&format!("{dir}/")));
                 if !here {
                     out.push(format!("{pid} skipped (no longer there)"));
                     continue;
