@@ -80,6 +80,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `resource.waiting` | host, resource, pid, cwd?, scope?, since | | host |
 | | `resource.released` | host, resource, pid? (without `pid`: nobody holds or waits) | | host |
 | | `resource.limit` | host, name, resources[], max, until? (empty `resources` removes it) | | agent, host |
+| safety | `kill.refused` | host, pid, name, reason | | agent, host |
 | task | `task.created` | title, url? | task | agent, host |
 | | `task.assigned` | agent, lead? — **exclusive** | task | agent, host |
 | | `task.unassigned` | reason? | task | agent, host |
@@ -259,6 +260,31 @@ how many worktrees may hold any of a set of resources at once.
 | `orphan` | processes running in a deleted worktree, with their pids |
 | `breach` | more worktrees hold a rule's resources than its `max`, while the rule lasts |
 | `queued` | a process waiting 10 min for a resource, with who holds it |
+| `refused` | `agent-fleet kill` refused a pid in the last hour, with the reason |
+
+## Killing processes
+
+`agent-fleet kill <pid>…` is how an agent stops a process. It reads the process table (`ps`) and
+refuses, killing nothing, when any pid is:
+
+- a terminal multiplexer (`herdr`), a pane's shell, an agent (`claude`, `devin`, `codex`, or what
+  a pane's shell runs), an `agent-fleet` daemon, or an ancestor of any of them;
+- the caller's own ancestor (its shell, its script's parent, its agent);
+- inside another agent's process tree.
+
+It kills the caller's own processes (its agent's tree) and orphans `doctor` proved (on Linux, still
+in a deleted directory): TERM, then KILL after `--grace` seconds. Each refusal is logged as
+`kill.refused`.
+
+`agent-fleet hook bash` is a Claude Code PreToolUse hook that refuses (exit 2) a Bash command
+running a raw `kill`, `pkill` or `killall`, also behind `sudo`, `xargs`, `timeout`, `sh -c`,
+`eval`, `find -exec` or `ssh <host>`. `kill -0` and `kill -l` pass. It guards against a slip, not
+against an agent set on evading it.
+
+```json
+{ "hooks": { "PreToolUse": [ { "matcher": "Bash",
+  "hooks": [ { "type": "command", "command": "agent-fleet hook bash" } ] } ] } }
+```
 
 ## The operator's screen
 

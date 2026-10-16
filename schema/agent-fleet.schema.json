@@ -379,6 +379,33 @@
           ],
           "type": "object"
         },
+        "KillRefused": {
+          "additionalProperties": false,
+          "description": "`agent-fleet kill` refused to signal `pid` on `host`.",
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "host",
+            "pid",
+            "name",
+            "reason"
+          ],
+          "type": "object"
+        },
         "MsgDelivered": {
           "additionalProperties": false,
           "description": "The `msg.sent` named by `re` reached the agent, which then turned `observed`.",
@@ -954,6 +981,22 @@
         {
           "properties": {
             "data": {
+              "$ref": "#/$defs/KillRefused"
+            },
+            "type": {
+              "const": "kill.refused",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
               "$ref": "#/$defs/TaskCreated"
             },
             "type": {
@@ -1436,6 +1479,40 @@
           ],
           "type": "object"
         },
+        "RefusedKill": {
+          "properties": {
+            "by": {
+              "type": "string"
+            },
+            "host": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "ts": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "by",
+            "host",
+            "pid",
+            "name",
+            "reason",
+            "ts"
+          ],
+          "type": "object"
+        },
         "Resource": {
           "properties": {
             "holder": {
@@ -1806,6 +1883,14 @@
           },
           "description": "Undelivered doorbells by the id of their `msg.sent`.",
           "type": "object"
+        },
+        "refused_kills": {
+          "default": [],
+          "description": "The latest kills `agent-fleet kill` refused, oldest first; at most `MAX_REFUSED`.",
+          "items": {
+            "$ref": "#/$defs/RefusedKill"
+          },
+          "type": "array"
         },
         "resources": {
           "additionalProperties": {

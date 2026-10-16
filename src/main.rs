@@ -4,6 +4,7 @@ mod doctor;
 mod event;
 mod host;
 mod hub;
+mod kill;
 mod scan;
 mod state;
 mod stats;
@@ -111,6 +112,21 @@ enum Cmd {
         /// The condition that clears it.
         #[arg(long)]
         until: Option<String>,
+    },
+    /// Signal processes safely: TERM, then KILL after --grace. Refuses agents, panes, the fleet's
+    /// daemons and anything above them, your own ancestors and other agents' processes; kills
+    /// only your own processes and orphans `doctor` proved. A refusal kills nothing and is logged.
+    Kill {
+        #[arg(required = true)]
+        pids: Vec<u32>,
+        /// Seconds between TERM and KILL.
+        #[arg(long, default_value_t = 5)]
+        grace: u64,
+    },
+    /// Hooks for agent harnesses.
+    Hook {
+        #[command(subcommand)]
+        cmd: HookCmd,
     },
     /// Capacity rules for the resources hosts report.
     Resource {
@@ -310,6 +326,13 @@ enum TaskCmd {
     Show {
         task: String,
     },
+}
+
+#[derive(Subcommand)]
+enum HookCmd {
+    /// Claude Code PreToolUse hook: reads the tool call on stdin and refuses (exit 2) a Bash
+    /// command that runs a raw kill, pkill or killall.
+    Bash,
 }
 
 #[derive(Subcommand)]
@@ -527,6 +550,15 @@ async fn main() -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&api_schema())?);
         return Ok(());
     }
+    if let Cmd::Hook { cmd: HookCmd::Bash } = cli.cmd {
+        let mut input = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+        if let Some(msg) = kill::hook(&input) {
+            eprintln!("{msg}");
+            std::process::exit(2);
+        }
+        return Ok(());
+    }
     let ctx = Ctx {
         paths: Paths::from_env(&cli.instance)?,
         cli,
@@ -708,6 +740,89 @@ async fn main() -> Result<()> {
                 unblocks_when: until.clone(),
             };
             ctx.task_event(task, Known::BlockerRaised(body)).await?;
+        }
+        Cmd::Hook { .. } => unreachable!("handled before the context"),
+        Cmd::Kill { pids, grace } => {
+            let t = kill::table()?;
+            let me = std::process::id();
+            let host = ctx.host_name();
+            let state = ctx.state().await.ok();
+            let orphans: std::collections::BTreeSet<u32> =
+                state.as_ref().map_or_else(Default::default, |s| {
+                    doctor::findings(s, now)
+                        .iter()
+                        .filter(|f| f.kind == "orphan")
+                        .filter_map(|f| s.worktree_procs.get(&f.subject))
+                        .filter(|p| p.procs.host == host)
+                        .flat_map(|p| p.procs.pids.iter().copied())
+                        .collect()
+                });
+            // The scan is minutes old: on Linux the pid must still be in a deleted directory.
+            let still_orphaned = |pid: u32| {
+                orphans.contains(&pid)
+                    && (!cfg!(target_os = "linux")
+                        || std::fs::read_link(format!("/proc/{pid}/cwd"))
+                            .is_ok_and(|c| c.to_string_lossy().ends_with(" (deleted)")))
+            };
+            let refused: Vec<(u32, String)> = pids
+                .iter()
+                .filter_map(|&pid| {
+                    kill::judge(&t, me, pid, || still_orphaned(pid))
+                        .err()
+                        .map(|why| (pid, why))
+                })
+                .collect();
+            if !refused.is_empty() {
+                let actor = ctx.me().await;
+                for (pid, why) in &refused {
+                    eprintln!("agent-fleet kill: REFUSED {why}");
+                    let body = Known::KillRefused(KillRefused {
+                        host: host.clone(),
+                        pid: *pid,
+                        name: t.get(pid).map_or("?".into(), |p| p.name.clone()),
+                        reason: why.clone(),
+                    });
+                    let logged = match &actor {
+                        Ok(a) => ctx
+                            .write(Envelope::new(a.clone(), &ctx.cli.project, body))
+                            .await
+                            .map(|_| ()),
+                        Err(err) => Err(anyhow::anyhow!("{err:#}")),
+                    };
+                    if let Err(err) = logged {
+                        eprintln!("agent-fleet kill: refusal not logged: {err:#}");
+                    }
+                }
+                bail!(
+                    "killed nothing: {} of {} refused",
+                    refused.len(),
+                    pids.len()
+                );
+            }
+            let signal = |pid: u32, sig| unsafe { libc::kill(pid as i32, sig) };
+            for &pid in pids {
+                signal(pid, libc::SIGTERM);
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(*grace);
+            let mut left: Vec<u32> = pids.clone();
+            while !left.is_empty() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                left.retain(|&p| scan::alive(p));
+            }
+            for &pid in &left {
+                signal(pid, libc::SIGKILL);
+            }
+            for &pid in pids {
+                let how = if left.contains(&pid) {
+                    format!("KILL after {grace}s")
+                } else {
+                    "TERM".into()
+                };
+                println!(
+                    "killed {pid} ({}): {how}",
+                    t.get(&pid).map_or("?", |p| &p.name)
+                );
+            }
         }
         Cmd::Resource { cmd } => {
             let (name, host, resources, max, until) = match cmd {
