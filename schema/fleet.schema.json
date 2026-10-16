@@ -1,0 +1,1015 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "protocol": 1,
+  "schema_version": 1,
+  "schemas": {
+    "event": {
+      "$defs": {
+        "Actor": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "description": "`agent:<host>/<session>/<name>`, `host:<name>`, `human:<handle>`.",
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/$defs/ActorKind"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ],
+          "type": "object"
+        },
+        "ActorKind": {
+          "enum": [
+            "agent",
+            "human",
+            "host",
+            "hub"
+          ],
+          "type": "string"
+        },
+        "AgentDown": {
+          "additionalProperties": false,
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "agent"
+          ],
+          "type": "object"
+        },
+        "AgentState": {
+          "description": "An agent's lifecycle state, as the terminal multiplexer reports it.",
+          "enum": [
+            "idle",
+            "working",
+            "blocked",
+            "done",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "AgentStateChanged": {
+          "additionalProperties": false,
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/$defs/AgentState"
+            }
+          },
+          "required": [
+            "agent",
+            "state"
+          ],
+          "type": "object"
+        },
+        "AgentUp": {
+          "additionalProperties": false,
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "host": {
+              "type": "string"
+            },
+            "kind": {
+              "description": "Agent program, e.g. `claude`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane": {
+              "description": "Multiplexer pane currently hosting the agent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "$ref": "#/$defs/AgentState"
+            }
+          },
+          "required": [
+            "agent",
+            "host",
+            "state"
+          ],
+          "type": "object"
+        },
+        "AskRaised": {
+          "additionalProperties": false,
+          "properties": {
+            "context": {
+              "description": "A link to the context needed to answer.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "options": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "question": {
+              "type": "string"
+            },
+            "recommendation": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "question"
+          ],
+          "type": "object"
+        },
+        "BlockerRaised": {
+          "additionalProperties": false,
+          "properties": {
+            "owner": {
+              "description": "Who or what has to act: an agent, a resource, an ask.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "unblocks_when": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "what": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "what"
+          ],
+          "type": "object"
+        },
+        "BlockerResolved": {
+          "additionalProperties": false,
+          "description": "Resolves the `blocker.raised` named by the envelope's `re`.",
+          "properties": {
+            "note": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "Dep": {
+          "additionalProperties": false,
+          "description": "`task` is blocked by `on`.",
+          "properties": {
+            "on": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "on"
+          ],
+          "type": "object"
+        },
+        "Handoff": {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "evidence": {
+              "description": "Persistent paths or links.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "learned": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "next": {
+              "description": "The exact next step.",
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "to",
+            "next"
+          ],
+          "type": "object"
+        },
+        "HostHealth": {
+          "additionalProperties": false,
+          "properties": {
+            "agents": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "disk_free": {
+              "description": "Bytes available to unprivileged users on the fleet data volume.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "disk_total": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "host": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "host",
+            "disk_free",
+            "disk_total",
+            "agents"
+          ],
+          "type": "object"
+        },
+        "MsgDelivered": {
+          "additionalProperties": false,
+          "description": "The `msg.sent` named by `re` reached the agent, which then turned `observed`.",
+          "properties": {
+            "observed": {
+              "$ref": "#/$defs/AgentState"
+            },
+            "to": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "to",
+            "observed"
+          ],
+          "type": "object"
+        },
+        "MsgSent": {
+          "additionalProperties": false,
+          "description": "A doorbell: a short prompt pointing at an event or a task.",
+          "properties": {
+            "kind": {
+              "description": "What the recipient should do, e.g. `REVIEW`, `FYI`, `UNBLOCKED`.",
+              "type": "string"
+            },
+            "ref": {
+              "description": "The event or task the message is about.",
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "to",
+            "kind",
+            "ref",
+            "text"
+          ],
+          "type": "object"
+        },
+        "TaskAssigned": {
+          "additionalProperties": false,
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "lead": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "agent"
+          ],
+          "type": "object"
+        },
+        "TaskCreated": {
+          "additionalProperties": false,
+          "properties": {
+            "title": {
+              "type": "string"
+            },
+            "url": {
+              "description": "Where the spec lives (an issue, a doc).",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "title"
+          ],
+          "type": "object"
+        },
+        "TaskState": {
+          "description": "Task lifecycle, aligned with the A2A task states.",
+          "enum": [
+            "submitted",
+            "working",
+            "input-required",
+            "completed",
+            "failed",
+            "canceled"
+          ],
+          "type": "string"
+        },
+        "TaskStateChanged": {
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "$ref": "#/$defs/TaskState"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        "TaskUnassigned": {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Every event: the envelope fields plus a `type` tag and its `data`.",
+      "oneOf": [
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/AgentUp"
+            },
+            "type": {
+              "const": "agent.up",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/AgentStateChanged"
+            },
+            "type": {
+              "const": "agent.state",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/AgentDown"
+            },
+            "type": {
+              "const": "agent.down",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/HostHealth"
+            },
+            "type": {
+              "const": "host.health",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/TaskCreated"
+            },
+            "type": {
+              "const": "task.created",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/TaskAssigned"
+            },
+            "type": {
+              "const": "task.assigned",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/TaskUnassigned"
+            },
+            "type": {
+              "const": "task.unassigned",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/TaskStateChanged"
+            },
+            "type": {
+              "const": "task.state",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/Dep"
+            },
+            "type": {
+              "const": "task.dep.added",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/Dep"
+            },
+            "type": {
+              "const": "task.dep.removed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/BlockerRaised"
+            },
+            "type": {
+              "const": "blocker.raised",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/BlockerResolved"
+            },
+            "type": {
+              "const": "blocker.resolved",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/AskRaised"
+            },
+            "type": {
+              "const": "ask.raised",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/MsgSent"
+            },
+            "type": {
+              "const": "msg.sent",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/MsgDelivered"
+            },
+            "type": {
+              "const": "msg.delivered",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/Handoff"
+            },
+            "type": {
+              "const": "handoff",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        }
+      ],
+      "properties": {
+        "actor": {
+          "$ref": "#/$defs/Actor"
+        },
+        "id": {
+          "description": "ULID chosen by the writer. Appending the same id twice is a no-op.",
+          "type": "string"
+        },
+        "project": {
+          "type": "string"
+        },
+        "re": {
+          "description": "The event this one answers or follows.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ts": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "v": {
+          "description": "Schema version of this event's type.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "v",
+        "ts",
+        "actor",
+        "project"
+      ],
+      "title": "Event",
+      "type": "object"
+    },
+    "state": {
+      "$defs": {
+        "Agent": {
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "kind": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "since": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/$defs/AgentState"
+            }
+          },
+          "required": [
+            "host",
+            "state",
+            "since"
+          ],
+          "type": "object"
+        },
+        "AgentState": {
+          "description": "An agent's lifecycle state, as the terminal multiplexer reports it.",
+          "enum": [
+            "idle",
+            "working",
+            "blocked",
+            "done",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "Ask": {
+          "properties": {
+            "by": {
+              "type": "string"
+            },
+            "context": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "options": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "question": {
+              "type": "string"
+            },
+            "recommendation": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "since": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "task": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "by",
+            "question",
+            "options",
+            "since"
+          ],
+          "type": "object"
+        },
+        "Blocker": {
+          "properties": {
+            "by": {
+              "type": "string"
+            },
+            "owner": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "since": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "task": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "unblocks_when": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "what": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "what",
+            "by",
+            "since"
+          ],
+          "type": "object"
+        },
+        "Host": {
+          "properties": {
+            "agents": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "disk_free": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "disk_total": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "ts": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "disk_free",
+            "disk_total",
+            "agents",
+            "ts"
+          ],
+          "type": "object"
+        },
+        "Msg": {
+          "properties": {
+            "from": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "ref": {
+              "type": "string"
+            },
+            "since": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "from",
+            "to",
+            "kind",
+            "ref",
+            "text",
+            "since"
+          ],
+          "type": "object"
+        },
+        "Task": {
+          "properties": {
+            "blocked_by": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "handoffs": {
+              "description": "Ids of `handoff` events, oldest first.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "lead": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "owner": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "project": {
+              "type": "string"
+            },
+            "since": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/$defs/TaskState"
+            },
+            "title": {
+              "type": "string"
+            },
+            "url": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "project",
+            "title",
+            "state",
+            "since",
+            "blocked_by",
+            "handoffs"
+          ],
+          "type": "object"
+        },
+        "TaskState": {
+          "description": "Task lifecycle, aligned with the A2A task states.",
+          "enum": [
+            "submitted",
+            "working",
+            "input-required",
+            "completed",
+            "failed",
+            "canceled"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "agents": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Agent"
+          },
+          "type": "object"
+        },
+        "asks": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Ask"
+          },
+          "description": "Open asks by the id of their `ask.raised`.",
+          "type": "object"
+        },
+        "blockers": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Blocker"
+          },
+          "description": "Open blockers by the id of their `blocker.raised`.",
+          "type": "object"
+        },
+        "hosts": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Host"
+          },
+          "type": "object"
+        },
+        "last": {
+          "description": "Id of the last event folded in.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "msgs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Msg"
+          },
+          "description": "Undelivered doorbells by the id of their `msg.sent`.",
+          "type": "object"
+        },
+        "tasks": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Task"
+          },
+          "type": "object"
+        },
+        "unknown": {
+          "description": "Events this binary cannot fold (an unknown type, or a known type at a newer `v`): kept in\nthe log, skipped here.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "hosts",
+        "agents",
+        "tasks",
+        "blockers",
+        "asks",
+        "msgs",
+        "unknown"
+      ],
+      "title": "State",
+      "type": "object"
+    }
+  },
+  "title": "fleet api schema"
+}
