@@ -1,4 +1,4 @@
-//! `fleet doctor`: what needs a human look, read off the state. Pure, like the reducer.
+//! `agent-fleet doctor`: what needs a human look, read off the state. Pure, like the reducer.
 
 use std::collections::BTreeMap;
 

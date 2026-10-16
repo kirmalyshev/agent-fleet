@@ -1,4 +1,4 @@
-//! `fleet host`: one per machine and herdr session. Presence from herdr, disk health, a local replica of the log,
+//! `agent-fleet host`: one per machine and herdr session. Presence from herdr, disk health, a local replica of the log,
 //! and doorbell delivery into herdr agents.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -176,17 +176,17 @@ impl Host {
         match self.client.write(&e).await {
             Ok(Sent::Spooled(why)) => {
                 bump(&self.n.spooled);
-                eprintln!("fleet host: {ty} spooled ({why})");
+                eprintln!("agent-fleet host: {ty} spooled ({why})");
             }
             Ok(Sent::Accepted { .. }) => {}
             Err(err) => {
                 bump(&self.n.write_failures);
-                eprintln!("fleet host: {ty} NOT written: {err:#}");
+                eprintln!("agent-fleet host: {ty} NOT written: {err:#}");
                 return false;
             }
         }
         if let Err(err) = self.replica.lock().unwrap().append(&e.into_event()) {
-            eprintln!("fleet host: replica append: {err}");
+            eprintln!("agent-fleet host: replica append: {err}");
         }
         true
     }
@@ -311,7 +311,7 @@ impl Host {
                     Ok(()) => return,
                     Err(why) => {
                         bump(&host.n.herdr_errors);
-                        eprintln!("fleet host: watch {pane}: {why:#}; again in {wait:?}");
+                        eprintln!("agent-fleet host: watch {pane}: {why:#}; again in {wait:?}");
                         tokio::time::sleep(wait).await;
                         wait = backoff(wait);
                     }
@@ -338,7 +338,7 @@ impl Host {
                 return Ok(());
             }
             let Ok(ev) = serde_json::from_str::<Value>(&line) else {
-                eprintln!("fleet host: unreadable herdr event: {line}");
+                eprintln!("agent-fleet host: unreadable herdr event: {line}");
                 continue;
             };
             if ev["event"] != "pane.agent_status_changed" {
@@ -382,7 +382,7 @@ impl Host {
             let started = Instant::now();
             if let Err(err) = self.presence_once().await {
                 bump(&self.n.herdr_errors);
-                eprintln!("fleet host: presence: {err:#}; again in {wait:?}");
+                eprintln!("agent-fleet host: presence: {err:#}; again in {wait:?}");
             }
             if started.elapsed() > Duration::from_secs(60) {
                 wait = Duration::from_secs(1);
@@ -396,7 +396,7 @@ impl Host {
         let pong = herdr_call(&self.cfg.herdr_socket, "ping", json!({})).await?;
         if pong["protocol"].as_u64() != Some(HERDR_PROTOCOL) {
             bail!(
-                "herdr speaks protocol {} but this fleet build knows {HERDR_PROTOCOL}; presence is off",
+                "herdr speaks protocol {} but this agent-fleet build knows {HERDR_PROTOCOL}; presence is off",
                 pong["protocol"]
             );
         }
@@ -411,7 +411,7 @@ impl Host {
         // One bad line or one failed lookup is logged and skipped.
         while let Some(line) = sub.lines.next_line().await? {
             let Ok(ev) = serde_json::from_str::<Value>(&line) else {
-                eprintln!("fleet host: unreadable herdr event: {line}");
+                eprintln!("agent-fleet host: unreadable herdr event: {line}");
                 continue;
             };
             let data = &ev["data"];
@@ -426,7 +426,7 @@ impl Host {
                         }
                         Err(err) => {
                             bump(&self.n.herdr_errors);
-                            eprintln!("fleet host: agent in {pane}: {err}");
+                            eprintln!("agent-fleet host: agent in {pane}: {err}");
                         }
                     }
                 }
@@ -470,7 +470,7 @@ impl Host {
                     })))
                     .await;
                 }
-                Err(err) => eprintln!("fleet host: statvfs: {err}"),
+                Err(err) => eprintln!("agent-fleet host: statvfs: {err}"),
             }
         }
     }
@@ -486,7 +486,7 @@ impl Host {
             tick.tick().await;
             if let Err(err) = self.scan_once(&mut prev).await {
                 bump(&self.n.herdr_errors);
-                eprintln!("fleet host: scan: {err:#}");
+                eprintln!("agent-fleet host: scan: {err:#}");
             }
         }
     }
@@ -527,7 +527,7 @@ impl Host {
                 Ok(info) => info,
                 Err(err) => {
                     bump(&self.n.herdr_errors);
-                    eprintln!("fleet host: processes of {pane}: {err:#}");
+                    eprintln!("agent-fleet host: processes of {pane}: {err:#}");
                     continue;
                 }
             };
@@ -632,7 +632,7 @@ impl Host {
         loop {
             let started = Instant::now();
             if let Err(err) = self.sync_once().await {
-                eprintln!("fleet host: sync: {err:#}; again in {wait:?}");
+                eprintln!("agent-fleet host: sync: {err:#}; again in {wait:?}");
             }
             if started.elapsed() > Duration::from_secs(60) {
                 wait = Duration::from_secs(1);
@@ -646,7 +646,7 @@ impl Host {
         let f = self.client.flush_spool().await?;
         if f.rejected > 0 {
             eprintln!(
-                "fleet host: {} spooled events were refused by the hub; see spool.rejected.jsonl",
+                "agent-fleet host: {} spooled events were refused by the hub; see spool.rejected.jsonl",
                 f.rejected
             );
         }
@@ -667,7 +667,7 @@ impl Host {
                         .is_some_and(|r| r.status == StatusCode::GONE) =>
                 {
                     eprintln!(
-                        "fleet host: the hub does not know cursor {cursor:?}; re-reading its whole log"
+                        "agent-fleet host: the hub does not know cursor {cursor:?}; re-reading its whole log"
                     );
                     self.replica.lock().unwrap().set_meta("cursor", "")?;
                     cursor = None;
@@ -718,7 +718,7 @@ impl Host {
             let pending = match self.replica.lock().unwrap().all() {
                 Ok(events) => State::fold(&events).msgs,
                 Err(err) => {
-                    eprintln!("fleet host: replica: {err}");
+                    eprintln!("agent-fleet host: replica: {err}");
                     continue;
                 }
             };
@@ -739,7 +739,7 @@ impl Host {
                 // Never type into a busy or blocked agent; retry a failed ring at most once a minute.
                 if !matches!(state, AgentState::Idle | AgentState::Done) {
                     if waiting.insert(id.clone()) {
-                        eprintln!("fleet host: {id} waits: {} is {state:?}", msg.to);
+                        eprintln!("agent-fleet host: {id} waits: {} is {state:?}", msg.to);
                     }
                     continue;
                 }
@@ -776,21 +776,23 @@ impl Host {
                             .publish(self.presence(Known::MsgDelivered(delivered)).re(&id))
                             .await
                         {
-                            eprintln!("fleet host: delivered {id} to {}", msg.to);
+                            eprintln!("agent-fleet host: delivered {id} to {}", msg.to);
                         } else {
                             eprintln!(
-                                "fleet host: {id} reached {} but msg.delivered was not written; will retry",
+                                "agent-fleet host: {id} reached {} but msg.delivered was not written; will retry",
                                 msg.to
                             );
                         }
                     }
                     Ok(_) => {
                         bump(&self.n.ring_failures);
-                        eprintln!("fleet host: {id}: prompted, but no `working` seen; will retry")
+                        eprintln!(
+                            "agent-fleet host: {id}: prompted, but no `working` seen; will retry"
+                        )
                     }
                     Err(err) => {
                         bump(&self.n.ring_failures);
-                        eprintln!("fleet host: {id}: {err}; will retry");
+                        eprintln!("agent-fleet host: {id}: {err}; will retry");
                     }
                 }
             }
@@ -817,10 +819,10 @@ fn short(id: &str) -> &str {
     id.rsplit('/').next().unwrap_or(id)
 }
 
-/// The text typed into the agent. The `[fleet …]` prefix marks it as machine-sent, never a human turn.
+/// The text typed into the agent. The `[agent-fleet …]` prefix marks it as machine-sent, never a human turn.
 pub fn doorbell(from: &str, to: &str, kind: &str, reference: &str, text: &str, id: &str) -> String {
     format!(
-        "[fleet {}→{}] {kind} {reference}: {text} (event {id})",
+        "[agent-fleet {}→{}] {kind} {reference}: {text} (event {id})",
         short(from),
         short(to)
     )
@@ -832,7 +834,7 @@ pub fn doorbell(from: &str, to: &str, kind: &str, reference: &str, text: &str, i
 pub async fn run(cfg: Config, client: Client) -> Result<()> {
     let replica = Store::open(&cfg.replica)?;
     eprintln!(
-        "fleet host: host={} session={} herdr={} replica={} ({} events)",
+        "agent-fleet host: host={} session={} herdr={} replica={} ({} events)",
         cfg.host,
         cfg.session,
         cfg.herdr_socket.display(),
@@ -866,7 +868,7 @@ mod tests {
         );
         assert_eq!(
             d,
-            "[fleet lead→impl] REVIEW task:p/7: please look (event 01ABC)"
+            "[agent-fleet lead→impl] REVIEW task:p/7: please look (event 01ABC)"
         );
     }
 
@@ -1034,7 +1036,7 @@ mod tests {
         let prompts = fake.prompts.lock().unwrap().clone();
         assert_eq!(prompts.len(), 1);
         assert!(
-            prompts[0].starts_with("[fleet lead→a] FYI x: hi"),
+            prompts[0].starts_with("[agent-fleet lead→a] FYI x: hi"),
             "{prompts:?}"
         );
     }

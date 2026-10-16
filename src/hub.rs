@@ -1,4 +1,4 @@
-//! `fleet hub`: the log, the fold, and the one sequencer for exclusive writes, over HTTP + SSE.
+//! `agent-fleet hub`: the log, the fold, and the one sequencer for exclusive writes, over HTTP + SSE.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
@@ -137,7 +137,7 @@ pub async fn serve(listen: SocketAddr, db: &Path, hub_file: &Path, token: String
     }
     let hub = Hub::new(Store::open(db)?)?;
     eprintln!(
-        "fleet hub: {} events in {}, listening on http://{listen}",
+        "agent-fleet hub: {} events in {}, listening on http://{listen}",
         hub.store.len()?,
         db.display()
     );

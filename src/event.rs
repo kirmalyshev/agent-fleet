@@ -9,7 +9,7 @@ use crate::state::State;
 
 /// Wire protocol. Bumped on a breaking change to the envelope or a core type.
 pub const PROTOCOL: u32 = 1;
-/// Version of the `fleet api schema` document layout.
+/// Version of the `agent-fleet api schema` document layout.
 pub const SCHEMA_VERSION: u32 = 1;
 /// Per-type schema version every v1 core type carries in `v`.
 pub const TYPE_VERSION: u32 = 1;
@@ -580,11 +580,11 @@ pub fn parse_strict(raw: &Value) -> Result<Envelope<Known>, Reject> {
     Ok(e)
 }
 
-/// The `fleet api schema` document, laid out like herdr's `api schema`.
+/// The `agent-fleet api schema` document, laid out like herdr's `api schema`.
 pub fn api_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "title": "fleet api schema",
+        "title": "agent-fleet api schema",
         "protocol": PROTOCOL,
         "schema_version": SCHEMA_VERSION,
         "schemas": {
@@ -695,11 +695,11 @@ mod tests {
 
     #[test]
     fn committed_schema_is_current() {
-        let committed = include_str!("../schema/fleet.schema.json");
+        let committed = include_str!("../schema/agent-fleet.schema.json");
         let current = serde_json::to_string_pretty(&api_schema()).unwrap() + "\n";
         assert!(
             committed == current,
-            "schema/fleet.schema.json is stale: run `fleet api schema > schema/fleet.schema.json`"
+            "schema/agent-fleet.schema.json is stale: run `agent-fleet api schema > schema/agent-fleet.schema.json`"
         );
     }
 }

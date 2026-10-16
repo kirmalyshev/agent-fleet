@@ -30,23 +30,28 @@ use store::Store;
 struct Cli {
     /// Which fleet: one instance per project or product, each with its own hub, log, token,
     /// spool and replica.
-    #[arg(long, global = true, env = "FLEET_INSTANCE", default_value = client::DEFAULT_INSTANCE)]
+    #[arg(long, global = true, env = "AGENT_FLEET_INSTANCE", default_value = client::DEFAULT_INSTANCE)]
     instance: String,
     /// Hub URL [default: the one this instance's hub wrote, else http://127.0.0.1:7710].
-    #[arg(long, global = true, env = "FLEET_HUB")]
+    #[arg(long, global = true, env = "AGENT_FLEET_HUB")]
     hub: Option<String>,
     /// Bearer token file [default: <data dir>/token].
-    #[arg(long, global = true, env = "FLEET_TOKEN_FILE")]
+    #[arg(long, global = true, env = "AGENT_FLEET_TOKEN_FILE")]
     token_file: Option<PathBuf>,
     /// Who is writing: `agent:<host>/<session>/<name>`. Derived from herdr when run inside a pane.
-    #[arg(long = "as", global = true, env = "FLEET_AGENT")]
+    #[arg(long = "as", global = true, env = "AGENT_FLEET_AGENT")]
     me: Option<String>,
     /// Project for events that do not name one through a task id.
-    #[arg(long, global = true, env = "FLEET_PROJECT", default_value = "default")]
+    #[arg(
+        long,
+        global = true,
+        env = "AGENT_FLEET_PROJECT",
+        default_value = "default"
+    )]
     project: String,
-    /// This machine's name in agent and host ids; `fleet host` and the CLI must agree on it
+    /// This machine's name in agent and host ids; `agent-fleet host` and the CLI must agree on it
     /// [default: the system hostname].
-    #[arg(long, global = true, env = "FLEET_HOST")]
+    #[arg(long, global = true, env = "AGENT_FLEET_HOST")]
     host_name: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
@@ -79,7 +84,7 @@ enum Cmd {
     },
     /// What every agent is doing.
     Ps,
-    /// The fleet instances on this machine and the hub each one uses.
+    /// The agent-fleet instances on this machine and the hub each one uses.
     Instances,
     /// The fleet on one screen, live: agents, worktrees, tasks, findings, and the actions on them.
     Tui,
@@ -121,7 +126,7 @@ enum Cmd {
         #[arg(long)]
         context: Option<String>,
     },
-    /// Ring an agent's doorbell: `[fleet <from>→<to>] TYPE ref: text (event <id>)`.
+    /// Ring an agent's doorbell: `[agent-fleet <from>→<to>] TYPE ref: text (event <id>)`.
     Tell {
         agent: String,
         #[arg(value_name = "TYPE")]
@@ -322,13 +327,13 @@ impl Ctx {
             std::env::var("HERDR_SESSION"),
             std::env::var("HERDR_SOCKET_PATH"),
         ) {
-            // The pane id stands in only for an agent herdr knows to be unnamed, as `fleet host`
+            // The pane id stands in only for an agent herdr knows to be unnamed, as `agent-fleet host`
             // does; a failed lookup must not quietly give this agent a second identity.
             let got = host::herdr_call(sock.as_ref(), "agent.get", json!({ "target": pane }))
                 .await
                 .map_err(|err| {
                     anyhow::anyhow!(
-                        "could not ask herdr which agent this pane holds ({err:#}); pass --as or set FLEET_AGENT"
+                        "could not ask herdr which agent this pane holds ({err:#}); pass --as or set AGENT_FLEET_AGENT"
                     )
                 })?;
             let name = got["agent"]["name"].as_str().map_or(pane, str::to_string);
@@ -337,14 +342,14 @@ impl Ctx {
                 id: format!("agent:{}/{session}/{name}", self.host_name()),
             });
         }
-        bail!("who is writing? pass --as agent:<host>/<session>/<name> or set FLEET_AGENT")
+        bail!("who is writing? pass --as agent:<host>/<session>/<name> or set AGENT_FLEET_AGENT")
     }
 
     /// The hub's state, or the local replica's when the hub is unreachable.
     async fn state(&self) -> Result<State> {
         let (s, note) = self.snapshot_state().await?;
         if let Some(note) = note {
-            eprintln!("fleet: {note}");
+            eprintln!("agent-fleet: {note}");
         }
         Ok(s)
     }
@@ -382,7 +387,7 @@ impl Ctx {
         let found: Vec<&String> = s.agents.keys().filter(|a| short(a) == name).collect();
         match found.as_slice() {
             [one] => Ok((*one).clone()),
-            [] => bail!("no agent named {name} is up (see `fleet ps`)"),
+            [] => bail!("no agent named {name} is up (see `agent-fleet ps`)"),
             many => bail!(
                 "{name} is ambiguous: {}",
                 many.iter()

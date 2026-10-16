@@ -1551,5 +1551,5 @@
       "type": "object"
     }
   },
-  "title": "fleet api schema"
+  "title": "agent-fleet api schema"
 }

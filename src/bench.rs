@@ -1,5 +1,5 @@
-//! `fleet bench`: load on a throwaway hub in this process, through the same client the CLI uses.
-//! It measures the hub and the client, not herdr or the agents; `fleet stats` covers those.
+//! `agent-fleet bench`: load on a throwaway hub in this process, through the same client the CLI uses.
+//! It measures the hub and the client, not herdr or the agents; `agent-fleet stats` covers those.
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -73,7 +73,7 @@ pub async fn run(events: usize, concurrency: usize) -> Result<String> {
         events > 0 && concurrency > 0,
         "events and concurrency must be > 0"
     );
-    let dir = std::env::temp_dir().join(format!("fleet-bench-{}", ulid::Ulid::new()));
+    let dir = std::env::temp_dir().join(format!("agent-fleet-bench-{}", ulid::Ulid::new()));
     std::fs::create_dir_all(&dir)?;
     let result = bench(&dir, events, concurrency).await;
     let _ = std::fs::remove_dir_all(&dir);
