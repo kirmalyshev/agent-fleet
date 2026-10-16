@@ -122,13 +122,28 @@ pub struct Group {
     pub orphaned: bool,
 }
 
-/// Groups processes not in `exclude` by the worktree their cwd is in (the deepest one). A
-/// process whose cwd was deleted, inside a directory that holds linked worktrees, is grouped
-/// under that old path as an orphan: nothing that could stop it knows it is there.
+/// The terminal multiplexer and the shells of its panes are never a worktree's processes:
+/// they are the operator's own, whatever directory they sit in.
+fn is_terminal(procs: &Procs, p: &Proc) -> bool {
+    p.name == "herdr"
+        || procs
+            .0
+            .get(&p.ppid)
+            .is_some_and(|parent| parent.name == "herdr")
+}
+
+/// Groups processes not in `exclude` by the worktree their cwd is in (the deepest one).
+///
+/// An orphan is a process whose cwd was deleted together with its worktree: the cwd is in no
+/// worktree that exists, it lies in a directory that holds linked worktrees, and the worktree
+/// directory it names is gone from disk (`exists`). Orphan groups never mix with a live
+/// worktree's processes. A process in a deleted subdirectory of a live worktree belongs to that
+/// worktree; it is not an orphan.
 pub fn by_worktree(
     procs: &Procs,
     exclude: &HashSet<u32>,
     worktrees: &[(String, bool)],
+    exists: impl Fn(&str) -> bool,
 ) -> BTreeMap<String, Group> {
     let inside = |cwd: &str, dir: &str| cwd == dir || cwd.starts_with(&format!("{dir}/"));
     let homes: BTreeSet<&str> = worktrees
@@ -141,31 +156,36 @@ pub fn by_worktree(
         let Some(cwd) = p.cwd.as_deref() else {
             continue;
         };
-        if exclude.contains(&pid) {
+        if exclude.contains(&pid) || is_terminal(procs, p) {
             continue;
         }
-        if p.deleted {
-            if let Some(home) = homes
-                .iter()
-                .filter(|h| inside(cwd, h) && cwd != **h)
-                .max_by_key(|h| h.len())
-            {
-                // The worktree's own directory, one level under its home.
-                let rest = &cwd[home.len() + 1..];
-                let root = format!("{home}/{}", rest.split('/').next().unwrap_or(rest));
-                let g = out.entry(root).or_default();
-                g.pids.push(pid);
-                g.orphaned = true;
-            }
-            continue;
-        }
-        if let Some((wt, _)) = worktrees
+        let live = worktrees
             .iter()
             .filter(|(w, _)| inside(cwd, w))
-            .max_by_key(|(w, _)| w.len())
-        {
+            .max_by_key(|(w, _)| w.len());
+        if let Some((wt, _)) = live {
             out.entry(wt.clone()).or_default().pids.push(pid);
+            continue;
         }
+        if !p.deleted {
+            continue;
+        }
+        let Some(home) = homes
+            .iter()
+            .filter(|h| inside(cwd, h) && cwd != **h)
+            .max_by_key(|h| h.len())
+        else {
+            continue;
+        };
+        // The worktree's own directory, one level under its home.
+        let rest = &cwd[home.len() + 1..];
+        let root = format!("{home}/{}", rest.split('/').next().unwrap_or(rest));
+        if exists(&root) || worktrees.iter().any(|(w, _)| inside(w, &root)) {
+            continue;
+        }
+        let g = out.entry(root).or_default();
+        g.pids.push(pid);
+        g.orphaned = true;
     }
     for g in out.values_mut() {
         g.pids.sort_unstable();
@@ -369,7 +389,7 @@ mod tests {
             ("/w/a".to_string(), true),
             ("/w/app/live".to_string(), true),
         ];
-        let g = by_worktree(&procs, &exclude, &wts);
+        let g = by_worktree(&procs, &exclude, &wts, |_| false);
         assert_eq!(
             g["/w/a"],
             Group {
@@ -387,6 +407,44 @@ mod tests {
         );
         assert_eq!(g["/w/app/old"].pids, vec![7], "the deepest home names it");
         assert_eq!(g.len(), 4, "{g:?}");
+    }
+
+    #[test]
+    fn a_deleted_subdirectory_of_a_live_checkout_is_not_an_orphan() {
+        let mut herdr = proc(0, 0, "/r", false);
+        herdr.name = "herdr".into();
+        let procs = Procs(HashMap::from([
+            (1, herdr),
+            (2, proc(1, 0, "/home/p/app", false)), // a pane shell in the main checkout
+            (3, proc(0, 0, "/home/p/app", false)), // a server there
+            (4, proc(0, 0, "/home/p/app/design/tmp", true)), // its subdirectory was deleted
+            (5, proc(0, 0, "/home/p/gone-wt", true)), // a worktree beside it, deleted
+            (6, proc(0, 0, "/home/p/still-here/x", true)), // deleted inside a dir that exists
+        ]));
+        let wts = vec![
+            ("/home/p/app".to_string(), false),
+            ("/home/p/app-wt".to_string(), true), // makes /home/p a worktree home
+        ];
+        let g = by_worktree(&procs, &HashSet::new(), &wts, |d| d == "/home/p/still-here");
+        assert_eq!(
+            g["/home/p/app"],
+            Group {
+                pids: vec![3, 4],
+                orphaned: false
+            }
+        );
+        assert_eq!(
+            g["/home/p/gone-wt"],
+            Group {
+                pids: vec![5],
+                orphaned: true
+            }
+        );
+        assert_eq!(
+            g.len(),
+            2,
+            "no pane shell, no herdr, nothing under an existing dir: {g:?}"
+        );
     }
 
     #[test]

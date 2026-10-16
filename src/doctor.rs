@@ -178,7 +178,8 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
     for (key, p) in &s.worktree_procs {
         let p = &p.procs;
         let names = p.names.join(", ");
-        if p.orphaned {
+        // Defence in depth: a directory that is a known worktree is never "deleted".
+        if p.orphaned && !s.worktrees.contains_key(key) {
             let pids: Vec<String> = p.pids.iter().map(u32::to_string).collect();
             out.push(finding(
                 "orphan",
