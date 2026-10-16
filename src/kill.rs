@@ -153,6 +153,8 @@ pub fn judge(
         return Err(why);
     }
     let mine = agent_of(t, me);
+    // Outside any agent (a person's shell, ssh), what that shell started is the caller's own.
+    let shell = parent(t, me).filter(|_| mine.is_none());
     match agent_of(t, pid) {
         Some(a) if Some(a) == mine => Ok(()),
         Some(a) => Err(format!(
@@ -160,6 +162,7 @@ pub fn judge(
             name(t, pid),
             name(t, a)
         )),
+        None if shell.is_some_and(|sh| ancestors(t, pid).contains(&sh)) => Ok(()),
         None if orphan() => Ok(()),
         None => Err(format!(
             "pid {pid} ({}) is not yours: no process of yours started it and doctor has not \
@@ -431,6 +434,29 @@ mod tests {
             judge(&t, ME, 999, || true)
                 .unwrap_err()
                 .contains("no such process")
+        );
+    }
+
+    #[test]
+    fn outside_any_agent_what_your_shell_started_is_yours() {
+        let t = parse_ps(
+            "1 0 launchd
+             10 1 sshd
+             11 10 sh
+             12 11 agent-fleet
+             13 11 sleep
+             20 1 sleep",
+        );
+        assert_eq!(judge(&t, 12, 13, || false), Ok(()));
+        assert!(
+            judge(&t, 12, 20, || false)
+                .unwrap_err()
+                .contains("not yours")
+        );
+        assert!(
+            judge(&t, 12, 11, || false)
+                .unwrap_err()
+                .contains("your own ancestor")
         );
     }
 
