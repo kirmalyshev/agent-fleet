@@ -496,6 +496,13 @@ impl Envelope<Known> {
     }
 }
 
+/// `agent:<host>/<session>/<name>`, each part non-empty.
+pub fn is_agent_id(id: &str) -> bool {
+    id.strip_prefix("agent:")
+        .map(|rest| rest.splitn(3, '/').collect::<Vec<_>>())
+        .is_some_and(|p| p.len() == 3 && p.iter().all(|x| !x.is_empty()))
+}
+
 /// Why the hub refuses an event. Maps 1:1 onto an HTTP status.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reject {
@@ -565,6 +572,19 @@ pub fn parse_strict(raw: &Value) -> Result<Envelope<Known>, Reject> {
             "project and actor.id must be set".into(),
         ));
     }
+    let recipient = match &e.body {
+        Known::MsgSent(m) => Some(&m.to),
+        Known::Handoff(h) => Some(&h.to),
+        Known::TaskAssigned(a) => Some(&a.agent),
+        _ => None,
+    };
+    if let Some(to) = recipient
+        && !is_agent_id(to)
+    {
+        return Err(Reject::BadRequest(format!(
+            "{to:?} is not an agent id (agent:<host>/<session>/<name>)"
+        )));
+    }
     if e.body.needs_task() && e.task.is_none() {
         return Err(Reject::BadRequest(format!(
             "{} needs `task`",
@@ -616,6 +636,32 @@ mod tests {
         )
         .task("task:p/1");
         serde_json::to_value(e).unwrap()
+    }
+
+    #[test]
+    fn a_doorbell_to_a_pane_id_is_refused() {
+        let tell = |to: &str| {
+            let e = Envelope::new(
+                agent(),
+                "p",
+                Known::MsgSent(MsgSent {
+                    to: to.into(),
+                    kind: "ANSWER".into(),
+                    reference: "x".into(),
+                    text: "t".into(),
+                }),
+            );
+            parse_strict(&serde_json::to_value(e).unwrap())
+        };
+        assert!(
+            matches!(tell("wDN:p1"), Err(Reject::BadRequest(ref m)) if m.contains("not an agent id"))
+        );
+        assert!(tell("agent:h/s").is_err());
+        assert!(tell("agent:h/s/b").is_ok());
+        assert!(
+            tell("agent:h/s/w1:p2").is_ok(),
+            "an unnamed agent is named by its pane"
+        );
     }
 
     #[test]
