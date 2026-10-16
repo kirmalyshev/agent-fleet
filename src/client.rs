@@ -392,6 +392,14 @@ impl Client {
         Ok(self.get("/state").await?.json().await?)
     }
 
+    pub async fn stats(&self, since_s: i64) -> Result<Value> {
+        Ok(self
+            .get(&format!("/stats?since={since_s}"))
+            .await?
+            .json()
+            .await?)
+    }
+
     pub async fn events_after(&self, after: Option<&str>) -> Result<Vec<Event>> {
         let path = match after {
             Some(id) => format!("/events?after={id}"),
@@ -473,6 +481,30 @@ mod tests {
             }),
         )
         .task("task:p/1")
+    }
+
+    #[tokio::test]
+    async fn stats_count_outcomes_and_render() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        start_hub(listener, &dir.path().join("hub.db")).await;
+        let c = Client::new(&base, "tok".into(), dir.path().join("spool.jsonl"));
+        let e = block(1);
+        c.write(&e).await.unwrap();
+        c.write(&e).await.unwrap();
+        let v = c.stats(3600).await.unwrap();
+        assert_eq!(
+            v["hub"]["outcomes"],
+            serde_json::json!({ "accepted": 1, "duplicate": 1 })
+        );
+        assert_eq!(v["hub"]["post_us"]["n"], 2);
+        assert_eq!(v["log"]["by_type"]["blocker.raised"], 1);
+        let lag = &v["log"]["ingest_lag_ms"];
+        assert_eq!(lag["n"], 1, "the hub stamps arrival: {lag}");
+        let text = crate::ui::stats(&v).unwrap();
+        assert!(text.contains("blocker.raised 1"), "{text}");
+        assert!(text.contains("accepted 1, duplicate 1"), "{text}");
     }
 
     #[test]

@@ -10,7 +10,8 @@ One Rust binary, no runtime. Linux and macOS. Agents run in [herdr](https://herd
 fleet hub                 the log, the fold, the sequencer (HTTP + SSE on 127.0.0.1)
 fleet host                one per machine and herdr session: presence from herdr, disk, a replica, doorbells
 fleet ps                  what every agent is doing
-fleet task add|rm|ls|show claim (exclusive: 409 if taken), cancel or release, list, inspect
+fleet task add|done|rm|ls|show
+                          claim (exclusive: 409 if taken), finish, cancel or release, list, inspect
 fleet dep add|rm          task A is blocked by task B
 fleet block / unblock     raise and resolve blockers
 fleet ask                 a question for an operator
@@ -18,6 +19,8 @@ fleet tell <agent> <TYPE> <ref> <text>
                           ring an agent's doorbell; delivered = it was seen working afterwards
 fleet state --json        the folded state
 fleet ui --text           the board: agents, tasks, blockers, asks, undelivered doorbells, hosts
+fleet stats               doorbell latency and loss, event lag, host and hub vitals
+fleet bench               load-test a throwaway hub: latency, throughput, follower lag, 409 races
 fleet api schema          JSON Schema of events and state (schema/fleet.schema.json)
 ```
 

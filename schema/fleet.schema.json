@@ -249,6 +249,16 @@
             },
             "host": {
               "type": "string"
+            },
+            "stats": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/HostStats"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -259,12 +269,93 @@
           ],
           "type": "object"
         },
+        "HostStats": {
+          "additionalProperties": false,
+          "description": "The host agent's own vitals. Counters run from the host's start, so a drop in `uptime_s`\nbetween two reports is a restart.",
+          "properties": {
+            "cpu_ms": {
+              "description": "User + system CPU time of the host process.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "herdr_errors": {
+              "description": "Failed herdr calls and dropped herdr subscriptions.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_rss_kb": {
+              "description": "Peak resident memory of the host process.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "ring_failures": {
+              "description": "Rings that failed or were not followed by `working`.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rings": {
+              "description": "Doorbells typed into an agent.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "spooled": {
+              "description": "Events this host sent to the spool instead of the hub.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "uptime_s": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "write_failures": {
+              "description": "Events this host could neither send nor spool.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "uptime_s",
+            "max_rss_kb",
+            "cpu_ms",
+            "rings",
+            "ring_failures",
+            "herdr_errors",
+            "write_failures",
+            "spooled"
+          ],
+          "type": "object"
+        },
         "MsgDelivered": {
           "additionalProperties": false,
           "description": "The `msg.sent` named by `re` reached the agent, which then turned `observed`.",
           "properties": {
+            "attempts": {
+              "description": "Rings it took, this one included.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "observed": {
               "$ref": "#/$defs/AgentState"
+            },
+            "rung": {
+              "description": "When the ring that worked was typed.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "to": {
               "type": "string"

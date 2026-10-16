@@ -44,10 +44,19 @@ impl Store {
                 seq  INTEGER PRIMARY KEY AUTOINCREMENT,
                 id   TEXT NOT NULL UNIQUE,
                 type TEXT NOT NULL,
-                json TEXT NOT NULL
+                json TEXT NOT NULL,
+                at   INTEGER
             );
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )?;
+        let has_at: bool = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('events') WHERE name = 'at'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_at {
+            conn.execute_batch("ALTER TABLE events ADD COLUMN at INTEGER")?;
+        }
         Ok(Self { conn })
     }
 
@@ -58,10 +67,39 @@ impl Store {
             Body::Unknown(v) => v["type"].as_str().unwrap_or("?").to_string(),
         };
         let n = self.conn.execute(
-            "INSERT OR IGNORE INTO events (id, type, json) VALUES (?1, ?2, ?3)",
-            params![e.id, ty, serde_json::to_string(e)?],
+            "INSERT OR IGNORE INTO events (id, type, json, at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                e.id,
+                ty,
+                serde_json::to_string(e)?,
+                chrono::Utc::now().timestamp_millis()
+            ],
         )?;
         Ok(n == 1)
+    }
+
+    /// Every event with the time it reached this store (unix ms; `None` for rows older than
+    /// the column).
+    pub fn all_with_arrival(&self) -> Result<Vec<(Event, Option<i64>)>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT json, at FROM events ORDER BY seq")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+        })?;
+        rows.map(|row| {
+            let (json, at) = row?;
+            Ok((serde_json::from_str(&json)?, at))
+        })
+        .collect()
+    }
+
+    pub fn bytes(&self) -> Result<u64> {
+        Ok(self.conn.query_row(
+            "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     pub fn contains(&self, id: &str) -> Result<bool> {
@@ -177,6 +215,24 @@ mod tests {
         let e: Event = serde_json::from_value(v.clone()).unwrap();
         s.append(&e).unwrap();
         assert_eq!(serde_json::to_value(&s.all().unwrap()[0]).unwrap(), v);
+    }
+
+    #[test]
+    fn a_log_from_before_arrival_times_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hub.db");
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
+                 type TEXT NOT NULL, json TEXT NOT NULL);",
+            )
+            .unwrap();
+        let s = Store::open(&db).unwrap();
+        s.append(&ev(1)).unwrap();
+        let rows = s.all_with_arrival().unwrap();
+        assert!(rows[0].1.is_some());
+        assert!(Store::open(&db).is_ok(), "the column is added once");
     }
 
     #[test]

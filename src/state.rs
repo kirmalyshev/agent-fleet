@@ -450,6 +450,8 @@ mod tests {
                 Known::MsgDelivered(MsgDelivered {
                     to: "agent:h/s/b".into(),
                     observed: AgentState::Working,
+                    rung: None,
+                    attempts: None,
                 }),
             )
             .re(&mid)

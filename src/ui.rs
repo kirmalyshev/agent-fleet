@@ -5,6 +5,7 @@ use std::fmt::Write;
 use chrono::{DateTime, Utc};
 
 use crate::state::State;
+use crate::stats::{Dist, LogStats};
 
 pub fn ago(now: DateTime<Utc>, ts: DateTime<Utc>) -> String {
     let s = (now - ts).num_seconds().max(0);
@@ -199,6 +200,126 @@ pub fn board(s: &State, now: DateTime<Utc>) -> String {
         );
     }
     out
+}
+
+/// `ms` as `850ms`, `1.2s`, `3m10s`.
+pub fn dur(ms: u64) -> String {
+    match ms {
+        0..1000 => format!("{ms}ms"),
+        1000..60_000 => format!("{:.1}s", ms as f64 / 1000.0),
+        60_000..3_600_000 => format!("{}m{:02}s", ms / 60_000, ms / 1000 % 60),
+        _ => format!("{}h{:02}m", ms / 3_600_000, ms / 60_000 % 60),
+    }
+}
+
+fn dist(name: &str, d: &Dist, f: fn(u64) -> String) -> String {
+    if d.n == 0 {
+        return format!("{name:<8} -\n");
+    }
+    format!(
+        "{name:<8} p50 {:<8} p90 {:<8} p99 {:<8} max {:<8} n={}\n",
+        f(d.p50),
+        f(d.p90),
+        f(d.p99),
+        f(d.max),
+        d.n
+    )
+}
+
+fn mb(kb: u64) -> String {
+    if kb < 1024 {
+        return format!("{kb} KB");
+    }
+    format!("{:.1} MB", kb as f64 / 1024.0)
+}
+
+/// `GET /stats` as text.
+pub fn stats(v: &serde_json::Value) -> anyhow::Result<String> {
+    let log: LogStats = serde_json::from_value(v["log"].clone())?;
+    let hub = &v["hub"];
+    let u = |k: &str| hub[k].as_u64().unwrap_or(0);
+    let mut o = String::new();
+    let d = &log.doorbells;
+    let _ = writeln!(o, "== doorbells (last {})", dur(log.window_s as u64 * 1000));
+    let _ = writeln!(
+        o,
+        "sent {}  delivered {}  pending {}  lost {} (>{}m)  retried {}",
+        d.sent,
+        d.delivered,
+        d.pending,
+        d.lost,
+        crate::stats::LOST_AFTER_S / 60,
+        d.retried
+    );
+    o += &dist("total", &d.total_ms, dur);
+    o += &dist("wait", &d.wait_ms, dur);
+    o += &dist("react", &d.react_ms, dur);
+    let p = &log.presence;
+    let _ = writeln!(
+        o,
+        "\n== presence\nagents {}  up {}  down {}  state changes {}  flaps (<5s) {}  unknown {}",
+        p.agents, p.ups, p.downs, p.state_changes, p.flaps, p.unknown_states
+    );
+    let _ = writeln!(o, "\n== events\n{} in window", log.events);
+    o += &dist("lag", &log.ingest_lag_ms, dur);
+    let types: Vec<String> = log
+        .by_type
+        .iter()
+        .map(|(t, n)| format!("{t} {n}"))
+        .collect();
+    let _ = writeln!(o, "{}", types.join(", "));
+    let _ = writeln!(o, "\n== hosts");
+    for (name, h) in &log.hosts {
+        let _ = write!(
+            o,
+            "{name}  reports {}/{}  max gap {}  restarts {}",
+            h.reports,
+            h.expected,
+            dur(h.max_gap_s as u64 * 1000),
+            h.restarts
+        );
+        if let Some(s) = &h.last {
+            let _ = write!(
+                o,
+                "  up {}  rss {}  cpu {}  rings {} (failed {})  herdr errors {}  write failures {}  spooled {}",
+                dur(s.uptime_s * 1000),
+                mb(s.max_rss_kb),
+                dur(s.cpu_ms),
+                s.rings,
+                s.ring_failures,
+                s.herdr_errors,
+                s.write_failures,
+                s.spooled
+            );
+        }
+        o.push('\n');
+    }
+    let _ = writeln!(
+        o,
+        "\n== hub\nup {}  rss {}  cpu {}  events {}  db {}  followers {}",
+        dur(u("uptime_s") * 1000),
+        mb(u("max_rss_kb")),
+        dur(u("cpu_ms")),
+        u("events"),
+        mb(u("db_bytes") / 1024),
+        u("followers")
+    );
+    let post: Dist = serde_json::from_value(hub["post_us"].clone())?;
+    o += &dist("post", &post, |us| {
+        if us < 1000 {
+            format!("{us}µs")
+        } else {
+            dur(us / 1000)
+        }
+    });
+    let outcomes: Vec<String> = hub["outcomes"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(k, n)| format!("{k} {n}"))
+        .collect();
+    let _ = writeln!(o, "outcomes: {}", outcomes.join(", "));
+    Ok(o)
 }
 
 #[cfg(test)]

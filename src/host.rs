@@ -99,6 +99,22 @@ struct Host {
     wake: Notify,
     /// Fires after an `agent.state` is recorded.
     seen: Notify,
+    started: Instant,
+    n: Counters,
+}
+
+/// Since start; reported in `host.health`.
+#[derive(Default)]
+struct Counters {
+    rings: AtomicU64,
+    ring_failures: AtomicU64,
+    herdr_errors: AtomicU64,
+    write_failures: AtomicU64,
+    spooled: AtomicU64,
+}
+
+fn bump(c: &AtomicU64) {
+    c.fetch_add(1, Ordering::Relaxed);
 }
 
 fn backoff(d: Duration) -> Duration {
@@ -115,6 +131,23 @@ impl Host {
             next_epoch: AtomicU64::new(1),
             wake: Notify::new(),
             seen: Notify::new(),
+            started: Instant::now(),
+            n: Counters::default(),
+        }
+    }
+
+    fn stats(&self) -> HostStats {
+        let (max_rss_kb, cpu_ms) = crate::stats::self_usage();
+        let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        HostStats {
+            uptime_s: self.started.elapsed().as_secs(),
+            max_rss_kb,
+            cpu_ms,
+            rings: get(&self.n.rings),
+            ring_failures: get(&self.n.ring_failures),
+            herdr_errors: get(&self.n.herdr_errors),
+            write_failures: get(&self.n.write_failures),
+            spooled: get(&self.n.spooled),
         }
     }
 
@@ -135,9 +168,13 @@ impl Host {
     async fn publish(&self, e: Envelope<Known>) -> bool {
         let ty = e.body.type_name();
         match self.client.write(&e).await {
-            Ok(Sent::Spooled(why)) => eprintln!("fleet host: {ty} spooled ({why})"),
+            Ok(Sent::Spooled(why)) => {
+                bump(&self.n.spooled);
+                eprintln!("fleet host: {ty} spooled ({why})");
+            }
             Ok(Sent::Accepted { .. }) => {}
             Err(err) => {
+                bump(&self.n.write_failures);
                 eprintln!("fleet host: {ty} NOT written: {err:#}");
                 return false;
             }
@@ -267,6 +304,7 @@ impl Host {
                 match host.watch(&pane, epoch).await {
                     Ok(()) => return,
                     Err(why) => {
+                        bump(&host.n.herdr_errors);
                         eprintln!("fleet host: watch {pane}: {why:#}; again in {wait:?}");
                         tokio::time::sleep(wait).await;
                         wait = backoff(wait);
@@ -337,6 +375,7 @@ impl Host {
         loop {
             let started = Instant::now();
             if let Err(err) = self.presence_once().await {
+                bump(&self.n.herdr_errors);
                 eprintln!("fleet host: presence: {err:#}; again in {wait:?}");
             }
             if started.elapsed() > Duration::from_secs(60) {
@@ -379,7 +418,10 @@ impl Host {
                             let epoch = self.agent_up(&pane, &info["agent"]).await;
                             self.watch_pane(pane, epoch);
                         }
-                        Err(err) => eprintln!("fleet host: agent in {pane}: {err}"),
+                        Err(err) => {
+                            bump(&self.n.herdr_errors);
+                            eprintln!("fleet host: agent in {pane}: {err}");
+                        }
                     }
                 }
                 "pane_closed" | "pane_exited" => self.agent_down(&pane, "pane closed").await,
@@ -404,9 +446,10 @@ impl Host {
     }
 
     async fn health_loop(self: Arc<Self>) {
-        // First report once the inventory has had a moment, then every 5 minutes.
+        // First report once the inventory has had a moment, then every minute.
         let start = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut tick = tokio::time::interval_at(start, Duration::from_secs(300));
+        let every = Duration::from_secs(crate::stats::HEALTH_EVERY_S as u64);
+        let mut tick = tokio::time::interval_at(start, every);
         loop {
             tick.tick().await;
             match rustix::fs::statvfs(&self.cfg.data_dir) {
@@ -417,6 +460,7 @@ impl Host {
                         disk_free: s.f_bavail * s.f_frsize,
                         disk_total: s.f_blocks * s.f_frsize,
                         agents,
+                        stats: Some(self.stats()),
                     })))
                     .await;
                 }
@@ -506,6 +550,7 @@ impl Host {
     /// prompt proves nothing.
     async fn delivery_loop(self: Arc<Self>) {
         let mut tried: HashMap<String, Instant> = HashMap::new();
+        let mut attempts: HashMap<String, u32> = HashMap::new();
         let mut waiting: HashSet<String> = HashSet::new();
         loop {
             tokio::select! {
@@ -521,6 +566,7 @@ impl Host {
                 }
             };
             tried.retain(|id, _| pending.contains_key(id));
+            attempts.retain(|id, _| pending.contains_key(id));
             waiting.retain(|id| pending.contains_key(id));
             for (id, msg) in pending {
                 let target = {
@@ -556,11 +602,18 @@ impl Host {
                     &id,
                 );
                 let params = json!({ "target": pane, "text": text, "wait": { "until": ["working"], "timeout_ms": 20000 } });
+                let attempt = attempts.entry(id.clone()).or_default();
+                *attempt += 1;
+                let attempt = *attempt;
+                bump(&self.n.rings);
+                let rung = chrono::Utc::now();
                 match herdr_call(&self.cfg.herdr_socket, "agent.prompt", params).await {
                     Ok(_) if self.saw_working(&pane, before).await => {
                         let delivered = MsgDelivered {
                             to: msg.to.clone(),
                             observed: AgentState::Working,
+                            rung: Some(rung),
+                            attempts: Some(attempt),
                         };
                         if self
                             .publish(self.presence(Known::MsgDelivered(delivered)).re(&id))
@@ -575,9 +628,13 @@ impl Host {
                         }
                     }
                     Ok(_) => {
+                        bump(&self.n.ring_failures);
                         eprintln!("fleet host: {id}: prompted, but no `working` seen; will retry")
                     }
-                    Err(err) => eprintln!("fleet host: {id}: {err}; will retry"),
+                    Err(err) => {
+                        bump(&self.n.ring_failures);
+                        eprintln!("fleet host: {id}: {err}; will retry");
+                    }
                 }
             }
         }

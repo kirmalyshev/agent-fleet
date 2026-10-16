@@ -71,7 +71,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | presence | `agent.up` | agent, host, kind?, state, pane? | | host |
 | | `agent.state` | agent, state (`idle` `working` `blocked` `done` `unknown`) | | host |
 | | `agent.down` | agent, reason? | | host |
-| | `host.health` | host, disk_free, disk_total, agents | | host |
+| | `host.health` | host, disk_free, disk_total, agents, stats? (every minute) | | host |
 | task | `task.created` | title, url? | task | agent, host |
 | | `task.assigned` | agent, lead? — **exclusive** | task | agent, host |
 | | `task.unassigned` | reason? | task | agent, host |
@@ -81,7 +81,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `blocker.resolved` | note? | re = the raise | agent, host |
 | question | `ask.raised` | question, options[], recommendation?, context? | task | agent |
 | comms | `msg.sent` | to, kind, ref, text | | agent, host |
-| | `msg.delivered` | to, observed | re = the send | host |
+| | `msg.delivered` | to, observed, rung?, attempts? | re = the send | host |
 | | `handoff` | to, next, done?, evidence[], learned? | task | agent |
 
 Task states follow the A2A task lifecycle names, so tools that know A2A read them as-is.
@@ -122,6 +122,7 @@ from the log, so host agents and CLIs upgrade independently of the hub.
 | `GET` | `/events/stream?after=<id>` | SSE: the backlog after the cursor, then live events; `410` for an unknown cursor |
 | `GET` | `/state` | the folded state |
 | `GET` | `/schema` | the same document as `fleet api schema` |
+| `GET` | `/stats?since=<s>` | the hub's vitals and numbers read off the last `s` seconds of the log (see Metrics) |
 
 The cursor is an event id, but order is **arrival** order at the hub. A spooled event with an old
 ULID that arrives late is still returned after the cursor, so a follower never misses it.
@@ -183,6 +184,30 @@ supervisor restarts it rather than leaving a host that looks healthy and no long
   replaced), the host re-reads the whole log. Read commands (`ps`, `task ls/show`, `state`,
   `ui`) ask the hub and fall back to the replica only when the hub is unreachable, saying how
   old the replica's last event is.
+
+## Metrics
+
+The log is the record, so most numbers are read off it; the hub stamps each event's arrival
+time, and the host agent reports its own vitals in `host.health.stats`. `fleet stats` shows
+them, `GET /stats` returns them as JSON.
+
+- **Doorbells.** Sent, delivered, pending, and lost (undelivered for over 10 minutes). Time to
+  delivery splits into `wait` (sent until the ring that worked: the agent was busy) and
+  `react` (that ring until the agent turned `working`), from `msg.delivered.rung`. A delivery
+  that took more than one ring (`attempts`) counts as retried.
+- **Presence.** Agents seen, ups and downs, state changes, flaps (a state that lasted under
+  5 s), and changes into `unknown`.
+- **Lag.** Hub arrival minus the writer's `ts`; spooled events are the long tail.
+- **Hosts.** Reports received against those expected, the longest silence, restarts (a drop
+  in `uptime_s`), and the last vitals: memory, CPU, rings and failed rings, herdr errors,
+  events spooled or not written at all.
+- **Hub.** Uptime, memory, CPU, log size, followers, the time each recent `POST /events`
+  spent in the hub (lock wait included), and posts by outcome (accepted, duplicate, 400, 409…).
+
+`fleet bench` runs a throwaway hub in-process and measures it with the same client the CLI
+uses: post latency alone and under contention, throughput, how far a follower lags a writer,
+and whether racing claims stay exclusive. It measures the hub and the client, not herdr or
+the agents.
 
 ## Files
 
