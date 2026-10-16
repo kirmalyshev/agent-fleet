@@ -298,10 +298,19 @@ pub async fn worktrees(host: &str, repo: &str) -> Vec<WorktreeState> {
         let changed = git(&path, &["diff", "--name-only", &format!("{base}...HEAD")])
             .await
             .unwrap_or_default();
+        // A submodule pointer moves on most branches; it is shared plumbing, not overlapping work.
+        let gitmodules = ["config", "--file", ".gitmodules", "--get-regexp", "path"];
+        let submodules: Vec<String> = git(&path, &gitmodules)
+            .await
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(1).map(str::to_string))
+            .collect();
         let files: BTreeSet<String> = changed
             .lines()
             .map(str::to_string)
             .chain(dirty.iter().cloned())
+            .filter(|f| !submodules.contains(f))
             .collect();
         out.push(WorktreeState {
             host: host.to_string(),
@@ -475,7 +484,8 @@ mod tests {
         sh(
             "git init -q -b main r && cd r && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m one \
             && echo x > a.txt && git add a.txt && git -c user.name=t -c user.email=t@t commit -q -m two \
-            && git worktree add -q ../w -b feat && echo y > ../w/b.txt",
+            && git worktree add -q ../w -b feat && echo y > ../w/b.txt \
+            && printf '[submodule \"lib\"]\\n\\tpath = lib\\n\\turl = x\\n' > ../w/.gitmodules && touch ../w/lib",
         );
         assert_eq!(repo_of(&format!("{}/../w", r)).await.as_deref(), Some(r));
         let mut wts = worktrees("h", r).await;
@@ -485,7 +495,17 @@ mod tests {
             .iter()
             .find(|w| w.branch.as_deref() == Some("feat"))
             .unwrap();
-        assert_eq!((w.unpushed, w.dirty), (2, 1), "no remote has either commit");
+        assert_eq!(
+            (w.unpushed, w.dirty),
+            (2, 3),
+            "no remote has either commit; three files are dirty"
+        );
         assert!(w.files.contains(&"b.txt".to_string()), "{:?}", w.files);
+        assert!(
+            !w.files.contains(&"lib".to_string()),
+            "a submodule path is not work: {:?}",
+            w.files
+        );
+        assert!(w.files.contains(&".gitmodules".to_string()));
     }
 }
