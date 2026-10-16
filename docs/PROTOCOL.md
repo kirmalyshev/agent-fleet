@@ -94,7 +94,8 @@ Task states follow the A2A task lifecycle names, so tools that know A2A read the
 
 - **Strict on write.** `POST /events` accepts only known types at `v: 1`, with no unknown fields
   in the envelope or in `data`, with the envelope fields the type needs, at most 64 KiB, and from
-  an allowed actor kind. A malformed or oversized event is `400`; a forbidden actor (any `human`,
+  an allowed actor kind, and with every recipient (`msg.sent.to`, `handoff.to`,
+  `task.assigned.agent`) a full agent id. A malformed or oversized event is `400`; a forbidden actor (any `human`,
   any `hub`, or a kind not in the table) is `403`. Clients apply the same rules before sending,
   so an invalid event is refused locally and never spooled.
 - **Exclusive assignment.** `task.assigned` for a task that already has an owner and is not

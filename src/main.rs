@@ -380,7 +380,8 @@ impl Ctx {
 
     /// A full agent id from a short name, among the agents that are up.
     async fn resolve_agent(&self, name: &str) -> Result<String> {
-        if name.contains(':') {
+        // A pane id (`w1:p2`) has a colon too; only `agent:` makes a full id.
+        if name.starts_with("agent:") {
             return Ok(name.to_string());
         }
         let s = self.state().await?;
