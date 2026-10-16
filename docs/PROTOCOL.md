@@ -76,6 +76,10 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | machine | `worktree.state` | host, path, repo, branch?, head, unpushed, dirty, files[] (only what still differs from the default branch), last_commit, in_main? (on change) | | host |
 | | `worktree.gone` | host, path | | host |
 | | `worktree.procs` | host, path, procs, rss_kb, cpu_pct, names[], pids[], orphaned (each scan; `procs: 0` once when they end) | | host |
+| resource | `resource.taken` | host, resource, pid, cwd?, scope?, since | | host |
+| | `resource.waiting` | host, resource, pid, cwd?, scope?, since | | host |
+| | `resource.released` | host, resource, pid? (without `pid`: nobody holds or waits) | | host |
+| | `resource.limit` | host, name, resources[], max, until? (empty `resources` removes it) | | agent, host |
 | task | `task.created` | title, url? | task | agent, host |
 | | `task.assigned` | agent, lead? — **exclusive** | task | agent, host |
 | | `task.unassigned` | reason? | task | agent, host |
@@ -231,6 +235,17 @@ Every 5 minutes the host agent scans its machine. It writes facts, never verdict
   *deleted* directory beside the worktrees is an orphan: nothing that could stop it knows it is
   there. Git calls run with `GIT_OPTIONAL_LOCKS=0`, so a scan never takes an agent's index lock.
 
+- **Resources.** Every 5 seconds, each lock given as `--lock <name>=<dir>`. A lock is a
+  directory, held while it exists. The holder's pid is in its `owner` file, else in `pid`; it
+  counts while either process is alive. Optional `cwd` and `scope` files say where and what.
+  Waiters are files in `<dir>.waiting/`, named `<unix seconds>.<pid>`, with pid, scope and cwd on
+  their first three lines. Changes go out as `resource.taken`, `resource.waiting` and
+  `resource.released`; a host starting to watch a lock first releases it in full, so nothing it
+  missed while down survives. The host only reads: the scripts keep doing the locking.
+
+A capacity rule (`agent-fleet resource limit <name> <resources>… --max N --until HH:MM`) says
+how many worktrees may hold any of a set of resources at once.
+
 `agent-fleet doctor` (and the board) reads verdicts off that state:
 
 | Finding | When |
@@ -242,11 +257,14 @@ Every 5 minutes the host agent scans its machine. It writes facts, never verdict
 | `forgotten` | a worktree no agent works in, with unsaved work for an hour, or clean and 3 days untouched; running processes are named |
 | `unpushed` | an agent's worktree holding commits no remote has for an hour |
 | `orphan` | processes running in a deleted worktree, with their pids |
+| `breach` | more worktrees hold a rule's resources than its `max`, while the rule lasts |
+| `queued` | a process waiting 10 min for a resource, with who holds it |
 
 ## The operator's screen
 
 `agent-fleet tui` shows the state live (every 2 s): agents with their CPU, memory, task and branch;
-worktrees with unpushed and dirty work and what they run; tasks; findings. Writes go through the
+worktrees with unpushed and dirty work and what they run; tasks; findings; resources with their
+holder, queue and rules. Writes go through the
 same events as the CLI (`msg.sent`, `task.state`, `task.unassigned`). Two actions are local to
 the machine and ask first: removing a worktree no agent works in, and killing the processes
 left in one (only those still running there, so a reused pid is never hit).

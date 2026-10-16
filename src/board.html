@@ -99,8 +99,8 @@ td.dim, .dim { color: var(--text-3); }
 .st.idle, .st.done, .st.completed, .st.canceled, .st.submitted { color: var(--idle); }
 .st.working-task { color: var(--ok); }
 .badge { display: inline-flex; align-items: center; height: 20px; padding: 0 7px; border-radius: 4px; font-size: var(--fs-meta); font-weight: 600; white-space: nowrap; }
-.k-hung, .k-orphan, .k-duplicate, .b-bad { background: var(--bad-soft); color: var(--bad); }
-.k-heavy, .k-unpushed, .k-forgotten, .b-warn { background: var(--warn-soft); color: var(--warn); }
+.k-hung, .k-orphan, .k-duplicate, .k-breach, .b-bad { background: var(--bad-soft); color: var(--bad); }
+.k-heavy, .k-unpushed, .k-forgotten, .k-queued, .b-warn { background: var(--warn-soft); color: var(--warn); }
 .k-stale, .b-dim { background: var(--surface-2); color: var(--text-3); box-shadow: inset 0 0 0 1px var(--line); }
 .b-ok { background: var(--ok-soft); color: var(--ok); }
 .count-bad { color: var(--bad); font-weight: 650; }
@@ -183,8 +183,8 @@ h2 .dim { font-weight: 400; }
 <script>
 "use strict";
 const KEY = "agent-fleet-token";
-const TABS = ["tree", "agents", "worktrees", "tasks", "findings", "doorbells", "hosts"];
-const LABEL = { tree: "Tree", agents: "Agents", worktrees: "Worktrees", tasks: "Tasks", findings: "Findings", doorbells: "Doorbells", hosts: "Hosts" };
+const TABS = ["tree", "agents", "worktrees", "tasks", "resources", "findings", "doorbells", "hosts"];
+const LABEL = { tree: "Tree", agents: "Agents", worktrees: "Worktrees", tasks: "Tasks", resources: "Resources", findings: "Findings", doorbells: "Doorbells", hosts: "Hosts" };
 const TERMINAL = ["completed", "failed", "canceled"];
 const openState = {};
 let token = null, data = null, stats = null, tab = "tree", filter = "", err = null, loadedAt = 0, statsAt = 0;
@@ -390,6 +390,24 @@ function tasksTab(s) {
   }), ["No tasks yet", "Agents record theirs with agent-fleet task add when they start an issue."]);
 }
 
+function resourcesTab(s) {
+  const ix = indexes(s);
+  const who = h => `${h.scope ? esc(h.scope) : "pid " + h.pid}${h.cwd ? ` <span class="dim mono">${esc(short(h.cwd))}</span>` : ""}`;
+  const rows = Object.entries(s.resources).filter(([k, r]) => match(k, r.holder?.scope, r.holder?.cwd, ...r.waiting.map(w => w.scope)));
+  const res = table([["Resource"], ["Holder"], ["For", "r"], ["Queue"], ["Findings"]], rows.map(([k, r]) => {
+    const h = r.holder;
+    const queue = r.waiting.map((w, i) => `<div>${i + 1}. ${who(w)} <span class="dim">· ${ago(w.since)}</span></div>`).join("");
+    return `<tr><td class="mono">${esc(k)}</td><td>${h ? `<span title="pid ${h.pid}">${who(h)}</span>` : badge("b-ok", "free")}</td>
+      <td class="r num">${h ? ago(h.since) : ""}</td><td class="wrap">${queue || `<span class="zero">–</span>`}</td><td>${findingBadges(ix, k)}</td></tr>`;
+  }), ["No resource is held", "Hosts started with --lock report who holds each lock and who waits for it."]);
+  const rules = Object.entries(s.limits);
+  if (!rules.length) return res;
+  const at = t => t ? new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+  return res + `<h2>Capacity rules</h2>` + table([["Rule"], ["At most", "r"], ["Of"], ["Until", "r"], ["Findings"]], rules.map(([k, l]) =>
+    `<tr><td class="mono">${esc(k)}</td><td class="r num">${l.max}</td><td class="mono">${esc(l.resources.join(" / "))}</td>
+     <td class="r num">${l.until && Date.parse(l.until) < Date.now() ? `<span class="zero">expired</span>` : esc(at(l.until))}</td><td>${findingBadges(ix, k)}</td></tr>`), ["", ""]);
+}
+
 function findingsTab() {
   const rows = data.findings.filter(f => match(f.kind, f.subject, f.detail));
   return table([["Kind"], ["About"], ["What"]], rows.map(f =>
@@ -457,7 +475,7 @@ function render() {
   const undelivered = Object.keys(s.msgs).length;
   const n = {
     tree: new Set(Object.values(s.worktrees).map(w => w.state.host + ":" + w.state.repo)).size, agents: a.length,
-    worktrees: Object.keys(s.worktrees).length, tasks: open, findings: data.findings.length, doorbells: undelivered, hosts: Object.keys(s.hosts).length,
+    worktrees: Object.keys(s.worktrees).length, tasks: open, resources: Object.values(s.resources).filter(r => r.holder).length, findings: data.findings.length, doorbells: undelivered, hosts: Object.keys(s.hosts).length,
   };
   const statsBar = [
     ["agents", `<b>${a.length}</b> agents`, ""],
@@ -468,10 +486,10 @@ function render() {
     ["findings", `<b>${data.findings.length}</b> findings`, data.findings.length ? "warn" : ""],
     undelivered ? ["doorbells", `<b>${undelivered}</b> undelivered`, "warn"] : null,
   ].filter(Boolean).map(([t, html, cls]) => `<button class="stat ${cls}" data-tab="${t}">${html}</button>`).join("");
-  const alerts = data.findings.filter(f => ["orphan", "hung", "duplicate"].includes(f.kind)).slice(0, 3)
+  const alerts = data.findings.filter(f => ["orphan", "hung", "duplicate", "breach"].includes(f.kind)).slice(0, 3)
     .map(f => `<div class="banner">${ICON.alert}<div><b>${esc(f.kind)}</b> · <span class="mono">${esc(home(f.subject))}</span><div class="sub">${esc(f.detail)}</div></div></div>`);
   if (err) alerts.unshift(`<div class="banner warn">${ICON.alert}<div><b>Showing data from ${ago(new Date(loadedAt).toISOString())} ago.</b><div class="sub">${esc(err)} Retrying every 3 seconds.</div></div></div>`);
-  const body = { tree: treeTab, agents: agentsTab, worktrees: worktreesTab, tasks: tasksTab, findings: findingsTab, doorbells: doorbellsTab, hosts: hostsTab }[tab](s);
+  const body = { tree: treeTab, agents: agentsTab, worktrees: worktreesTab, tasks: tasksTab, resources: resourcesTab, findings: findingsTab, doorbells: doorbellsTab, hosts: hostsTab }[tab](s);
   app.innerHTML = shell(n, statsBar, body, alerts);
   bind(focused, caret);
 }

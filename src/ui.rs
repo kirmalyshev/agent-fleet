@@ -4,7 +4,7 @@ use std::fmt::Write;
 
 use chrono::{DateTime, Utc};
 
-use crate::state::State;
+use crate::state::{Hold, State};
 use crate::stats::{Dist, LogStats};
 
 pub fn ago(now: DateTime<Utc>, ts: DateTime<Utc>) -> String {
@@ -15,6 +15,46 @@ pub fn ago(now: DateTime<Utc>, ts: DateTime<Utc>) -> String {
         3600..86400 => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
         _ => format!("{}d", s / 86400),
     }
+}
+
+/// `pid 42 "e2e, 3 flows" in wt-a, 12m`: the cwd's last component, not the whole path.
+pub fn hold(now: DateTime<Utc>, h: &Hold) -> String {
+    let mut out = format!("pid {}", h.pid);
+    if let Some(sc) = &h.scope {
+        let _ = write!(out, " \"{sc}\"");
+    }
+    if let Some(c) = &h.cwd {
+        let _ = write!(out, " in {}", c.rsplit('/').next().unwrap_or(c));
+    }
+    let _ = write!(out, ", {}", ago(now, h.since));
+    out
+}
+
+/// Each held or queued-for resource, then the capacity rules.
+pub fn resources(s: &State, now: DateTime<Utc>) -> String {
+    let mut out = String::new();
+    for (key, r) in &s.resources {
+        let holder = r
+            .holder
+            .as_ref()
+            .map_or("free".to_string(), |h| hold(now, h));
+        let _ = writeln!(out, "{key:<24} {holder}");
+        for (i, w) in r.waiting.iter().enumerate() {
+            let _ = writeln!(out, "{:<24}   {}. {}", "", i + 1, hold(now, w));
+        }
+    }
+    for (key, l) in &s.limits {
+        let until = l.until.map_or(String::new(), |u| {
+            format!(" until {}", u.with_timezone(&chrono::Local).format("%H:%M"))
+        });
+        let _ = writeln!(
+            out,
+            "{key:<24} rule: at most {} of {}{until}",
+            l.max,
+            l.resources.join(" / ")
+        );
+    }
+    out
 }
 
 fn state_name<T: serde::Serialize>(v: T) -> String {
@@ -48,6 +88,10 @@ pub fn ps(s: &State, now: DateTime<Utc>) -> String {
     }
     if s.agents.is_empty() {
         out.push_str("(no agents up)\n");
+    }
+    let res = resources(s, now);
+    if !res.is_empty() {
+        let _ = write!(out, "\n{:<24} HOLDER / QUEUE\n{res}", "RESOURCE");
     }
     out
 }

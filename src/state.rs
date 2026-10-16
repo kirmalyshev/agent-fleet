@@ -7,7 +7,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::event::{
-    AgentState, Body, Event, Known, TYPE_VERSION, TaskState, WorktreeProcs, WorktreeState,
+    AgentState, Body, Event, Known, ResourceHold, ResourceLimit, TYPE_VERSION, TaskState,
+    WorktreeProcs, WorktreeState,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -27,6 +28,12 @@ pub struct State {
     pub worktrees: BTreeMap<String, Worktree>,
     /// Processes running in worktrees (or orphaned beside them) by `<host>:<path>`.
     pub worktree_procs: BTreeMap<String, Procs>,
+    /// Held or queued-for resources by `<host>:<resource>`.
+    #[serde(default)]
+    pub resources: BTreeMap<String, Resource>,
+    /// Capacity rules by `<host>:<name>`.
+    #[serde(default)]
+    pub limits: BTreeMap<String, ResourceLimit>,
     /// Events this binary cannot fold (an unknown type, or a known type at a newer `v`): kept in
     /// the log, skipped here.
     pub unknown: u64,
@@ -71,6 +78,34 @@ pub struct Worktree {
 pub struct Procs {
     pub procs: WorktreeProcs,
     pub ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Resource {
+    pub host: String,
+    pub resource: String,
+    pub holder: Option<Hold>,
+    /// Oldest first.
+    pub waiting: Vec<Hold>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Hold {
+    pub pid: u32,
+    pub cwd: Option<String>,
+    pub scope: Option<String>,
+    pub since: DateTime<Utc>,
+}
+
+impl From<&ResourceHold> for Hold {
+    fn from(d: &ResourceHold) -> Self {
+        Self {
+            pid: d.pid,
+            cwd: d.cwd.clone(),
+            scope: d.scope.clone(),
+            since: d.since,
+        }
+    }
 }
 
 pub fn worktree_key(host: &str, path: &str) -> String {
@@ -130,6 +165,17 @@ impl State {
             s.apply(e);
         }
         s
+    }
+
+    fn resource_mut(&mut self, host: &str, resource: &str) -> &mut Resource {
+        self.resources
+            .entry(worktree_key(host, resource))
+            .or_insert_with(|| Resource {
+                host: host.to_string(),
+                resource: resource.to_string(),
+                holder: None,
+                waiting: Vec::new(),
+            })
     }
 
     /// The agent holding `task`, if the task is assigned and still open.
@@ -195,6 +241,38 @@ impl State {
                             ts,
                         },
                     );
+                }
+            }
+            Known::ResourceTaken(d) => {
+                let r = self.resource_mut(&d.host, &d.resource);
+                r.waiting.retain(|w| w.pid != d.pid);
+                r.holder = Some(d.into());
+            }
+            Known::ResourceWaiting(d) => {
+                let r = self.resource_mut(&d.host, &d.resource);
+                r.waiting.retain(|w| w.pid != d.pid);
+                r.waiting.push(d.into());
+                r.waiting.sort_by_key(|w| w.since);
+            }
+            Known::ResourceReleased(d) => {
+                let key = worktree_key(&d.host, &d.resource);
+                if let (Some(r), Some(pid)) = (self.resources.get_mut(&key), d.pid) {
+                    r.waiting.retain(|w| w.pid != pid);
+                    if r.holder.as_ref().is_some_and(|h| h.pid == pid) {
+                        r.holder = None;
+                    }
+                    if r.holder.is_some() || !r.waiting.is_empty() {
+                        return;
+                    }
+                }
+                self.resources.remove(&key);
+            }
+            Known::ResourceLimit(d) => {
+                let key = worktree_key(&d.host, &d.name);
+                if d.resources.is_empty() {
+                    self.limits.remove(&key);
+                } else {
+                    self.limits.insert(key, d.clone());
                 }
             }
             Known::WorktreeGone(d) => {
@@ -412,6 +490,53 @@ mod tests {
         );
         let s = State::fold(events.iter().chain([&down.into_event()]));
         assert!(s.agents.is_empty());
+    }
+
+    #[test]
+    fn resources_follow_their_holder_and_queue() {
+        let since = Utc::now();
+        let hold = |pid| ResourceHold {
+            host: "h".into(),
+            resource: "sim".into(),
+            pid,
+            cwd: None,
+            scope: None,
+            since,
+        };
+        let released = |pid| {
+            Known::ResourceReleased(ResourceReleased {
+                host: "h".into(),
+                resource: "sim".into(),
+                pid,
+            })
+        };
+        let fold = |bodies: Vec<Known>| {
+            let events: Vec<Event> = bodies
+                .into_iter()
+                .map(|b| ev(ActorKind::Host, b).into_event())
+                .collect();
+            State::fold(&events)
+        };
+        let queued = vec![
+            Known::ResourceTaken(hold(1)),
+            Known::ResourceWaiting(hold(2)),
+            Known::ResourceWaiting(hold(3)),
+            released(Some(1)),
+            Known::ResourceTaken(hold(2)),
+        ];
+        let s = fold(queued.clone());
+        let r = &s.resources["h:sim"];
+        assert_eq!(r.holder.as_ref().map(|h| h.pid), Some(2));
+        assert_eq!(r.waiting.iter().map(|w| w.pid).collect::<Vec<_>>(), [3]);
+        let mut all_gone = queued.clone();
+        all_gone.extend([released(Some(3)), released(Some(2))]);
+        assert!(fold(all_gone).resources.is_empty());
+        let mut reset = queued;
+        reset.push(released(None));
+        assert!(
+            fold(reset).resources.is_empty(),
+            "a release without pid clears it"
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
@@ -76,6 +76,9 @@ enum Cmd {
         /// A repository whose worktrees to watch even when no agent works in it. Repeatable.
         #[arg(long = "repo")]
         repos: Vec<String>,
+        /// A lock directory to report as a resource, `<name>=<dir>`. Repeatable.
+        #[arg(long = "lock", value_parser = parse_lock)]
+        locks: Vec<(String, PathBuf)>,
     },
     /// Protocol metadata.
     Api {
@@ -108,6 +111,11 @@ enum Cmd {
         /// The condition that clears it.
         #[arg(long)]
         until: Option<String>,
+    },
+    /// Capacity rules for the resources hosts report.
+    Resource {
+        #[command(subcommand)]
+        cmd: ResourceCmd,
     },
     /// Resolve a blocker by its id.
     Unblock {
@@ -305,6 +313,54 @@ enum TaskCmd {
 }
 
 #[derive(Subcommand)]
+enum ResourceCmd {
+    /// At most --max worktrees hold any of <resources> at once; `doctor` flags a breach.
+    Limit {
+        name: String,
+        #[arg(required = true)]
+        resources: Vec<String>,
+        #[arg(long, default_value_t = 1)]
+        max: u32,
+        /// Expiry: `HH:MM` today, local time, or an RFC 3339 timestamp.
+        #[arg(long, value_parser = parse_until)]
+        until: Option<DateTime<Utc>>,
+        /// [default: this machine]
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Remove a rule.
+    Unlimit {
+        name: String,
+        #[arg(long)]
+        host: Option<String>,
+    },
+}
+
+fn parse_until(s: &str) -> Result<DateTime<Utc>, String> {
+    if let Ok(t) = DateTime::parse_from_rfc3339(s) {
+        return Ok(t.with_timezone(&Utc));
+    }
+    let t = chrono::NaiveTime::parse_from_str(s, "%H:%M")
+        .map_err(|_| format!("not HH:MM or RFC 3339: {s}"))?;
+    chrono::Local::now()
+        .date_naive()
+        .and_time(t)
+        .and_local_timezone(chrono::Local)
+        .earliest()
+        .map(|t| t.with_timezone(&Utc))
+        .ok_or_else(|| format!("{s} does not exist today"))
+}
+
+fn parse_lock(s: &str) -> Result<(String, PathBuf), String> {
+    match s.split_once('=') {
+        Some((name, dir)) if !name.is_empty() && !dir.is_empty() => {
+            Ok((name.to_string(), PathBuf::from(dir)))
+        }
+        _ => Err(format!("not <name>=<dir>: {s}")),
+    }
+}
+
+#[derive(Subcommand)]
 enum DepCmd {
     Add { task: String, on: String },
     Rm { task: String, on: String },
@@ -492,6 +548,7 @@ async fn main() -> Result<()> {
             herdr_socket,
             session,
             repos,
+            locks,
         } => {
             let cfg = host::Config {
                 host: ctx.host_name(),
@@ -500,6 +557,7 @@ async fn main() -> Result<()> {
                 replica: ctx.paths.replica(),
                 data_dir: ctx.paths.dir.clone(),
                 repos: repos.clone(),
+                locks: locks.clone(),
             };
             host::run(cfg, ctx.client()?).await?;
         }
@@ -650,6 +708,27 @@ async fn main() -> Result<()> {
                 unblocks_when: until.clone(),
             };
             ctx.task_event(task, Known::BlockerRaised(body)).await?;
+        }
+        Cmd::Resource { cmd } => {
+            let (name, host, resources, max, until) = match cmd {
+                ResourceCmd::Limit {
+                    name,
+                    resources,
+                    max,
+                    until,
+                    host,
+                } => (name, host, resources.clone(), *max, *until),
+                ResourceCmd::Unlimit { name, host } => (name, host, Vec::new(), 0, None),
+            };
+            let body = Known::ResourceLimit(ResourceLimit {
+                host: host.clone().unwrap_or_else(|| ctx.host_name()),
+                name: name.clone(),
+                resources,
+                max,
+                until,
+            });
+            let e = Envelope::new(ctx.me().await?, &ctx.cli.project, body);
+            ctx.write(e).await?;
         }
         Cmd::Unblock { blocker, note } => {
             let e = Envelope::new(

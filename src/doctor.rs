@@ -6,8 +6,8 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
 use crate::event::AgentState;
-use crate::state::{Agent, State, Worktree};
-use crate::ui::{ago, dur};
+use crate::state::{Agent, Hold, State, Worktree};
+use crate::ui::{ago, dur, hold};
 
 /// Idle, done or blocked this long: the agent is stale.
 pub const STALE: Duration = Duration::hours(2);
@@ -20,6 +20,8 @@ pub const HEAVY_CPU_PCT: u32 = 200;
 pub const UNPUSHED: Duration = Duration::hours(1);
 /// A clean worktree nobody works in, untouched this long, is clutter.
 pub const ABANDONED: Duration = Duration::days(3);
+/// Queued this long for a resource: worth a look at who holds it.
+pub const QUEUED: Duration = Duration::minutes(10);
 /// Files every branch touches; sharing them is not duplicate work.
 const SHARED_BY_ALL: &[&str] = &[
     "bun.lock",
@@ -32,7 +34,8 @@ const SHARED_BY_ALL: &[&str] = &[
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Finding {
-    /// `stale`, `hung`, `heavy`, `duplicate`, `forgotten`, `unpushed`, `orphan`.
+    /// `stale`, `hung`, `heavy`, `duplicate`, `forgotten`, `unpushed`, `orphan`, `breach`,
+    /// `queued`.
     pub kind: &'static str,
     /// The agent id or `<host>:<path>` it is about.
     pub subject: String,
@@ -57,6 +60,21 @@ pub fn worktree_of<'a>(s: &'a State, a: &Agent) -> Option<(&'a String, &'a Workt
                 && (cwd == w.state.path || cwd.starts_with(&format!("{}/", w.state.path)))
         })
         .max_by_key(|(_, w)| w.state.path.len())
+}
+
+/// Who a resource holder is for a capacity rule: its worktree, else its cwd, else its pid.
+fn holder_of(s: &State, host: &str, h: &Hold) -> String {
+    let Some(cwd) = h.cwd.as_deref() else {
+        return format!("pid {}", h.pid);
+    };
+    s.worktrees
+        .iter()
+        .filter(|(_, w)| {
+            w.state.host == host
+                && (cwd == w.state.path || cwd.starts_with(&format!("{}/", w.state.path)))
+        })
+        .max_by_key(|(_, w)| w.state.path.len())
+        .map_or(cwd.to_string(), |(k, _)| k.clone())
 }
 
 fn procs(n: u32) -> String {
@@ -263,6 +281,49 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
             ));
         }
     }
+    for (key, l) in &s.limits {
+        if l.until.is_some_and(|u| now >= u) {
+            continue;
+        }
+        let held: Vec<(&String, &Hold)> = s
+            .resources
+            .values()
+            .filter(|r| r.host == l.host && l.resources.contains(&r.resource))
+            .filter_map(|r| Some((&r.resource, r.holder.as_ref()?)))
+            .collect();
+        let holders: std::collections::BTreeSet<String> =
+            held.iter().map(|(_, h)| holder_of(s, &l.host, h)).collect();
+        if holders.len() > l.max as usize {
+            let what: Vec<String> = held
+                .iter()
+                .map(|(r, h)| format!("{r}: {}", hold(now, h)))
+                .collect();
+            out.push(finding(
+                "breach",
+                key,
+                format!(
+                    "{} hold {} at once, the rule allows {}: {}",
+                    holders.len(),
+                    l.resources.join(" / "),
+                    l.max,
+                    what.join("; ")
+                ),
+            ));
+        }
+    }
+    for (key, r) in &s.resources {
+        for w in r.waiting.iter().filter(|w| now - w.since >= QUEUED) {
+            let behind = r
+                .holder
+                .as_ref()
+                .map_or("nobody".to_string(), |h| hold(now, h));
+            out.push(finding(
+                "queued",
+                key,
+                format!("{}, behind {behind}", hold(now, w)),
+            ));
+        }
+    }
     out
 }
 
@@ -433,6 +494,60 @@ mod tests {
         s.agents.insert("agent:h/s/mac".into(), a.clone());
         assert_eq!(worktree_of(&s, &a).map(|(k, _)| k.as_str()), Some("h:/w/a"));
         assert!(findings(&s, now).is_empty(), "no CPU reading is not 0% CPU");
+    }
+
+    #[test]
+    fn a_capacity_rule_counts_worktrees_and_a_long_wait_is_queued() {
+        use crate::event::ResourceLimit;
+        use crate::state::Resource;
+        let now = Utc::now();
+        let mut s = State::default();
+        s.worktrees
+            .insert(worktree_key("h", "/w/a"), tree("/w/a", &[], 0, 0, now));
+        let at = |pid, cwd: &str, mins| Hold {
+            pid,
+            cwd: Some(cwd.into()),
+            scope: None,
+            since: now - Duration::minutes(mins),
+        };
+        let mut put = |name: &str, holder: Option<Hold>, waiting: Vec<Hold>| {
+            s.resources.insert(
+                worktree_key("h", name),
+                Resource {
+                    host: "h".into(),
+                    resource: name.into(),
+                    holder,
+                    waiting,
+                },
+            );
+        };
+        put("sim", Some(at(1, "/w/a", 30)), vec![at(3, "/w/b", 12)]);
+        put("build.1", Some(at(2, "/w/a/src/mobile", 5)), vec![]);
+        let rule = |max, until| ResourceLimit {
+            host: "h".into(),
+            name: "native".into(),
+            resources: vec!["sim".into(), "build.1".into()],
+            max,
+            until,
+        };
+        s.limits.insert("h:native".into(), rule(1, None));
+        assert_eq!(
+            kinds(&findings(&s, now)),
+            vec![("queued", "h:sim")],
+            "one worktree holding both is one holder"
+        );
+        s.resources.get_mut("h:build.1").unwrap().holder = Some(at(2, "/w/c", 5));
+        assert_eq!(
+            kinds(&findings(&s, now)),
+            vec![("breach", "h:native"), ("queued", "h:sim")]
+        );
+        s.limits
+            .insert("h:native".into(), rule(1, Some(now - Duration::minutes(1))));
+        assert_eq!(
+            kinds(&findings(&s, now)),
+            vec![("queued", "h:sim")],
+            "expired"
+        );
     }
 
     #[test]

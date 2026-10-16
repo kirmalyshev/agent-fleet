@@ -9,12 +9,14 @@ One Rust binary, no runtime. Linux and macOS. Agents run in [herdr](https://herd
 ```
 agent-fleet hub                 the log, the fold, the sequencer (HTTP + SSE on 127.0.0.1)
 agent-fleet host                one per machine and herdr session: presence from herdr, disk, a replica, doorbells
-agent-fleet ps                  what every agent is doing
+agent-fleet ps                  what every agent is doing, and who holds or waits for each resource
 agent-fleet task add|done|rm|ls|show
                           claim (exclusive: 409 if taken), finish, cancel or release, list, inspect
 agent-fleet dep add|rm          task A is blocked by task B
 agent-fleet block / unblock     raise and resolve blockers
 agent-fleet ask                 a question for an operator
+agent-fleet resource limit|unlimit
+                          a capacity rule over the locks hosts report (host --lock name=dir)
 agent-fleet tell <agent> <TYPE> <ref> <text>
                           ring an agent's doorbell; delivered = it was seen working afterwards
 agent-fleet state --json        the folded state
@@ -25,7 +27,7 @@ agent-fleet ui                  the board in the browser, live: a tree of reposi
 agent-fleet ui --text           the board: agents, tasks, blockers, asks, undelivered doorbells, hosts
 agent-fleet stats               doorbell latency and loss, event lag, host and hub vitals
 agent-fleet doctor              stale, hung or heavy agents, duplicate work, forgotten worktrees,
-                          unpushed commits, orphaned processes
+                          unpushed commits, orphaned processes, capacity breaches, long queues
 agent-fleet instances           one fleet per project or product: each has its own hub, log and token
 agent-fleet bench               load-test a throwaway hub: latency, throughput, follower lag, 409 races
 agent-fleet api schema          JSON Schema of events and state (schema/agent-fleet.schema.json)

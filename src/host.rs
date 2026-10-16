@@ -79,6 +79,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Repositories whose worktrees to watch besides the ones agents work in.
     pub repos: Vec<String>,
+    /// Lock directories to report as resources: (name, directory).
+    pub locks: Vec<(String, PathBuf)>,
 }
 
 #[derive(Clone)]
@@ -119,6 +121,9 @@ struct Counters {
 fn bump(c: &AtomicU64) {
     c.fetch_add(1, Ordering::Relaxed);
 }
+
+/// How often the host reads the locks it watches.
+const LOCKS_EVERY: Duration = Duration::from_secs(5);
 
 /// How often the host samples agents' processes and the worktrees.
 const SCAN_EVERY: Duration = Duration::from_secs(300);
@@ -638,6 +643,47 @@ impl Host {
     }
 
     /// Keeps the replica current: pull from the cursor, then follow the SSE feed. Reconnects forever.
+    /// Every `LOCKS_EVERY`: each watched lock's holder and queue, sent as they change. A change
+    /// that could not be written is sent again on the next read.
+    async fn lock_loop(self: Arc<Self>) {
+        let mut seen: HashMap<String, scan::Lock> = HashMap::new();
+        let mut tick = tokio::time::interval(LOCKS_EVERY);
+        loop {
+            tick.tick().await;
+            for (name, dir) in &self.cfg.locks {
+                let now = scan::read_lock(dir);
+                let mut ok = true;
+                for c in scan::lock_changes(seen.get(name), &now) {
+                    let hold = |h: &scan::Hold| ResourceHold {
+                        host: self.cfg.host.clone(),
+                        resource: name.clone(),
+                        pid: h.pid,
+                        cwd: h.cwd.clone().or_else(|| scan::cwd_of(h.pid)),
+                        scope: h.scope.clone(),
+                        since: h.since,
+                    };
+                    let released = |pid| {
+                        Known::ResourceReleased(ResourceReleased {
+                            host: self.cfg.host.clone(),
+                            resource: name.clone(),
+                            pid,
+                        })
+                    };
+                    let body = match c {
+                        scan::LockChange::ReleasedAll => released(None),
+                        scan::LockChange::Released(pid) => released(Some(pid)),
+                        scan::LockChange::Taken(h) => Known::ResourceTaken(hold(h)),
+                        scan::LockChange::Waiting(h) => Known::ResourceWaiting(hold(h)),
+                    };
+                    ok &= self.publish(self.presence(body)).await;
+                }
+                if ok {
+                    seen.insert(name.clone(), now);
+                }
+            }
+        }
+    }
+
     async fn sync_loop(self: Arc<Self>) {
         let mut wait = Duration::from_secs(1);
         loop {
@@ -859,6 +905,7 @@ pub async fn run(cfg: Config, client: Client) -> Result<()> {
         r = tokio::spawn(host.clone().delivery_loop()) => bail!("doorbell delivery stopped: {r:?}"),
         r = tokio::spawn(host.clone().presence_loop()) => bail!("presence stopped: {r:?}"),
         r = tokio::spawn(host.clone().scan_loop()) => bail!("scans stopped: {r:?}"),
+        r = tokio::spawn(host.clone().lock_loop()) => bail!("lock reads stopped: {r:?}"),
     }
 }
 
@@ -960,6 +1007,7 @@ mod tests {
             replica: dir.join("replica.db"),
             data_dir: dir.to_path_buf(),
             repos: Vec::new(),
+            locks: Vec::new(),
         };
         let client = Client::new("http://127.0.0.1:1", "t".into(), dir.join("spool.jsonl"));
         let host = Arc::new(Host::new(
@@ -1121,6 +1169,7 @@ mod tests {
             replica: dir.path().join("replica.db"),
             data_dir: dir.path().to_path_buf(),
             repos: Vec::new(),
+            locks: Vec::new(),
         };
         let replica = Store::open(&cfg.replica).unwrap();
         replica

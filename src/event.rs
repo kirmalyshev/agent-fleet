@@ -132,6 +132,14 @@ pub enum Known {
     WorktreeGone(WorktreeGone),
     #[serde(rename = "worktree.procs")]
     WorktreeProcs(WorktreeProcs),
+    #[serde(rename = "resource.taken")]
+    ResourceTaken(ResourceHold),
+    #[serde(rename = "resource.waiting")]
+    ResourceWaiting(ResourceHold),
+    #[serde(rename = "resource.released")]
+    ResourceReleased(ResourceReleased),
+    #[serde(rename = "resource.limit")]
+    ResourceLimit(ResourceLimit),
     #[serde(rename = "task.created")]
     TaskCreated(TaskCreated),
     #[serde(rename = "task.assigned")]
@@ -284,6 +292,47 @@ pub struct WorktreeProcs {
     pub orphaned: bool,
 }
 
+/// A process holds (`resource.taken`) or queues for (`resource.waiting`) a resource on its host:
+/// a lock the host reads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceHold {
+    pub host: String,
+    /// The host's name for it, e.g. `sim` or `build.1`.
+    pub resource: String,
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// What the process says it is doing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// When it took the resource or joined the queue.
+    pub since: DateTime<Utc>,
+}
+
+/// `pid` let go of the resource or left its queue. Without `pid`: nobody holds or waits for it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceReleased {
+    pub host: String,
+    pub resource: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+}
+
+/// A capacity rule: at most `max` worktrees hold any of `resources` on `host` at once, until
+/// `until`. Replaces the rule of the same `name`; an empty `resources` removes it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceLimit {
+    pub host: String,
+    pub name: String,
+    pub resources: Vec<String>,
+    pub max: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorktreeGone {
@@ -413,6 +462,10 @@ impl Known {
             Self::WorktreeState(_) => "worktree.state",
             Self::WorktreeGone(_) => "worktree.gone",
             Self::WorktreeProcs(_) => "worktree.procs",
+            Self::ResourceTaken(_) => "resource.taken",
+            Self::ResourceWaiting(_) => "resource.waiting",
+            Self::ResourceReleased(_) => "resource.released",
+            Self::ResourceLimit(_) => "resource.limit",
             Self::TaskCreated(_) => "task.created",
             Self::TaskAssigned(_) => "task.assigned",
             Self::TaskUnassigned(_) => "task.unassigned",
@@ -439,7 +492,10 @@ impl Known {
             | Self::AgentUsage(_)
             | Self::WorktreeState(_)
             | Self::WorktreeGone(_)
-            | Self::WorktreeProcs(_) => &[Host],
+            | Self::WorktreeProcs(_)
+            | Self::ResourceTaken(_)
+            | Self::ResourceWaiting(_)
+            | Self::ResourceReleased(_) => &[Host],
             Self::MsgDelivered(_) => &[Host],
             Self::AskRaised(_) | Self::Handoff(_) => &[Agent],
             _ => &[Agent, Host],
