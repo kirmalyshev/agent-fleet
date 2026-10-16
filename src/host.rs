@@ -1,7 +1,7 @@
 //! `fleet host`: one per machine and herdr session. Presence from herdr, disk health, a local replica of the log,
 //! and doorbell delivery into herdr agents.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,6 +17,7 @@ use tokio::sync::Notify;
 
 use crate::client::{Client, Refused, Sent};
 use crate::event::*;
+use crate::scan;
 use crate::state::State;
 use crate::store::Store;
 
@@ -76,6 +77,8 @@ pub struct Config {
     pub herdr_socket: PathBuf,
     pub replica: PathBuf,
     pub data_dir: PathBuf,
+    /// Repositories whose worktrees to watch besides the ones agents work in.
+    pub repos: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -116,6 +119,9 @@ struct Counters {
 fn bump(c: &AtomicU64) {
     c.fetch_add(1, Ordering::Relaxed);
 }
+
+/// How often the host samples agents' processes and the worktrees.
+const SCAN_EVERY: Duration = Duration::from_secs(300);
 
 fn backoff(d: Duration) -> Duration {
     (d * 2).min(Duration::from_secs(60))
@@ -469,6 +475,157 @@ impl Host {
         }
     }
 
+    /// Every `SCAN_EVERY`: each agent's process tree cost, and every worktree of the repositories
+    /// agents work in, sent when it changed.
+    async fn scan_loop(self: Arc<Self>) {
+        // agent → (cpu ms so far, when sampled); CPU % needs two samples.
+        let mut prev: HashMap<String, (u64, Instant)> = HashMap::new();
+        let start = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut tick = tokio::time::interval_at(start, SCAN_EVERY);
+        loop {
+            tick.tick().await;
+            if let Err(err) = self.scan_once(&mut prev).await {
+                bump(&self.n.herdr_errors);
+                eprintln!("fleet host: scan: {err:#}");
+            }
+        }
+    }
+
+    async fn scan_once(&self, prev: &mut HashMap<String, (u64, Instant)>) -> Result<()> {
+        let list = herdr_call(&self.cfg.herdr_socket, "agent.list", json!({})).await?;
+        // Two snapshots a second apart, so CPU is known from the first scan on.
+        let (before, t0) = (scan::Procs::read(), Instant::now());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let procs = scan::Procs::read();
+        let gap = t0.elapsed().as_millis() as u64;
+        let mut repos: BTreeSet<String> = self.cfg.repos.iter().cloned().collect();
+        let mut agent_pids: HashSet<u32> = HashSet::new();
+        let mut sampled = HashSet::new();
+        for a in list["agents"].as_array().into_iter().flatten() {
+            let pane = a["pane_id"].as_str().unwrap_or_default();
+            let Some(agent) = self
+                .panes
+                .lock()
+                .unwrap()
+                .get(pane)
+                .map(|l| l.agent.clone())
+            else {
+                continue;
+            };
+            let cwd = a["foreground_cwd"]
+                .as_str()
+                .or(a["cwd"].as_str())
+                .map(str::to_string);
+            if let Some(repo) = match &cwd {
+                Some(c) => scan::repo_of(c).await,
+                None => None,
+            } {
+                repos.insert(repo);
+            }
+            let target = json!({ "pane_id": pane });
+            let info = match herdr_call(&self.cfg.herdr_socket, "pane.process_info", target).await {
+                Ok(info) => info,
+                Err(err) => {
+                    bump(&self.n.herdr_errors);
+                    eprintln!("fleet host: processes of {pane}: {err:#}");
+                    continue;
+                }
+            };
+            let Some(shell) = info["process_info"]["shell_pid"].as_u64() else {
+                continue;
+            };
+            let tree = procs.tree(shell as u32);
+            if tree.is_empty() {
+                continue;
+            }
+            agent_pids.extend(&tree);
+            let (rss_kb, cpu_ms) = procs.sum(&tree);
+            let now = Instant::now();
+            // CPU over the whole interval since the last scan when there was one.
+            let cpu_pct = match prev.insert(agent.clone(), (cpu_ms, now)) {
+                Some((was, at)) => {
+                    (cpu_ms.saturating_sub(was) * 100
+                        / now.duration_since(at).as_millis().max(1) as u64)
+                        as u32
+                }
+                None => procs.cpu_pct(&before, &tree, gap),
+            };
+            sampled.insert(agent.clone());
+            self.publish(self.presence(Known::AgentUsage(AgentUsage {
+                agent,
+                rss_kb,
+                cpu_pct,
+                procs: tree.len() as u32,
+                cwd,
+            })))
+            .await;
+        }
+        prev.retain(|a, _| sampled.contains(a));
+        // ponytail: refolds the replica per scan, like delivery; share one live State if it grows.
+        let state = State::fold(&self.replica.lock().unwrap().all()?);
+        let known = &state.worktrees;
+        let mine = |w: &&crate::state::Worktree| w.state.host == self.cfg.host;
+        repos.extend(known.values().filter(mine).map(|w| w.state.repo.clone()));
+        let mut all = Vec::new();
+        for repo in repos {
+            let found = scan::worktrees(&self.cfg.host, &repo).await;
+            for w in &found {
+                let key = crate::state::worktree_key(&w.host, &w.path);
+                if known.get(&key).map(|k| &k.state) != Some(w) {
+                    self.publish(self.presence(Known::WorktreeState(w.clone())))
+                        .await;
+                }
+            }
+            for k in known.values().filter(mine).filter(|k| k.state.repo == repo) {
+                if !found.iter().any(|w| w.path == k.state.path) {
+                    self.publish(self.presence(Known::WorktreeGone(WorktreeGone {
+                        host: self.cfg.host.clone(),
+                        path: k.state.path.clone(),
+                    })))
+                    .await;
+                }
+            }
+            all.extend(found.into_iter().map(|w| {
+                let linked = w.path != w.repo;
+                (w.path, linked)
+            }));
+        }
+        let groups = scan::by_worktree(&procs, &agent_pids, &all);
+        for (path, g) in &groups {
+            let (rss_kb, _) = procs.sum(&g.pids);
+            let names: BTreeSet<&str> = g
+                .pids
+                .iter()
+                .filter_map(|p| Some(procs.0.get(p)?.name.as_str()))
+                .collect();
+            self.publish(self.presence(Known::WorktreeProcs(WorktreeProcs {
+                host: self.cfg.host.clone(),
+                path: path.clone(),
+                procs: g.pids.len() as u32,
+                rss_kb,
+                cpu_pct: procs.cpu_pct(&before, &g.pids, gap),
+                names: names.into_iter().take(8).map(str::to_string).collect(),
+                pids: g.pids.iter().take(20).copied().collect(),
+                orphaned: g.orphaned,
+            })))
+            .await;
+        }
+        for p in state.worktree_procs.values() {
+            if p.procs.host == self.cfg.host && !groups.contains_key(&p.procs.path) {
+                self.publish(self.presence(Known::WorktreeProcs(WorktreeProcs {
+                    procs: 0,
+                    rss_kb: 0,
+                    cpu_pct: 0,
+                    names: Vec::new(),
+                    pids: Vec::new(),
+                    ..p.procs.clone()
+                })))
+                .await;
+            }
+        }
+        Ok(())
+    }
+
     /// Keeps the replica current: pull from the cursor, then follow the SSE feed. Reconnects forever.
     async fn sync_loop(self: Arc<Self>) {
         let mut wait = Duration::from_secs(1);
@@ -688,6 +845,7 @@ pub async fn run(cfg: Config, client: Client) -> Result<()> {
         r = tokio::spawn(host.clone().health_loop()) => bail!("health reports stopped: {r:?}"),
         r = tokio::spawn(host.clone().delivery_loop()) => bail!("doorbell delivery stopped: {r:?}"),
         r = tokio::spawn(host.clone().presence_loop()) => bail!("presence stopped: {r:?}"),
+        r = tokio::spawn(host.clone().scan_loop()) => bail!("scans stopped: {r:?}"),
     }
 }
 
@@ -788,6 +946,7 @@ mod tests {
             herdr_socket: sock,
             replica: dir.join("replica.db"),
             data_dir: dir.to_path_buf(),
+            repos: Vec::new(),
         };
         let client = Client::new("http://127.0.0.1:1", "t".into(), dir.join("spool.jsonl"));
         let host = Arc::new(Host::new(
@@ -948,6 +1107,7 @@ mod tests {
             herdr_socket: dir.path().join("none.sock"),
             replica: dir.path().join("replica.db"),
             data_dir: dir.path().to_path_buf(),
+            repos: Vec::new(),
         };
         let replica = Store::open(&cfg.replica).unwrap();
         replica

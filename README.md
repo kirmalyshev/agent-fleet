@@ -20,6 +20,9 @@ fleet tell <agent> <TYPE> <ref> <text>
 fleet state --json        the folded state
 fleet ui --text           the board: agents, tasks, blockers, asks, undelivered doorbells, hosts
 fleet stats               doorbell latency and loss, event lag, host and hub vitals
+fleet doctor              stale, hung or heavy agents, duplicate work, forgotten worktrees,
+                          unpushed commits, orphaned processes
+fleet instances           one fleet per project or product: each has its own hub, log and token
 fleet bench               load-test a throwaway hub: latency, throughput, follower lag, 409 races
 fleet api schema          JSON Schema of events and state (schema/fleet.schema.json)
 ```
@@ -66,15 +69,16 @@ fleet ui --text
 ```
 
 `herdr session list` shows each session's socket. Settings come from flags or the environment:
-`FLEET_HUB`, `FLEET_HOME`, `FLEET_TOKEN_FILE`, `FLEET_AGENT`, `FLEET_PROJECT`, `FLEET_HOST`
-(this machine's name in ids, default the hostname).
+`FLEET_INSTANCE` (which fleet, default `default`), `FLEET_HUB`, `FLEET_HOME`,
+`FLEET_TOKEN_FILE`, `FLEET_AGENT`, `FLEET_PROJECT`, `FLEET_HOST` (this machine's name in ids,
+default the hostname).
 
 When the hub is down, ordinary writes go to a local spool and replay later. `task add` refuses
 instead, because only the hub can decide who owns a task. Reads fall back to the host's replica.
 
 ## The protocol
 
-[docs/PROTOCOL.md](docs/PROTOCOL.md): the envelope, the 16 v1 types, the rules the hub enforces
+[docs/PROTOCOL.md](docs/PROTOCOL.md): the envelope, the v1 types, the rules the hub enforces
 (400 / 403 / 409, idempotent append), the HTTP API, doorbells, presence, spool and replica.
 
 ## v2

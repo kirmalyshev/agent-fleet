@@ -110,6 +110,45 @@
           ],
           "type": "object"
         },
+        "AgentUsage": {
+          "additionalProperties": false,
+          "description": "What an agent's processes cost: the pane's whole process tree, sampled by its host.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "cpu_pct": {
+              "description": "CPU since the previous sample, in percent of one core.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cwd": {
+              "description": "Where the agent works.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "procs": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rss_kb": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "agent",
+            "rss_kb",
+            "cpu_pct",
+            "procs"
+          ],
+          "type": "object"
+        },
         "AskRaised": {
           "additionalProperties": false,
           "properties": {
@@ -466,6 +505,139 @@
             }
           },
           "type": "object"
+        },
+        "WorktreeGone": {
+          "additionalProperties": false,
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "host",
+            "path"
+          ],
+          "type": "object"
+        },
+        "WorktreeProcs": {
+          "additionalProperties": false,
+          "description": "Processes running in a worktree that no agent's process tree holds: dev servers, databases,\ntest runs, shells. Sent each scan while there are any, then once with `procs: 0`.",
+          "properties": {
+            "cpu_pct": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "host": {
+              "type": "string"
+            },
+            "names": {
+              "description": "Distinct process names, at most 8.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "orphaned": {
+              "description": "The directory is gone: nothing that could stop these processes knows they are there.",
+              "type": "boolean"
+            },
+            "path": {
+              "type": "string"
+            },
+            "pids": {
+              "description": "At most 20.",
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "procs": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rss_kb": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "host",
+            "path",
+            "procs",
+            "rss_kb",
+            "cpu_pct",
+            "names",
+            "pids",
+            "orphaned"
+          ],
+          "type": "object"
+        },
+        "WorktreeState": {
+          "additionalProperties": false,
+          "description": "A git worktree on a host, as its last scan found it. Sent when it changes.",
+          "properties": {
+            "branch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "dirty": {
+              "description": "Modified and untracked files.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "files": {
+              "description": "Files changed against the default branch, plus dirty ones; at most `MAX_FILES`.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "head": {
+              "type": "string"
+            },
+            "host": {
+              "type": "string"
+            },
+            "last_commit": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "repo": {
+              "description": "The main checkout the worktree belongs to.",
+              "type": "string"
+            },
+            "unpushed": {
+              "description": "Commits on HEAD that no remote has.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "host",
+            "path",
+            "repo",
+            "head",
+            "unpushed",
+            "dirty",
+            "files",
+            "last_commit"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -526,6 +698,70 @@
             },
             "type": {
               "const": "host.health",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/AgentUsage"
+            },
+            "type": {
+              "const": "agent.usage",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/WorktreeState"
+            },
+            "type": {
+              "const": "worktree.state",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/WorktreeGone"
+            },
+            "type": {
+              "const": "worktree.gone",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/WorktreeProcs"
+            },
+            "type": {
+              "const": "worktree.procs",
               "type": "string"
             }
           },
@@ -798,6 +1034,17 @@
             },
             "state": {
               "$ref": "#/$defs/AgentState"
+            },
+            "usage": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Usage"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
             }
           },
           "required": [
@@ -963,6 +1210,22 @@
           ],
           "type": "object"
         },
+        "Procs": {
+          "properties": {
+            "procs": {
+              "$ref": "#/$defs/WorktreeProcs"
+            },
+            "ts": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "procs",
+            "ts"
+          ],
+          "type": "object"
+        },
         "Task": {
           "properties": {
             "blocked_by": {
@@ -1032,6 +1295,176 @@
             "canceled"
           ],
           "type": "string"
+        },
+        "Usage": {
+          "properties": {
+            "cpu_pct": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "procs": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rss_kb": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "ts": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "rss_kb",
+            "cpu_pct",
+            "procs",
+            "ts"
+          ],
+          "type": "object"
+        },
+        "Worktree": {
+          "properties": {
+            "since": {
+              "description": "When it last changed.",
+              "format": "date-time",
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/$defs/WorktreeState"
+            }
+          },
+          "required": [
+            "state",
+            "since"
+          ],
+          "type": "object"
+        },
+        "WorktreeProcs": {
+          "additionalProperties": false,
+          "description": "Processes running in a worktree that no agent's process tree holds: dev servers, databases,\ntest runs, shells. Sent each scan while there are any, then once with `procs: 0`.",
+          "properties": {
+            "cpu_pct": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "host": {
+              "type": "string"
+            },
+            "names": {
+              "description": "Distinct process names, at most 8.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "orphaned": {
+              "description": "The directory is gone: nothing that could stop these processes knows they are there.",
+              "type": "boolean"
+            },
+            "path": {
+              "type": "string"
+            },
+            "pids": {
+              "description": "At most 20.",
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "procs": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rss_kb": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "host",
+            "path",
+            "procs",
+            "rss_kb",
+            "cpu_pct",
+            "names",
+            "pids",
+            "orphaned"
+          ],
+          "type": "object"
+        },
+        "WorktreeState": {
+          "additionalProperties": false,
+          "description": "A git worktree on a host, as its last scan found it. Sent when it changes.",
+          "properties": {
+            "branch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "dirty": {
+              "description": "Modified and untracked files.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "files": {
+              "description": "Files changed against the default branch, plus dirty ones; at most `MAX_FILES`.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "head": {
+              "type": "string"
+            },
+            "host": {
+              "type": "string"
+            },
+            "last_commit": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "repo": {
+              "description": "The main checkout the worktree belongs to.",
+              "type": "string"
+            },
+            "unpushed": {
+              "description": "Commits on HEAD that no remote has.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "host",
+            "path",
+            "repo",
+            "head",
+            "unpushed",
+            "dirty",
+            "files",
+            "last_commit"
+          ],
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1087,6 +1520,20 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "worktree_procs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Procs"
+          },
+          "description": "Processes running in worktrees (or orphaned beside them) by `<host>:<path>`.",
+          "type": "object"
+        },
+        "worktrees": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Worktree"
+          },
+          "description": "Git worktrees by `<host>:<path>`.",
+          "type": "object"
         }
       },
       "required": [
@@ -1096,6 +1543,8 @@
         "blockers",
         "asks",
         "msgs",
+        "worktrees",
+        "worktree_procs",
         "unknown"
       ],
       "title": "State",
