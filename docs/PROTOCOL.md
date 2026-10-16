@@ -72,6 +72,10 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `agent.state` | agent, state (`idle` `working` `blocked` `done` `unknown`) | | host |
 | | `agent.down` | agent, reason? | | host |
 | | `host.health` | host, disk_free, disk_total, agents, stats? (every minute) | | host |
+| | `agent.usage` | agent, rss_kb, cpu_pct, procs, cwd? (each scan) | | host |
+| machine | `worktree.state` | host, path, repo, branch?, head, unpushed, dirty, files[], last_commit (on change) | | host |
+| | `worktree.gone` | host, path | | host |
+| | `worktree.procs` | host, path, procs, rss_kb, cpu_pct, names[], pids[], orphaned (each scan; `procs: 0` once when they end) | | host |
 | task | `task.created` | title, url? | task | agent, host |
 | | `task.assigned` | agent, lead? — **exclusive** | task | agent, host |
 | | `task.unassigned` | reason? | task | agent, host |
@@ -209,11 +213,48 @@ uses: post latency alone and under contention, throughput, how far a follower la
 and whether racing claims stay exclusive. It measures the hub and the client, not herdr or
 the agents.
 
+## Watching the machine
+
+Every 5 minutes the host agent scans its machine. It writes facts, never verdicts:
+
+- **Agents' cost.** For each agent, the pane's whole process tree: memory, CPU since the last
+  scan, process count and working directory (`agent.usage`). Linux only, from `/proc`.
+- **Worktrees.** Every git worktree of every repository an agent works in, plus `--repo`
+  extras: branch, HEAD, commits no remote has, dirty files, files changed against the default
+  branch, last commit (`worktree.state`, sent when it changes; `worktree.gone` when removed).
+- **What repositories run.** A repository runs its own processes: dev servers, bundlers,
+  databases, test suites. Processes whose working directory is in a worktree, outside every
+  agent's tree, are grouped per worktree (`worktree.procs`). A process still running in a
+  *deleted* directory beside the worktrees is an orphan: nothing that could stop it knows it is
+  there. Git calls run with `GIT_OPTIONAL_LOCKS=0`, so a scan never takes an agent's index lock.
+
+`fleet doctor` (and the board) reads verdicts off that state:
+
+| Finding | When |
+|---|---|
+| `stale` | an agent idle, done or blocked for 2 h |
+| `hung` | working for 30 min at under 2% CPU, its worktree unchanged as long |
+| `heavy` | an agent's tree, or a worktree's processes, over 4 GB or 200% CPU |
+| `duplicate` | two agents in one worktree, or two agents' worktrees changing the same files (lockfiles aside) |
+| `forgotten` | a worktree no agent works in, with unsaved work for an hour, or clean and 3 days untouched; running processes are named |
+| `unpushed` | an agent's worktree holding commits no remote has for an hour |
+| `orphan` | processes running in a deleted worktree, with their pids |
+
+## Instances
+
+One machine can run several fleets, one per project or product. `--instance <name>` (or
+`FLEET_INSTANCE`) picks one; each has its own directory, so its own hub log, token, spool and
+replica. `fleet hub` writes its URL into the instance's directory, and every other command
+of that instance finds its hub there, unless `FLEET_HUB` says otherwise. Two hubs on one
+machine need two `--listen` ports. A host agent serves one instance and one herdr session.
+`fleet instances` lists them.
+
 ## Files
 
-Everything lives in one data directory: `FLEET_HOME`, or the platform data directory
-(`directories` crate): `hub.db`, `replica.db`, `spool.jsonl`, `spool.rejected.jsonl`, `token`,
-and the lock files `spool.lock` and `spool.flush`. `FLEET_TOKEN_FILE` and `fleet hub --db` move
+Everything of an instance lives in one data directory: `FLEET_HOME`, or the platform data
+directory (`directories` crate) for the default instance and `instances/<name>` under it for
+the others: `hub.db`, `replica.db`, `spool.jsonl`, `spool.rejected.jsonl`, `token`, `hub` (the
+hub's URL), and the lock files `spool.lock` and `spool.flush`. `FLEET_TOKEN_FILE` and `fleet hub --db` move
 the token and the hub database elsewhere.
 
 ## Not in v1

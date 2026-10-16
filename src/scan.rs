@@ -1,0 +1,433 @@
+//! What the host agent samples on its machine: the cost of each agent's process tree, and the
+//! git worktrees its agents work in.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::Path;
+
+use chrono::{DateTime, Utc};
+
+use crate::event::{MAX_FILES, WorktreeState};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Proc {
+    pub ppid: u32,
+    /// CPU time so far, reaped children included.
+    pub cpu_ms: u64,
+    pub rss_kb: u64,
+    pub name: String,
+    /// `None` when unreadable; a deleted directory keeps its old path and `deleted`.
+    pub cwd: Option<String>,
+    pub deleted: bool,
+}
+
+/// Every process on this machine at one moment. Empty off Linux.
+#[derive(Debug, Default)]
+pub struct Procs(pub HashMap<u32, Proc>);
+
+impl Procs {
+    #[cfg(target_os = "linux")]
+    pub fn read() -> Self {
+        // SAFETY: sysconf only reads configuration.
+        let (tick, page) = unsafe {
+            (
+                libc::sysconf(libc::_SC_CLK_TCK).max(1) as u64,
+                libc::sysconf(libc::_SC_PAGESIZE).max(1) as u64,
+            )
+        };
+        let mut all = HashMap::new();
+        let Ok(dir) = std::fs::read_dir("/proc") else {
+            return Self(all);
+        };
+        for entry in dir.flatten() {
+            let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse().ok()) else {
+                continue;
+            };
+            let Some((ppid, ticks, pages)) = std::fs::read_to_string(entry.path().join("stat"))
+                .ok()
+                .and_then(|s| parse_stat(&s))
+            else {
+                continue;
+            };
+            let cwd = std::fs::read_link(entry.path().join("cwd"))
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned());
+            let deleted = cwd.as_deref().is_some_and(|c| c.ends_with(" (deleted)"));
+            let name = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+            all.insert(
+                pid,
+                Proc {
+                    ppid,
+                    cpu_ms: ticks * 1000 / tick,
+                    rss_kb: pages * page / 1024,
+                    name: name.trim().to_string(),
+                    cwd: cwd.map(|c| c.trim_end_matches(" (deleted)").to_string()),
+                    deleted,
+                },
+            );
+        }
+        Self(all)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn read() -> Self {
+        Self::default()
+    }
+
+    /// `root` and everything under it; empty if `root` is gone.
+    pub fn tree(&self, root: u32) -> Vec<u32> {
+        if !self.0.contains_key(&root) {
+            return Vec::new();
+        }
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (&pid, p) in &self.0 {
+            children.entry(p.ppid).or_default().push(pid);
+        }
+        let (mut out, mut todo) = (Vec::new(), vec![root]);
+        while let Some(pid) = todo.pop() {
+            out.push(pid);
+            todo.extend(children.get(&pid).into_iter().flatten());
+        }
+        out
+    }
+
+    /// Resident memory (KiB) and CPU so far (ms) of `pids`.
+    pub fn sum(&self, pids: &[u32]) -> (u64, u64) {
+        pids.iter()
+            .filter_map(|p| self.0.get(p))
+            .fold((0, 0), |(r, c), p| (r + p.rss_kb, c + p.cpu_ms))
+    }
+
+    /// CPU percent of one core that `pids` used between `earlier` and now, `ms` apart. A
+    /// process missing from `earlier` started since, so all of its time counts.
+    pub fn cpu_pct(&self, earlier: &Procs, pids: &[u32], ms: u64) -> u32 {
+        let used: u64 = pids
+            .iter()
+            .filter_map(|p| {
+                Some(
+                    self.0
+                        .get(p)?
+                        .cpu_ms
+                        .saturating_sub(earlier.0.get(p).map_or(0, |e| e.cpu_ms)),
+                )
+            })
+            .sum();
+        (used * 100 / ms.max(1)) as u32
+    }
+}
+
+/// Processes running in a worktree, or in a deleted directory beside worktrees (orphans).
+#[derive(Debug, Default, PartialEq)]
+pub struct Group {
+    pub pids: Vec<u32>,
+    pub orphaned: bool,
+}
+
+/// Groups processes not in `exclude` by the worktree their cwd is in (the deepest one). A
+/// process whose cwd was deleted, inside a directory that holds linked worktrees, is grouped
+/// under that old path as an orphan: nothing that could stop it knows it is there.
+pub fn by_worktree(
+    procs: &Procs,
+    exclude: &HashSet<u32>,
+    worktrees: &[(String, bool)],
+) -> BTreeMap<String, Group> {
+    let inside = |cwd: &str, dir: &str| cwd == dir || cwd.starts_with(&format!("{dir}/"));
+    let homes: BTreeSet<&str> = worktrees
+        .iter()
+        .filter(|(_, linked)| *linked)
+        .filter_map(|(p, _)| Path::new(p).parent()?.to_str())
+        .collect();
+    let mut out: BTreeMap<String, Group> = BTreeMap::new();
+    for (&pid, p) in &procs.0 {
+        let Some(cwd) = p.cwd.as_deref() else {
+            continue;
+        };
+        if exclude.contains(&pid) {
+            continue;
+        }
+        if p.deleted {
+            if let Some(home) = homes
+                .iter()
+                .filter(|h| inside(cwd, h) && cwd != **h)
+                .max_by_key(|h| h.len())
+            {
+                // The worktree's own directory, one level under its home.
+                let rest = &cwd[home.len() + 1..];
+                let root = format!("{home}/{}", rest.split('/').next().unwrap_or(rest));
+                let g = out.entry(root).or_default();
+                g.pids.push(pid);
+                g.orphaned = true;
+            }
+            continue;
+        }
+        if let Some((wt, _)) = worktrees
+            .iter()
+            .filter(|(w, _)| inside(cwd, w))
+            .max_by_key(|(w, _)| w.len())
+        {
+            out.entry(wt.clone()).or_default().pids.push(pid);
+        }
+    }
+    for g in out.values_mut() {
+        g.pids.sort_unstable();
+    }
+    out
+}
+
+/// `/proc/<pid>/stat` → (ppid, utime + stime + cutime + cstime ticks, rss pages).
+pub fn parse_stat(s: &str) -> Option<(u32, u64, u64)> {
+    // The command name may hold spaces and parens; the fields after the last `)` do not.
+    let f: Vec<&str> = s[s.rfind(')')? + 1..].split_whitespace().collect();
+    let n = |i: usize| f.get(i)?.parse::<u64>().ok();
+    Some((n(1)? as u32, n(11)? + n(12)? + n(13)? + n(14)?, n(21)?))
+}
+
+async fn git(dir: &str, args: &[&str]) -> Option<String> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        // Never take the index lock an agent's own git may need.
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .await
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The main checkout of the repository `dir` is in.
+pub async fn repo_of(dir: &str) -> Option<String> {
+    let common = git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .await?;
+    let common = Path::new(common.trim());
+    match common.file_name()?.to_str()? {
+        ".git" => Some(common.parent()?.to_str()?.to_string()),
+        _ => None, // a bare repository has no main checkout to look at
+    }
+}
+
+/// `git worktree list --porcelain` → (path, head, branch) of each worktree still on disk.
+pub fn parse_worktrees(s: &str) -> Vec<(String, String, Option<String>)> {
+    let mut out = Vec::new();
+    for block in s.split("\n\n") {
+        let (mut path, mut head, mut branch, mut skip) = (None, None, None, false);
+        for line in block.lines() {
+            match line.split_once(' ').unwrap_or((line, "")) {
+                ("worktree", p) => path = Some(p.to_string()),
+                ("HEAD", h) => head = Some(h.to_string()),
+                ("branch", b) => {
+                    branch = Some(b.trim_start_matches("refs/heads/").to_string());
+                }
+                ("bare", _) | ("prunable", _) => skip = true,
+                _ => {}
+            }
+        }
+        if let (Some(path), Some(head), false) = (path, head, skip) {
+            out.push((path, head, branch));
+        }
+    }
+    out
+}
+
+/// File names in `git status --porcelain` output (the new name of a rename).
+pub fn parse_status(s: &str) -> Vec<String> {
+    s.lines()
+        .filter_map(|l| l.get(3..))
+        .map(|f| {
+            f.rsplit(" -> ")
+                .next()
+                .unwrap_or(f)
+                .trim_matches('"')
+                .to_string()
+        })
+        .collect()
+}
+
+/// Every worktree of `repo`, as `host` sees it now.
+pub async fn worktrees(host: &str, repo: &str) -> Vec<WorktreeState> {
+    let Some(list) = git(repo, &["worktree", "list", "--porcelain"]).await else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (path, head, branch) in parse_worktrees(&list) {
+        let Some(last) = git(&path, &["log", "-1", "--format=%cI"]).await else {
+            continue;
+        };
+        let Ok(last_commit) = DateTime::parse_from_rfc3339(last.trim()) else {
+            continue;
+        };
+        let dirty = parse_status(
+            &git(&path, &["status", "--porcelain"])
+                .await
+                .unwrap_or_default(),
+        );
+        let unpushed = git(
+            &path,
+            &["rev-list", "--count", "HEAD", "--not", "--remotes"],
+        )
+        .await
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or(0);
+        let base = git(&path, &["rev-parse", "--abbrev-ref", "origin/HEAD"])
+            .await
+            .map_or_else(|| "origin/main".to_string(), |b| b.trim().to_string());
+        let changed = git(&path, &["diff", "--name-only", &format!("{base}...HEAD")])
+            .await
+            .unwrap_or_default();
+        let files: BTreeSet<String> = changed
+            .lines()
+            .map(str::to_string)
+            .chain(dirty.iter().cloned())
+            .collect();
+        out.push(WorktreeState {
+            host: host.to_string(),
+            path,
+            repo: repo.to_string(),
+            branch,
+            head,
+            unpushed,
+            dirty: dirty.len() as u32,
+            files: files.into_iter().take(MAX_FILES).collect(),
+            last_commit: last_commit.with_timezone(&Utc),
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stat_line_with_a_tricky_name() {
+        let s = "42 (a) b (c)) S 7 42 42 0 -1 4194560 100 0 0 0 150 50 10 5 20 0 3 0 1000 9000 512 rest";
+        assert_eq!(parse_stat(s), Some((7, 215, 512)));
+        assert_eq!(parse_stat("garbage"), None);
+    }
+
+    #[test]
+    fn worktree_list_skips_bare_and_prunable() {
+        let s = "worktree /r/main\nHEAD aaa\nbranch refs/heads/main\n\n\
+                 worktree /w/x\nHEAD bbb\ndetached\n\n\
+                 worktree /w/gone\nHEAD ccc\nbranch refs/heads/y\nprunable gitdir file points to non-existent location\n";
+        assert_eq!(
+            parse_worktrees(s),
+            vec![
+                ("/r/main".into(), "aaa".into(), Some("main".into())),
+                ("/w/x".into(), "bbb".into(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn status_names_take_the_new_side_of_a_rename() {
+        assert_eq!(
+            parse_status(" M src/a.ts\n?? new file.md\nR  old.ts -> new.ts\n"),
+            vec!["src/a.ts", "new file.md", "new.ts"]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_process_has_a_tree() {
+        let procs = Procs::read();
+        let me = procs.tree(std::process::id());
+        assert!(!me.is_empty());
+        assert!(procs.sum(&me).0 > 0);
+        assert!(procs.tree(u32::MAX).is_empty());
+    }
+
+    fn proc(ppid: u32, cpu_ms: u64, cwd: &str, deleted: bool) -> Proc {
+        Proc {
+            ppid,
+            cpu_ms,
+            rss_kb: 10,
+            name: "p".into(),
+            cwd: Some(cwd.into()),
+            deleted,
+        }
+    }
+
+    #[test]
+    fn processes_group_by_worktree_and_orphans_are_flagged() {
+        let procs = Procs(HashMap::from([
+            (1, proc(0, 0, "/w/a/src", false)),      // the agent
+            (2, proc(1, 0, "/w/a", false)),          // under the agent: not a service
+            (3, proc(0, 0, "/w/a/web", false)),      // a dev server in a
+            (4, proc(0, 0, "/r/main/sub", false)),   // in the main checkout
+            (5, proc(0, 0, "/w/gone/x", true)),      // its worktree was deleted
+            (7, proc(0, 0, "/w/app/old/y", true)),   // deleted, beside /w/app/live
+            (6, proc(0, 0, "/tmp/elsewhere", true)), // deleted, but nowhere near a worktree
+        ]));
+        let exclude: HashSet<u32> = procs.tree(1).into_iter().collect();
+        let wts = vec![
+            ("/r/main".to_string(), false),
+            ("/w/a".to_string(), true),
+            ("/w/app/live".to_string(), true),
+        ];
+        let g = by_worktree(&procs, &exclude, &wts);
+        assert_eq!(
+            g["/w/a"],
+            Group {
+                pids: vec![3],
+                orphaned: false
+            }
+        );
+        assert_eq!(g["/r/main"].pids, vec![4]);
+        assert_eq!(
+            g["/w/gone"],
+            Group {
+                pids: vec![5],
+                orphaned: true
+            }
+        );
+        assert_eq!(g["/w/app/old"].pids, vec![7], "the deepest home names it");
+        assert_eq!(g.len(), 4, "{g:?}");
+    }
+
+    #[test]
+    fn cpu_counts_new_processes_whole() {
+        let before = Procs(HashMap::from([(1, proc(0, 1000, "/", false))]));
+        let after = Procs(HashMap::from([
+            (1, proc(0, 1500, "/", false)),
+            (2, proc(1, 300, "/", false)),
+        ]));
+        assert_eq!(after.cpu_pct(&before, &[1, 2], 1000), 80);
+    }
+
+    #[tokio::test]
+    async fn a_worktree_with_unpushed_and_dirty_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("r");
+        let r = repo.to_str().unwrap();
+        let sh = |cmd: &str| {
+            let ok = std::process::Command::new("sh")
+                .args(["-c", cmd])
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "{cmd}");
+        };
+        sh(
+            "git init -q -b main r && cd r && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m one \
+            && echo x > a.txt && git add a.txt && git -c user.name=t -c user.email=t@t commit -q -m two \
+            && git worktree add -q ../w -b feat && echo y > ../w/b.txt",
+        );
+        assert_eq!(repo_of(&format!("{}/../w", r)).await.as_deref(), Some(r));
+        let mut wts = worktrees("h", r).await;
+        wts.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(wts.len(), 2, "{wts:#?}");
+        let w = wts
+            .iter()
+            .find(|w| w.branch.as_deref() == Some("feat"))
+            .unwrap();
+        assert_eq!((w.unpushed, w.dirty), (2, 1), "no remote has either commit");
+        assert!(w.files.contains(&"b.txt".to_string()), "{:?}", w.files);
+    }
+}

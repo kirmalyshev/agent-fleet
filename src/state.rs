@@ -6,7 +6,9 @@ use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::event::{AgentState, Body, Event, Known, TYPE_VERSION, TaskState};
+use crate::event::{
+    AgentState, Body, Event, Known, TYPE_VERSION, TaskState, WorktreeProcs, WorktreeState,
+};
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct State {
@@ -21,6 +23,10 @@ pub struct State {
     pub asks: BTreeMap<String, Ask>,
     /// Undelivered doorbells by the id of their `msg.sent`.
     pub msgs: BTreeMap<String, Msg>,
+    /// Git worktrees by `<host>:<path>`.
+    pub worktrees: BTreeMap<String, Worktree>,
+    /// Processes running in worktrees (or orphaned beside them) by `<host>:<path>`.
+    pub worktree_procs: BTreeMap<String, Procs>,
     /// Events this binary cannot fold (an unknown type, or a known type at a newer `v`): kept in
     /// the log, skipped here.
     pub unknown: u64,
@@ -41,6 +47,34 @@ pub struct Agent {
     pub pane: Option<String>,
     pub state: AgentState,
     pub since: DateTime<Utc>,
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Usage {
+    pub rss_kb: u64,
+    pub cpu_pct: u32,
+    pub procs: u32,
+    pub cwd: Option<String>,
+    pub ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Worktree {
+    pub state: WorktreeState,
+    /// When it last changed.
+    pub since: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Procs {
+    pub procs: WorktreeProcs,
+    pub ts: DateTime<Utc>,
+}
+
+pub fn worktree_key(host: &str, path: &str) -> String {
+    format!("{host}:{path}")
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -125,8 +159,46 @@ impl State {
                         pane: d.pane.clone(),
                         state: d.state,
                         since: ts,
+                        usage: None,
                     },
                 );
+            }
+            Known::AgentUsage(d) => {
+                if let Some(a) = self.agents.get_mut(&d.agent) {
+                    a.usage = Some(Usage {
+                        rss_kb: d.rss_kb,
+                        cpu_pct: d.cpu_pct,
+                        procs: d.procs,
+                        cwd: d.cwd.clone(),
+                        ts,
+                    });
+                }
+            }
+            Known::WorktreeState(d) => {
+                self.worktrees.insert(
+                    worktree_key(&d.host, &d.path),
+                    Worktree {
+                        state: d.clone(),
+                        since: ts,
+                    },
+                );
+            }
+            Known::WorktreeProcs(d) => {
+                let key = worktree_key(&d.host, &d.path);
+                if d.procs == 0 {
+                    self.worktree_procs.remove(&key);
+                } else {
+                    self.worktree_procs.insert(
+                        key,
+                        Procs {
+                            procs: d.clone(),
+                            ts,
+                        },
+                    );
+                }
+            }
+            Known::WorktreeGone(d) => {
+                self.worktrees.remove(&worktree_key(&d.host, &d.path));
             }
             Known::AgentState(d) => {
                 // Only `agent.up` brings an agent in: a late state change never revives a downed one.

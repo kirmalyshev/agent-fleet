@@ -1,8 +1,10 @@
 mod bench;
 mod client;
+mod doctor;
 mod event;
 mod host;
 mod hub;
+mod scan;
 mod state;
 mod stats;
 mod store;
@@ -25,14 +27,13 @@ use store::Store;
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Hub URL.
-    #[arg(
-        long,
-        global = true,
-        env = "FLEET_HUB",
-        default_value = "http://127.0.0.1:7710"
-    )]
-    hub: String,
+    /// Which fleet: one instance per project or product, each with its own hub, log, token,
+    /// spool and replica.
+    #[arg(long, global = true, env = "FLEET_INSTANCE", default_value = client::DEFAULT_INSTANCE)]
+    instance: String,
+    /// Hub URL [default: the one this instance's hub wrote, else http://127.0.0.1:7710].
+    #[arg(long, global = true, env = "FLEET_HUB")]
+    hub: Option<String>,
     /// Bearer token file [default: <data dir>/token].
     #[arg(long, global = true, env = "FLEET_TOKEN_FILE")]
     token_file: Option<PathBuf>,
@@ -66,6 +67,9 @@ enum Cmd {
         herdr_socket: PathBuf,
         #[arg(long, env = "HERDR_SESSION")]
         session: String,
+        /// A repository whose worktrees to watch even when no agent works in it. Repeatable.
+        #[arg(long = "repo")]
+        repos: Vec<String>,
     },
     /// Protocol metadata.
     Api {
@@ -74,6 +78,8 @@ enum Cmd {
     },
     /// What every agent is doing.
     Ps,
+    /// The fleet instances on this machine and the hub each one uses.
+    Instances,
     /// Tasks: `add` claims (exclusive), `done` finishes, `rm` cancels or releases.
     Task {
         #[command(subcommand)]
@@ -127,6 +133,12 @@ enum Cmd {
         /// Window back from now: `90s`, `30m`, `24h`, `7d`.
         #[arg(long, default_value = "24h", value_parser = parse_window)]
         since: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// What needs a look: stale, hung or heavy agents, duplicate work, forgotten worktrees,
+    /// unpushed commits.
+    Doctor {
         #[arg(long)]
         json: bool,
     },
@@ -236,7 +248,7 @@ impl Ctx {
             .clone()
             .unwrap_or_else(|| self.paths.token());
         Ok(Client::new(
-            &self.cli.hub,
+            &self.cli.hub.clone().unwrap_or_else(|| self.paths.hub_url()),
             client::read_token(&token_file)?,
             self.paths.spool(),
         ))
@@ -362,7 +374,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let ctx = Ctx {
-        paths: Paths::from_env()?,
+        paths: Paths::from_env(&cli.instance)?,
         cli,
     };
     let now = Utc::now();
@@ -375,11 +387,13 @@ async fn main() -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| ctx.paths.token());
             let token = client::read_or_create_token(&token_file)?;
-            hub::serve(*listen, db.as_ref().unwrap_or(&ctx.paths.hub_db()), token).await?;
+            let db = db.clone().unwrap_or_else(|| ctx.paths.hub_db());
+            hub::serve(*listen, &db, &ctx.paths.hub_file(), token).await?;
         }
         Cmd::Host {
             herdr_socket,
             session,
+            repos,
         } => {
             let cfg = host::Config {
                 host: ctx.host_name(),
@@ -387,8 +401,15 @@ async fn main() -> Result<()> {
                 herdr_socket: herdr_socket.clone(),
                 replica: ctx.paths.replica(),
                 data_dir: ctx.paths.dir.clone(),
+                repos: repos.clone(),
             };
             host::run(cfg, ctx.client()?).await?;
+        }
+        Cmd::Instances => {
+            for (name, hub) in Paths::instances()? {
+                let mark = if name == ctx.cli.instance { "*" } else { " " };
+                println!("{mark} {name:<20} {hub}");
+            }
         }
         Cmd::Ps => print!("{}", ui::ps(&ctx.state().await?, now)),
         Cmd::Stats { since, json } => {
@@ -397,6 +418,14 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
                 print!("{}", ui::stats(&v)?);
+            }
+        }
+        Cmd::Doctor { json } => {
+            let f = doctor::findings(&ctx.state().await?, now);
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&f)?);
+            } else {
+                print!("{}", ui::doctor(&f));
             }
         }
         Cmd::Bench {

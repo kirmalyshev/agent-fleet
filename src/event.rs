@@ -124,6 +124,14 @@ pub enum Known {
     AgentDown(AgentDown),
     #[serde(rename = "host.health")]
     HostHealth(HostHealth),
+    #[serde(rename = "agent.usage")]
+    AgentUsage(AgentUsage),
+    #[serde(rename = "worktree.state")]
+    WorktreeState(WorktreeState),
+    #[serde(rename = "worktree.gone")]
+    WorktreeGone(WorktreeGone),
+    #[serde(rename = "worktree.procs")]
+    WorktreeProcs(WorktreeProcs),
     #[serde(rename = "task.created")]
     TaskCreated(TaskCreated),
     #[serde(rename = "task.assigned")]
@@ -211,6 +219,68 @@ pub struct HostStats {
     pub write_failures: u64,
     /// Events this host sent to the spool instead of the hub.
     pub spooled: u64,
+}
+
+/// What an agent's processes cost: the pane's whole process tree, sampled by its host.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentUsage {
+    pub agent: String,
+    pub rss_kb: u64,
+    /// CPU since the previous sample, in percent of one core.
+    pub cpu_pct: u32,
+    pub procs: u32,
+    /// Where the agent works.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+/// A git worktree on a host, as its last scan found it. Sent when it changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorktreeState {
+    pub host: String,
+    pub path: String,
+    /// The main checkout the worktree belongs to.
+    pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub head: String,
+    /// Commits on HEAD that no remote has.
+    pub unpushed: u32,
+    /// Modified and untracked files.
+    pub dirty: u32,
+    /// Files changed against the default branch, plus dirty ones; at most `MAX_FILES`.
+    pub files: Vec<String>,
+    pub last_commit: DateTime<Utc>,
+}
+
+/// Most files a `worktree.state` lists.
+pub const MAX_FILES: usize = 200;
+
+/// Processes running in a worktree that no agent's process tree holds: dev servers, databases,
+/// test runs, shells. Sent each scan while there are any, then once with `procs: 0`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorktreeProcs {
+    pub host: String,
+    pub path: String,
+    pub procs: u32,
+    pub rss_kb: u64,
+    pub cpu_pct: u32,
+    /// Distinct process names, at most 8.
+    pub names: Vec<String>,
+    /// At most 20.
+    pub pids: Vec<u32>,
+    /// The directory is gone: nothing that could stop these processes knows they are there.
+    pub orphaned: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorktreeGone {
+    pub host: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -331,6 +401,10 @@ impl Known {
             Self::AgentState(_) => "agent.state",
             Self::AgentDown(_) => "agent.down",
             Self::HostHealth(_) => "host.health",
+            Self::AgentUsage(_) => "agent.usage",
+            Self::WorktreeState(_) => "worktree.state",
+            Self::WorktreeGone(_) => "worktree.gone",
+            Self::WorktreeProcs(_) => "worktree.procs",
             Self::TaskCreated(_) => "task.created",
             Self::TaskAssigned(_) => "task.assigned",
             Self::TaskUnassigned(_) => "task.unassigned",
@@ -350,9 +424,14 @@ impl Known {
     pub fn writers(&self) -> &'static [ActorKind] {
         use ActorKind::*;
         match self {
-            Self::AgentUp(_) | Self::AgentState(_) | Self::AgentDown(_) | Self::HostHealth(_) => {
-                &[Host]
-            }
+            Self::AgentUp(_)
+            | Self::AgentState(_)
+            | Self::AgentDown(_)
+            | Self::HostHealth(_)
+            | Self::AgentUsage(_)
+            | Self::WorktreeState(_)
+            | Self::WorktreeGone(_)
+            | Self::WorktreeProcs(_) => &[Host],
             Self::MsgDelivered(_) => &[Host],
             Self::AskRaised(_) | Self::Handoff(_) => &[Agent],
             _ => &[Agent, Host],

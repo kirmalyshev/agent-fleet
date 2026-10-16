@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use axum::extract::{Query, Request, State as AxState};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
@@ -130,7 +130,8 @@ impl Hub {
 
 type Shared = Arc<Mutex<Hub>>;
 
-pub async fn serve(listen: SocketAddr, db: &Path, token: String) -> Result<()> {
+/// Serves the hub. Once bound, writes its URL to `hub_file`, where this instance's clients look.
+pub async fn serve(listen: SocketAddr, db: &Path, hub_file: &Path, token: String) -> Result<()> {
     if listen.ip().is_unspecified() {
         bail!("refusing to listen on {listen}: bind a specific address (default 127.0.0.1)");
     }
@@ -140,7 +141,12 @@ pub async fn serve(listen: SocketAddr, db: &Path, token: String) -> Result<()> {
         hub.store.len()?,
         db.display()
     );
-    let listener = tokio::net::TcpListener::bind(listen).await?;
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .with_context(|| {
+            format!("bind {listen}; if another instance's hub holds it, pass --listen")
+        })?;
+    std::fs::write(hub_file, format!("http://{listen}\n"))?;
     axum::serve(listener, router(hub, token)).await?;
     Ok(())
 }
@@ -421,9 +427,14 @@ mod tests {
     async fn refuses_unspecified_listen_address() {
         let dir = tempfile::tempdir().unwrap();
         for addr in ["0.0.0.0:7710", "[::]:7710"] {
-            let err = serve(addr.parse().unwrap(), &dir.path().join("h.db"), "t".into())
-                .await
-                .unwrap_err();
+            let err = serve(
+                addr.parse().unwrap(),
+                &dir.path().join("h.db"),
+                &dir.path().join("hub"),
+                "t".into(),
+            )
+            .await
+            .unwrap_err();
             assert!(err.to_string().contains("refusing"), "{err}");
         }
     }

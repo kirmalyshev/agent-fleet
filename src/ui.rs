@@ -187,6 +187,8 @@ pub fn board(s: &State, now: DateTime<Utc>) -> String {
             m.reference
         );
     }
+    out.push('\n');
+    out.push_str(&doctor(&crate::doctor::findings(s, now)));
     let _ = writeln!(out, "\n== hosts ({})", s.hosts.len());
     for (h, x) in &s.hosts {
         let gb = |b: u64| b as f64 / 1e9;
@@ -198,6 +200,14 @@ pub fn board(s: &State, now: DateTime<Utc>) -> String {
             x.agents,
             ago(now, x.ts)
         );
+    }
+    out
+}
+
+pub fn doctor(f: &[crate::doctor::Finding]) -> String {
+    let mut out = format!("== findings ({})\n", f.len());
+    for x in f {
+        let _ = writeln!(out, "{:<10} {}  {}", x.kind, x.subject, x.detail);
     }
     out
 }

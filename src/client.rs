@@ -15,22 +15,78 @@ use serde_json::Value;
 use crate::event::{Envelope, Event, Known};
 use crate::state::State;
 
-/// Where this machine keeps its files. `FLEET_HOME` overrides the platform data directory.
+/// Where this machine keeps one instance's files. `FLEET_HOME` names the directory outright;
+/// otherwise the platform data directory holds the default instance, and `instances/<name>`
+/// every other one.
 pub struct Paths {
     pub dir: PathBuf,
 }
 
+pub const DEFAULT_INSTANCE: &str = "default";
+const DEFAULT_HUB: &str = "http://127.0.0.1:7710";
+
 impl Paths {
-    pub fn from_env() -> Result<Self> {
+    pub fn from_env(instance: &str) -> Result<Self> {
+        if instance.is_empty()
+            || !instance
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            bail!("instance names are letters, digits, - and _: {instance:?}");
+        }
         let dir = match std::env::var_os("FLEET_HOME") {
             Some(d) => PathBuf::from(d),
-            None => directories::ProjectDirs::from("", "", "fleet")
-                .ok_or_else(|| anyhow!("no home directory; set FLEET_HOME"))?
-                .data_dir()
-                .to_path_buf(),
+            None => {
+                let base = Self::base()?;
+                match instance {
+                    DEFAULT_INSTANCE => base,
+                    name => base.join("instances").join(name),
+                }
+            }
         };
         std::fs::create_dir_all(&dir)?;
         Ok(Self { dir })
+    }
+
+    pub fn base() -> Result<PathBuf> {
+        Ok(directories::ProjectDirs::from("", "", "fleet")
+            .ok_or_else(|| anyhow!("no home directory; set FLEET_HOME"))?
+            .data_dir()
+            .to_path_buf())
+    }
+
+    /// The instances on this machine, by name, with the hub each one points at.
+    pub fn instances() -> Result<Vec<(String, String)>> {
+        let base = Self::base()?;
+        let mut out = vec![(
+            DEFAULT_INSTANCE.to_string(),
+            Self { dir: base.clone() }.hub_url(),
+        )];
+        if let Ok(dir) = std::fs::read_dir(base.join("instances")) {
+            let mut named: Vec<(String, String)> = dir
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_str()?.to_string();
+                    Some((name, Self { dir: e.path() }.hub_url()))
+                })
+                .collect();
+            named.sort();
+            out.extend(named);
+        }
+        Ok(out)
+    }
+
+    /// The hub this instance uses: what `fleet hub` last wrote here, or the local default.
+    pub fn hub_url(&self) -> String {
+        std::fs::read_to_string(self.hub_file())
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_HUB.into())
+    }
+
+    pub fn hub_file(&self) -> PathBuf {
+        self.dir.join("hub")
     }
     pub fn hub_db(&self) -> PathBuf {
         self.dir.join("hub.db")
