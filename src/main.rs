@@ -74,7 +74,7 @@ enum Cmd {
     },
     /// What every agent is doing.
     Ps,
-    /// Tasks: `add` claims (exclusive), `rm` cancels or releases.
+    /// Tasks: `add` claims (exclusive), `done` finishes, `rm` cancels or releases.
     Task {
         #[command(subcommand)]
         cmd: TaskCmd,
@@ -181,6 +181,12 @@ enum TaskCmd {
         to: Option<String>,
         #[arg(long)]
         lead: Option<String>,
+    },
+    /// Finish a task: completed, or with --failed failed. Frees it for a new claim.
+    Done {
+        task: String,
+        #[arg(long)]
+        failed: bool,
     },
     /// Cancel a task, or with --release only give it up.
     Rm {
@@ -460,6 +466,15 @@ async fn main() -> Result<()> {
                     }),
                 )
                 .await?;
+            }
+            TaskCmd::Done { task, failed } => {
+                let state = if *failed {
+                    TaskState::Failed
+                } else {
+                    TaskState::Completed
+                };
+                ctx.task_event(task, Known::TaskState(TaskStateChanged { state }))
+                    .await?;
             }
             TaskCmd::Ls { all } => print!("{}", ui::tasks(&ctx.state().await?, *all, now)),
             TaskCmd::Show { task } => {

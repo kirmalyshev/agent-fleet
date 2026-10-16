@@ -10,7 +10,8 @@ One Rust binary, no runtime. Linux and macOS. Agents run in [herdr](https://herd
 fleet hub                 the log, the fold, the sequencer (HTTP + SSE on 127.0.0.1)
 fleet host                one per machine and herdr session: presence from herdr, disk, a replica, doorbells
 fleet ps                  what every agent is doing
-fleet task add|rm|ls|show claim (exclusive: 409 if taken), cancel or release, list, inspect
+fleet task add|done|rm|ls|show
+                          claim (exclusive: 409 if taken), finish, cancel or release, list, inspect
 fleet dep add|rm          task A is blocked by task B
 fleet block / unblock     raise and resolve blockers
 fleet ask                 a question for an operator
