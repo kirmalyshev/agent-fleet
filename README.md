@@ -20,7 +20,7 @@ agent-fleet resource limit|unlimit
 agent-fleet tell <agent> <TYPE> <ref> <text>
                           ring an agent's doorbell; delivered = it was seen working afterwards
 agent-fleet kill <pid>...       stop your own processes or proved orphans; refuses agents and their ancestors
-agent-fleet hook bash           Claude Code PreToolUse hook: blocks raw kill/pkill/killall
+agent-fleet hook bash           PreToolUse hook (Claude Code, Devin CLI): blocks raw kill/pkill/killall
 agent-fleet state --json        the folded state
 agent-fleet tui                 the fleet on one screen, live: agents, worktrees, tasks, findings,
                           with tell, focus, task done/release/cancel, remove a worktree, kill orphans

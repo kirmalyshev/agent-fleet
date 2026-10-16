@@ -330,8 +330,8 @@ enum TaskCmd {
 
 #[derive(Subcommand)]
 enum HookCmd {
-    /// Claude Code PreToolUse hook: reads the tool call on stdin and refuses (exit 2) a Bash
-    /// command that runs a raw kill, pkill or killall.
+    /// PreToolUse hook for Claude Code and Devin CLI: reads the tool call on stdin and refuses
+    /// (exit 2) a shell command that runs a raw kill, pkill or killall.
     Bash,
 }
 

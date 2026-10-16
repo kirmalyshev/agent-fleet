@@ -276,13 +276,14 @@ It kills the caller's own processes (its agent's tree) and orphans `doctor` prov
 in a deleted directory): TERM, then KILL after `--grace` seconds. Each refusal is logged as
 `kill.refused`.
 
-`agent-fleet hook bash` is a Claude Code PreToolUse hook that refuses (exit 2) a Bash command
+`agent-fleet hook bash` is a PreToolUse hook for Claude Code (tool `Bash`) and Devin CLI (tool
+`exec`, which also reads hooks from `.claude/settings.json`) that refuses (exit 2) a shell command
 running a raw `kill`, `pkill` or `killall`, also behind `sudo`, `xargs`, `timeout`, `sh -c`,
 `eval`, `find -exec` or `ssh <host>`. `kill -0` and `kill -l` pass. It guards against a slip, not
 against an agent set on evading it.
 
 ```json
-{ "hooks": { "PreToolUse": [ { "matcher": "Bash",
+{ "hooks": { "PreToolUse": [ { "matcher": "Bash|exec",
   "hooks": [ { "type": "command", "command": "agent-fleet hook bash" } ] } ] } }
 ```
 
