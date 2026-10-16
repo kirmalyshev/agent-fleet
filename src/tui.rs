@@ -39,13 +39,15 @@ enum Tab {
     Worktrees,
     Tasks,
     Findings,
+    Resources,
 }
 
-const TABS: [(Tab, &str); 4] = [
+const TABS: [(Tab, &str); 5] = [
     (Tab::Agents, "1 Agents"),
     (Tab::Worktrees, "2 Worktrees"),
     (Tab::Tasks, "3 Tasks"),
     (Tab::Findings, "4 Findings"),
+    (Tab::Resources, "5 Resources"),
 ];
 
 /// An action waiting for `y`.
@@ -64,7 +66,7 @@ enum Mode {
 
 struct App {
     tab: Tab,
-    tables: [TableState; 4],
+    tables: [TableState; 5],
     state: State,
     found: Vec<Finding>,
     warn: Option<String>,
@@ -103,7 +105,7 @@ fn agent_color(s: AgentState) -> Color {
 
 fn kind_color(kind: &str) -> Color {
     match kind {
-        "hung" | "orphan" | "duplicate" => Color::Red,
+        "hung" | "orphan" | "duplicate" | "breach" => Color::Red,
         "heavy" | "unpushed" | "forgotten" => Color::Yellow,
         _ => DIM,
     }
@@ -128,6 +130,7 @@ impl App {
             Tab::Worktrees => self.worktree_keys().len(),
             Tab::Tasks => self.state.tasks.len(),
             Tab::Findings => self.found.len(),
+            Tab::Resources => self.state.resources.len() + self.state.limits.len(),
         }
     }
 
@@ -276,7 +279,7 @@ async fn key(app: &mut App, code: KeyCode, fleet: &impl Fleet) -> bool {
         KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
             app.tab = TABS[(app.tab as usize + TABS.len() - 1) % TABS.len()].0
         }
-        KeyCode::Char(c @ '1'..='4') => app.tab = TABS[(c as u8 - b'1') as usize].0,
+        KeyCode::Char(c @ '1'..='5') => app.tab = TABS[(c as u8 - b'1') as usize].0,
         KeyCode::Enter if app.tab == Tab::Findings => jump(app),
         KeyCode::Char(c) => action(app, c, fleet).await,
         _ => {}
@@ -301,6 +304,12 @@ fn jump(app: &mut App) {
     } else if let Some(i) = app.worktree_keys().iter().position(|k| *k == subject) {
         app.tab = Tab::Worktrees;
         app.tables[Tab::Worktrees as usize].select(Some(i));
+    } else if let Some(i) = (app.state.resources.keys())
+        .chain(app.state.limits.keys())
+        .position(|k| *k == subject)
+    {
+        app.tab = Tab::Resources;
+        app.tables[Tab::Resources as usize].select(Some(i));
     }
 }
 
@@ -505,7 +514,7 @@ fn draw(f: &mut Frame, app: &App, fleet: &impl Fleet, now: DateTime<Utc>) {
     let alerts: Vec<&Finding> = app
         .found
         .iter()
-        .filter(|f| matches!(f.kind, "orphan" | "hung" | "duplicate"))
+        .filter(|f| matches!(f.kind, "orphan" | "hung" | "duplicate" | "breach"))
         .take(3)
         .collect();
     let [head, alert, tabs, table, detail, foot] = Layout::vertical([
@@ -579,6 +588,7 @@ fn draw(f: &mut Frame, app: &App, fleet: &impl Fleet, now: DateTime<Utc>) {
         Tab::Worktrees => worktrees(app, now),
         Tab::Tasks => tasks(app, now),
         Tab::Findings => found(app),
+        Tab::Resources => resources(app, now),
     };
     let rows: Vec<Row> = rows
         .into_iter()
@@ -629,11 +639,12 @@ fn draw(f: &mut Frame, app: &App, fleet: &impl Fleet, now: DateTime<Utc>) {
                 Tab::Worktrees => "x Remove · K Kill · ",
                 Tab::Tasks => "d Done · u Release · x Cancel · ",
                 Tab::Findings => "Enter Go to · ",
+                Tab::Resources => "",
             };
             Line::from(vec![
                 Span::styled(note, Style::new().fg(Color::Cyan)),
                 Span::raw(format!(
-                    "↑↓/jk Move · ←→/1-4 Tab · {own}r Refresh · ? Help · q Quit"
+                    "↑↓/jk Move · ←→/1-5 Tab · {own}r Refresh · ? Help · q Quit"
                 )),
             ])
         }
@@ -956,6 +967,94 @@ fn found(app: &App) -> View<'_> {
     )
 }
 
+fn resources(app: &App, now: DateTime<Utc>) -> View<'_> {
+    let s = &app.state;
+    let mut rows: Vec<Row> = s
+        .resources
+        .iter()
+        .map(|(key, r)| {
+            let (holder, age) = r
+                .holder
+                .as_ref()
+                .map_or(("free".into(), String::new()), |h| {
+                    let what = h.scope.clone().unwrap_or_else(|| format!("pid {}", h.pid));
+                    let wt = h
+                        .cwd
+                        .as_deref()
+                        .map_or("", |c| c.rsplit('/').next().unwrap_or(c));
+                    (format!("{what} · {wt}"), ago(now, h.since))
+                });
+            let queue = match r.waiting.first() {
+                None => String::new(),
+                Some(w) => format!(
+                    "{} waiting, first {} ago",
+                    r.waiting.len(),
+                    ago(now, w.since)
+                ),
+            };
+            Row::new(vec![
+                Cell::from(home(key)),
+                Cell::from(holder),
+                Cell::from(age),
+                Cell::from(queue).fg(if r.waiting.is_empty() {
+                    DIM
+                } else {
+                    Color::Yellow
+                }),
+            ])
+        })
+        .collect();
+    rows.extend(s.limits.iter().map(|(key, l)| {
+        let until = l.until.map_or(String::new(), |u| {
+            format!("until {}", u.with_timezone(&chrono::Local).format("%H:%M"))
+        });
+        Row::new(vec![
+            Cell::from(home(key)),
+            Cell::from(format!(
+                "rule: at most {} of {}",
+                l.max,
+                l.resources.join(" / ")
+            )),
+            Cell::from(String::new()),
+            Cell::from(until).fg(DIM),
+        ])
+    }));
+    let at = app.at();
+    let about = if let Some((key, r)) = s.resources.iter().nth(at) {
+        let mut lines = vec![Line::styled(home(key), Style::new().bold())];
+        match &r.holder {
+            Some(h) => lines.push(Line::raw(format!("held by {}", crate::ui::hold(now, h)))),
+            None => lines.push(Line::raw("free")),
+        }
+        for (i, w) in r.waiting.iter().enumerate() {
+            lines.push(Line::raw(format!(
+                "  {}. {}",
+                i + 1,
+                crate::ui::hold(now, w)
+            )));
+        }
+        lines.extend(finding_lines(app, key));
+        lines
+    } else if let Some((key, _)) = s.limits.iter().nth(at - s.resources.len()) {
+        let mut lines = vec![Line::styled(home(key), Style::new().bold())];
+        lines.extend(finding_lines(app, key));
+        lines
+    } else {
+        vec![]
+    };
+    (
+        vec!["RESOURCE", "HOLDER", "FOR", "QUEUE"],
+        vec![
+            Constraint::Length(24),
+            Constraint::Percentage(45),
+            Constraint::Length(7),
+            Constraint::Min(20),
+        ],
+        rows,
+        about,
+    )
+}
+
 fn finding_lines<'a>(app: &'a App, subject: &str) -> Vec<Line<'a>> {
     app.findings_for(subject)
         .into_iter()
@@ -973,7 +1072,7 @@ fn help(f: &mut Frame) {
         Line::styled("agent-fleet tui", Style::new().bold()),
         Line::raw(""),
         Line::raw("↑↓ / j k      move            PgUp PgDn   ten rows"),
-        Line::raw("← → / 1-4     tabs            r           refresh now (it refreshes every 2 s)"),
+        Line::raw("← → / 1-5     tabs            r           refresh now (it refreshes every 2 s)"),
         Line::raw(""),
         Line::raw("Agents        t  ring the agent's doorbell (agent-fleet tell)"),
         Line::raw("              f  focus its herdr pane (same host and session)"),
@@ -983,7 +1082,8 @@ fn help(f: &mut Frame) {
         Line::raw("                 else git worktree remove, which refuses unsaved work)"),
         Line::raw("              K  kill the processes left in it (TERM; only those still there)"),
         Line::raw("Tasks         d  done · u release · x cancel"),
-        Line::raw("Findings      Enter  go to the agent or worktree"),
+        Line::raw("Findings      Enter  go to the agent, worktree or resource"),
+        Line::raw("Resources     locks the hosts read: holder, queue, capacity rules"),
         Line::raw(""),
         Line::raw("Every action asks first. Findings are `agent-fleet doctor`'s."),
         Line::raw(""),

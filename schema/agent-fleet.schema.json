@@ -440,6 +440,111 @@
           ],
           "type": "object"
         },
+        "ResourceHold": {
+          "additionalProperties": false,
+          "description": "A process holds (`resource.taken`) or queues for (`resource.waiting`) a resource on its host:\na lock the host reads.",
+          "properties": {
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "resource": {
+              "description": "The host's name for it, e.g. `sim` or `build.1`.",
+              "type": "string"
+            },
+            "scope": {
+              "description": "What the process says it is doing.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "since": {
+              "description": "When it took the resource or joined the queue.",
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "host",
+            "resource",
+            "pid",
+            "since"
+          ],
+          "type": "object"
+        },
+        "ResourceLimit": {
+          "additionalProperties": false,
+          "description": "A capacity rule: at most `max` worktrees hold any of `resources` on `host` at once, until\n`until`. Replaces the rule of the same `name`; an empty `resources` removes it.",
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "max": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "type": "string"
+            },
+            "resources": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "until": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "host",
+            "name",
+            "resources",
+            "max"
+          ],
+          "type": "object"
+        },
+        "ResourceReleased": {
+          "additionalProperties": false,
+          "description": "`pid` let go of the resource or left its queue. Without `pid`: nobody holds or waits for it.",
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "resource": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "host",
+            "resource"
+          ],
+          "type": "object"
+        },
         "TaskAssigned": {
           "additionalProperties": false,
           "properties": {
@@ -773,6 +878,70 @@
             },
             "type": {
               "const": "worktree.procs",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/ResourceHold"
+            },
+            "type": {
+              "const": "resource.taken",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/ResourceHold"
+            },
+            "type": {
+              "const": "resource.waiting",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/ResourceReleased"
+            },
+            "type": {
+              "const": "resource.released",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/ResourceLimit"
+            },
+            "type": {
+              "const": "resource.limit",
               "type": "string"
             }
           },
@@ -1159,6 +1328,36 @@
           ],
           "type": "object"
         },
+        "Hold": {
+          "properties": {
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "scope": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "since": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "pid",
+            "since"
+          ],
+          "type": "object"
+        },
         "Host": {
           "properties": {
             "agents": {
@@ -1234,6 +1433,76 @@
           "required": [
             "procs",
             "ts"
+          ],
+          "type": "object"
+        },
+        "Resource": {
+          "properties": {
+            "holder": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Hold"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "resource": {
+              "type": "string"
+            },
+            "waiting": {
+              "description": "Oldest first.",
+              "items": {
+                "$ref": "#/$defs/Hold"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "host",
+            "resource",
+            "waiting"
+          ],
+          "type": "object"
+        },
+        "ResourceLimit": {
+          "additionalProperties": false,
+          "description": "A capacity rule: at most `max` worktrees hold any of `resources` on `host` at once, until\n`until`. Replaces the rule of the same `name`; an empty `resources` removes it.",
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "max": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "type": "string"
+            },
+            "resources": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "until": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "host",
+            "name",
+            "resources",
+            "max"
           ],
           "type": "object"
         },
@@ -1523,11 +1792,27 @@
             "null"
           ]
         },
+        "limits": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ResourceLimit"
+          },
+          "default": {},
+          "description": "Capacity rules by `<host>:<name>`.",
+          "type": "object"
+        },
         "msgs": {
           "additionalProperties": {
             "$ref": "#/$defs/Msg"
           },
           "description": "Undelivered doorbells by the id of their `msg.sent`.",
+          "type": "object"
+        },
+        "resources": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Resource"
+          },
+          "default": {},
+          "description": "Held or queued-for resources by `<host>:<resource>`.",
           "type": "object"
         },
         "tasks": {

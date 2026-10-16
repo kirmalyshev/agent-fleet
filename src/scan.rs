@@ -340,9 +340,211 @@ pub async fn worktrees(host: &str, repo: &str) -> Vec<WorktreeState> {
     out
 }
 
+/// A lock as the host reads it: who holds it and who queues for it, oldest first.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Lock {
+    pub holder: Option<Hold>,
+    pub waiting: Vec<Hold>,
+}
+
+/// One holder or waiter. `cwd` is what the lock says; the host asks the process when it does not.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hold {
+    pub pid: u32,
+    pub cwd: Option<String>,
+    pub scope: Option<String>,
+    pub since: DateTime<Utc>,
+}
+
+pub fn alive(pid: u32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    pid > 0
+        && (unsafe { libc::kill(pid as i32, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+}
+
+fn mtime(p: &Path) -> Option<DateTime<Utc>> {
+    Some(std::fs::metadata(p).ok()?.modified().ok()?.into())
+}
+
+fn line(p: &Path, n: usize) -> Option<String> {
+    let s = std::fs::read_to_string(p).ok()?;
+    let l = s.lines().nth(n)?.trim();
+    (!l.is_empty()).then(|| l.to_string())
+}
+
+/// A lock directory, held while it exists. The holder's pid is in its `owner` file, else in
+/// `pid`; a process still alive under either keeps it held. `cwd` and `scope` files describe the
+/// holder. Waiters are files in `<dir>.waiting/`, named `<unix seconds>.<pid>`, with the pid,
+/// scope and cwd on their first three lines. A waiter whose process is gone does not count.
+pub fn read_lock(dir: &Path) -> Lock {
+    let file = |name: &str| dir.join(name);
+    let pid_in = |name: &str| line(&file(name), 0).and_then(|l| l.parse::<u32>().ok());
+    let holder = match (pid_in("owner"), pid_in("pid")) {
+        (owner, pid) if owner.is_some_and(alive) || pid.is_some_and(alive) => {
+            let (pid, from) = match owner {
+                Some(o) => (o, "owner"),
+                None => (pid.unwrap_or(0), "pid"),
+            };
+            Some(Hold {
+                pid,
+                cwd: line(&file("cwd"), 0),
+                scope: line(&file("scope"), 0),
+                since: mtime(&file(from)).unwrap_or_else(Utc::now),
+            })
+        }
+        _ => None,
+    };
+    let mut queue = dir.as_os_str().to_owned();
+    queue.push(".waiting");
+    let mut waiting: Vec<Hold> = std::fs::read_dir(Path::new(&queue))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            let pid: u32 = line(&p, 0)?.parse().ok()?;
+            let since = e
+                .file_name()
+                .to_str()
+                .and_then(|n| n.split('.').next()?.parse::<i64>().ok())
+                .and_then(|t| DateTime::from_timestamp(t, 0))
+                .or_else(|| mtime(&p))?;
+            alive(pid).then(|| Hold {
+                pid,
+                scope: line(&p, 1),
+                cwd: line(&p, 2),
+                since,
+            })
+        })
+        .collect();
+    waiting.sort_by_key(|w| (w.since, w.pid));
+    Lock { holder, waiting }
+}
+
+/// How a lock changed since it was last read: who let go, who took it, who joined the queue.
+/// `before: None` is the first read, which owes a full release ahead of what it found.
+#[derive(Debug, PartialEq)]
+pub enum LockChange<'a> {
+    ReleasedAll,
+    Released(u32),
+    Taken(&'a Hold),
+    Waiting(&'a Hold),
+}
+
+pub fn lock_changes<'a>(before: Option<&Lock>, now: &'a Lock) -> Vec<LockChange<'a>> {
+    let mut out = Vec::new();
+    let empty = Lock::default();
+    let before = before.unwrap_or_else(|| {
+        out.push(LockChange::ReleasedAll);
+        &empty
+    });
+    let holder = |l: &Lock| l.holder.as_ref().map(|h| h.pid);
+    let had: BTreeSet<u32> = holder(before)
+        .into_iter()
+        .chain(before.waiting.iter().map(|w| w.pid))
+        .collect();
+    let has: BTreeSet<u32> = holder(now)
+        .into_iter()
+        .chain(now.waiting.iter().map(|w| w.pid))
+        .collect();
+    out.extend(
+        had.iter()
+            .filter(|p| !has.contains(p))
+            .map(|&p| LockChange::Released(p)),
+    );
+    if let Some(h) = &now.holder
+        && holder(before) != Some(h.pid)
+    {
+        out.push(LockChange::Taken(h));
+    }
+    let queued: Vec<u32> = before.waiting.iter().map(|w| w.pid).collect();
+    out.extend(
+        now.waiting
+            .iter()
+            .filter(|w| !queued.contains(&w.pid))
+            .map(LockChange::Waiting),
+    );
+    out
+}
+
+/// The working directory of a live process on this machine.
+pub fn cwd_of(pid: u32) -> Option<String> {
+    if cfg!(target_os = "linux") {
+        return std::fs::read_link(format!("/proc/{pid}/cwd"))
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
+    }
+    let out = std::process::Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix('n').map(str::to_string))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lock_reads_its_holder_and_live_waiters_and_diffs_into_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sim.lock");
+        assert_eq!(read_lock(&dir), Lock::default());
+        let me = std::process::id();
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("pid"), "999999999\n").unwrap();
+        assert_eq!(read_lock(&dir).holder, None, "a dead holder holds nothing");
+        std::fs::write(dir.join("owner"), format!("{me}\n")).unwrap();
+        std::fs::write(dir.join("scope"), "e2e, 3 flows\n").unwrap();
+        let q = tmp.path().join("sim.lock.waiting");
+        std::fs::create_dir(&q).unwrap();
+        std::fs::write(q.join("1700000000.1"), format!("{me}\nperf.sh\n/w/b\n")).unwrap();
+        std::fs::write(q.join("1600000000.2"), "999999999\nghost\n").unwrap();
+        let held = read_lock(&dir);
+        let h = held.holder.as_ref().unwrap();
+        assert_eq!(
+            (h.pid, h.scope.as_deref(), h.cwd.as_deref()),
+            (me, Some("e2e, 3 flows"), None)
+        );
+        assert_eq!(held.waiting.len(), 1, "the dead waiter is dropped");
+        let w = &held.waiting[0];
+        assert_eq!(
+            (w.pid, w.scope.as_deref(), w.cwd.as_deref()),
+            (me, Some("perf.sh"), Some("/w/b"))
+        );
+        assert_eq!(w.since.timestamp(), 1_700_000_000);
+
+        assert_eq!(
+            lock_changes(None, &held),
+            vec![
+                LockChange::ReleasedAll,
+                LockChange::Taken(h),
+                LockChange::Waiting(w)
+            ]
+        );
+        assert!(lock_changes(Some(&held), &held).is_empty());
+        let next = Lock {
+            holder: Some(Hold {
+                pid: 7,
+                ..w.clone()
+            }),
+            waiting: vec![],
+        };
+        assert_eq!(
+            lock_changes(Some(&held), &next),
+            vec![
+                LockChange::Released(me),
+                LockChange::Taken(next.holder.as_ref().unwrap())
+            ]
+        );
+        assert_eq!(
+            lock_changes(Some(&next), &Lock::default()),
+            vec![LockChange::Released(7)]
+        );
+    }
 
     #[test]
     fn stat_line_with_a_tricky_name() {
