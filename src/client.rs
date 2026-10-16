@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::event::{Envelope, Event, Known};
 use crate::state::State;
 
-/// Where this machine keeps one instance's files. `FLEET_HOME` names the directory outright;
+/// Where this machine keeps one instance's files. `AGENT_FLEET_HOME` names the directory outright;
 /// otherwise the platform data directory holds the default instance, and `instances/<name>`
 /// every other one.
 pub struct Paths {
@@ -34,7 +34,7 @@ impl Paths {
         {
             bail!("instance names are letters, digits, - and _: {instance:?}");
         }
-        let dir = match std::env::var_os("FLEET_HOME") {
+        let dir = match std::env::var_os("AGENT_FLEET_HOME") {
             Some(d) => PathBuf::from(d),
             None => {
                 let base = Self::base()?;
@@ -49,8 +49,8 @@ impl Paths {
     }
 
     pub fn base() -> Result<PathBuf> {
-        Ok(directories::ProjectDirs::from("", "", "fleet")
-            .ok_or_else(|| anyhow!("no home directory; set FLEET_HOME"))?
+        Ok(directories::ProjectDirs::from("", "", "agent-fleet")
+            .ok_or_else(|| anyhow!("no home directory; set AGENT_FLEET_HOME"))?
             .data_dir()
             .to_path_buf())
     }
@@ -76,7 +76,7 @@ impl Paths {
         Ok(out)
     }
 
-    /// The hub this instance uses: what `fleet hub` last wrote here, or the local default.
+    /// The hub this instance uses: what `agent-fleet hub` last wrote here, or the local default.
     pub fn hub_url(&self) -> String {
         std::fs::read_to_string(self.hub_file())
             .ok()
@@ -128,7 +128,7 @@ pub fn read_or_create_token(path: &Path) -> Result<String> {
             .mode(0o600)
             .open(path)?
             .write_all(hex.as_bytes())?;
-        eprintln!("fleet hub: wrote a new token to {}", path.display());
+        eprintln!("agent-fleet hub: wrote a new token to {}", path.display());
     }
     read_token(path)
 }
@@ -353,7 +353,7 @@ impl Client {
     }
 
     fn reject(&self, line: &str, why: &str) -> Result<()> {
-        eprintln!("fleet: moving a spooled event to the rejected file: {why}");
+        eprintln!("agent-fleet: moving a spooled event to the rejected file: {why}");
         let mut rej = OpenOptions::new()
             .append(true)
             .create(true)

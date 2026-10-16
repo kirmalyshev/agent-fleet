@@ -1,4 +1,4 @@
-//! `fleet tui`: the fleet on one screen, live, with the few actions an operator takes. Every
+//! `agent-fleet tui`: the fleet on one screen, live, with the few actions an operator takes. Every
 //! write goes through the same commands as the CLI; local actions (kill, remove) ask first.
 
 use std::path::Path;
@@ -407,11 +407,11 @@ async fn action(app: &mut App, c: char, fleet: &impl Fleet) {
     }
 }
 
-/// `<repo>/.fleet/hook`, when the repository ships one: it knows the stack, databases and
+/// `<repo>/.agent-fleet/hook`, when the repository ships one: it knows the stack, databases and
 /// caches a worktree holds, which fleet cannot.
 pub fn hook(repo: &str) -> Option<std::path::PathBuf> {
     use std::os::unix::fs::PermissionsExt;
-    let p = Path::new(repo).join(".fleet/hook");
+    let p = Path::new(repo).join(".agent-fleet/hook");
     let meta = std::fs::metadata(&p).ok()?;
     (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then_some(p)
 }
@@ -517,7 +517,10 @@ fn draw(f: &mut Frame, app: &App, fleet: &impl Fleet, now: DateTime<Utc>) {
         .count();
     let open = s.tasks.values().filter(|t| !t.state.is_terminal()).count();
     let summary = Line::from(vec![
-        Span::styled(format!("fleet {}", fleet.instance()), Style::new().bold()),
+        Span::styled(
+            format!("agent-fleet {}", fleet.instance()),
+            Style::new().bold(),
+        ),
         Span::raw(format!(
             " · {} · {} agents, {working} working · {open} open tasks · {} worktrees · ",
             fleet.hub(),
@@ -954,22 +957,22 @@ fn finding_lines<'a>(app: &'a App, subject: &str) -> Vec<Line<'a>> {
 
 fn help(f: &mut Frame) {
     let text = vec![
-        Line::styled("fleet tui", Style::new().bold()),
+        Line::styled("agent-fleet tui", Style::new().bold()),
         Line::raw(""),
         Line::raw("↑↓ / j k      move            PgUp PgDn   ten rows"),
         Line::raw("← → / 1-4     tabs            r           refresh now (it refreshes every 2 s)"),
         Line::raw(""),
-        Line::raw("Agents        t  ring the agent's doorbell (fleet tell)"),
+        Line::raw("Agents        t  ring the agent's doorbell (agent-fleet tell)"),
         Line::raw("              f  focus its herdr pane (same host and session)"),
         Line::raw(
-            "Worktrees     x  remove a worktree no agent works in (the repo's .fleet/hook retire,",
+            "Worktrees     x  remove a worktree no agent works in (the repo's .agent-fleet/hook retire,",
         ),
         Line::raw("                 else git worktree remove, which refuses unsaved work)"),
         Line::raw("              K  kill the processes left in it (TERM; only those still there)"),
         Line::raw("Tasks         d  done · u release · x cancel"),
         Line::raw("Findings      Enter  go to the agent or worktree"),
         Line::raw(""),
-        Line::raw("Every action asks first. Findings are `fleet doctor`'s."),
+        Line::raw("Every action asks first. Findings are `agent-fleet doctor`'s."),
         Line::raw(""),
         Line::styled("any key closes this", Style::new().fg(DIM)),
     ];
@@ -1054,7 +1057,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         for want in [
-            "fleet demo",
+            "agent-fleet demo",
             "1 findings",
             "hub unreachable",
             "builder",

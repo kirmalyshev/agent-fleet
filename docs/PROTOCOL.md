@@ -1,6 +1,6 @@
 # The fleet protocol, v1
 
-fleet coordinates many coding agents running in terminal panes across a few machines. It answers
+agent-fleet coordinates many coding agents running in terminal panes across a few machines. It answers
 two questions: *what is everyone doing?* and *did my message actually arrive?*
 
 Three rules carry the design:
@@ -18,21 +18,21 @@ Three rules carry the design:
 ## Topology
 
 ```
-        fleet hub  (one process: SQLite log, reducer, HTTP + SSE, the only sequencer)
+        agent-fleet hub  (one process: SQLite log, reducer, HTTP + SSE, the only sequencer)
            ▲  events / SSE
            │
-   fleet host (one per machine and herdr session) ── herdr socket ──▶ agent panes
+   agent-fleet host (one per machine and herdr session) ── herdr socket ──▶ agent panes
            ▲
    fleet CLI (agents) ── local spool when the hub is unreachable
 ```
 
-- **Hub** (`fleet hub`): appends events, folds them, serves `/state` and an SSE feed. It is the
+- **Hub** (`agent-fleet hub`): appends events, folds them, serves `/state` and an SSE feed. It is the
   single sequencer for the one exclusive operation in v1, `task.assigned`. It binds a specific
   address (default `127.0.0.1:7710`) and refuses `0.0.0.0` / `::`.
-- **Host agent** (`fleet host`): one per machine and herdr session. It publishes presence from
+- **Host agent** (`agent-fleet host`): one per machine and herdr session. It publishes presence from
   herdr's push events, reports disk health, keeps a full local replica of the log, and delivers
   doorbells to its agents.
-- **CLI** (`fleet …`): what agents use. Ordinary writes go to a local spool when the hub is down
+- **CLI** (`agent-fleet …`): what agents use. Ordinary writes go to a local spool when the hub is down
   and replay later. Exclusive writes refuse instead.
 
 The hub is never on a hot path: local locks, builds and merges do not depend on it. Hub down
@@ -55,12 +55,12 @@ means degraded visibility, not stopped work.
 ```
 
 Ids are stable strings: `agent:<host>/<session>/<name>`, `host:<name>`, `human:<handle>`,
-`task:<project>/<name>`. `<host>` is `FLEET_HOST` (default: the system hostname); `fleet host`
+`task:<project>/<name>`. `<host>` is `AGENT_FLEET_HOST` (default: the system hostname); `agent-fleet host`
 and the CLI on one machine read the same setting, so an agent's writes and its presence carry
 the same id. `actor.id` must start with its kind (`agent:`, `host:`).
 
-`fleet api schema` prints the JSON Schema of every event and of the state; it is committed as
-[`schema/fleet.schema.json`](../schema/fleet.schema.json) and a test fails when it goes stale.
+`agent-fleet api schema` prints the JSON Schema of every event and of the state; it is committed as
+[`schema/agent-fleet.schema.json`](../schema/agent-fleet.schema.json) and a test fails when it goes stale.
 The schema describes the shape. The rules below are stricter: required envelope fields per type,
 allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 
@@ -125,7 +125,7 @@ from the log, so host agents and CLIs upgrade independently of the hub.
 | `GET` | `/events?after=<id>&limit=<n>` | the log in arrival order after the given event, at most `limit` (default 1000); `410` if the cursor is not in the log |
 | `GET` | `/events/stream?after=<id>` | SSE: the backlog after the cursor, then live events; `410` for an unknown cursor |
 | `GET` | `/state` | the folded state |
-| `GET` | `/schema` | the same document as `fleet api schema` |
+| `GET` | `/schema` | the same document as `agent-fleet api schema` |
 | `GET` | `/stats?since=<s>` | the hub's vitals and numbers read off the last `s` seconds of the log (see Metrics) |
 
 The cursor is an event id, but order is **arrival** order at the hub. A spooled event with an old
@@ -139,11 +139,11 @@ blocked_by, handoffs), open `blockers` and `asks` (with their context link) keye
 
 ## Doorbells
 
-`fleet tell <agent> <TYPE> <ref> <text>` writes `msg.sent`. The host agent of the recipient's
+`agent-fleet tell <agent> <TYPE> <ref> <text>` writes `msg.sent`. The host agent of the recipient's
 machine types it into the agent as
 
 ```
-[fleet <from>→<to>] <TYPE> <ref>: <text> (event <id>)
+[agent-fleet <from>→<to>] <TYPE> <ref>: <text> (event <id>)
 ```
 
 The `[fleet` prefix marks the turn as machine-sent, so it is never mistaken for a human
@@ -174,12 +174,12 @@ supervisor restarts it rather than leaving a host that looks healthy and no long
 
 - **Spool.** When the hub is unreachable, or answers with anything that is not a verdict on the
   event (401, 404, 429, 5xx…), an ordinary write is appended to `spool.jsonl` in the data
-  directory. The next write from any `fleet` process on that machine, and the host agent's sync
+  directory. The next write from any `agent-fleet` process on that machine, and the host agent's sync
   loop, replay it in order before anything new. One process replays at a time; the spool is
   rewritten by write-then-rename, and replay is idempotent, so a crash mid-replay is harmless.
   Only a verdict (400, 403, 409, 413, 415, 422 with the hub's error body) or an unreadable line
   moves an event to `spool.rejected.jsonl`. While events wait, every later write says why.
-- **Exclusive writes never spool.** `fleet task add` with the hub unreachable fails: two
+- **Exclusive writes never spool.** `agent-fleet task add` with the hub unreachable fails: two
   partitioned copies cannot both grant the same task. It also waits for the spool to drain, so
   it never overtakes a spooled release.
 - **Replica.** The host agent pulls `GET /events?after=<cursor>` and then follows the SSE feed
@@ -192,7 +192,7 @@ supervisor restarts it rather than leaving a host that looks healthy and no long
 ## Metrics
 
 The log is the record, so most numbers are read off it; the hub stamps each event's arrival
-time, and the host agent reports its own vitals in `host.health.stats`. `fleet stats` shows
+time, and the host agent reports its own vitals in `host.health.stats`. `agent-fleet stats` shows
 them, `GET /stats` returns them as JSON.
 
 - **Doorbells.** Sent, delivered, pending, and lost (undelivered for over 10 minutes). Time to
@@ -208,7 +208,7 @@ them, `GET /stats` returns them as JSON.
 - **Hub.** Uptime, memory, CPU, log size, followers, the time each recent `POST /events`
   spent in the hub (lock wait included), and posts by outcome (accepted, duplicate, 400, 409…).
 
-`fleet bench` runs a throwaway hub in-process and measures it with the same client the CLI
+`agent-fleet bench` runs a throwaway hub in-process and measures it with the same client the CLI
 uses: post latency alone and under contention, throughput, how far a follower lags a writer,
 and whether racing claims stay exclusive. It measures the hub and the client, not herdr or
 the agents.
@@ -228,7 +228,7 @@ Every 5 minutes the host agent scans its machine. It writes facts, never verdict
   *deleted* directory beside the worktrees is an orphan: nothing that could stop it knows it is
   there. Git calls run with `GIT_OPTIONAL_LOCKS=0`, so a scan never takes an agent's index lock.
 
-`fleet doctor` (and the board) reads verdicts off that state:
+`agent-fleet doctor` (and the board) reads verdicts off that state:
 
 | Finding | When |
 |---|---|
@@ -242,7 +242,7 @@ Every 5 minutes the host agent scans its machine. It writes facts, never verdict
 
 ## The operator's screen
 
-`fleet tui` shows the state live (every 2 s): agents with their CPU, memory, task and branch;
+`agent-fleet tui` shows the state live (every 2 s): agents with their CPU, memory, task and branch;
 worktrees with unpushed and dirty work and what they run; tasks; findings. Writes go through the
 same events as the CLI (`msg.sent`, `task.state`, `task.unassigned`). Two actions are local to
 the machine and ask first: removing a worktree no agent works in, and killing the processes
@@ -250,28 +250,28 @@ left in one (only those still running there, so a reused pid is never hit).
 
 **Repository hook.** A repository knows what fleet cannot: which database, caches and
 simulators a worktree holds, and how its stack stops. If its main checkout has an executable
-`.fleet/hook`, removing a worktree runs `.fleet/hook retire <path>` instead of
+`.agent-fleet/hook`, removing a worktree runs `.agent-fleet/hook retire <path>` instead of
 `git worktree remove`; the hook does the repository's own teardown and exits non-zero to refuse.
 
 ## Instances
 
 One machine can run several fleets, one per project or product. `--instance <name>` (or
-`FLEET_INSTANCE`) picks one; each has its own directory, so its own hub log, token, spool and
-replica. `fleet hub` writes its URL into the instance's directory, and every other command
-of that instance finds its hub there, unless `FLEET_HUB` says otherwise. Two hubs on one
+`AGENT_FLEET_INSTANCE`) picks one; each has its own directory, so its own hub log, token, spool and
+replica. `agent-fleet hub` writes its URL into the instance's directory, and every other command
+of that instance finds its hub there, unless `AGENT_FLEET_HUB` says otherwise. Two hubs on one
 machine need two `--listen` ports. A host agent serves one instance and one herdr session.
-`fleet instances` lists them.
+`agent-fleet instances` lists them.
 
 ## Files
 
-Everything of an instance lives in one data directory: `FLEET_HOME`, or the platform data
+Everything of an instance lives in one data directory: `AGENT_FLEET_HOME`, or the platform data
 directory (`directories` crate) for the default instance and `instances/<name>` under it for
 the others: `hub.db`, `replica.db`, `spool.jsonl`, `spool.rejected.jsonl`, `token`, `hub` (the
-hub's URL), and the lock files `spool.lock` and `spool.flush`. `FLEET_TOKEN_FILE` and `fleet hub --db` move
+hub's URL), and the lock files `spool.lock` and `spool.flush`. `AGENT_FLEET_TOKEN_FILE` and `agent-fleet hub --db` move
 the token and the hub database elsewhere.
 
 ## Not in v1
 
 Decisions and the human channel (`ask.answered`, `decision.*`), data-defined extension types,
-the web board, code-host ingest, a NATS transport, `fleet run`/`kill` process ownership, Windows.
+the web board, code-host ingest, a NATS transport, `agent-fleet run`/`kill` process ownership, Windows.
 These are v2.

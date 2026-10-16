@@ -3,6 +3,30 @@
 version = 4
 
 [[package]]
+name = "agent-fleet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "directories",
+ "futures-util",
+ "libc",
+ "ratatui",
+ "reqwest",
+ "rusqlite",
+ "rustix 1.1.5",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "ulid",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -444,30 +468,6 @@ name = "find-msvc-tools"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
-
-[[package]]
-name = "fleet"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "clap",
- "directories",
- "futures-util",
- "libc",
- "ratatui",
- "reqwest",
- "rusqlite",
- "rustix 1.1.5",
- "schemars",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-stream",
- "ulid",
-]
 
 [[package]]
 name = "foldhash"
