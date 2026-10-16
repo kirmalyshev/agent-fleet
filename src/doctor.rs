@@ -104,7 +104,7 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
         let Some(u) = &a.usage else { continue };
         if a.state == AgentState::Working
             && idle_for >= HUNG
-            && u.cpu_pct < HUNG_CPU_PCT
+            && u.cpu_pct.is_some_and(|c| c < HUNG_CPU_PCT)
             && wt.is_none_or(|(_, w)| now - w.since >= HUNG)
         {
             let still = wt.map_or(String::new(), |(_, w)| {
@@ -116,19 +116,21 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
                 format!(
                     "working for {} at {}% CPU{still}",
                     ago(now, a.since),
-                    u.cpu_pct
+                    u.cpu_pct.unwrap_or(0)
                 ),
             ));
         }
-        if u.rss_kb >= HEAVY_RSS_KB || u.cpu_pct >= HEAVY_CPU_PCT {
+        if let (Some(rss), Some(cpu)) = (u.rss_kb, u.cpu_pct)
+            && (rss >= HEAVY_RSS_KB || cpu >= HEAVY_CPU_PCT)
+        {
             out.push(finding(
                 "heavy",
                 id,
                 format!(
                     "{:.1} GB, {}% CPU over {} processes",
-                    u.rss_kb as f64 / (1024.0 * 1024.0),
-                    u.cpu_pct,
-                    u.procs
+                    rss as f64 / (1024.0 * 1024.0),
+                    cpu,
+                    u.procs.unwrap_or(0)
                 ),
             ));
         }
@@ -273,9 +275,9 @@ mod tests {
             state,
             since,
             usage: Some(Usage {
-                rss_kb,
-                cpu_pct: cpu,
-                procs: 3,
+                rss_kb: Some(rss_kb),
+                cpu_pct: Some(cpu),
+                procs: Some(3),
                 cwd: Some(cwd.into()),
                 ts: since,
             }),
@@ -409,6 +411,22 @@ mod tests {
                 .insert(name.into(), agent(AgentState::Working, now, "/w/a", 50, 1));
         }
         assert_eq!(kinds(&findings(&s, now)), vec![("duplicate", "h:/w/a")]);
+    }
+
+    #[test]
+    fn an_agent_measured_only_by_its_cwd_is_placed_and_never_hung() {
+        let now = Utc::now();
+        let mut s = State::default();
+        s.worktrees.insert(
+            worktree_key("h", "/w/a"),
+            tree("/w/a", &[], 0, 0, now - Duration::hours(2)),
+        );
+        let mut a = agent(AgentState::Working, now - Duration::hours(1), "/w/a", 0, 0);
+        let u = a.usage.as_mut().unwrap();
+        (u.rss_kb, u.cpu_pct, u.procs) = (None, None, None);
+        s.agents.insert("agent:h/s/mac".into(), a.clone());
+        assert_eq!(worktree_of(&s, &a).map(|(k, _)| k.as_str()), Some("h:/w/a"));
+        assert!(findings(&s, now).is_empty(), "no CPU reading is not 0% CPU");
     }
 
     #[test]

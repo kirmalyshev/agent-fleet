@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-fleet board</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='%232f6fdf'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --line: #e3e6eb; --text: #1b1f24; --dim: #69727d;
+  --zebra: #f9fafb; --accent: #2f6fdf; --ok: #1f8a4c; --warn: #b7791f; --bad: #c43838; --idle: #69727d;
+  --chip: #eef1f5; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0f1216; --panel: #161a20; --line: #262c34; --text: #e6e9ee; --dim: #8b949e;
+    --zebra: #1a1f26; --accent: #6ea8ff; --ok: #4cc17e; --warn: #e0a84a; --bad: #f06a6a; --idle: #8b949e; --chip: #20262e; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { position: sticky; top: 0; z-index: 2; background: var(--bg); border-bottom: 1px solid var(--line); padding: 12px 16px 0; }
+h1 { font-size: 16px; margin: 0 8px 0 0; display: inline; }
+.top { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.chip { background: var(--chip); border-radius: 999px; padding: 2px 10px; font-size: 13px; white-space: nowrap; }
+.chip b { font-variant-numeric: tabular-nums; }
+.chip.bad { color: var(--bad); } .chip.warn { color: var(--warn); } .chip.ok { color: var(--ok); }
+.age { margin-left: auto; color: var(--dim); font-size: 12px; }
+.alerts { margin: 8px 0 0; }
+.alert { color: var(--bad); font-size: 13px; padding: 2px 0; overflow-wrap: anywhere; }
+nav { display: flex; gap: 2px; margin-top: 10px; overflow-x: auto; scrollbar-width: none; }
+nav::-webkit-scrollbar { display: none; }
+nav button { border: 0; background: none; color: var(--dim); font: inherit; padding: 8px 12px; border-bottom: 2px solid transparent; cursor: pointer; white-space: nowrap; }
+nav button.on { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+nav button .n { color: var(--dim); font-weight: 400; margin-left: 4px; }
+main { padding: 12px 16px 40px; }
+.tools { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+input[type=search] { flex: 1; min-width: 160px; max-width: 360px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); font: inherit; }
+.wrap { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; }
+th { text-align: left; font-weight: 500; color: var(--dim); font-size: 12px; padding: 8px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+td { padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+tr:last-child td { border-bottom: 0; }
+tbody tr:nth-child(even) { background: var(--zebra); }
+td.num { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+td.mono, .mono { font-family: var(--mono); font-size: 12.5px; }
+td.path { font-family: var(--mono); font-size: 12px; color: var(--dim); overflow-wrap: anywhere; }
+.dim { color: var(--dim); }
+.pill { display: inline-block; border-radius: 4px; padding: 0 6px; font-size: 12px; font-weight: 600; text-transform: lowercase; }
+.s-working, .t-working { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+.s-blocked, .t-failed, .k-hung, .k-orphan, .k-duplicate { color: var(--bad); background: color-mix(in srgb, var(--bad) 14%, transparent); }
+.s-unknown, .t-input-required, .k-heavy, .k-unpushed, .k-forgotten { color: var(--warn); background: color-mix(in srgb, var(--warn) 16%, transparent); }
+.s-idle, .s-done, .t-completed, .t-canceled, .t-submitted, .k-stale { color: var(--idle); background: var(--chip); }
+.flag { color: var(--bad); font-weight: 600; }
+.warnnum { color: var(--warn); font-weight: 600; }
+.empty { padding: 24px; text-align: center; color: var(--dim); }
+.gate { max-width: 520px; margin: 12vh auto; padding: 24px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+.gate h1 { display: block; margin-bottom: 8px; }
+.gate input { width: 100%; margin: 12px 0; padding: 8px 10px; font: 13px var(--mono); border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); }
+.gate button, .tools button { padding: 6px 14px; border: 1px solid var(--line); border-radius: 6px; background: var(--chip); color: var(--text); font: inherit; cursor: pointer; }
+.err { color: var(--bad); }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-bottom: 12px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.card .v { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.card .l { color: var(--dim); font-size: 12px; }
+.tree { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 4px 0; }
+.tree details { padding-left: 18px; }
+.tree > details { padding-left: 8px; border-bottom: 1px solid var(--line); }
+.tree > details:last-child { border-bottom: 0; }
+.tree summary { cursor: pointer; padding: 6px 8px 6px 0; list-style-position: outside; }
+.tree summary::marker { color: var(--dim); }
+.node { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; }
+.node .name { font-weight: 600; }
+.node .mono { font-weight: 500; }
+.leaf { padding: 4px 8px 4px 34px; display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: baseline; }
+.leaf.task { padding-left: 52px; }
+.tag { font-size: 12px; color: var(--dim); }
+.tag.warn { color: var(--warn); } .tag.bad { color: var(--bad); } .tag.ok { color: var(--ok); }
+.quiet { color: var(--dim); }
+@media (max-width: 640px) { .hide-sm { display: none; } main, header { padding-left: 12px; padding-right: 12px; } }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+"use strict";
+const KEY = "agent-fleet-token";
+const TABS = ["tree", "agents", "worktrees", "tasks", "findings", "doorbells", "hosts"];
+const openState = {};
+const det = (key, dflt) => `data-k="${esc(key)}" ${(key in openState ? openState[key] : dflt) ? "open" : ""}`;
+let token = null, data = null, stats = null, tab = "tree", filter = "", err = null, loadedAt = 0, statsAt = 0;
+try { token = localStorage.getItem(KEY); tab = localStorage.getItem(KEY + "-tab") || tab; } catch (_) {}
+// `agent-fleet ui` opens /#token=…: the fragment never reaches a server; keep it here, drop it from the address bar.
+{
+  const m = location.hash.match(/token=([^&]+)/);
+  if (m) {
+    token = decodeURIComponent(m[1]);
+    try { localStorage.setItem(KEY, token); } catch (_) {}
+    history.replaceState(null, "", location.pathname + location.search);
+  }
+}
+if (!TABS.includes(tab)) tab = "tree";
+
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const short = id => String(id ?? "").split("/").pop();
+const home = p => String(p ?? "").replace(/^(\w[\w.-]*:)?\/(home|Users)\/[^/]+\//, (m, host) => (host || "") + "~/");
+const mb = kb => kb == null ? "" : kb >= 1048576 ? (kb / 1048576).toFixed(1) + "G" : Math.round(kb / 1024) + "M";
+function ago(ts) {
+  if (!ts) return "";
+  const s = Math.max(0, Math.round((Date.now() - Date.parse(ts)) / 1000));
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  if (s < 86400) return Math.floor(s / 3600) + "h" + String(Math.floor(s % 3600 / 60)).padStart(2, "0") + "m";
+  return Math.floor(s / 86400) + "d";
+}
+const dur = ms => ms == null ? "–" : ms < 1000 ? ms + "ms" : ms < 60000 ? (ms / 1000).toFixed(1) + "s" : Math.floor(ms / 60000) + "m" + String(Math.round(ms / 1000) % 60).padStart(2, "0") + "s";
+const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+const pill = (cls, text) => `<span class="pill ${cls}">${esc(text)}</span>`;
+const match = (...parts) => !filter || parts.join(" ").toLowerCase().includes(filter);
+
+async function get(path) {
+  const r = await fetch(path, { headers: { Authorization: "Bearer " + token }, cache: "no-store" });
+  if (r.status === 401) { token = null; try { localStorage.removeItem(KEY); } catch (_) {} throw new Error("the hub refused the token"); }
+  if (!r.ok) throw new Error(path + ": HTTP " + r.status);
+  return r.json();
+}
+
+async function refresh() {
+  if (!token) return render();
+  try {
+    data = await get("/board");
+    if (Date.now() - statsAt > 30000) { stats = await get("/stats?since=86400"); statsAt = Date.now(); }
+    err = null; loadedAt = Date.now();
+  } catch (e) { err = e.message; }
+  render();
+}
+
+function gate() {
+  return `<div class="gate"><h1>agent-fleet board</h1>
+    <div class="dim">Paste this hub's bearer token. It stays in this browser only.
+    On the hub's machine: <span class="mono">cat ~/Library/Application\\ Support/agent-fleet/token</span> (macOS)
+    or <span class="mono">cat ~/.local/share/agent-fleet/token</span> (Linux).</div>
+    ${err ? `<div class="err">${esc(err)}</div>` : ""}
+    <form id="tf"><input id="ti" type="password" autocomplete="off" placeholder="token" autofocus><button>Open the board</button></form></div>`;
+}
+
+function treeTab(s) {
+  const TERMINAL = ["completed", "failed", "canceled"];
+  const flags = {};
+  for (const f of data.findings) for (const subj of f.subject.split(" + ")) (flags[subj] = flags[subj] || []).push(f);
+  const tasksOf = {};
+  for (const [id, t] of Object.entries(s.tasks)) if (t.owner && !TERMINAL.includes(t.state)) (tasksOf[t.owner] = tasksOf[t.owner] || []).push([id, t]);
+  const blockers = {};
+  for (const b of Object.values(s.blockers)) if (b.task) (blockers[b.task] = blockers[b.task] || []).push(b);
+  const inWt = {};
+  for (const [id, k] of Object.entries(data.worktree_of)) (inWt[k] = inWt[k] || []).push(id);
+  const placed = new Set(Object.keys(data.worktree_of));
+  const fl = subj => (flags[subj] || []).map(f => `<span class="pill k-${esc(f.kind)}" title="${esc(f.detail)}">${esc(f.kind)}</span>`).join("");
+  const taskLeaf = ([id, t]) => {
+    const bs = blockers[id] || [];
+    const title = t.url ? `<a href="${esc(t.url)}" target="_blank" rel="noopener">${esc(t.title)}</a>` : esc(t.title);
+    return `<div class="leaf task">${pill("t-" + t.state, t.state)}<span class="mono">${esc(id.replace(/^task:/, ""))}</span><span>${title}</span>
+      <span class="tag">${ago(t.since)}</span>${bs.map(b => `<span class="tag bad" title="${esc(b.unblocks_when || "")}">blocked: ${esc(b.what)}</span>`).join("")}</div>`;
+  };
+  const agentLeaf = id => {
+    const a = s.agents[id], u = a.usage, ts = tasksOf[id] || [];
+    const cost = u?.cpu_pct != null ? `<span class="tag">${u.cpu_pct}% · ${mb(u.rss_kb)}</span>` : "";
+    return `<div class="leaf">${pill("s-" + a.state, a.state)}<span class="mono">${esc(short(id))}</span><span class="tag">${esc(a.host)} · ${ago(a.since)}</span>${cost}${fl(id)}</div>`
+      + ts.map(taskLeaf).join("");
+  };
+  // Repositories, by host and main checkout.
+  const repos = {};
+  for (const [k, w] of Object.entries(s.worktrees)) {
+    const rk = w.state.host + ":" + w.state.repo;
+    (repos[rk] = repos[rk] || { host: w.state.host, repo: w.state.repo, wts: [] }).wts.push([k, w]);
+  }
+  const weight = ([k, w]) => {
+    const ags = inWt[k] || [];
+    const working = ags.some(id => s.agents[id]?.state === "working");
+    return (working ? 0 : ags.length ? 1 : (flags[k] || []).length ? 2 : (w.state.unpushed || w.state.dirty) ? 3 : 4);
+  };
+  const wtNode = ([k, w]) => {
+    const st = w.state, p = s.worktree_procs[k]?.procs, ags = inWt[k] || [];
+    const tags = [st.unpushed ? `<span class="tag warn">${st.unpushed} unpushed</span>` : "", st.dirty ? `<span class="tag warn">${st.dirty} dirty</span>` : "",
+      p ? `<span class="tag" title="${esc(p.names.join(", "))}">runs ${p.procs} · ${mb(p.rss_kb)}</span>` : "", `<span class="tag">commit ${ago(st.last_commit)}</span>`].join("");
+    const open = ags.length || (flags[k] || []).length;
+    return `<details ${det("w:" + k, open)}><summary><span class="node"><span class="mono">${esc(st.branch || "(detached)")}</span>
+      ${st.path === st.repo ? `<span class="tag">main checkout</span>` : ""}${tags}${fl(k)}<span class="path tag">${esc(home(st.path))}</span></span></summary>
+      ${ags.map(agentLeaf).join("") || `<div class="leaf quiet">no agent</div>`}</details>`;
+  };
+  const repoNodes = Object.values(repos)
+    .filter(r => match(r.repo, r.host, ...r.wts.map(([k, w]) => (w.state.branch || "") + " " + (inWt[k] || []).join(" "))))
+    .sort((a, b) => a.repo.localeCompare(b.repo) || a.host.localeCompare(b.host))
+    .map(r => {
+      const wts = r.wts.sort((x, y) => weight(x) - weight(y) || (x[1].state.branch || "").localeCompare(y[1].state.branch || ""));
+      const active = wts.filter(x => weight(x) < 4), quiet = wts.filter(x => weight(x) === 4);
+      const ags = wts.flatMap(([k]) => inWt[k] || []);
+      const working = ags.filter(id => s.agents[id]?.state === "working").length;
+      const nflags = wts.reduce((n, [k]) => n + (flags[k] || []).length, 0) + ags.reduce((n, id) => n + (flags[id] || []).length, 0);
+      const unsaved = wts.filter(([, w]) => w.state.unpushed || w.state.dirty).length;
+      const rk = r.host + ":" + r.repo;
+      return `<details ${det("r:" + rk, true)}><summary><span class="node"><span class="name">${esc(r.repo.split("/").pop())}</span><span class="tag">${esc(r.host)}</span>
+        <span class="tag">${plural(wts.length, "worktree")}</span><span class="tag ${working ? "ok" : ""}">${plural(ags.length, "agent")}${working ? `, ${working} working` : ""}</span>
+        ${unsaved ? `<span class="tag warn">${unsaved} with unsaved work</span>` : ""}${nflags ? `<span class="tag bad">${nflags} findings</span>` : ""}</span></summary>
+        ${active.map(wtNode).join("")}
+        ${quiet.length ? `<details ${det("q:" + rk, false)}><summary><span class="quiet">${quiet.length} quiet worktrees (no agent, nothing unsaved, no findings)</span></summary>${quiet.map(wtNode).join("")}</details>` : ""}
+      </details>`;
+    });
+  const loose = Object.keys(s.agents).filter(id => !placed.has(id) && match(id, s.agents[id].host, s.agents[id].state));
+  const looseNode = loose.length ? `<details ${det("loose", true)}><summary><span class="node"><span class="name">Agents outside a known worktree</span><span class="tag">${loose.length}</span></span></summary>
+    ${loose.sort().map(agentLeaf).join("")}</details>` : "";
+  const unowned = Object.entries(s.tasks).filter(([id, t]) => !TERMINAL.includes(t.state) && !(t.owner && s.agents[t.owner]) && match(id, t.title));
+  const byProject = {};
+  for (const e of unowned) (byProject[e[1].project] = byProject[e[1].project] || []).push(e);
+  const taskNode = Object.keys(byProject).length ? `<details ${det("tasks", true)}><summary><span class="node"><span class="name">Open tasks with no agent up</span><span class="tag">${unowned.length}</span></span></summary>
+    ${Object.entries(byProject).map(([p, ts]) => `<details ${det("p:" + p, true)}><summary><span class="mono">${esc(p)}</span> <span class="tag">${ts.length}</span></summary>${ts.map(taskLeaf).join("")}</details>`).join("")}</details>` : "";
+  const all = repoNodes.join("") + looseNode + taskNode;
+  return all ? `<div class="tree">${all}</div>` : `<div class="wrap"><div class="empty">${esc(filter ? "nothing matches the filter" : "no worktrees reported yet")}</div></div>`;
+}
+
+function agentsTab(s) {
+  const order = { blocked: 0, unknown: 1, working: 2, idle: 3, done: 4 };
+  const owned = {};
+  for (const [id, t] of Object.entries(s.tasks)) if (t.owner && !["completed", "failed", "canceled"].includes(t.state)) owned[t.owner] = id;
+  const flags = {};
+  for (const f of data.findings) for (const subj of f.subject.split(" + ")) flags[subj] = (flags[subj] || 0) + 1;
+  const rows = Object.entries(s.agents)
+    .filter(([id, a]) => match(id, a.host, a.state, owned[id], data.worktree_of[id]))
+    .sort(([ia, a], [ib, b]) => (order[a.state] - order[b.state]) || a.host.localeCompare(b.host) || ia.localeCompare(ib));
+  const wt = id => { const k = data.worktree_of[id]; const w = k && s.worktrees[k]; return w ? (w.state.branch || "(detached)") : ""; };
+  return table(["Agent", "Host", "State", "For", "CPU", "Mem", "Task", "Branch", "!"], rows.map(([id, a]) => {
+    const u = a.usage, n = flags[id] || 0;
+    return `<tr><td class="mono">${esc(short(id))}</td><td class="dim">${esc(a.host)}</td><td>${pill("s-" + a.state, a.state)}</td>
+      <td class="num">${ago(a.since)}</td><td class="num">${u?.cpu_pct != null ? u.cpu_pct + "%" : ""}</td><td class="num">${mb(u?.rss_kb)}</td>
+      <td class="mono">${esc(short(owned[id] || ""))}</td><td class="mono hide-sm">${esc(wt(id))}</td><td class="flag">${n || ""}</td></tr>`;
+  }), "no agents");
+}
+
+function worktreesTab(s) {
+  const busy = {};
+  for (const [id, k] of Object.entries(data.worktree_of)) (busy[k] = busy[k] || []).push(short(id));
+  const keys = Object.keys(s.worktrees).concat(Object.keys(s.worktree_procs).filter(k => s.worktree_procs[k].procs.orphaned));
+  const rows = keys.filter(k => match(k, s.worktrees[k]?.state.branch, (busy[k] || []).join(" ")));
+  return table(["Branch", "Host", "Agent", "Unpushed", "Dirty", "Runs", "Commit", "Worktree"], rows.map(k => {
+    const w = s.worktrees[k], p = s.worktree_procs[k]?.procs;
+    const runs = p ? `${p.procs} · ${mb(p.rss_kb)}` : "";
+    if (!w) return `<tr><td class="flag">worktree gone</td><td class="dim">${esc(p.host)}</td><td></td><td></td><td></td>
+      <td class="num flag" title="${esc(p.names.join(", "))}">${runs}</td><td></td><td class="path">${esc(home(p.path))}</td></tr>`;
+    const st = w.state, n = (v) => v ? `<span class="warnnum">${v}</span>` : `<span class="dim">·</span>`;
+    return `<tr><td class="mono">${esc(st.branch || "(detached)")}</td><td class="dim">${esc(st.host)}</td><td class="mono">${esc((busy[k] || []).join(", "))}</td>
+      <td class="num">${n(st.unpushed)}</td><td class="num">${n(st.dirty)}</td><td class="num" title="${esc(p ? p.names.join(", ") : "")}">${runs}</td>
+      <td class="num">${ago(st.last_commit)}</td><td class="path">${esc(home(st.path))}</td></tr>`;
+  }), "no worktrees reported yet");
+}
+
+function tasksTab(s) {
+  const blockers = {};
+  for (const b of Object.values(s.blockers)) if (b.task) (blockers[b.task] = blockers[b.task] || []).push(b);
+  const rows = Object.entries(s.tasks).filter(([id, t]) => match(id, t.title, t.owner, t.state))
+    .sort(([, a], [, b]) => Date.parse(b.since) - Date.parse(a.since));
+  return table(["Task", "State", "For", "Owner", "Blockers", "Title"], rows.map(([id, t]) => {
+    const bs = blockers[id] || [];
+    const title = t.url ? `<a href="${esc(t.url)}" target="_blank" rel="noopener">${esc(t.title)}</a>` : esc(t.title);
+    return `<tr><td class="mono">${esc(id.replace(/^task:/, ""))}</td><td>${pill("t-" + t.state, t.state)}</td><td class="num">${ago(t.since)}</td>
+      <td class="mono">${esc(short(t.owner || "–"))}</td><td class="flag" title="${esc(bs.map(b => b.what).join("\n"))}">${bs.length || ""}</td><td>${title}</td></tr>`;
+  }), "no tasks yet: agents record theirs with agent-fleet task add");
+}
+
+function findingsTab() {
+  const rows = data.findings.filter(f => match(f.kind, f.subject, f.detail));
+  return table(["Kind", "About", "Detail"], rows.map(f =>
+    `<tr><td>${pill("k-" + f.kind, f.kind)}</td><td class="path">${esc(home(f.subject))}</td><td>${esc(f.detail)}</td></tr>`), "nothing needs a look");
+}
+
+function doorbellsTab(s) {
+  const d = stats?.log?.doorbells;
+  const cards = d ? `<div class="grid">
+    ${card(d.sent, "sent, last 24 h")}${card(d.delivered, "delivered")}${card(d.pending, "pending")}${card(d.lost, "lost (undelivered > 10 min)", d.lost ? "bad" : "")}
+    ${card(dur(d.total_ms.p50), "send → working, p50")}${card(dur(d.total_ms.p90), "p90 (waits for busy agents)")}${card(dur(d.react_ms.p50), "ring → working, p50")}${card(d.retried, "needed a second ring")}
+  </div>` : "";
+  const rows = Object.entries(s.msgs).filter(([id, m]) => match(m.from, m.to, m.kind, m.text))
+    .sort(([, a], [, b]) => Date.parse(a.since) - Date.parse(b.since));
+  return cards + `<div class="dim" style="margin:4px 0 8px">Undelivered now</div>` + table(["Waiting", "From", "To", "Kind", "Ref", "Text"], rows.map(([id, m]) =>
+    `<tr><td class="num">${ago(m.since)}</td><td class="mono">${esc(short(m.from))}</td><td class="mono">${esc(short(m.to))}</td>
+     <td>${esc(m.kind)}</td><td class="mono">${esc(m.reference)}</td><td>${esc(m.text)}</td></tr>`), "every doorbell is delivered");
+}
+
+function hostsTab(s) {
+  const hs = stats?.log?.hosts || {};
+  const hub = stats?.hub;
+  const hubCard = hub ? `<div class="grid">${card(dur(hub.uptime_s * 1000), "hub up")}${card(mb(hub.max_rss_kb), "hub memory")}
+    ${card(hub.events, "events in the log")}${card(hub.followers, "followers (host agents)")}${card(dur(Math.round(hub.post_us.p50 / 1000)), "write, p50")}</div>` : "";
+  const rows = Object.entries(s.hosts).filter(([h]) => match(h));
+  return hubCard + table(["Host", "Agents", "Disk free", "Reported", "Up", "Memory", "Rings", "herdr errors", "Spooled"], rows.map(([h, x]) => {
+    const r = hs[h], l = r?.last;
+    const gb = b => (b / 1e9).toFixed(1);
+    const late = (Date.now() - Date.parse(x.ts)) > 180000;
+    return `<tr><td class="mono">${esc(h)}</td><td class="num">${x.agents}</td><td class="num">${gb(x.disk_free)} / ${gb(x.disk_total)} GB</td>
+      <td class="num ${late ? "flag" : ""}">${ago(x.ts)} ago</td><td class="num">${l ? dur(l.uptime_s * 1000) : ""}</td><td class="num">${l ? mb(l.max_rss_kb) : ""}</td>
+      <td class="num">${l ? l.rings + (l.ring_failures ? ` <span class="flag">(${l.ring_failures} failed)</span>` : "") : ""}</td>
+      <td class="num">${l?.herdr_errors ?? ""}</td><td class="num">${l?.spooled ?? ""}</td></tr>`;
+  }), "no host has reported");
+}
+
+const card = (v, l, cls = "") => `<div class="card"><div class="v ${cls === "bad" ? "err" : ""}">${esc(v)}</div><div class="l">${esc(l)}</div></div>`;
+function table(head, rows, none) {
+  if (!rows.length) return `<div class="wrap"><div class="empty">${esc(filter ? "nothing matches the filter" : none)}</div></div>`;
+  return `<div class="wrap"><table><thead><tr>${head.map(h => `<th class="${["Branch"].includes(h) ? "hide-sm" : ""}">${esc(h)}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table></div>`;
+}
+
+function render() {
+  const app = document.getElementById("app");
+  if (!token) { app.innerHTML = gate(); bindGate(); return; }
+  if (!data) { app.innerHTML = `<div class="gate">${err ? `<div class="err">${esc(err)}</div>` : "loading…"}</div>`; return; }
+  const s = data.state, a = Object.values(s.agents);
+  const count = st => a.filter(x => x.state === st).length;
+  const open = Object.values(s.tasks).filter(t => !["completed", "failed", "canceled"].includes(t.state)).length;
+  const alerts = data.findings.filter(f => ["orphan", "hung", "duplicate"].includes(f.kind)).slice(0, 3);
+  const n = { tree: Object.keys(s.worktrees).length ? new Set(Object.values(s.worktrees).map(w => w.state.host + ":" + w.state.repo)).size : 0, agents: a.length, worktrees: Object.keys(s.worktrees).length, tasks: open, findings: data.findings.length,
+    doorbells: Object.keys(s.msgs).length, hosts: Object.keys(s.hosts).length };
+  const body = { tree: treeTab, agents: agentsTab, worktrees: worktreesTab, tasks: tasksTab, findings: findingsTab, doorbells: doorbellsTab, hosts: hostsTab }[tab](s);
+  const focused = document.activeElement?.id === "q";
+  app.innerHTML = `<header>
+    <div class="top"><h1>agent-fleet</h1>
+      <span class="chip"><b>${a.length}</b> agents</span>
+      <span class="chip ok"><b>${count("working")}</b> working</span>
+      <span class="chip"><b>${count("idle") + count("done")}</b> idle</span>
+      ${count("blocked") ? `<span class="chip bad"><b>${count("blocked")}</b> blocked</span>` : ""}
+      <span class="chip"><b>${open}</b> open tasks</span>
+      <span class="chip ${data.findings.length ? "warn" : "ok"}"><b>${data.findings.length}</b> findings</span>
+      <span class="chip ${Object.keys(s.msgs).length ? "warn" : ""}"><b>${Object.keys(s.msgs).length}</b> undelivered</span>
+      <span class="chip"><b>${n.hosts}</b> hosts</span>
+      <span class="age">${err ? `<span class="err">${esc(err)}</span> · ` : ""}updated ${ago(new Date(loadedAt).toISOString())} ago</span></div>
+    <div class="alerts">${alerts.map(f => `<div class="alert">${esc(f.kind)}: ${esc(home(f.subject))} · ${esc(f.detail)}</div>`).join("")}</div>
+    <nav>${TABS.map(t => `<button data-tab="${t}" class="${t === tab ? "on" : ""}">${t[0].toUpperCase() + t.slice(1)}<span class="n">${n[t]}</span></button>`).join("")}</nav>
+  </header>
+  <main><div class="tools"><input id="q" type="search" placeholder="filter" value="${esc(filter)}"><button id="out" title="forget the token in this browser">sign out</button></div>${body}</main>`;
+  app.querySelectorAll("details[data-k]").forEach(d => d.ontoggle = () => { openState[d.dataset.k] = d.open; });
+  app.querySelectorAll("nav button").forEach(b => b.onclick = () => { tab = b.dataset.tab; try { localStorage.setItem(KEY + "-tab", tab); } catch (_) {} render(); });
+  const q = document.getElementById("q");
+  q.oninput = () => { filter = q.value.trim().toLowerCase(); render(); };
+  if (focused) { q.focus(); q.setSelectionRange(q.value.length, q.value.length); }
+  document.getElementById("out").onclick = () => { token = null; data = null; try { localStorage.removeItem(KEY); } catch (_) {} render(); };
+}
+
+function bindGate() {
+  const f = document.getElementById("tf");
+  f.onsubmit = e => { e.preventDefault(); token = document.getElementById("ti").value.trim(); if (!token) return;
+    try { localStorage.setItem(KEY, token); } catch (_) {} data = null; statsAt = 0; refresh(); };
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

@@ -20,6 +20,8 @@ agent-fleet tell <agent> <TYPE> <ref> <text>
 agent-fleet state --json        the folded state
 agent-fleet tui                 the fleet on one screen, live: agents, worktrees, tasks, findings,
                           with tell, focus, task done/release/cancel, remove a worktree, kill orphans
+agent-fleet ui                  the board in the browser, live: a tree of repositories, worktrees,
+                          agents and tasks with every status, plus agents, findings, doorbells, hosts
 agent-fleet ui --text           the board: agents, tasks, blockers, asks, undelivered doorbells, hosts
 agent-fleet stats               doorbell latency and loss, event lag, host and hub vitals
 agent-fleet doctor              stale, hung or heavy agents, duplicate work, forgotten worktrees,

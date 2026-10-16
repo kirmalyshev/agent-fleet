@@ -673,7 +673,10 @@ fn agents(app: &App, now: DateTime<Utc>) -> View<'_> {
                 .usage
                 .as_ref()
                 .map_or((String::new(), String::new()), |u| {
-                    (format!("{}%", u.cpu_pct), mb(u.rss_kb))
+                    (
+                        u.cpu_pct.map(|c| format!("{c}%")).unwrap_or_default(),
+                        u.rss_kb.map(mb).unwrap_or_default(),
+                    )
                 });
             let n = app.findings_for(id).len();
             Row::new(vec![
@@ -703,11 +706,12 @@ fn agents(app: &App, now: DateTime<Utc>) -> View<'_> {
                 )),
             ])];
             if let Some(u) = &a.usage {
+                let cost = match (u.procs, u.rss_kb, u.cpu_pct) {
+                    (Some(p), Some(r), Some(c)) => format!("{p} processes, {}, {c}% CPU · ", mb(r)),
+                    _ => String::new(),
+                };
                 l.push(Line::raw(format!(
-                    "{} processes, {}, {}% CPU · in {} (sampled {} ago)",
-                    u.procs,
-                    mb(u.rss_kb),
-                    u.cpu_pct,
+                    "{cost}in {} (sampled {} ago)",
                     u.cwd.as_deref().map(home).unwrap_or_default(),
                     ago(now, u.ts)
                 )));

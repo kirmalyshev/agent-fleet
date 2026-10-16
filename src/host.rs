@@ -536,6 +536,17 @@ impl Host {
             };
             let tree = procs.tree(shell as u32);
             if tree.is_empty() {
+                // No process table here (macOS): where the agent works still places it in a worktree.
+                if cwd.is_some() {
+                    self.publish(self.presence(Known::AgentUsage(AgentUsage {
+                        agent,
+                        rss_kb: None,
+                        cpu_pct: None,
+                        procs: None,
+                        cwd,
+                    })))
+                    .await;
+                }
                 continue;
             }
             agent_pids.extend(&tree);
@@ -553,9 +564,9 @@ impl Host {
             sampled.insert(agent.clone());
             self.publish(self.presence(Known::AgentUsage(AgentUsage {
                 agent,
-                rss_kb,
-                cpu_pct,
-                procs: tree.len() as u32,
+                rss_kb: Some(rss_kb),
+                cpu_pct: Some(cpu_pct),
+                procs: Some(tree.len() as u32),
                 cwd,
             })))
             .await;

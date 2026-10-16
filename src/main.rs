@@ -162,10 +162,14 @@ enum Cmd {
         #[arg(long, required = true)]
         json: bool,
     },
-    /// The board: agents, tasks, blockers, asks, undelivered doorbells, hosts.
+    /// The board in the browser (live, every status), or with --text here.
     Ui {
-        #[arg(long, required = true)]
+        /// Print the board here instead of opening it in the browser.
+        #[arg(long)]
         text: bool,
+        /// Print the board's address instead of opening it (the token is not in it).
+        #[arg(long, conflicts_with = "text")]
+        url: bool,
     },
 }
 
@@ -203,6 +207,40 @@ impl tui::Fleet for Ctx {
 
     fn host(&self) -> String {
         self.host_name()
+    }
+}
+
+fn read_token(ctx: &Ctx) -> Result<String> {
+    let file = ctx
+        .cli
+        .token_file
+        .clone()
+        .unwrap_or_else(|| ctx.paths.token());
+    client::read_token(&file)
+}
+
+/// Opens the hub's board in the default browser, signed in: the token rides in the URL fragment,
+/// which the browser never sends to a server, and the page drops it from the address bar.
+fn open_board(hub: &str, token: &str) -> Result<()> {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let url = format!("{hub}/#token={token}");
+    let status = std::process::Command::new(opener)
+        .arg(&url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            println!("opened {hub}/ in the browser");
+            Ok(())
+        }
+        _ => bail!(
+            "could not run {opener}; open {hub}/ yourself and paste the token from the token file"
+        ),
     }
 }
 
@@ -489,7 +527,15 @@ async fn main() -> Result<()> {
             concurrency,
         } => print!("{}", bench::run(*events, *concurrency).await?),
         Cmd::State { .. } => println!("{}", serde_json::to_string_pretty(&ctx.state().await?)?),
-        Cmd::Ui { .. } => print!("{}", ui::board(&ctx.state().await?, now)),
+        Cmd::Ui { text: true, .. } => print!("{}", ui::board(&ctx.state().await?, now)),
+        Cmd::Ui { url, .. } => {
+            let hub = tui::Fleet::hub(&ctx);
+            if *url {
+                println!("{hub}/");
+            } else {
+                open_board(&hub, &read_token(&ctx)?)?;
+            }
+        }
         Cmd::Task { cmd } => match cmd {
             TaskCmd::Add {
                 task,
