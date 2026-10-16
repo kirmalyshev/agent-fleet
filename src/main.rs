@@ -222,13 +222,18 @@ fn read_token(ctx: &Ctx) -> Result<String> {
 /// Opens the hub's board in the default browser, signed in: the token rides in the URL fragment,
 /// which the browser never sends to a server, and the page drops it from the address bar.
 fn open_board(hub: &str, token: &str) -> Result<()> {
-    let opener = if cfg!(target_os = "macos") {
+    // `$BROWSER` (a command, maybe with arguments) wins, as for any Unix tool that opens a page.
+    let default = if cfg!(target_os = "macos") {
         "open"
     } else {
         "xdg-open"
     };
+    let browser = std::env::var("BROWSER").unwrap_or_default();
+    let mut words = browser.split_whitespace();
+    let opener = words.next().unwrap_or(default).to_string();
     let url = format!("{hub}/#token={token}");
-    let status = std::process::Command::new(opener)
+    let status = std::process::Command::new(&opener)
+        .args(words)
         .arg(&url)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
