@@ -15,7 +15,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::doctor::{Finding, findings, worktree_of};
 use crate::event::{AgentState, Known, TaskState, TaskStateChanged, TaskUnassigned};
-use crate::state::State;
+use crate::state::{State, worktree_key};
 use crate::ui::ago;
 
 /// What the screen needs from the CLI: reads with a note on where they came from, and writes.
@@ -1006,7 +1006,13 @@ fn resources(app: &App, now: DateTime<Utc>) -> View<'_> {
         .collect();
     rows.extend(s.limits.iter().map(|(key, l)| {
         let until = l.until.map_or(String::new(), |u| {
-            format!("until {}", u.with_timezone(&chrono::Local).format("%H:%M"))
+            if now >= u {
+                "expired".to_string()
+            } else {
+                let u = u.with_timezone(&chrono::Local);
+                let today = u.date_naive() == now.with_timezone(&chrono::Local).date_naive();
+                format!("→{}", u.format(if today { "%H:%M" } else { "%b%d" }))
+            }
         });
         Row::new(vec![
             Cell::from(home(key)),
@@ -1015,8 +1021,8 @@ fn resources(app: &App, now: DateTime<Utc>) -> View<'_> {
                 l.max,
                 l.resources.join(" / ")
             )),
-            Cell::from(String::new()),
             Cell::from(until).fg(DIM),
+            Cell::from(String::new()),
         ])
     }));
     let at = app.at();
@@ -1035,8 +1041,30 @@ fn resources(app: &App, now: DateTime<Utc>) -> View<'_> {
         }
         lines.extend(finding_lines(app, key));
         lines
-    } else if let Some((key, _)) = s.limits.iter().nth(at - s.resources.len()) {
-        let mut lines = vec![Line::styled(home(key), Style::new().bold())];
+    } else if let Some((key, l)) = s.limits.iter().nth(at - s.resources.len()) {
+        let mut lines = vec![
+            Line::styled(home(key), Style::new().bold()),
+            Line::raw(format!("at most {} of {}", l.max, l.resources.join(" / "))),
+            Line::raw(l.until.map_or("no expiry".to_string(), |u| {
+                if now >= u {
+                    format!("expired at {}", crate::ui::at(now, u))
+                } else {
+                    format!("until {}", crate::ui::at(now, u))
+                }
+            })),
+        ];
+        for name in &l.resources {
+            let Some(r) = s.resources.get(&worktree_key(&l.host, name)) else {
+                continue;
+            };
+            if let Some(h) = &r.holder {
+                lines.push(Line::raw(format!(
+                    "{name}: held by {} · {} waiting",
+                    crate::ui::hold(now, h),
+                    r.waiting.len()
+                )));
+            }
+        }
         lines.extend(finding_lines(app, key));
         lines
     } else {
@@ -1179,5 +1207,116 @@ mod tests {
         ] {
             assert!(screen.contains(want), "missing {want:?}");
         }
+    }
+
+    #[test]
+    fn a_rule_row_puts_expiry_in_for_and_explains_itself() {
+        use crate::event::{Actor, ActorKind, Envelope, Event, ResourceHold, ResourceLimit};
+        let now = Utc::now();
+        let until = now + chrono::Duration::hours(3);
+        let far = now + chrono::Duration::hours(30);
+        let old = now - chrono::Duration::hours(2);
+        let ev = |body| {
+            Envelope::new(
+                Actor {
+                    kind: ActorKind::Host,
+                    id: "host:h".into(),
+                },
+                "p",
+                body,
+            )
+            .into_event()
+        };
+        let hold = |pid: u32, cwd: &str, mins: i64, waiting: bool| {
+            let h = ResourceHold {
+                host: "h".into(),
+                resource: "sim".into(),
+                pid,
+                cwd: Some(cwd.into()),
+                scope: None,
+                since: now - chrono::Duration::minutes(mins),
+            };
+            if waiting {
+                Known::ResourceWaiting(h)
+            } else {
+                Known::ResourceTaken(h)
+            }
+        };
+        let rule = |name: &str, until| {
+            Known::ResourceLimit(ResourceLimit {
+                host: "h".into(),
+                name: name.into(),
+                resources: vec!["sim".into()],
+                max: 1,
+                until,
+            })
+        };
+        let events: Vec<Event> = [
+            hold(42, "/w/a", 5, false),
+            hold(43, "/w/b", 1, true),
+            rule("native", Some(until)),
+            rule("far", Some(far)),
+            rule("old", Some(old)),
+        ]
+        .into_iter()
+        .map(ev)
+        .collect();
+        let state = State::fold(&events);
+        let mut tables: [TableState; 5] = Default::default();
+        tables[Tab::Resources as usize].select(Some(1));
+        let mut app = App {
+            tab: Tab::Resources,
+            tables,
+            found: findings(&state, now),
+            state,
+            warn: None,
+            note: None,
+            mode: Mode::Normal,
+            loaded: None,
+        };
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let local = |t: DateTime<Utc>| t.with_timezone(&chrono::Local);
+        let today = |t: DateTime<Utc>| local(t).date_naive() == local(now).date_naive();
+        let want_for = |u: DateTime<Utc>| {
+            format!(
+                "→{}",
+                local(u).format(if today(u) { "%H:%M" } else { "%b%d" })
+            )
+        };
+        let rows = |term: &Terminal<TestBackend>| -> Vec<String> {
+            term.backend()
+                .buffer()
+                .content()
+                .chunks(120)
+                .map(|r| r.iter().map(|c| c.symbol()).collect())
+                .collect()
+        };
+        term.draw(|f| draw(f, &app, &Stub, now)).unwrap();
+        let screen = rows(&term);
+        let find = |name: &str| screen.iter().find(|r| r.contains(name)).unwrap();
+        assert!(
+            find("h:native").contains(&want_for(until)),
+            "FOR has the expiry"
+        );
+        let old_row = find("h:old");
+        assert!(old_row.contains("expired") && !old_row.contains('→'));
+        assert!(find("h:far").contains(&want_for(far)), "FOR has the date");
+        let detail = screen.join("\n");
+        assert!(detail.contains(&format!("until {}", crate::ui::at(now, far))));
+        app.tables[Tab::Resources as usize].select(Some(2));
+        term.draw(|f| draw(f, &app, &Stub, now)).unwrap();
+        let screen = rows(&term).join("\n");
+        for want in [
+            "at most 1 of sim".to_string(),
+            format!("until {}", crate::ui::at(now, until)),
+            "sim: held by pid 42 in a".to_string(),
+            "1 waiting".to_string(),
+        ] {
+            assert!(screen.contains(&want), "missing {want:?}");
+        }
+        app.tables[Tab::Resources as usize].select(Some(3));
+        term.draw(|f| draw(f, &app, &Stub, now)).unwrap();
+        let screen = rows(&term).join("\n");
+        assert!(screen.contains(&format!("expired at {}", crate::ui::at(now, old))));
     }
 }
