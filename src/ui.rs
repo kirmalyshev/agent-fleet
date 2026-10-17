@@ -17,6 +17,16 @@ pub fn ago(now: DateTime<Utc>, ts: DateTime<Utc>) -> String {
     }
 }
 
+/// `ts` in local time: "21:00" today, "17 Oct 21:00" any other day.
+pub fn at(now: DateTime<Utc>, ts: DateTime<Utc>) -> String {
+    let t = ts.with_timezone(&chrono::Local);
+    if t.date_naive() == now.with_timezone(&chrono::Local).date_naive() {
+        t.format("%H:%M").to_string()
+    } else {
+        t.format("%d %b %H:%M").to_string()
+    }
+}
+
 /// `pid 42 "e2e, 3 flows" in wt-a, 12m`: the cwd's last component, not the whole path.
 pub fn hold(now: DateTime<Utc>, h: &Hold) -> String {
     let mut out = format!("pid {}", h.pid);
@@ -45,7 +55,11 @@ pub fn resources(s: &State, now: DateTime<Utc>) -> String {
     }
     for (key, l) in &s.limits {
         let until = l.until.map_or(String::new(), |u| {
-            format!(" until {}", u.with_timezone(&chrono::Local).format("%H:%M"))
+            if now >= u {
+                " expired".to_string()
+            } else {
+                format!(" until {}", at(now, u))
+            }
         });
         let _ = writeln!(
             out,
@@ -388,5 +402,47 @@ mod tests {
             [s(5), s(125), s(3_725), s(200_000)],
             ["5s", "2m", "1h02m", "2d"]
         );
+    }
+
+    #[test]
+    fn a_past_rule_is_expired_and_a_far_one_shows_its_date() {
+        use crate::event::ResourceLimit;
+        let now = Utc::now();
+        let near = now + chrono::Duration::hours(2);
+        let far = now + chrono::Duration::hours(30);
+        let mut s = State::default();
+        for (name, until) in [
+            ("live", Some(near)),
+            ("far", Some(far)),
+            ("old", Some(now - chrono::Duration::hours(1))),
+        ] {
+            s.limits.insert(
+                format!("h:{name}"),
+                ResourceLimit {
+                    host: "h".into(),
+                    name: name.into(),
+                    resources: vec!["sim".into()],
+                    max: 1,
+                    until,
+                },
+            );
+        }
+        let out = resources(&s, now);
+        let local = |t: DateTime<Utc>| t.with_timezone(&chrono::Local);
+        assert_eq!(at(far, far), local(far).format("%H:%M").to_string());
+        assert_eq!(at(now, far), local(far).format("%d %b %H:%M").to_string());
+        for (name, want) in [
+            ("h:live", format!(" until {}", at(now, near))),
+            (
+                "h:far",
+                format!(" until {}", local(far).format("%d %b %H:%M")),
+            ),
+            ("h:old", " expired".to_string()),
+        ] {
+            let line = out.lines().find(|l| l.contains(name)).unwrap();
+            assert!(line.contains(&want), "{name}: {line}");
+        }
+        let old = out.lines().find(|l| l.contains("h:old")).unwrap();
+        assert!(!old.contains("until"), "{old}");
     }
 }
