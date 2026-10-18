@@ -102,6 +102,19 @@ impl Procs {
         out
     }
 
+    /// `pid` or an ancestor of it is in `pids` — e.g. a program under its own `app-server`.
+    pub fn under_any(&self, pid: u32, pids: &HashSet<u32>) -> bool {
+        let mut at = Some(pid);
+        for _ in 0..64 {
+            let Some(cur) = at else { return false };
+            if pids.contains(&cur) {
+                return true;
+            }
+            at = self.0.get(&cur).map(|p| p.ppid);
+        }
+        false
+    }
+
     /// `pid` or an ancestor of it has `name` — e.g. a process inside a herdr pane.
     pub fn under(&self, pid: u32, name: &str) -> bool {
         let mut at = Some(pid);
@@ -541,6 +554,43 @@ pub fn lock_changes<'a>(before: Option<&Lock>, now: &'a Lock) -> Vec<LockChange<
     out
 }
 
+/// `codex app-server daemon`, `claude daemon` and friends: an agent program's own
+/// infrastructure, not an agent session — `true` when `pid`'s argv carries an
+/// `app-server` or `daemon` in the subcommand slot. Only the first argument counts: a
+/// `daemon` inside a `-p` prompt (which `ps -o args=` shows unquoted) is no daemon.
+pub fn daemonish(pid: u32) -> bool {
+    is_infra(&argv_of(pid))
+}
+
+fn is_infra(argv: &[String]) -> bool {
+    argv.get(1)
+        .is_some_and(|t| t == "app-server" || t == "daemon")
+}
+
+fn argv_of(pid: u32) -> Vec<String> {
+    if cfg!(target_os = "linux") {
+        return std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|b| {
+                b.split(|&c| c == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    std::process::Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "args="])
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The working directory of a live process on this machine.
 pub fn cwd_of(pid: u32) -> Option<String> {
     if cfg!(target_os = "linux") {
@@ -861,7 +911,6 @@ mod tests {
     async fn a_worktree_with_unpushed_and_dirty_work() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("r");
-        let r = repo.to_str().unwrap();
         let sh = |cmd: &str| {
             let ok = std::process::Command::new("sh")
                 .args(["-c", cmd])
@@ -878,6 +927,9 @@ mod tests {
             && git worktree add -q ../w -b feat && echo y > ../w/b.txt \
             && printf '[submodule \"lib\"]\\n\\tpath = lib\\n\\turl = x\\n' > ../w/.gitmodules && touch ../w/lib",
         );
+        // git resolves the repo path; on macOS the temp dir is reached through a symlink.
+        let repo = repo.canonicalize().unwrap();
+        let r = repo.to_str().unwrap();
         assert_eq!(repo_of(&format!("{}/../w", r)).await.as_deref(), Some(r));
         let mut wts = worktrees("h", r).await;
         wts.sort_by(|a, b| a.path.cmp(&b.path));
@@ -898,5 +950,34 @@ mod tests {
             w.files
         );
         assert!(w.files.contains(&".gitmodules".to_string()));
+    }
+
+    #[test]
+    fn a_programs_own_daemon_is_infrastructure_not_a_session() {
+        let argv = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(is_infra(&argv(&["/x/bin/codex", "app-server", "daemon"])));
+        assert!(is_infra(&argv(&["/x/bin/claude", "daemon"])));
+        assert!(!is_infra(&argv(&["/x/bin/codex"])));
+        assert!(!is_infra(&argv(&[
+            "/x/bin/claude",
+            "--dangerously-skip-permissions"
+        ])));
+        // a "daemon" inside a -p prompt is no daemon — ps splits the quoted argument
+        assert!(!is_infra(&argv(&[
+            "/x/bin/claude",
+            "-p",
+            "restart",
+            "the",
+            "daemon"
+        ])));
+        assert!(!is_infra(&argv(&["/x/bin/claude", "-p", "daemon"])));
+    }
+
+    #[test]
+    fn a_daemons_children_are_infrastructure_too() {
+        let t = procs(&[(1, 0, "codex"), (2, 1, "codex"), (3, 2, "codex")]);
+        let infra: HashSet<u32> = [1].into_iter().collect();
+        assert!(t.under_any(3, &infra));
+        assert!(!t.under_any(3, &HashSet::new()));
     }
 }

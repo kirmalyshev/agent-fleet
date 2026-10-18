@@ -85,6 +85,9 @@ pub struct Config {
     pub locks: Vec<(String, PathBuf)>,
     /// Minutes an agent may idle/block after working before its lead is told it's stalled.
     pub stall_min: u64,
+    /// `host --stuck-act`: let the host act on a stuck cause itself — keystrokes and
+    /// handoffs. Off (the default) it only classifies, records `agent.stuck`, and tells.
+    pub stuck_act: bool,
 }
 
 #[derive(Clone)]
@@ -737,13 +740,23 @@ impl Host {
             }
         }
         // Agent programs outside every herdr pane tree: every agent runs in herdr. Managed =
-        // any ancestor is `herdr`; the host's own tree (its `devin auth status` refresh) is out.
+        // any ancestor is `herdr`; the host's own tree (its `devin auth status` refresh) is
+        // out, and so is a program's own infrastructure — an `app-server`/`daemon`
+        // subcommand process and everything under it.
         let own: HashSet<u32> = procs.tree(std::process::id()).into_iter().collect();
+        let infra: HashSet<u32> = procs
+            .0
+            .iter()
+            .filter(|(_, p)| crate::kill::AGENTS.contains(&p.name.as_str()))
+            .filter(|&(&pid, _)| crate::scan::daemonish(pid))
+            .map(|(&pid, _)| pid)
+            .collect();
         let mut seen = HashSet::new();
         for (&pid, p) in &procs.0 {
             if !crate::kill::AGENTS.contains(&p.name.as_str())
                 || own.contains(&pid)
                 || procs.under(pid, "herdr")
+                || procs.under_any(pid, &infra)
             {
                 continue;
             }
@@ -1006,7 +1019,7 @@ impl Host {
     }
 }
 
-fn short(id: &str) -> &str {
+pub(crate) fn short(id: &str) -> &str {
     id.rsplit('/').next().unwrap_or(id)
 }
 
@@ -1145,6 +1158,7 @@ mod tests {
             checkouts: Default::default(),
             locks: Vec::new(),
             stall_min: 15,
+            stuck_act: false,
         };
         let client = Client::new("http://127.0.0.1:1", "t".into(), dir.join("spool.jsonl"));
         let host = Arc::new(Host::new(
@@ -1309,6 +1323,7 @@ mod tests {
             checkouts: Default::default(),
             locks: Vec::new(),
             stall_min: 15,
+            stuck_act: false,
         };
         let replica = Store::open(&cfg.replica).unwrap();
         replica

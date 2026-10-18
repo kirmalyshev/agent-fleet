@@ -98,6 +98,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | spawn | `spawn.requested` | name, agent, host, session, repo, issue?, branch, profile, brief, level?, lead?, worktree?, replaces?, why | | agent, host |
 | | `spawn.result` | agent, ok, pane?, worktree?, error? | re = the request | host |
 | | `agent.unmanaged` | host, pid, program?, cwd?, since? — no `program` clears the report | | host |
+| | `agent.stuck` | agent, cause?, detail, until? — no `cause` clears the record | | host |
 
 Task states follow the A2A task lifecycle names, so tools that know A2A read them as-is.
 
@@ -300,6 +301,70 @@ to the root coordinator. An episode is the stretch since the agent's current sta
 deduped against `msg.sent` already in the log — a restart does not re-report — and each
 finding's detail says who was told, or that nobody was.
 
+## Stuck causes
+
+Every 5 seconds the host reads the visible screen of each of its `idle` or `blocked` agents —
+and of a `working` one `doctor` calls `hung` — through herdr's `agent.read`, and names ONE
+cause with a pure classifier from its own screen text — `agent.quota` supplies the spent
+window's reset for `until` and gates the handoff target, but the account being out is not
+itself a cause; the program must say so on screen. A screen signal matches only on the
+program's own UI lines: a `⏺`, `⎿`, `│` or `•` line is
+the agent's prose or tool output, and a banner quoted there means nothing. The result lands
+in `agent.stuck` (`cause`, `detail`, `until`), written when the cause
+appears or changes, and once with no `cause` when the agent works again. State `stuck` is
+keyed by agent; `ps`, the TUI and the board show the cause next to the state, `doctor` puts
+it in the `hung`/`stalled` detail, and the push names it too — for `permission`, `waiting`
+and `unknown` it also carries the screen's last lines.
+
+| Cause | Signal |
+|---|---|
+| `quota` | the program's own quota line on screen: Devin "Quota exhausted", Claude "usage limit" / "limit reached … resets", Codex "usage limit". `until` is the spent window's `resets_at` (from `agent.quota`) when known. |
+| `rate_limit` | a short retry window on a line about a limit: "rate limit", "reset in N minutes", "retry after". `until` is the parsed wait (5 min when unparseable). |
+| `unsent` | a prompt sits in the input box: "Press Enter to send queued", or a pasted brief never sent. |
+| `context_full` | the program's own footer says its context is nearly gone: Devin `Context: N / M tokens (P%)` at P ≥ 90, Claude `Context left until auto-compact: P%` at P ≤ 10, Codex `P% context left` at P ≤ 10. |
+| `error` | "Something went wrong", "Send a message to continue", an API error line. |
+| `permission` | herdr reports `blocked`: a permission or trust prompt waits. |
+| `resource` | its worktree holds or queues for a resource: "waiting for sim behind the e2e run, ~21m". A legitimate wait, never `hung` or `stalled`. |
+| `held` | its open task is deliberately held: an open `blocker.raised` (with `what`/`owner`/`unblocks_when`) or an unfinished `task.dep`. |
+| `waiting` | idle after it worked, nothing else on screen (finished, or asked something). |
+| `unknown` | none of the above. |
+
+Each cause earns at most one action per episode, logged as events (`msg.sent`,
+`spawn.requested`), and never on an agent that is `working` unless `hung`, nor on one whose
+task is finished. Actions that touch an agent — keystrokes and handoffs — only run under
+`host --stuck-act`; without it the host still classifies and records `agent.stuck`, and
+every would-be action becomes one tell to the lead naming what it would have done. And
+nothing acts or tells before the state has lasted `--stall-min`: a prompt a human is still
+typing is not `unsent` yet:
+
+- `quota` with `until` more than 30 min away or unknown: hand the work to the profile's
+  `on_quota` (a fleet.toml key), but only when that profile's kind still has quota on this
+  host; otherwise tell the lead it is out of quota and no fallback has quota. `until` within
+  30 min: tell the lead it waits, then send `continue` once after `until`. A target whose
+  kind is the agent's own is never a quota handoff — a `haiku` profile's kind is `claude`,
+  it shares the Claude account's limits, so a Claude agent out of quota is never handed to
+  it on the same host.
+- `rate_limit`: wait; `continue` once after `until`.
+- `unsent`: one Enter, but only while the "Press Enter to send queued" hint is on screen;
+  with no hint, one Escape and the queued text re-sent; still there, tell the lead. A
+  prompt queued behind a running turn never gets the Escape, and nothing is re-sent while
+  a doorbell to the agent is still undelivered.
+- `context_full`: hand off to the profile's `fallback` with a HANDOFF note to read git
+  status, git log and any STATE.md first.
+- `error`: `continue` once; if the error cause returns, tell the lead with the screen's
+  last lines.
+- `resource`: no action — the wait is legitimate — until it beats 2× the holder's stated
+  ETA (a "~21m" in its scope) or 60 min; then one tell to the lead.
+- `held`: nothing at all — no push, no escalation; `doctor` shows `held`, not `stalled`.
+- `permission`, `waiting`, `unknown`: the `HUNG`/`STALLED` push tells the lead, with the
+  cause and the screen's last lines.
+
+When a stalled agent's tell got no reaction — the lead stayed idle/done for `--stall-min`
+after the `HUNG`/`STALLED` push, an escalation, or the agent's own message was delivered —
+the host sends ONE `ESCALATED` `msg.sent` to the lead's own lead, and so on up the
+`agent.role` chain to an up root-coordinator, never past it. Each hop waits its own
+`--stall-min` and dedupes like every tell: once per episode, by the log.
+
 ## Killing processes
 
 `agent-fleet kill <pid>…` is how an agent stops a process. It reads the process table (`ps`) and
@@ -336,7 +401,10 @@ agent start`; the read-only and admin forms (`--version`, `--help`, `auth status
 exit (`claude -p`, `codex exec`) when the caller is itself in herdr (`HERDR_ENV=1`): they run in
 the caller's pane tree, so the host counts them as managed. And the host's process scan reports every
 agent-program process it finds outside all of herdr's pane trees as `agent.unmanaged` (a process
-is managed when any ancestor is `herdr`, and the host's own process tree is excluded; the
+is managed when any ancestor is `herdr`, the host's own process tree is excluded, and so is
+a program's own infrastructure — an `app-server` or `daemon` in the subcommand slot (the
+first argument; a `daemon` inside a `-p` prompt is no daemon), as in `codex app-server
+daemon` or `claude daemon`, and everything under such a process; the
 process's directory is known on Linux only), re-sent without `program` once the process is gone;
 `agent-fleet doctor` shows them as `unmanaged` findings.
 

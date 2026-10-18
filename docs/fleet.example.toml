@@ -12,6 +12,7 @@ args = []                        # extra args for herdr agent.start
 prefix = "dv-"                   # default agent name = prefix + issue number
 cap = 2                          # live agents of this profile for this repo; absent = no cap
 fallback = "sonnet"              # used when this one is at cap, out of quota, or for a handoff
+on_quota = "haiku"               # used when its kind is out of quota >30m out; haiku must still have quota on this host
 handoff_min = 5                  # see Handoff
 [profiles.sonnet]
 kind = "claude"
@@ -23,6 +24,11 @@ kind = "claude"
 args = ["--model", "opus", "--dangerously-skip-permissions"]
 unset_env = ["CLAUDE_CONFIG_DIR"]
 prefix = "o-"
+[profiles.haiku]
+kind = "claude"                  # the claude account's limits apply; a claude agent is never handed to it on the same host
+args = ["--model", "haiku", "--dangerously-skip-permissions"]
+unset_env = ["CLAUDE_CONFIG_DIR"]
+prefix = "h-"
 
 [[rules]]                        # first match wins; a rule with no `match` is the default
 match = ["ios", "simulator", "label:mobile"]

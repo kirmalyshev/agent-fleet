@@ -155,6 +155,42 @@
           ],
           "type": "object"
         },
+        "AgentStuck": {
+          "additionalProperties": false,
+          "description": "Why an agent on the writer's host is stopped, read off its screen. Sent when the cause\nappears or changes; `cause` absent clears the record once the agent works again.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "cause": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/StuckCause"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "detail": {
+              "description": "What the screen showed, or what was done about it.",
+              "type": "string"
+            },
+            "until": {
+              "description": "When the condition lifts: a quota window's reset, a rate-limit's retry.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "agent",
+            "detail"
+          ],
+          "type": "object"
+        },
         "AgentUnmanaged": {
           "additionalProperties": false,
           "description": "An agent program running outside every herdr pane tree on `host`, reported by the host's\nprocess scan. `procs: 0`-style clearing: the next scan without it sends the same event minus\n`program`.",
@@ -857,6 +893,61 @@
           ],
           "type": "object"
         },
+        "StuckCause": {
+          "description": "Why an agent is stuck, as its host reads it off the screen.",
+          "oneOf": [
+            {
+              "const": "quota",
+              "description": "The program's account is out of quota.",
+              "type": "string"
+            },
+            {
+              "const": "rate_limit",
+              "description": "A short rate-limit wait: `until` is when to retry.",
+              "type": "string"
+            },
+            {
+              "const": "unsent",
+              "description": "A prompt sits in the input box, never sent.",
+              "type": "string"
+            },
+            {
+              "const": "context_full",
+              "description": "The program's context is nearly full.",
+              "type": "string"
+            },
+            {
+              "const": "error",
+              "description": "An error on screen waits on a nudge or a human.",
+              "type": "string"
+            },
+            {
+              "const": "permission",
+              "description": "A permission or trust prompt (herdr reports `blocked`).",
+              "type": "string"
+            },
+            {
+              "const": "resource",
+              "description": "Its worktree holds or waits on a resource; a legitimate wait, not a hang.",
+              "type": "string"
+            },
+            {
+              "const": "held",
+              "description": "Its task is deliberately held: an open blocker or an unfinished dep.",
+              "type": "string"
+            },
+            {
+              "const": "waiting",
+              "description": "Idle after working, nothing blocking on screen.",
+              "type": "string"
+            },
+            {
+              "const": "unknown",
+              "description": "None of the above matched.",
+              "type": "string"
+            }
+          ]
+        },
         "TaskAssigned": {
           "additionalProperties": false,
           "properties": {
@@ -1542,6 +1633,22 @@
             },
             "type": {
               "const": "agent.unmanaged",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/AgentStuck"
+            },
+            "type": {
+              "const": "agent.stuck",
               "type": "string"
             }
           },
@@ -2238,6 +2345,91 @@
           ],
           "type": "object"
         },
+        "Stuck": {
+          "description": "An agent's current stuck record: the latest `agent.stuck` with a cause.",
+          "properties": {
+            "cause": {
+              "$ref": "#/$defs/StuckCause"
+            },
+            "detail": {
+              "description": "What the screen showed, or what was done about it.",
+              "type": "string"
+            },
+            "since": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "until": {
+              "description": "When the condition lifts, if the cause names one.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "cause",
+            "detail",
+            "since"
+          ],
+          "type": "object"
+        },
+        "StuckCause": {
+          "description": "Why an agent is stuck, as its host reads it off the screen.",
+          "oneOf": [
+            {
+              "const": "quota",
+              "description": "The program's account is out of quota.",
+              "type": "string"
+            },
+            {
+              "const": "rate_limit",
+              "description": "A short rate-limit wait: `until` is when to retry.",
+              "type": "string"
+            },
+            {
+              "const": "unsent",
+              "description": "A prompt sits in the input box, never sent.",
+              "type": "string"
+            },
+            {
+              "const": "context_full",
+              "description": "The program's context is nearly full.",
+              "type": "string"
+            },
+            {
+              "const": "error",
+              "description": "An error on screen waits on a nudge or a human.",
+              "type": "string"
+            },
+            {
+              "const": "permission",
+              "description": "A permission or trust prompt (herdr reports `blocked`).",
+              "type": "string"
+            },
+            {
+              "const": "resource",
+              "description": "Its worktree holds or waits on a resource; a legitimate wait, not a hang.",
+              "type": "string"
+            },
+            {
+              "const": "held",
+              "description": "Its task is deliberately held: an open blocker or an unfinished dep.",
+              "type": "string"
+            },
+            {
+              "const": "waiting",
+              "description": "Idle after working, nothing blocking on screen.",
+              "type": "string"
+            },
+            {
+              "const": "unknown",
+              "description": "None of the above matched.",
+              "type": "string"
+            }
+          ]
+        },
         "Task": {
           "properties": {
             "blocked_by": {
@@ -2611,6 +2803,14 @@
           },
           "default": {},
           "description": "Spawn requests by their `spawn.requested` id; answered ones are kept for 24 h.",
+          "type": "object"
+        },
+        "stuck": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Stuck"
+          },
+          "default": {},
+          "description": "Why a stopped agent is stopped, as its host read it off the screen, keyed by agent id.",
           "type": "object"
         },
         "tasks": {

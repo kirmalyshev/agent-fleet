@@ -272,9 +272,10 @@ function treeTab(s) {
     return `<div class="row leaf task">${st(t.state)}<span class="mono">${esc(id.replace(/^task:/, ""))}</span><span class="title">${title}</span>
       <span class="right">${bs.map(b => badge("b-bad", "blocked", b.what + (b.unblocks_when ? " · until " + b.unblocks_when : ""))).join("")}<span class="meta num">${ago(t.since)}</span></span></div>`;
   };
+  const stuckBadge = id => { const st2 = s.stuck?.[id]; return st2 ? " " + badge("b-warn", st2.cause, st2.detail) : ""; };
   const agentLeaf = id => {
     const a = s.agents[id], ts = ix.tasksOf[id] || [];
-    return `<div class="row leaf"><span></span>${st(a.state)}<span class="who">${esc(short(id))}</span>
+    return `<div class="row leaf"><span></span>${st(a.state)}${stuckBadge(id)}<span class="who">${esc(short(id))}</span>
       <span class="meta">${esc(a.host)} · for ${ago(a.since)}${a.usage?.cpu_pct != null ? " · " + usage(a.usage) : ""}</span>
       <span class="right">${findingBadges(ix, id)}</span></div>${ts.map(taskLeaf).join("")}`;
   };
@@ -356,7 +357,7 @@ function agentsTab(s) {
   const branch = id => { const w = s.worktrees[data.worktree_of[id]]; return w ? (w.state.branch || "detached HEAD") : ""; };
   return table([["Agent"], ["State", "fit"], ["For", "r"], ["CPU", "r"], ["Memory", "r"], ["Task"], ["Role"], ["Lead"], ["Branch", "hide-sm"], ["Host", "hide-sm"], ["Findings"]], rows.map(([id, a]) => {
     const u = a.usage, r = s.roles?.[id];
-    return `<tr><td class="mono">${esc(short(id))}</td><td>${st(a.state)}</td><td class="r num">${ago(a.since)}</td>
+    return `<tr><td class="mono">${esc(short(id))}</td><td>${st(a.state)}${stuckBadge(id)}</td><td class="r num">${ago(a.since)}</td>
       <td class="r num">${u?.cpu_pct != null ? u.cpu_pct + "%" : `<span class="zero">–</span>`}</td><td class="r num">${u?.rss_kb != null ? mb(u.rss_kb) : `<span class="zero">–</span>`}</td>
       <td class="mono">${esc(short(owned[id] || ""))}</td><td class="mono">${r ? esc(r.level + (r.domain ? " · " + r.domain : "")) : ""}</td><td class="mono">${r?.lead ? esc(short(r.lead)) : ""}</td><td class="mono hide-sm">${esc(branch(id))}</td><td class="dim hide-sm">${esc(a.host)}</td><td>${findingBadges(ix, id)}</td></tr>`;
   }), ["No agents up", "Agents appear here as soon as a host agent sees them in herdr."]);

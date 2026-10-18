@@ -122,8 +122,8 @@ pub fn kind_profile(s: &State, id: &str, kind: Option<&str>) -> String {
 
 pub fn ps(s: &State, now: DateTime<Utc>) -> String {
     let mut out = format!(
-        "{:<44} {:<8} {:>7}  {:<14} {:<9} {:<12} TASK\n",
-        "AGENT", "STATE", "FOR", "KIND", "ROLE", "LEAD"
+        "{:<44} {:<8} {:<13} {:>7}  {:<14} {:<9} {:<12} TASK\n",
+        "AGENT", "STATE", "STUCK", "FOR", "KIND", "ROLE", "LEAD"
     );
     for (id, a) in &s.agents {
         let task = s
@@ -136,8 +136,9 @@ pub fn ps(s: &State, now: DateTime<Utc>) -> String {
         let role = s.roles.get(id);
         let _ = writeln!(
             out,
-            "{id:<44} {:<8} {:>7}  {:<14} {:<9} {:<12} {}",
+            "{id:<44} {:<8} {:<13} {:>7}  {:<14} {:<9} {:<12} {}",
             state_name(a.state),
+            s.stuck.get(id).map(|st| st.cause.name()).unwrap_or(""),
             ago(now, a.since),
             kind_profile(s, id, a.kind.as_deref()),
             role.map(|r| r.level.short()).unwrap_or(""),

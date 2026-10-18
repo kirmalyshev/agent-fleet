@@ -44,6 +44,49 @@ pub enum AgentState {
     Unknown,
 }
 
+/// Why an agent is stuck, as its host reads it off the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StuckCause {
+    /// The program's account is out of quota.
+    Quota,
+    /// A short rate-limit wait: `until` is when to retry.
+    RateLimit,
+    /// A prompt sits in the input box, never sent.
+    Unsent,
+    /// The program's context is nearly full.
+    ContextFull,
+    /// An error on screen waits on a nudge or a human.
+    Error,
+    /// A permission or trust prompt (herdr reports `blocked`).
+    Permission,
+    /// Its worktree holds or waits on a resource; a legitimate wait, not a hang.
+    Resource,
+    /// Its task is deliberately held: an open blocker or an unfinished dep.
+    Held,
+    /// Idle after working, nothing blocking on screen.
+    Waiting,
+    /// None of the above matched.
+    Unknown,
+}
+
+impl StuckCause {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Quota => "quota",
+            Self::RateLimit => "rate_limit",
+            Self::Unsent => "unsent",
+            Self::ContextFull => "context_full",
+            Self::Error => "error",
+            Self::Permission => "permission",
+            Self::Resource => "resource",
+            Self::Held => "held",
+            Self::Waiting => "waiting",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Task lifecycle, aligned with the A2A task states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
@@ -211,6 +254,8 @@ pub enum Known {
     SpawnResult(SpawnResult),
     #[serde(rename = "agent.unmanaged")]
     AgentUnmanaged(AgentUnmanaged),
+    #[serde(rename = "agent.stuck")]
+    AgentStuck(AgentStuck),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -559,6 +604,21 @@ pub struct AgentUnmanaged {
     pub since: Option<DateTime<Utc>>,
 }
 
+/// Why an agent on the writer's host is stopped, read off its screen. Sent when the cause
+/// appears or changes; `cause` absent clears the record once the agent works again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentStuck {
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<StuckCause>,
+    /// What the screen showed, or what was done about it.
+    pub detail: String,
+    /// When the condition lifts: a quota window's reset, a rate-limit's retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<DateTime<Utc>>,
+}
+
 /// `agent-fleet spawn` (or `handoff`) asks the host agent on `host` to create a worktree (or a
 /// workspace in an existing one), start the agent and give it the brief. The requester and the
 /// host may be on different machines.
@@ -663,6 +723,7 @@ impl Known {
             Self::SpawnRequested(_) => "spawn.requested",
             Self::SpawnResult(_) => "spawn.result",
             Self::AgentUnmanaged(_) => "agent.unmanaged",
+            Self::AgentStuck(_) => "agent.stuck",
         }
     }
 
@@ -682,7 +743,8 @@ impl Known {
             | Self::ResourceWaiting(_)
             | Self::ResourceReleased(_)
             | Self::AgentQuota(_)
-            | Self::AgentUnmanaged(_) => &[Host],
+            | Self::AgentUnmanaged(_)
+            | Self::AgentStuck(_) => &[Host],
             Self::MsgDelivered(_) | Self::SpawnResult(_) => &[Host],
             Self::AskRaised(_) | Self::Handoff(_) => &[Agent],
             _ => &[Agent, Host],
@@ -838,6 +900,7 @@ pub fn parse_strict(raw: &Value) -> Result<Envelope<Known>, Reject> {
             .chain([&s.agent])
             .collect(),
         Known::SpawnResult(r) => vec![&r.agent],
+        Known::AgentStuck(s) => vec![&s.agent],
         _ => vec![],
     };
     if let Some(to) = recipients.into_iter().find(|to| !is_agent_id(to)) {

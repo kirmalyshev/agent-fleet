@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::event::{
     AgentState, Body, Event, Known, Level, QuotaWindow, ResourceHold, ResourceLimit,
-    SpawnRequested, SpawnResult, TYPE_VERSION, TaskState, WorktreeProcs, WorktreeState,
+    SpawnRequested, SpawnResult, StuckCause, TYPE_VERSION, TaskState, WorktreeProcs, WorktreeState,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -49,6 +49,9 @@ pub struct State {
     /// Agent programs outside herdr on each host, keyed `<host>:<pid>`.
     #[serde(default)]
     pub unmanaged: BTreeMap<String, Unmanaged>,
+    /// Why a stopped agent is stopped, as its host read it off the screen, keyed by agent id.
+    #[serde(default)]
+    pub stuck: BTreeMap<String, Stuck>,
     /// Events this binary cannot fold (an unknown type, or a known type at a newer `v`): kept in
     /// the log, skipped here.
     pub unknown: u64,
@@ -212,6 +215,18 @@ pub struct Ask {
     pub options: Vec<String>,
     pub recommendation: Option<String>,
     pub context: Option<String>,
+    pub since: DateTime<Utc>,
+}
+
+/// An agent's current stuck record: the latest `agent.stuck` with a cause.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Stuck {
+    pub cause: StuckCause,
+    /// What the screen showed, or what was done about it.
+    pub detail: String,
+    /// When the condition lifts, if the cause names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<DateTime<Utc>>,
     pub since: DateTime<Utc>,
 }
 
@@ -450,7 +465,24 @@ impl State {
             }
             Known::AgentDown(d) => {
                 self.agents.remove(&d.agent);
+                self.stuck.remove(&d.agent);
             }
+            Known::AgentStuck(d) => match &d.cause {
+                Some(cause) => {
+                    self.stuck.insert(
+                        d.agent.clone(),
+                        Stuck {
+                            cause: *cause,
+                            detail: d.detail.clone(),
+                            until: d.until,
+                            since: ts,
+                        },
+                    );
+                }
+                None => {
+                    self.stuck.remove(&d.agent);
+                }
+            },
             Known::AgentQuota(d) => {
                 self.quotas.insert(
                     worktree_key(&d.host, &d.kind),
