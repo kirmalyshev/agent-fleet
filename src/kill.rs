@@ -424,6 +424,15 @@ fn agent_admin(args: &[String]) -> bool {
     }
 }
 
+/// A one-shot run that answers and exits: `claude -p|--print …`, `codex exec …`.
+fn agent_oneshot(w: &[String]) -> bool {
+    match base(&w[0]) {
+        "claude" => w[1..].iter().any(|a| a == "-p" || a == "--print"),
+        "codex" => first_arg(&w[1..]).is_some_and(|a| a == "exec"),
+        _ => false,
+    }
+}
+
 /// `npx`/`bunx`/`pnpm|bun|yarn dlx` running an agent package still starts it outside herdr.
 fn agent_pkg(w: &[String]) -> bool {
     let known = |pkg: Option<&String>| {
@@ -451,11 +460,13 @@ fn first_arg(w: &[String]) -> Option<&String> {
 
 /// A command that starts an agent program outside herdr — `claude`, `devin` or `codex` run for a
 /// session, or an agent package via npx/bunx/dlx, wherever it hides. `herdr agent start` and the
-/// admin forms pass.
-pub fn agent_start(line: &str) -> Option<String> {
+/// admin forms pass, and so do one-shot runs from a caller that is itself in herdr.
+pub fn agent_start(line: &str, in_herdr: bool) -> Option<String> {
     scan_cmds(line, 0, &|w: &[String]| {
-        ((AGENTS.contains(&base(&w[0])) && !agent_admin(&w[1..])) || agent_pkg(w))
-            .then(|| w.join(" "))
+        let program = AGENTS.contains(&base(&w[0]))
+            && !agent_admin(&w[1..])
+            && !(in_herdr && agent_oneshot(w));
+        (program || agent_pkg(w)).then(|| w.join(" "))
     })
 }
 
@@ -467,7 +478,8 @@ processes and orphans `agent-fleet doctor` proved, TERM then KILL. `kill -0` pas
 pub const UNMANAGED_REFUSAL: &str = "agent-fleet: every agent runs in herdr. Spawn one with \
 `agent-fleet spawn <owner/repo>#<issue>`, or start it in a pane with \
 `herdr agent start <name> --kind <program> --pane <pane>`. The read-only and admin forms \
-(--version, --help, auth status, doctor, models, mcp list|get, update --check) pass.";
+(--version, --help, auth status, doctor, models, mcp list|get, update --check) pass, and so \
+do one-shot `claude -p` and `codex exec` from an agent that is itself in herdr.";
 
 /// The PreToolUse hook for Claude Code and Devin CLI (same format): the tool call on stdin,
 /// refused with exit 2 when it is a shell command running a raw kill or starting an agent
@@ -482,7 +494,7 @@ pub fn hook(stdin: &str) -> Option<String> {
     if let Some(hit) = raw_kill(line) {
         return Some(format!("{HOOK_REFUSAL}\nBlocked: {hit}"));
     }
-    let hit = agent_start(line)?;
+    let hit = agent_start(line, std::env::var("HERDR_ENV").is_ok_and(|v| v == "1"))?;
     Some(format!("{UNMANAGED_REFUSAL}\nBlocked: {hit}"))
 }
 
@@ -684,7 +696,7 @@ mod tests {
             "yarn dlx @openai/codex",
             "timeout -k 2 30s claude",
         ] {
-            assert!(agent_start(line).is_some(), "{line}");
+            assert!(agent_start(line, false).is_some(), "{line}");
         }
         for line in [
             "claude --version",
@@ -714,7 +726,23 @@ mod tests {
             "cat > /tmp/f <<'EOF'\nclaude -p x\nEOF\necho done",
             "echo a << b",
         ] {
-            assert_eq!(agent_start(line), None, "{line}");
+            assert_eq!(agent_start(line, false), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_one_shot_passes_only_from_inside_herdr() {
+        for line in [
+            "claude -p 'review this'",
+            "claude --model opus --print x",
+            "codex exec 'audit'",
+            "timeout 300 codex exec x",
+        ] {
+            assert_eq!(agent_start(line, true), None, "{line}");
+            assert!(agent_start(line, false).is_some(), "{line}");
+        }
+        for line in ["devin -p x", "claude", "codex", "claude --resume"] {
+            assert!(agent_start(line, true).is_some(), "{line}");
         }
     }
 
