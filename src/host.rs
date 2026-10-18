@@ -639,7 +639,7 @@ impl Host {
                 repos.insert(repo);
             }
             if tree.is_empty() {
-                // No process table here (macOS): where the agent works still places it in a worktree.
+                // No process tree: where the agent works still places it in a worktree.
                 if cwd.is_some() {
                     self.publish(self.presence(Known::AgentUsage(AgentUsage {
                         agent,

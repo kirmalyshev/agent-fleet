@@ -73,11 +73,11 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `agent.state` | agent, state (`idle` `working` `blocked` `done` `unknown`) | | host |
 | | `agent.down` | agent, reason? | | host |
 | | `host.health` | host, disk_free, disk_total, agents, stats? (every minute) | | host |
-| | `agent.usage` | agent, rss_kb?, cpu_pct?, procs?, cwd? (each scan; the numbers on Linux only) | | host |
+| | `agent.usage` | agent, rss_kb?, cpu_pct?, procs?, cwd? (each scan) | | host |
 | | `agent.role` | agent, level? (`root-coordinator` `domain-lead` `implementation-lead` `implementer`; absent `level` removes the role), lead?, domain? | | agent, host |
 | machine | `worktree.state` | host, path, repo, branch?, head, unpushed, dirty, files[] (only what still differs from the default branch), last_commit, in_main? (on change) | | host |
 | | `worktree.gone` | host, path | | host |
-| | `worktree.procs` | host, path, procs, rss_kb, cpu_pct, names[], pids[], orphaned (each scan; `procs: 0` once when they end) | | host |
+| | `worktree.procs` | host, path, procs, rss_kb, cpu_pct, names[], pids[], orphaned (each scan; `procs: 0` once when they end; Linux only — `ps` reports no working directory on macOS) | | host |
 | | `agent.quota` | host, kind, windows[] ({name, used_pct, resets_at?}), plan?, exhausted, read_at (each minute, when anything but `read_at` changes) | | host |
 | resource | `resource.taken` | host, resource, pid, cwd?, scope?, since | | host |
 | | `resource.waiting` | host, resource, pid, cwd?, scope?, since | | host |
@@ -252,7 +252,8 @@ the agents.
 Every 5 minutes the host agent scans its machine. It writes facts, never verdicts:
 
 - **Agents' cost.** For each agent, the pane's whole process tree: memory, CPU since the last
-  scan, process count and working directory (`agent.usage`). Linux only, from `/proc`.
+  scan, process count and working directory (`agent.usage`), from `/proc` on Linux and one `ps`
+  call on macOS.
 - **Worktrees.** Every git worktree of every repository an agent works in, plus `--repo`
   extras: branch, HEAD, commits no remote has, dirty files, files changed against the default
   branch, last commit (`worktree.state`, sent when it changes; `worktree.gone` when removed).
@@ -325,9 +326,9 @@ agent start`; the read-only and admin forms (`--version`, `--help`, `auth status
 `models`, `mcp list`/`mcp get`, `update --check`) pass, and so do one-shot runs that answer and
 exit (`claude -p`, `codex exec`) when the caller is itself in herdr (`HERDR_ENV=1`): they run in
 the caller's pane tree, so the host counts them as managed. And the host's process scan reports every
-agent-program process it finds outside all of herdr's pane trees as `agent.unmanaged` (Linux
-only — the check walks /proc ancestors; a process is managed when any ancestor is `herdr`, and
-the host's own process tree is excluded), re-sent without `program` once the process is gone;
+agent-program process it finds outside all of herdr's pane trees as `agent.unmanaged` (a process
+is managed when any ancestor is `herdr`, and the host's own process tree is excluded; the
+process's directory is known on Linux only), re-sent without `program` once the process is gone;
 `agent-fleet doctor` shows them as `unmanaged` findings.
 
 ## Spawning
