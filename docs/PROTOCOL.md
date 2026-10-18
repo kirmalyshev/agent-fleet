@@ -98,6 +98,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | spawn | `spawn.requested` | name, agent, host, session, repo, issue?, branch, profile, brief, level?, lead?, worktree?, replaces?, why | | agent, host |
 | | `spawn.result` | agent, ok, pane?, worktree?, error? | re = the request | host |
 | | `agent.unmanaged` | host, pid, program?, cwd?, since? — no `program` clears the report | | host |
+| | `agent.stuck` | agent, cause?, detail, until? — no `cause` clears the record | | host |
 
 Task states follow the A2A task lifecycle names, so tools that know A2A read them as-is.
 
