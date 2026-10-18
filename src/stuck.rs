@@ -56,6 +56,13 @@ fn last_n(s: &str, n: usize) -> String {
         .join(" | ")
 }
 
+/// The "Press Enter to send queued" hint, on a UI chrome line — never in the agent's prose.
+fn send_hint(screen: &str) -> bool {
+    screen
+        .lines()
+        .any(|l| chrome(l) && l.to_lowercase().contains("press enter to send queued"))
+}
+
 /// The message waiting in a Devin input box, read off the screen: the box is the
 /// rule-bounded block directly above the model footer (`… Context: …`), the message the
 /// lines from `❭` on. `None` when no box can be located; `Some("")` for an empty box.
@@ -461,47 +468,78 @@ pub fn step(c: &Ctx, cause: &Cause, ep: &mut Episode) -> Option<Act> {
             }
             None
         }
-        StuckCause::Unsent => match ep.step {
-            0 => {
-                ep.step = 1;
-                ep.at = Some(now);
-                Some(Act::Enter)
-            }
-            1 if ep.at.is_some_and(|t| now - t >= UNSENT_RETRY) => {
-                ep.step = 2;
-                let queued = queued_text(screen).unwrap_or_default();
-                if a.state != AgentState::Working && !queued.is_empty() {
-                    return Some(Act::Resend(queued));
+        StuckCause::Unsent => {
+            // Like eait-watch: Enter only while the "Press Enter to send queued" hint is
+            // on screen; Escape + re-send only once it is gone, for a queued text we can
+            // name — never behind a running turn, and never while a doorbell to this
+            // agent is still undelivered.
+            let resend = || -> Option<Act> {
+                if a.state == AgentState::Working || s.msgs.values().any(|m| m.to == id) {
+                    return None;
                 }
+                let t = queued_text(screen).unwrap_or_default();
+                (!t.is_empty()).then(|| Act::Resend(t))
+            };
+            let held = |s: &State, why: &str| {
                 tell(
                     s,
                     id,
                     cause.kind,
                     format!(
-                        "{} still holds a prompt in its input box; nothing re-sent{}",
-                        crate::host::short(id),
-                        if a.state == AgentState::Working {
-                            " (it is behind a running turn)"
-                        } else {
-                            ""
-                        }
-                    ),
-                )
-            }
-            2 => {
-                ep.step = 3;
-                tell(
-                    s,
-                    id,
-                    cause.kind,
-                    format!(
-                        "{} still holds a prompt in its input box after Enter and a re-send",
+                        "{} holds a prompt in its input box; nothing re-sent{why}",
                         crate::host::short(id)
                     ),
                 )
+            };
+            let why = if a.state == AgentState::Working {
+                " (it is behind a running turn)"
+            } else if s.msgs.values().any(|m| m.to == id) {
+                " (a doorbell to it is still pending)"
+            } else {
+                ""
+            };
+            match ep.step {
+                0 => {
+                    ep.at = Some(now);
+                    if send_hint(screen) {
+                        ep.step = 1;
+                        Some(Act::Enter)
+                    } else {
+                        ep.step = 2;
+                        resend().or_else(|| held(s, why))
+                    }
+                }
+                1 if ep.at.is_some_and(|t| now - t >= UNSENT_RETRY) => {
+                    ep.step = 2;
+                    if send_hint(screen) {
+                        tell(
+                            s,
+                            id,
+                            cause.kind,
+                            format!(
+                                "{} still shows the send-queued hint after Enter",
+                                crate::host::short(id)
+                            ),
+                        )
+                    } else {
+                        resend().or_else(|| held(s, why))
+                    }
+                }
+                2 => {
+                    ep.step = 3;
+                    tell(
+                        s,
+                        id,
+                        cause.kind,
+                        format!(
+                            "{} still holds a prompt in its input box after Enter and a re-send",
+                            crate::host::short(id)
+                        ),
+                    )
+                }
+                _ => None,
             }
-            _ => None,
-        },
+        }
         StuckCause::ContextFull => {
             if ep.fired {
                 return None;
@@ -1218,22 +1256,49 @@ mod tests {
             Some(Act::Enter)
         ));
         assert!(step(&ctx(box_, now, None, false), &un, ep8).is_none());
-        match step(
-            &ctx(box_, now + Duration::seconds(61), None, false),
-            &un,
-            ep8,
-        ) {
-            Some(Act::Resend(t)) => assert_eq!(t, "do it"),
-            x => panic!("{x:?} is no resend"),
-        }
+        // the hint is still up 60 s on: no re-send while "press enter to send queued"
+        // shows — the lead is told instead
         assert!(matches!(
             step(
-                &ctx(box_, now + Duration::seconds(62), None, false),
+                &ctx(box_, now + Duration::seconds(61), None, false),
                 &un,
                 ep8
             ),
             Some(Act::Tell { .. })
         ));
+        // a pasted brief with no hint is Escape+re-sent right away …
+        let mut ep9 = Episode::default();
+        let ep9 = ep9.for_cause(a.since, StuckCause::Unsent);
+        let pasted = "──────────────\n❭ do it\n──────────────\nSWE-2 High · Context: 1 / 2,000 tokens (1%)\n";
+        match step(&ctx(pasted, now, None, false), &un, ep9) {
+            Some(Act::Resend(t)) => assert_eq!(t, "do it"),
+            x => panic!("{x:?} is no resend"),
+        }
+        // … but never while a doorbell to the agent is still undelivered
+        let mut s2 = state_with_lead();
+        s2.msgs.insert(
+            "m1".into(),
+            crate::state::Msg {
+                from: "agent:h/s/lead".into(),
+                to: "agent:h/s/a".into(),
+                kind: "FYI".into(),
+                reference: "x".into(),
+                text: "hi".into(),
+                since: now,
+            },
+        );
+        let mut ep10 = Episode::default();
+        let ep10 = ep10.for_cause(a.since, StuckCause::Unsent);
+        let ctx2 = Ctx {
+            s: &s2,
+            id,
+            a: &a,
+            screen: pasted,
+            now,
+            handoff: None,
+            continued_before: false,
+        };
+        assert!(matches!(step(&ctx2, &un, ep10), Some(Act::Tell { .. })));
         // permission/waiting/unknown never act
         for k in [
             StuckCause::Permission,

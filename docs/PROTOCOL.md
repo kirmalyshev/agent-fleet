@@ -345,8 +345,10 @@ typing is not `unsent` yet:
   it shares the Claude account's limits, so a Claude agent out of quota is never handed to
   it on the same host.
 - `rate_limit`: wait; `continue` once after `until`.
-- `unsent`: one Enter; still unsent 60 s later, one Escape and the queued text re-sent;
-  still there, tell the lead. A prompt queued behind a running turn never gets the Escape.
+- `unsent`: one Enter, but only while the "Press Enter to send queued" hint is on screen;
+  with no hint, one Escape and the queued text re-sent; still there, tell the lead. A
+  prompt queued behind a running turn never gets the Escape, and nothing is re-sent while
+  a doorbell to the agent is still undelivered.
 - `context_full`: hand off to the profile's `fallback` with a HANDOFF note to read git
   status, git log and any STATE.md first.
 - `error`: `continue` once; if the error cause returns, tell the lead with the screen's
