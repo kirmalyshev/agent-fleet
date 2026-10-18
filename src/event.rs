@@ -58,8 +58,12 @@ pub enum StuckCause {
     ContextFull,
     /// An error on screen waits on a nudge or a human.
     Error,
-    /// A permission or trust prompt (herdr reports `blocked`).
+    /// A permission or trust prompt (herdr reports `blocked`, or the program signaled one).
     Permission,
+    /// The program is asking the operator something.
+    Question,
+    /// The program reports an account problem (billing, hold, auth).
+    Account,
     /// Its worktree holds or waits on a resource; a legitimate wait, not a hang.
     Resource,
     /// Its task is deliberately held: an open blocker or an unfinished dep.
@@ -79,6 +83,8 @@ impl StuckCause {
             Self::ContextFull => "context_full",
             Self::Error => "error",
             Self::Permission => "permission",
+            Self::Question => "question",
+            Self::Account => "account",
             Self::Resource => "resource",
             Self::Held => "held",
             Self::Waiting => "waiting",
@@ -256,6 +262,8 @@ pub enum Known {
     AgentUnmanaged(AgentUnmanaged),
     #[serde(rename = "agent.stuck")]
     AgentStuck(AgentStuck),
+    #[serde(rename = "agent.signal")]
+    AgentSignal(AgentSignal),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -619,6 +627,23 @@ pub struct AgentStuck {
     pub until: Option<DateTime<Utc>>,
 }
 
+/// A structured signal from the agent's own program — a harness hook (`agent-fleet hook
+/// signal` / the statusline wrapper) writes it. `prompt` and `turn_end` open a new episode:
+/// the fold drops the agent's stored signal on them. `detail` carries the program's own
+/// text (an error message, a question) when there is one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSignal {
+    pub agent: String,
+    /// The agent program, e.g. `claude`; a plain string, so a new program needs no schema change.
+    pub program: String,
+    /// What the program said: `rate_limit`, `error`, `account`, `permission`, `idle`,
+    /// `question`, `quota`, `resumed`, `compacting`, `context_full`, `prompt`, `turn_end`.
+    pub signal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 /// `agent-fleet spawn` (or `handoff`) asks the host agent on `host` to create a worktree (or a
 /// workspace in an existing one), start the agent and give it the brief. The requester and the
 /// host may be on different machines.
@@ -724,6 +749,7 @@ impl Known {
             Self::SpawnResult(_) => "spawn.result",
             Self::AgentUnmanaged(_) => "agent.unmanaged",
             Self::AgentStuck(_) => "agent.stuck",
+            Self::AgentSignal(_) => "agent.signal",
         }
     }
 
@@ -746,7 +772,7 @@ impl Known {
             | Self::AgentUnmanaged(_)
             | Self::AgentStuck(_) => &[Host],
             Self::MsgDelivered(_) | Self::SpawnResult(_) => &[Host],
-            Self::AskRaised(_) | Self::Handoff(_) => &[Agent],
+            Self::AskRaised(_) | Self::Handoff(_) | Self::AgentSignal(_) => &[Agent],
             _ => &[Agent, Host],
         }
     }
@@ -901,6 +927,7 @@ pub fn parse_strict(raw: &Value) -> Result<Envelope<Known>, Reject> {
             .collect(),
         Known::SpawnResult(r) => vec![&r.agent],
         Known::AgentStuck(s) => vec![&s.agent],
+        Known::AgentSignal(s) => vec![&s.agent],
         _ => vec![],
     };
     if let Some(to) = recipients.into_iter().find(|to| !is_agent_id(to)) {
