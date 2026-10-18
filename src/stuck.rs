@@ -235,20 +235,6 @@ pub fn stuck_cause(
     quota: Option<&Quota>,
     now: DateTime<Utc>,
 ) -> Option<Cause> {
-    if quota.is_some_and(|q| q.exhausted_at(now)) {
-        let until = quota?
-            .windows
-            .iter()
-            .filter(|w| w.used_pct >= 100.0)
-            .filter_map(|w| w.resets_at)
-            .filter(|r| *r > now)
-            .min();
-        return Some(Cause {
-            kind: StuckCause::Quota,
-            detail: "the program's account is out of quota".into(),
-            until,
-        });
-    }
     let t6 = tail_lines(screen_tail, 6);
     let t14 = tail_lines(screen_tail, 14);
     if t6.lines().any(|l| {
@@ -277,11 +263,22 @@ pub fn stuck_cause(
             until: Some(now + wait),
         });
     }
+    // `quota` is the program saying it on screen — `agent.quota` only lends the spent
+    // window's `resets_at`. An idle agent on an out-of-quota account is just idle.
     if t14.lines().any(|l| quota_on_screen(program, l)) {
-        return Some(Cause::simple(
-            StuckCause::Quota,
-            "the program says its account is out of quota",
-        ));
+        let until = quota.and_then(|q| {
+            q.windows
+                .iter()
+                .filter(|w| w.used_pct >= 100.0)
+                .filter_map(|w| w.resets_at)
+                .filter(|r| *r > now)
+                .min()
+        });
+        return Some(Cause {
+            kind: StuckCause::Quota,
+            detail: "the program says its account is out of quota".into(),
+            until,
+        });
     }
     if let Some(line) = t14.lines().rev().find(|l| context_full(program, l)) {
         return Some(Cause {
@@ -599,9 +596,9 @@ fn minute(t: Option<DateTime<Utc>>) -> Option<i64> {
 }
 
 /// The profile `id` may be handed to for `kind`, when this host can use it. `quota` reads
-/// `on_quota` and refuses a profile whose kind is out on this host (a haiku shares the
-/// claude account, so a claude agent is never handed to it here); `context_full` reads
-/// `fallback`. `None` while a replacement is already open.
+/// `on_quota` and refuses a profile whose kind is the agent's own — a haiku shares the
+/// claude account, so a claude agent is never handed to it here — or out on this host;
+/// `context_full` reads `fallback`. `None` while a replacement is already open.
 fn handoff_target(
     host: &Host,
     s: &State,
@@ -618,12 +615,19 @@ fn handoff_target(
         _ => prof.fallback.as_deref()?,
     };
     let target = cfg.profiles.get(to)?;
-    if kind == StuckCause::Quota
-        && s.quotas
-            .get(&format!("{}:{}", host.cfg.host, target.kind))
-            .is_some_and(|q| q.exhausted_at(now))
-    {
-        return None;
+    if kind == StuckCause::Quota {
+        let mine = s
+            .agents
+            .get(id)
+            .and_then(|a| a.kind.as_deref())
+            .unwrap_or(&prof.kind);
+        if target.kind == mine
+            || s.quotas
+                .get(&format!("{}:{}", host.cfg.host, target.kind))
+                .is_some_and(|q| q.exhausted_at(now))
+        {
+            return None;
+        }
     }
     Some(to.to_string())
 }
@@ -690,7 +694,10 @@ pub async fn check(
             .any(|t| t.owner.as_deref() == Some(id) && !t.state.is_terminal());
     let busy = matches!(cause.kind, StuckCause::Quota | StuckCause::ContextFull)
         && crate::spawn::replacement_open(s, id);
-    if closed || busy {
+    // A grace stretch: the cause is classified and recorded from the first pass, but the
+    // host acts or tells only once the agent has sat in this state for --stall-min — a
+    // human half-typing a prompt is not "unsent" before that.
+    if closed || busy || now - a.since < Duration::minutes(host.cfg.stall_min as i64) {
         return Some((cause, tail));
     }
     let handoff = match cause.kind {
@@ -862,10 +869,26 @@ mod tests {
     fn every_cause_is_read_off_a_fixture_screen() {
         let now = Utc::now();
         let later = now + Duration::hours(2);
-        // quota: the program's quota first …
-        let c = stuck_cause(Some("devin"), "", Some(&quota_out(Some(later))), now).unwrap();
+        // quota: the program says so on screen; `agent.quota` only lends `until` —
+        // the account being out alone is no cause
+        let c = stuck_cause(
+            Some("devin"),
+            "Quota exhausted — come back later",
+            Some(&quota_out(Some(later))),
+            now,
+        )
+        .unwrap();
         assert_eq!((c.kind, c.until), (StuckCause::Quota, Some(later)));
-        // … then its own screen text
+        assert!(stuck_cause(Some("devin"), "", Some(&quota_out(Some(later))), now).is_none());
+        // … and its own screen text alone names it too
+        let c = stuck_cause(
+            Some("devin"),
+            "Quota exhausted — come back later",
+            None,
+            now,
+        )
+        .unwrap();
+        assert_eq!(c.kind, StuckCause::Quota);
         for (prog, screen) in [
             ("devin", "Quota exhausted — come back later"),
             (
@@ -1028,7 +1051,7 @@ mod tests {
     }
 
     #[test]
-    fn quota_primary_beats_the_screen_and_unsent_trumps_noise() {
+    fn the_screen_decides_and_unsent_trumps_noise() {
         let now = Utc::now();
         let c = stuck_cause(
             Some("devin"),
@@ -1037,7 +1060,7 @@ mod tests {
             now,
         )
         .unwrap();
-        assert_eq!(c.kind, StuckCause::Quota);
+        assert_eq!(c.kind, StuckCause::Unsent);
         let c = stuck_cause(
             Some("devin"),
             "resets in 3 min\nPress Enter to send queued",

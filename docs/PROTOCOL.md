@@ -305,8 +305,10 @@ finding's detail says who was told, or that nobody was.
 
 Every 5 seconds the host reads the visible screen of each of its `idle` or `blocked` agents —
 and of a `working` one `doctor` calls `hung` — through herdr's `agent.read`, and names ONE
-cause with a pure classifier: the program's `agent.quota` first, then its own screen text.
-A screen signal matches only on the program's own UI lines: a `⏺`, `⎿`, `│` or `•` line is
+cause with a pure classifier from its own screen text — `agent.quota` supplies the spent
+window's reset for `until` and gates the handoff target, but the account being out is not
+itself a cause; the program must say so on screen. A screen signal matches only on the
+program's own UI lines: a `⏺`, `⎿`, `│` or `•` line is
 the agent's prose or tool output, and a banner quoted there means nothing. The result lands
 in `agent.stuck` (`cause`, `detail`, `until`), written when the cause
 appears or changes, and once with no `cause` when the agent works again. State `stuck` is
@@ -316,7 +318,7 @@ and `unknown` it also carries the screen's last lines.
 
 | Cause | Signal |
 |---|---|
-| `quota` | `agent.quota` says the program's account is out (`exhausted_at`), or the screen does: Devin "Quota exhausted", Claude "usage limit" / "limit reached … resets", Codex "usage limit". `until` is the spent window's `resets_at` when known. |
+| `quota` | the program's own quota line on screen: Devin "Quota exhausted", Claude "usage limit" / "limit reached … resets", Codex "usage limit". `until` is the spent window's `resets_at` (from `agent.quota`) when known. |
 | `rate_limit` | a short retry window on a line about a limit: "rate limit", "reset in N minutes", "retry after". `until` is the parsed wait (5 min when unparseable). |
 | `unsent` | a prompt sits in the input box: "Press Enter to send queued", or a pasted brief never sent. |
 | `context_full` | the program's own footer says its context is nearly gone: Devin `Context: N / M tokens (P%)` at P ≥ 90, Claude `Context left until auto-compact: P%` at P ≤ 10, Codex `P% context left` at P ≤ 10. |
@@ -331,14 +333,17 @@ Each cause earns at most one action per episode, logged as events (`msg.sent`,
 `spawn.requested`), and never on an agent that is `working` unless `hung`, nor on one whose
 task is finished. Actions that touch an agent — keystrokes and handoffs — only run under
 `host --stuck-act`; without it the host still classifies and records `agent.stuck`, and
-every would-be action becomes one tell to the lead naming what it would have done:
+every would-be action becomes one tell to the lead naming what it would have done. And
+nothing acts or tells before the state has lasted `--stall-min`: a prompt a human is still
+typing is not `unsent` yet:
 
 - `quota` with `until` more than 30 min away or unknown: hand the work to the profile's
   `on_quota` (a fleet.toml key), but only when that profile's kind still has quota on this
   host; otherwise tell the lead it is out of quota and no fallback has quota. `until` within
-  30 min: tell the lead it waits, then send `continue` once after `until`. Note a `haiku`
-  profile's kind is `claude`: it shares the Claude account's limits, so a Claude agent out
-  of quota is never handed to it on the same host — the check above enforces it.
+  30 min: tell the lead it waits, then send `continue` once after `until`. A target whose
+  kind is the agent's own is never a quota handoff — a `haiku` profile's kind is `claude`,
+  it shares the Claude account's limits, so a Claude agent out of quota is never handed to
+  it on the same host.
 - `rate_limit`: wait; `continue` once after `until`.
 - `unsent`: one Enter; still unsent 60 s later, one Escape and the queued text re-sent;
   still there, tell the lead. A prompt queued behind a running turn never gets the Escape.

@@ -3329,6 +3329,104 @@ profile = "devin"
     }
 
     #[tokio::test]
+    async fn a_fresh_state_is_classified_but_never_acted_on() {
+        // Idle 5m < --stall-min 15: the cause lands in agent.stuck, but no keystroke and
+        // no tell fire inside the grace stretch.
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, stub) = run_act(
+            dir.path(),
+            &[(
+                "agent.read",
+                vec![json!({ "result": { "text": "Press Enter to send queued" } })],
+            )],
+        )
+        .await;
+        let mut s = stalled_state(Some("agent:h/s/lead"));
+        s.agents.get_mut("agent:h/s/a").unwrap().since = Utc::now() - chrono::Duration::minutes(5);
+        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
+        let evs = host.replica.lock().unwrap().all().unwrap().to_vec();
+        assert!(
+            evs.iter().any(|e| matches!(&e.body,
+                Body::Known(Known::AgentStuck(st)) if st.cause == Some(crate::event::StuckCause::Unsent))),
+            "the cause is still recorded"
+        );
+        assert!(
+            !stub.calls().iter().any(|m| m == "agent.send_keys"),
+            "no Enter inside the grace stretch: {:?}",
+            stub.calls()
+        );
+        assert!(msgs(&host).is_empty(), "no tell inside the grace stretch");
+    }
+
+    #[tokio::test]
+    async fn a_quota_handoff_never_targets_the_same_account() {
+        let cfg = |to: &str, kind: &str| {
+            format!(
+                "session = \"s\"\nbrief = \"b.md\"\n[profiles.sonnet]\nkind = \"claude\"\non_quota = \"{to}\"\n[profiles.{to}]\nkind = \"{kind}\"\nprefix = \"{to}-\"\n[[rules]]\nprofile = \"sonnet\"\n"
+            )
+        };
+        let scene = |dir: &Path, cfg: &str| {
+            let co = checkout(dir);
+            std::fs::write(co.join(".agent-fleet/fleet.toml"), cfg).unwrap();
+            std::fs::write(co.join(".agent-fleet/b.md"), "do it").unwrap();
+        };
+        let quota_state = || {
+            let mut s = stalled_state(Some("agent:h/s/lead"));
+            s.agents.get_mut("agent:h/s/a").unwrap().kind = Some("claude".into());
+            let mut r = req(None);
+            r.agent = "agent:h/s/a".into();
+            r.name = "a".into();
+            r.profile = "sonnet".into();
+            r.issue = None;
+            r.worktree = Some("/w/a".into());
+            s.apply(&Envelope::new(actor(), "p", Known::SpawnRequested(Box::new(r))).into_event());
+            s
+        };
+        let reqs = |host: &Host| {
+            host.replica
+                .lock()
+                .unwrap()
+                .all()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(&e.body, Body::Known(Known::SpawnRequested(_))))
+                .count()
+        };
+        let screen = vec![json!({ "result": { "text": "usage limit reached" } })];
+        // haiku is claude too — the same account, never a quota handoff
+        let dir = tempfile::tempdir().unwrap();
+        scene(dir.path(), &cfg("haiku", "claude"));
+        let (host, _stub) = run_act(dir.path(), &[("agent.read", screen.clone())]).await;
+        stuck(
+            &host,
+            &quota_state(),
+            &[],
+            &mut crate::stuck::Seen::default(),
+        )
+        .await;
+        assert_eq!(reqs(&host), 0, "no handoff onto the same account");
+        let got = msgs(&host);
+        assert!(
+            got.iter()
+                .any(|m| m.kind == "QUOTA" && m.text.contains("no fallback has quota")),
+            "the lead is told instead: {got:?}"
+        );
+        // a different kind with quota free is handed to
+        let dir = tempfile::tempdir().unwrap();
+        scene(dir.path(), &cfg("dv", "devin"));
+        let (host, _stub) = run_act(dir.path(), &[("agent.read", screen)]).await;
+        stuck(
+            &host,
+            &quota_state(),
+            &[],
+            &mut crate::stuck::Seen::default(),
+        )
+        .await;
+        assert_eq!(reqs(&host), 1, "the handoff went to the other account");
+    }
+
+    #[tokio::test]
     async fn stuck_actions_wait_for_stuck_act() {
         let screen = json!({ "result": { "text": "Press Enter to send queued" } });
         // Off: no keystroke into the agent — the lead gets a tell of what would be done.
