@@ -10,7 +10,7 @@ ORG = "example"
 kind = "devin"                   # program, matches agent.up kind and agent.quota kind
 args = []                        # extra args for herdr agent.start
 prefix = "dv-"                   # default agent name = prefix + issue number
-cap = 2                          # live agents of this profile across the fleet; absent = no cap
+cap = 2                          # live agents of this profile for this repo; absent = no cap
 fallback = "sonnet"              # used when this one is at cap, out of quota, or for a handoff
 handoff_min = 5                  # see Handoff
 [profiles.sonnet]

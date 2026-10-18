@@ -344,7 +344,7 @@ cycle, two defaults, no default.
 
 `agent-fleet spawn <owner/repo>#<issue>` reads the issue with `gh issue view` (`AGENT_FLEET_GH`
 names the binary), picks the rule — `--profile`, `--host` and `--level` override it — then walks
-the profile's fallback chain past a profile at `cap` (live agents of the profile plus pending
+the profile's fallback chain past a profile at `cap` (live agents of the profile for this repo plus pending
 requests) or whose kind's quota on the target host is exhausted — a quota counts as exhausted
 while a 100% window's reset is still ahead or the `exhausted` read is under 30 min old;
 every step lands in `why`. The brief renders in one pass over the template: tokens
