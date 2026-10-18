@@ -478,7 +478,7 @@ pub fn step(c: &Ctx, cause: &Cause, ep: &mut Episode) -> Option<Act> {
                     return None;
                 }
                 let t = queued_text(screen).unwrap_or_default();
-                (!t.is_empty()).then(|| Act::Resend(t))
+                (!t.is_empty()).then_some(Act::Resend(t))
             };
             let held = |s: &State, why: &str| {
                 tell(
@@ -673,6 +673,7 @@ fn handoff_target(
 /// Read the agent's screen, record `agent.stuck` when the cause appears or changes (and
 /// once with none when it works again), and run the cause's once-per-episode action.
 /// Returns the cause for the caller's report — `None` when the agent is not stuck.
+#[allow(clippy::too_many_arguments)]
 pub async fn check(
     host: &Arc<Host>,
     s: &State,

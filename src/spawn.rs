@@ -3,7 +3,7 @@
 //! the named host executes it — worktree or workspace, env scrub, agent start, the brief —
 //! and answers `spawn.result`.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1488,6 +1488,16 @@ async fn stuck(
     let prefix = agent_prefix(&host.cfg.host, &host.cfg.session);
     let min = chrono::Duration::minutes(host.cfg.stall_min as i64);
     let now = Utc::now();
+    // Indexed once per pass: sends by id (for a delivery's `re`), and the deliveries.
+    let sends: HashMap<&str, &Event> = events
+        .iter()
+        .filter(|e| matches!(&e.body, Body::Known(Known::MsgSent(_))))
+        .map(|e| (e.id.as_str(), e))
+        .collect();
+    let deliveries: Vec<&Event> = events
+        .iter()
+        .filter(|e| matches!(&e.body, Body::Known(Known::MsgDelivered(_))))
+        .collect();
     for (id, a) in &state.agents {
         if !id.starts_with(&prefix) {
             continue;
@@ -1518,7 +1528,7 @@ async fn stuck(
                 _ => format!("{text}; {}", c.kind.name()),
             };
         }
-        if let Some(to) = next_escalation(state, events, id, min, now) {
+        if let Some(to) = next_escalation(state, &sends, &deliveries, id, a, min, now) {
             let esctext = format!("{text}; its lead did not react");
             // One escalation per (episode, lead): the log is the dedupe across restarts.
             if !events.iter().any(|e| {
@@ -1563,44 +1573,44 @@ async fn stuck(
     }
 }
 
-/// The next lead up the chain that has not been told, once a delivered tell to the link
-/// below went unanswered for `min`: that lead never reached `working` after the delivery —
-/// the `HUNG`/`STALLED` push, an escalation, or the agent's own message all count. `None`
-/// while a link may still react or the chain ended at the root.
+/// The next lead up `id`'s chain to tell: the highest link with an in-episode delivery —
+/// the `HUNG`/`STALLED` push, an escalation, or the agent's own message — that stayed
+/// unanswered for `min`; the hop above it gets the escalation. A `msg.delivered` is written
+/// after the lead's working turn it observed, so a reaction is a turn strictly after the
+/// delivery's ts — the ring's own turn never counts. `None` while a link may still react
+/// or the chain ended at the root.
 fn next_escalation(
     state: &State,
-    events: &[Event],
+    sends: &HashMap<&str, &Event>,
+    deliveries: &[&Event],
     id: &str,
+    a: &crate::state::Agent,
     min: chrono::Duration,
     now: DateTime<Utc>,
 ) -> Option<String> {
-    for e in events {
-        if !matches!(&e.body, Body::Known(Known::MsgDelivered(_))) {
-            continue;
+    let chain = state.chain(id);
+    for link in chain.iter().rev() {
+        let pending = deliveries.iter().any(|d| {
+            if d.ts <= a.since || now - d.ts < min {
+                return false;
+            }
+            let Some(send) = d.re.as_deref().and_then(|re| sends.get(re)) else {
+                return false;
+            };
+            let Body::Known(Known::MsgSent(m)) = &send.body else {
+                return false;
+            };
+            if m.to != *link || (m.reference != short(id) && send.actor.id != id) {
+                return false;
+            }
+            !state.agents.get(*link).is_some_and(|l| {
+                l.state == AgentState::Working || l.worked.is_some_and(|w| w > d.ts)
+            })
+        });
+        if pending {
+            let next = crate::doctor::escalate(state, link)?;
+            return (next != id && state.agents.contains_key(next)).then(|| next.to_string());
         }
-        let Some(re) = &e.re else { continue };
-        let Some(send) = events.iter().find(|s| s.id == *re) else {
-            continue;
-        };
-        let Body::Known(Known::MsgSent(m)) = &send.body else {
-            continue;
-        };
-        if m.reference != short(id) && send.actor.id != id {
-            continue;
-        }
-        let lead = m.to.as_str();
-        if lead == id || now - e.ts < min {
-            continue;
-        }
-        let reacted = state
-            .agents
-            .get(lead)
-            .is_some_and(|l| l.state == AgentState::Working || l.worked.is_some_and(|w| w > e.ts));
-        if reacted {
-            continue;
-        }
-        let next = crate::doctor::escalate(state, lead)?;
-        return (next != lead).then(|| next.to_string());
     }
     None
 }
@@ -3331,6 +3341,19 @@ profile = "devin"
         assert_eq!(create["base"], "origin/main", "{create}");
     }
 
+    /// Sends by id and the deliveries, as `stuck` indexes them once per pass.
+    fn esc_idx(evs: &[Event]) -> (HashMap<&str, &Event>, Vec<&Event>) {
+        (
+            evs.iter()
+                .filter(|e| matches!(&e.body, Body::Known(Known::MsgSent(_))))
+                .map(|e| (e.id.as_str(), e))
+                .collect(),
+            evs.iter()
+                .filter(|e| matches!(&e.body, Body::Known(Known::MsgDelivered(_))))
+                .collect(),
+        )
+    }
+
     #[test]
     fn an_unanswered_tell_escalates_one_link_up() {
         let now = Utc::now();
@@ -3347,8 +3370,9 @@ profile = "devin"
             .insert("agent:h/s/a".into(), role(Some("agent:h/s/l1")));
         s.roles
             .insert("agent:h/s/l1".into(), role(Some("agent:h/s/l2")));
+        // the stalled agent, idle since before the tell
         s.agents.insert(
-            "agent:h/s/l1".into(),
+            "agent:h/s/a".into(),
             crate::state::Agent {
                 host: "h".into(),
                 kind: None,
@@ -3359,7 +3383,33 @@ profile = "devin"
                 usage: None,
             },
         );
-        let send = Envelope::new(
+        // l1: idle — the real ordering is send → lead working (the ring) → delivered →
+        // lead idle again; the ring's own working turn is no reaction.
+        s.agents.insert(
+            "agent:h/s/l1".into(),
+            crate::state::Agent {
+                host: "h".into(),
+                kind: None,
+                pane: None,
+                state: AgentState::Idle,
+                since: now - chrono::Duration::minutes(15),
+                worked: Some(now - min - chrono::Duration::seconds(90)),
+                usage: None,
+            },
+        );
+        s.agents.insert(
+            "agent:h/s/l2".into(),
+            crate::state::Agent {
+                host: "h".into(),
+                kind: None,
+                pane: None,
+                state: AgentState::Idle,
+                since: now,
+                worked: None,
+                usage: None,
+            },
+        );
+        let mut send = Envelope::new(
             actor(),
             "p",
             Known::MsgSent(MsgSent {
@@ -3370,12 +3420,13 @@ profile = "devin"
             }),
         )
         .into_event();
+        send.ts = now - min - chrono::Duration::minutes(2);
         let mut del = Envelope::new(
             actor(),
             "p",
             Known::MsgDelivered(MsgDelivered {
                 to: "agent:h/s/l1".into(),
-                observed: AgentState::Idle,
+                observed: AgentState::Working,
                 rung: None,
                 attempts: None,
             }),
@@ -3383,28 +3434,59 @@ profile = "devin"
         .re(&send.id)
         .into_event();
         del.ts = now - min - chrono::Duration::minutes(1);
-        // l1 stayed idle since the delivered tell: escalate to l1's own lead
+        let del_ts = del.ts;
+        let a = s.agents["agent:h/s/a"].clone();
+        let evs = [send, del];
+        let (sends, dels) = esc_idx(&evs);
+        // l1's delivery turn predates the delivery event; nothing since — escalate to l2
         assert_eq!(
-            next_escalation(&s, &[send.clone(), del.clone()], "agent:h/s/a", min, now),
+            next_escalation(&s, &sends, &dels, "agent:h/s/a", &a, min, now),
             Some("agent:h/s/l2".to_string())
         );
         // inside the stall window, nobody is escalated to
         assert_eq!(
             next_escalation(
                 &s,
-                &[send.clone(), del.clone()],
+                &sends,
+                &dels,
                 "agent:h/s/a",
+                &a,
                 min,
-                del.ts + min - chrono::Duration::seconds(1)
+                del_ts + min - chrono::Duration::seconds(1)
             ),
             None,
             "the lead still has time to react"
         );
+        // a delivery from an earlier episode does not count
+        assert_eq!(
+            next_escalation(
+                &s,
+                &sends,
+                &dels,
+                "agent:h/s/a",
+                &crate::state::Agent {
+                    since: now - chrono::Duration::seconds(30),
+                    ..a.clone()
+                },
+                min,
+                now
+            ),
+            None,
+            "the delivery predates this state"
+        );
         // a lead that worked after the delivery reacted: no escalation
         s.agents.get_mut("agent:h/s/l1").unwrap().worked = Some(now);
         assert_eq!(
-            next_escalation(&s, &[send, del], "agent:h/s/a", min, now),
+            next_escalation(&s, &sends, &dels, "agent:h/s/a", &a, min, now),
             None
+        );
+        // the next hop must be up: l2 down ends it
+        s.agents.remove("agent:h/s/l2");
+        s.agents.get_mut("agent:h/s/l1").unwrap().worked = None;
+        assert_eq!(
+            next_escalation(&s, &sends, &dels, "agent:h/s/a", &a, min, now),
+            None,
+            "l2 is down"
         );
     }
 
