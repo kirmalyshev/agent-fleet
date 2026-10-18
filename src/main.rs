@@ -818,6 +818,10 @@ async fn main() -> Result<()> {
                     );
                     client.write_exclusive(&created.task(&task)).await?;
                 }
+                if known.owner_of(&task) == Some(agent.as_str()) {
+                    println!("{task} is already assigned to {agent}");
+                    return Ok(());
+                }
                 let assigned = Envelope::new(
                     me,
                     &project,
@@ -1173,6 +1177,18 @@ async fn main() -> Result<()> {
                 issue.number, d.profile, prof.kind, d.host, d.why
             );
             let me = me.map_err(|e| anyhow::anyhow!("{e:#}"))?;
+            let task = spawn::task_id(&repo, issue.number);
+            if !state.tasks.contains_key(&task) {
+                let created = Envelope::new(
+                    me.clone(),
+                    spawn::task_project(&repo),
+                    Known::TaskCreated(TaskCreated {
+                        title: issue.title.clone(),
+                        url: Some(format!("https://github.com/{repo}/issues/{}", issue.number)),
+                    }),
+                );
+                ctx.client()?.write_exclusive(&created.task(&task)).await?;
+            }
             let req = SpawnRequested {
                 name,
                 agent,
