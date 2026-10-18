@@ -496,6 +496,15 @@ function render() {
   ].filter(Boolean).map(([t, html, cls]) => `<button class="stat ${cls}" data-tab="${t}">${html}</button>`).join("");
   const alerts = data.findings.filter(f => ["orphan", "hung", "duplicate", "breach"].includes(f.kind)).slice(0, 3)
     .map(f => `<div class="banner">${ICON.alert}<div><b>${esc(f.kind)}</b> · <span class="mono">${esc(home(f.subject))}</span><div class="sub">${esc(f.detail)}</div></div></div>`);
+  // Waiting for the principal: question signals and asks — the principal's only channel is
+  // this board, so they surface here, never as a push.
+  const waits = [
+    ...Object.entries(s.signals || {}).filter(([id, sig]) => sig.signal === "question" && s.agents[id])
+      .map(([id, sig]) => ({ who: id, since: sig.since, text: sig.detail || "" })),
+    ...Object.entries(s.asks || {}).map(([id, a]) => ({ who: a.by || id, since: a.since, text: a.question })),
+  ];
+  for (const w of waits) alerts.unshift(
+    `<div class="banner warn">${ICON.alert}<div><b>waiting for the principal</b> · <span class="mono">${esc(short(w.who))}</span>, ${ago(w.since)}<div class="sub">${esc(w.text)}</div></div></div>`);
   if (err) alerts.unshift(`<div class="banner warn">${ICON.alert}<div><b>Showing data from ${ago(new Date(loadedAt).toISOString())} ago.</b><div class="sub">${esc(err)} Retrying every 3 seconds.</div></div></div>`);
   const body = { tree: treeTab, agents: agentsTab, worktrees: worktreesTab, tasks: tasksTab, resources: resourcesTab, findings: findingsTab, doorbells: doorbellsTab, hosts: hostsTab }[tab](s);
   app.innerHTML = shell(n, statsBar, body, alerts);

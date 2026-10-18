@@ -320,7 +320,15 @@ pub fn board(s: &State, now: DateTime<Utc>) -> String {
             b.unblocks_when.as_deref().unwrap_or("-")
         );
     }
-    let _ = writeln!(out, "\n== asks ({})", s.asks.len());
+    let waits = crate::signal::questions(s);
+    let _ = writeln!(
+        out,
+        "\n== waiting for the principal ({})",
+        waits.len() + s.asks.len()
+    );
+    for (id, since, text) in waits {
+        let _ = writeln!(out, "{id}  {:>7}  {text}", ago(now, since));
+    }
     for (id, a) in &s.asks {
         let rec = a
             .recommendation
@@ -641,6 +649,66 @@ mod tests {
         assert!(row("h:claude").contains("week 8%"));
         assert!(row("h:claude").contains("read 3m ago"));
         assert!(row("h:devin").ends_with("  EXHAUSTED"));
+    }
+
+    #[test]
+    fn the_board_lists_what_waits_for_the_principal() {
+        use crate::event::*;
+        use crate::state::{Agent, Ask, Signal};
+        let now = Utc::now();
+        let mut s = State::default();
+        s.agents.insert(
+            "agent:h/s/a".into(),
+            Agent {
+                host: "h".into(),
+                kind: Some("claude".into()),
+                pane: None,
+                state: AgentState::Idle,
+                since: now - chrono::Duration::minutes(10),
+                worked: None,
+                usage: None,
+            },
+        );
+        s.signals.insert(
+            "agent:h/s/a".into(),
+            Signal {
+                signal: "question".into(),
+                detail: Some("which branch?".into()),
+                program: "claude".into(),
+                since: now - chrono::Duration::minutes(5),
+            },
+        );
+        s.asks.insert(
+            "ask1".into(),
+            Ask {
+                task: None,
+                by: "agent:h/s/a".into(),
+                question: "ship it?".into(),
+                options: vec![],
+                recommendation: None,
+                context: None,
+                since: now - chrono::Duration::minutes(2),
+            },
+        );
+        let out = board(&s, now);
+        assert!(out.contains("waiting for the principal (2)"), "{out}");
+        assert!(
+            out.contains("agent:h/s/a") && out.contains("which branch?"),
+            "{out}"
+        );
+        assert!(out.contains("ship it?"), "{out}");
+        // a signal for a down agent drops off the list
+        s.signals.insert(
+            "agent:h/s/gone".into(),
+            Signal {
+                signal: "question".into(),
+                detail: Some("gone".into()),
+                program: "claude".into(),
+                since: now,
+            },
+        );
+        let out = board(&s, now);
+        assert!(out.contains("waiting for the principal (2)"), "{out}");
     }
 
     #[test]
