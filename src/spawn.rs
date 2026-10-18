@@ -3516,6 +3516,109 @@ profile = "devin"
     }
 
     #[tokio::test]
+    async fn the_first_seen_deadline_stands_while_the_cause_does() {
+        let t0 = Utc::now() + chrono::Duration::minutes(12);
+        // rate_limit: the screen re-parses "resets in ~12 minutes" to now+12m every pass;
+        // the recorded until wins and agent.stuck is not republished for a moved until.
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run_act(
+            dir.path(),
+            &[(
+                "agent.read",
+                vec![json!({ "result": { "text":
+                    "Rate limit reached, resets in ~12 minutes" } })],
+            )],
+        )
+        .await;
+        let mut s = stalled_state(Some("agent:h/s/lead"));
+        s.stuck.insert(
+            "agent:h/s/a".into(),
+            crate::state::Stuck {
+                cause: crate::event::StuckCause::RateLimit,
+                detail: "d".into(),
+                until: Some(t0),
+                since: Utc::now() - chrono::Duration::minutes(5),
+            },
+        );
+        let a = s.agents["agent:h/s/a"].clone();
+        let got = crate::stuck::check(
+            &host,
+            &s,
+            &[],
+            &mut Default::default(),
+            &HashSet::new(),
+            "agent:h/s/a",
+            &a,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.0.until, Some(t0), "the first-seen deadline is kept");
+        let evs = host.replica.lock().unwrap().all().unwrap().to_vec();
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(&e.body, Body::Known(Known::AgentStuck(_)))),
+            "a moved until alone never republishes"
+        );
+        // quota: a near reset recorded earlier is not lost to a fresh read without one —
+        // losing it would make `until` unknown and a restart would hand the agent off.
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        std::fs::write(
+            co.join(".agent-fleet/fleet.toml"),
+            "session = \"s\"\nbrief = \"b.md\"\n[profiles.devin]\nkind = \"devin\"\non_quota = \"sonnet\"\nprefix = \"dv-\"\n[profiles.sonnet]\nkind = \"claude\"\nprefix = \"s-\"\n[[rules]]\nprofile = \"devin\"\n",
+        )
+        .unwrap();
+        std::fs::write(co.join(".agent-fleet/b.md"), "do it").unwrap();
+        let (host, _stub) = run_act(
+            dir.path(),
+            &[(
+                "agent.read",
+                vec![json!({ "result": { "text": "Quota exhausted" } })],
+            )],
+        )
+        .await;
+        let mut s = stalled_state(Some("agent:h/s/lead"));
+        let mut r = req(None);
+        r.agent = "agent:h/s/a".into();
+        r.name = "a".into();
+        r.issue = None;
+        r.worktree = Some("/w/a".into());
+        s.apply(&Envelope::new(actor(), "p", Known::SpawnRequested(Box::new(r))).into_event());
+        s.stuck.insert(
+            "agent:h/s/a".into(),
+            crate::state::Stuck {
+                cause: crate::event::StuckCause::Quota,
+                detail: "d".into(),
+                until: Some(t0),
+                since: Utc::now() - chrono::Duration::minutes(5),
+            },
+        );
+        let a = s.agents["agent:h/s/a"].clone();
+        let got = crate::stuck::check(
+            &host,
+            &s,
+            &[],
+            &mut Default::default(),
+            &HashSet::new(),
+            "agent:h/s/a",
+            &a,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.0.until, Some(t0));
+        let evs2 = host.replica.lock().unwrap().all().unwrap().to_vec();
+        assert!(
+            !evs2
+                .iter()
+                .any(|e| matches!(&e.body, Body::Known(Known::SpawnRequested(_)))),
+            "a near reset waits; it does not hand off"
+        );
+    }
+
+    #[tokio::test]
     async fn a_just_handed_agent_is_busy_in_the_same_pass() {
         let dir = tempfile::tempdir().unwrap();
         let co = checkout(dir.path());

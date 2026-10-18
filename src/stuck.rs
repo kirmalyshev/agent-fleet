@@ -665,12 +665,20 @@ pub async fn check(
         .kind
         .as_deref()
         .and_then(|k| s.quotas.get(&format!("{}:{k}", host.cfg.host)));
-    let cause = cause_of(
+    let mut cause = cause_of(
         s,
         id,
         a,
         stuck_cause(a.kind.as_deref(), &screen, quota, now),
     );
+    // The deadline is first-seen: while the cause stands, `s.stuck`'s `until` wins — a
+    // recomputed countdown would republish `agent.stuck` every pass and push the wait out
+    // forever (or lose it on a restart and turn a near quota wait into a handoff).
+    if let Some(prev) = s.stuck.get(id)
+        && prev.cause == cause.kind
+    {
+        cause.until = prev.until.or(cause.until);
+    }
     if s.stuck
         .get(id)
         .is_none_or(|w| w.cause != cause.kind || minute(w.until) != minute(cause.until))
