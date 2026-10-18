@@ -240,12 +240,26 @@ pub fn stuck_cause(
     None
 }
 
-/// The cause for a stopped agent: herdr's `blocked` is a permission or trust prompt, a
-/// recognized screen is its own cause, and anything else is `waiting` once the agent has
-/// worked, `unknown` before that.
-pub fn cause_of(a: &Agent, detected: Option<Cause>) -> Cause {
+/// The cause for a stopped agent: an intentional hold first, then herdr's `blocked` (a
+/// permission or trust prompt) and a legitimate resource wait, then a recognized screen,
+/// and `waiting` once the agent has worked, `unknown` before that.
+pub fn cause_of(s: &State, id: &str, a: &Agent, detected: Option<Cause>) -> Cause {
+    if let Some(detail) = crate::doctor::held(s, id) {
+        return Cause {
+            kind: StuckCause::Held,
+            detail,
+            until: None,
+        };
+    }
     if a.state == AgentState::Blocked {
         return Cause::simple(StuckCause::Permission, "a permission or trust prompt waits");
+    }
+    if let Some((detail, _, _)) = crate::doctor::resource_wait(s, a) {
+        return Cause {
+            kind: StuckCause::Resource,
+            detail,
+            until: None,
+        };
     }
     detected.unwrap_or_else(|| {
         if matches!(a.state, AgentState::Idle | AgentState::Done) && a.worked.is_some() {
@@ -465,7 +479,27 @@ pub fn step(c: &Ctx, cause: &Cause, ep: &mut Episode) -> Option<Act> {
             }
             Some(Act::Continue)
         }
-        StuckCause::Permission | StuckCause::Waiting | StuckCause::Unknown => None,
+        StuckCause::Resource => {
+            if ep.fired {
+                return None;
+            }
+            let (_, since, eta) = crate::doctor::resource_wait(s, a)?;
+            // the wait is overdue once it beats 2× the holder's stated ETA or 60 min
+            let waited = now - since;
+            if !(waited > Duration::minutes(60) || eta.is_some_and(|e| waited > e * 2)) {
+                return None;
+            }
+            ep.fired = true;
+            tell(
+                s,
+                id,
+                cause.kind,
+                format!("{} {}", crate::host::short(id), cause.detail),
+            )
+        }
+        StuckCause::Permission | StuckCause::Waiting | StuckCause::Unknown | StuckCause::Held => {
+            None
+        }
     }
 }
 
@@ -559,7 +593,12 @@ pub async fn check(
         .kind
         .as_deref()
         .and_then(|k| s.quotas.get(&format!("{}:{k}", host.cfg.host)));
-    let cause = cause_of(a, stuck_cause(a.kind.as_deref(), &screen, quota, now));
+    let cause = cause_of(
+        s,
+        id,
+        a,
+        stuck_cause(a.kind.as_deref(), &screen, quota, now),
+    );
     if s.stuck
         .get(id)
         .is_none_or(|w| w.cause != cause.kind || minute(w.until) != minute(cause.until))
@@ -800,19 +839,43 @@ mod tests {
         // nothing recognized → None; cause_of maps the rest
         assert!(stuck_cause(Some("devin"), "all quiet", None, now).is_none());
         assert_eq!(
-            cause_of(&agent(AgentState::Blocked, false), None).kind,
+            cause_of(
+                &State::default(),
+                "agent:h/s/a",
+                &agent(AgentState::Blocked, false),
+                None
+            )
+            .kind,
             StuckCause::Permission
         );
         assert_eq!(
-            cause_of(&agent(AgentState::Idle, true), None).kind,
+            cause_of(
+                &State::default(),
+                "agent:h/s/a",
+                &agent(AgentState::Idle, true),
+                None
+            )
+            .kind,
             StuckCause::Waiting
         );
         assert_eq!(
-            cause_of(&agent(AgentState::Idle, false), None).kind,
+            cause_of(
+                &State::default(),
+                "agent:h/s/a",
+                &agent(AgentState::Idle, false),
+                None
+            )
+            .kind,
             StuckCause::Unknown
         );
         assert_eq!(
-            cause_of(&agent(AgentState::Working, true), None).kind,
+            cause_of(
+                &State::default(),
+                "agent:h/s/a",
+                &agent(AgentState::Working, true),
+                None
+            )
+            .kind,
             StuckCause::Unknown
         );
     }
@@ -999,6 +1062,163 @@ mod tests {
             let e = e.for_cause(a.since, k);
             assert!(step(&ctx("", now, None, false), &cause(k, None), e).is_none());
         }
+    }
+
+    #[test]
+    fn held_and_resource_beat_the_screen_and_the_resource_wait_can_be_overdue() {
+        let now = Utc::now();
+        let mut s = state_with_lead();
+        let id = "agent:h/s/a";
+        let a = agent(AgentState::Idle, true);
+        // a held task: the cause is held whatever the screen says
+        s.tasks.insert(
+            "task:p/1".into(),
+            crate::state::Task {
+                project: "p".into(),
+                title: "t".into(),
+                url: None,
+                state: TaskState::Working,
+                since: now,
+                owner: Some(id.into()),
+                lead: None,
+                blocked_by: Default::default(),
+                handoffs: vec![],
+            },
+        );
+        s.blockers.insert(
+            "b1".into(),
+            crate::state::Blocker {
+                task: Some("task:p/1".into()),
+                what: "ships with the next release".into(),
+                owner: None,
+                unblocks_when: None,
+                by: "agent:h/s/x".into(),
+                since: now,
+            },
+        );
+        let detected = Some(Cause::simple(StuckCause::Error, "e"));
+        assert_eq!(cause_of(&s, id, &a, detected).kind, StuckCause::Held);
+        let mut ep = Episode::default();
+        let ep = ep.for_cause(a.since, StuckCause::Held);
+        let hc = cause(StuckCause::Held, None);
+        assert!(
+            step(
+                &Ctx {
+                    s: &s,
+                    id,
+                    a: &a,
+                    screen: "",
+                    now,
+                    handoff: None,
+                    continued_before: false
+                },
+                &hc,
+                ep
+            )
+            .is_none()
+        );
+        // a resource wait: cause resource; the tell fires only when overdue
+        let mut s2 = state_with_lead();
+        s2.worktrees.insert(
+            "h:/w/a".into(),
+            crate::state::Worktree {
+                state: crate::event::WorktreeState {
+                    host: "h".into(),
+                    path: "/w/a".into(),
+                    repo: "/r".into(),
+                    branch: None,
+                    head: "x".into(),
+                    unpushed: 0,
+                    dirty: 0,
+                    files: vec![],
+                    last_commit: now,
+                    in_main: false,
+                },
+                since: now,
+            },
+        );
+        s2.resources.insert(
+            "h:sim".into(),
+            crate::state::Resource {
+                host: "h".into(),
+                resource: "sim".into(),
+                holder: Some(crate::state::Hold {
+                    pid: 1,
+                    cwd: Some("/w/other".into()),
+                    scope: Some("e2e, ~21m".into()),
+                    since: now - Duration::minutes(30),
+                }),
+                waiting: vec![crate::state::Hold {
+                    pid: 2,
+                    cwd: Some("/w/a".into()),
+                    scope: None,
+                    since: now - Duration::minutes(10),
+                }],
+            },
+        );
+        let mut aq = agent(AgentState::Working, true);
+        aq.usage = Some(crate::state::Usage {
+            rss_kb: None,
+            cpu_pct: Some(0),
+            procs: None,
+            cwd: Some("/w/a".into()),
+            ts: now,
+        });
+        let c = cause_of(&s2, id, &aq, None);
+        assert_eq!(c.kind, StuckCause::Resource);
+        assert!(c.detail.contains("waiting for sim"), "{}", c.detail);
+        let mut ep2 = Episode::default();
+        let ep2 = ep2.for_cause(aq.since, StuckCause::Resource);
+        let rc = cause(StuckCause::Resource, None);
+        // 10 min in behind a ~21m ETA: not overdue
+        assert!(
+            step(
+                &Ctx {
+                    s: &s2,
+                    id,
+                    a: &aq,
+                    screen: "",
+                    now,
+                    handoff: None,
+                    continued_before: false
+                },
+                &rc,
+                ep2
+            )
+            .is_none()
+        );
+        // past 2× the ETA: one tell to the lead
+        let later = now + Duration::minutes(40);
+        let x = step(
+            &Ctx {
+                s: &s2,
+                id,
+                a: &aq,
+                screen: "",
+                now: later,
+                handoff: None,
+                continued_before: false,
+            },
+            &rc,
+            ep2,
+        );
+        assert!(matches!(x, Some(Act::Tell { .. })), "{x:?}");
+        assert!(
+            step(
+                &Ctx {
+                    s: &s2,
+                    id,
+                    a: &aq,
+                    screen: "",
+                    now: later,
+                    handoff: None,
+                    continued_before: false
+                },
+                &rc,
+                ep2
+            )
+            .is_none()
+        );
     }
 
     impl std::fmt::Debug for Act {

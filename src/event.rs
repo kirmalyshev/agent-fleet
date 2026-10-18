@@ -60,6 +60,10 @@ pub enum StuckCause {
     Error,
     /// A permission or trust prompt (herdr reports `blocked`).
     Permission,
+    /// Its worktree holds or waits on a resource; a legitimate wait, not a hang.
+    Resource,
+    /// Its task is deliberately held: an open blocker or an unfinished dep.
+    Held,
     /// Idle after working, nothing blocking on screen.
     Waiting,
     /// None of the above matched.
@@ -75,6 +79,8 @@ impl StuckCause {
             Self::ContextFull => "context_full",
             Self::Error => "error",
             Self::Permission => "permission",
+            Self::Resource => "resource",
+            Self::Held => "held",
             Self::Waiting => "waiting",
             Self::Unknown => "unknown",
         }

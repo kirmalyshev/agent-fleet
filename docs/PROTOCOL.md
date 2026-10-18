@@ -320,6 +320,8 @@ and `unknown` it also carries the screen's last lines.
 | `context_full` | the program's context is ≥90% full (a `Context:` line), or a context-low notice. |
 | `error` | "Something went wrong", "Send a message to continue", an API error line. |
 | `permission` | herdr reports `blocked`: a permission or trust prompt waits. |
+| `resource` | its worktree holds or queues for a resource: "waiting for sim behind the e2e run, ~21m". A legitimate wait, never `hung` or `stalled`. |
+| `held` | its open task is deliberately held: an open `blocker.raised` (with `what`/`owner`/`unblocks_when`) or an unfinished `task.dep`. |
 | `waiting` | idle after it worked, nothing else on screen (finished, or asked something). |
 | `unknown` | none of the above. |
 
@@ -340,6 +342,9 @@ task is finished:
   status, git log and any STATE.md first.
 - `error`: `continue` once; if the error cause returns, tell the lead with the screen's
   last lines.
+- `resource`: no action — the wait is legitimate — until it beats 2× the holder's stated
+  ETA (a "~21m" in its scope) or 60 min; then one tell to the lead.
+- `held`: nothing at all — no push, no escalation; `doctor` shows `held`, not `stalled`.
 - `permission`, `waiting`, `unknown`: the `HUNG`/`STALLED` push tells the lead, with the
   cause and the screen's last lines.
 
@@ -379,7 +384,9 @@ agent start`; the read-only and admin forms (`--version`, `--help`, `auth status
 exit (`claude -p`, `codex exec`) when the caller is itself in herdr (`HERDR_ENV=1`): they run in
 the caller's pane tree, so the host counts them as managed. And the host's process scan reports every
 agent-program process it finds outside all of herdr's pane trees as `agent.unmanaged` (a process
-is managed when any ancestor is `herdr`, and the host's own process tree is excluded; the
+is managed when any ancestor is `herdr`, the host's own process tree is excluded, and so is
+a program's own infrastructure — an `app-server` or `daemon` subcommand in its argv, as in
+`codex app-server daemon` or `claude daemon`; the
 process's directory is known on Linux only), re-sent without `program` once the process is gone;
 `agent-fleet doctor` shows them as `unmanaged` findings.
 

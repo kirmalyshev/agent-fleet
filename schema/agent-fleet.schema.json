@@ -927,6 +927,16 @@
               "type": "string"
             },
             {
+              "const": "resource",
+              "description": "Its worktree holds or waits on a resource; a legitimate wait, not a hang.",
+              "type": "string"
+            },
+            {
+              "const": "held",
+              "description": "Its task is deliberately held: an open blocker or an unfinished dep.",
+              "type": "string"
+            },
+            {
               "const": "waiting",
               "description": "Idle after working, nothing blocking on screen.",
               "type": "string"
@@ -2396,6 +2406,16 @@
             {
               "const": "permission",
               "description": "A permission or trust prompt (herdr reports `blocked`).",
+              "type": "string"
+            },
+            {
+              "const": "resource",
+              "description": "Its worktree holds or waits on a resource; a legitimate wait, not a hang.",
+              "type": "string"
+            },
+            {
+              "const": "held",
+              "description": "Its task is deliberately held: an open blocker or an unfinished dep.",
               "type": "string"
             },
             {

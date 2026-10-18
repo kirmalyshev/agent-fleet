@@ -741,9 +741,11 @@ impl Host {
         let own: HashSet<u32> = procs.tree(std::process::id()).into_iter().collect();
         let mut seen = HashSet::new();
         for (&pid, p) in &procs.0 {
+            // The program's own daemons (`codex app-server`, `claude daemon`) are not sessions.
             if !crate::kill::AGENTS.contains(&p.name.as_str())
                 || own.contains(&pid)
                 || procs.under(pid, "herdr")
+                || crate::scan::daemonish(pid)
             {
                 continue;
             }

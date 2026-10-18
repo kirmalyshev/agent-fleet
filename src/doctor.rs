@@ -103,6 +103,105 @@ fn files(v: &[&String]) -> String {
     }
 }
 
+/// The intentional hold on an agent's open task: an open blocker, else an unfinished dep.
+/// `None` when no open task of its is held.
+pub fn held(s: &State, id: &str) -> Option<String> {
+    for (tid, t) in &s.tasks {
+        if t.owner.as_deref() != Some(id) || t.state.is_terminal() {
+            continue;
+        }
+        for b in s.blockers.values() {
+            if b.task.as_deref() == Some(tid) {
+                let mut d = format!("held: {}", b.what);
+                if let Some(o) = &b.owner {
+                    d += &format!(" · {o}");
+                }
+                if let Some(w) = &b.unblocks_when {
+                    d += &format!(" · unblocks {w}");
+                }
+                return Some(d);
+            }
+        }
+        if let Some(dep) = t.blocked_by.first() {
+            return Some(format!("held: waits for {dep}"));
+        }
+    }
+    None
+}
+
+/// A "~21m" or "ETA 3h" in a hold's scope, as a duration.
+fn eta_of(scope: &str) -> Option<Duration> {
+    let low = scope.to_lowercase();
+    let pos = low
+        .find('~')
+        .map(|p| p + 1)
+        .or_else(|| low.find("eta ").map(|p| p + 4))?;
+    let rest = low[pos..].trim_start();
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let n: i64 = digits.parse().ok()?;
+    Some(match rest[digits.len()..].trim_start().chars().next() {
+        Some('h') => Duration::hours(n),
+        _ => Duration::minutes(n),
+    })
+}
+
+fn eta_str(d: Duration) -> String {
+    let m = d.num_minutes();
+    if m >= 60 {
+        format!("{}h{:02}m", m / 60, m % 60)
+    } else {
+        format!("{m}m")
+    }
+}
+
+/// The resource the agent's worktree holds or queues for, as `(detail, since, eta)`: `since`
+/// starts the wait's clock, `eta` the holder's stated one ("~21m" in its scope). A legitimate
+/// wait, never `hung` or `stalled`.
+pub fn resource_wait(s: &State, a: &Agent) -> Option<(String, DateTime<Utc>, Option<Duration>)> {
+    let (_, w) = worktree_of(s, a)?;
+    let inside = |h: &Hold| {
+        h.cwd
+            .as_deref()
+            .is_some_and(|c| c == w.state.path || c.starts_with(&format!("{}/", w.state.path)))
+    };
+    for r in s.resources.values().filter(|r| r.host == a.host) {
+        if let Some(h) = &r.holder
+            && inside(h)
+        {
+            let scope = h
+                .scope
+                .as_deref()
+                .map(|sc| format!(" ({sc})"))
+                .unwrap_or_default();
+            return Some((format!("holds {}{scope}", r.resource), h.since, None));
+        }
+        if let Some(wt) = r.waiting.iter().find(|w| inside(w)) {
+            let holder = r.holder.as_ref();
+            let eta = holder.and_then(|h| h.scope.as_deref()).and_then(eta_of);
+            let behind = holder
+                .map(|h| {
+                    format!(
+                        " behind {}",
+                        h.scope
+                            .clone()
+                            .or_else(|| h.cwd.clone())
+                            .unwrap_or_else(|| format!("pid {}", h.pid))
+                    )
+                })
+                .unwrap_or_default();
+            let eta_s = eta
+                .map(|d| format!(", ~{}", eta_str(d)))
+                .unwrap_or_default();
+            return Some((
+                format!("waiting for {}{behind}{eta_s}", r.resource),
+                wt.since,
+                eta,
+            ));
+        }
+    }
+    None
+}
+
 /// `stalled`: idle or blocked at least `min` since it last worked. The host's push uses this
 /// exact predicate, so the board and the notice can never disagree.
 pub fn stalled(a: &Agent, now: DateTime<Utc>, min: Duration) -> Option<String> {
@@ -115,6 +214,10 @@ pub fn stalled(a: &Agent, now: DateTime<Utc>, min: Duration) -> Option<String> {
 
 /// `hung`: `working` for HUNG at under HUNG_CPU_PCT, its worktree unchanged as long.
 pub fn hung(s: &State, a: &Agent, now: DateTime<Utc>) -> Option<String> {
+    // a worktree waiting on a resource is a legitimate wait, not a hang
+    if resource_wait(s, a).is_some() {
+        return None;
+    }
     let u = a.usage.as_ref()?;
     let wt = worktree_of(s, a);
     if a.state != AgentState::Working
@@ -174,7 +277,11 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
             .get(id)
             .map(|st| format!("; {}", st.cause.name()))
             .unwrap_or_default();
-        if let Some(detail) = stalled(a, now, STALLED) {
+        if let Some(h) = held(s, id) {
+            out.push(finding("held", id, format!("{h}{}", told(s, id))));
+        } else if resource_wait(s, a).is_none()
+            && let Some(detail) = stalled(a, now, STALLED)
+        {
             out.push(finding(
                 "stalled",
                 id,
@@ -963,5 +1070,93 @@ mod tests {
             agent(AgentState::Working, now, "/w/a", 80, 1),
         );
         assert!(findings(&s, now).is_empty());
+    }
+
+    #[test]
+    fn a_held_task_and_a_resource_wait_are_neither_stalled_nor_hung() {
+        let now = Utc::now();
+        let h = |n| now - Duration::hours(n);
+        let mut s = State::default();
+        s.worktrees
+            .insert(worktree_key("h", "/w/a"), tree("/w/a", &[], 0, 0, h(1)));
+        let mut a = agent(AgentState::Idle, h(1), "/w/a", 0, 1024);
+        a.worked = Some(h(1));
+        s.agents.insert("agent:h/s/held".into(), a);
+        s.tasks.insert(
+            "task:p/1".into(),
+            crate::state::Task {
+                project: "p".into(),
+                title: "t".into(),
+                url: None,
+                state: crate::event::TaskState::Working,
+                since: h(1),
+                owner: Some("agent:h/s/held".into()),
+                lead: None,
+                blocked_by: Default::default(),
+                handoffs: vec![],
+            },
+        );
+        s.blockers.insert(
+            "b1".into(),
+            crate::state::Blocker {
+                task: Some("task:p/1".into()),
+                what: "waits for the perf run".into(),
+                owner: None,
+                unblocks_when: None,
+                by: "agent:h/s/x".into(),
+                since: h(1),
+            },
+        );
+        assert_eq!(
+            held(&s, "agent:h/s/held").as_deref(),
+            Some("held: waits for the perf run")
+        );
+        let f = findings(&s, now);
+        assert!(
+            f.iter()
+                .any(|x| x.kind == "held" && x.subject == "agent:h/s/held"),
+            "{f:#?}"
+        );
+        assert!(
+            !f.iter()
+                .any(|x| x.kind == "stalled" && x.subject == "agent:h/s/held")
+        );
+        // a working agent 1st in the sim queue behind a "~21m" e2e is a legitimate wait
+        s.agents.insert(
+            "agent:h/s/q".into(),
+            agent(AgentState::Working, h(1), "/w/a", 0, 1024),
+        );
+        s.resources.insert(
+            "h:sim".into(),
+            crate::state::Resource {
+                host: "h".into(),
+                resource: "sim".into(),
+                holder: Some(Hold {
+                    pid: 1,
+                    cwd: Some("/w/other".into()),
+                    scope: Some("e2e, ~21m".into()),
+                    since: h(1),
+                }),
+                waiting: vec![Hold {
+                    pid: 2,
+                    cwd: Some("/w/a/x".into()),
+                    scope: None,
+                    since: now - Duration::minutes(10),
+                }],
+            },
+        );
+        let q = s.agents.get("agent:h/s/q").unwrap();
+        let (detail, _, eta) = resource_wait(&s, q).unwrap();
+        assert!(
+            detail.contains("waiting for sim behind e2e, ~21m") || detail.contains("~21m"),
+            "{detail}"
+        );
+        assert_eq!(eta, Some(Duration::minutes(21)));
+        assert!(hung(&s, q, now).is_none(), "a queued agent is not hung");
+        let f = findings(&s, now);
+        assert!(
+            !f.iter()
+                .any(|x| x.kind == "stalled" && x.subject == "agent:h/s/q")
+        );
     }
 }

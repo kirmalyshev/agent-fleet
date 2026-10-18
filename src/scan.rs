@@ -541,6 +541,43 @@ pub fn lock_changes<'a>(before: Option<&Lock>, now: &'a Lock) -> Vec<LockChange<
     out
 }
 
+/// `codex app-server daemon`, `claude daemon` and friends: an agent program's own
+/// infrastructure, not an agent session — `true` when `pid`'s argv carries an
+/// `app-server` or `daemon` subcommand.
+pub fn daemonish(pid: u32) -> bool {
+    is_infra(&argv_of(pid))
+}
+
+fn is_infra(argv: &[String]) -> bool {
+    argv.iter()
+        .skip(1)
+        .any(|t| t == "app-server" || t == "daemon")
+}
+
+fn argv_of(pid: u32) -> Vec<String> {
+    if cfg!(target_os = "linux") {
+        return std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|b| {
+                b.split(|&c| c == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    std::process::Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "args="])
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The working directory of a live process on this machine.
 pub fn cwd_of(pid: u32) -> Option<String> {
     if cfg!(target_os = "linux") {
@@ -900,5 +937,17 @@ mod tests {
             w.files
         );
         assert!(w.files.contains(&".gitmodules".to_string()));
+    }
+
+    #[test]
+    fn a_programs_own_daemon_is_infrastructure_not_a_session() {
+        let argv = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(is_infra(&argv(&["/x/bin/codex", "app-server", "daemon"])));
+        assert!(is_infra(&argv(&["/x/bin/claude", "daemon"])));
+        assert!(!is_infra(&argv(&["/x/bin/codex"])));
+        assert!(!is_infra(&argv(&[
+            "/x/bin/claude",
+            "--dangerously-skip-permissions"
+        ])));
     }
 }
