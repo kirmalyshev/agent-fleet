@@ -28,7 +28,7 @@ pub const QUEUED: Duration = Duration::minutes(10);
 pub const QUOTA_PCT: f64 = 90.0;
 /// A spawn request unanswered this long means its host is not listening.
 pub const SPAWN_UNANSWERED: Duration = Duration::minutes(5);
-/// Idle or blocked this long after working, with no lead to tell: same as `host --stall-min`.
+/// Idle or blocked this long after working: somebody should be told. Same as `host --stall-min`.
 pub const STALLED: Duration = Duration::minutes(crate::spawn::STALL_MIN as i64);
 /// A failed spawn stays a finding this long.
 pub const SPAWN_FAILED: Duration = Duration::hours(1);
@@ -103,6 +103,62 @@ fn files(v: &[&String]) -> String {
     }
 }
 
+/// `stalled`: idle or blocked at least `min` since it last worked. The host's push uses this
+/// exact predicate, so the board and the notice can never disagree.
+pub fn stalled(a: &Agent, now: DateTime<Utc>, min: Duration) -> Option<String> {
+    let idle_for = now - a.since;
+    (matches!(a.state, AgentState::Idle | AgentState::Blocked)
+        && idle_for >= min
+        && a.worked.is_some())
+    .then(|| format!("idle for {}m since it worked", idle_for.num_minutes()))
+}
+
+/// `hung`: `working` for HUNG at under HUNG_CPU_PCT, its worktree unchanged as long.
+pub fn hung(s: &State, a: &Agent, now: DateTime<Utc>) -> Option<String> {
+    let u = a.usage.as_ref()?;
+    let wt = worktree_of(s, a);
+    if a.state != AgentState::Working
+        || now - a.since < HUNG
+        || !u.cpu_pct.is_some_and(|c| c < HUNG_CPU_PCT)
+        || !wt.is_none_or(|(_, w)| now - w.since >= HUNG)
+    {
+        return None;
+    }
+    let still = wt.map_or(String::new(), |(_, w)| {
+        format!(", its worktree unchanged for {}", ago(now, w.since))
+    });
+    Some(format!(
+        "working for {} at {}% CPU{still}",
+        ago(now, a.since),
+        u.cpu_pct.unwrap_or(0)
+    ))
+}
+
+/// Who a stuck agent's notice goes to: its declared lead, else an up root-coordinator, else
+/// nobody — and never the agent itself.
+pub fn escalate<'a>(s: &'a State, id: &str) -> Option<&'a str> {
+    let to = s
+        .roles
+        .get(id)
+        .and_then(|r| r.lead.as_deref())
+        .or_else(|| {
+            s.agents
+                .keys()
+                .find(|a| {
+                    s.roles
+                        .get(*a)
+                        .is_some_and(|r| r.level == Level::RootCoordinator)
+                })
+                .map(String::as_str)
+        })?;
+    (to != id).then_some(to)
+}
+
+/// "; <who> told" when a stuck agent has somebody, "; nobody to tell" when it does not.
+fn told(s: &State, id: &str) -> String {
+    escalate(s, id).map_or_else(|| "; nobody to tell".to_string(), |t| format!("; {t} told"))
+}
+
 pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
     let mut out = Vec::new();
     // Worktree key → the live agents working in it.
@@ -113,15 +169,8 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
             occupied.entry(key).or_default().push(id);
         }
         let idle_for = now - a.since;
-        if matches!(a.state, AgentState::Idle | AgentState::Blocked)
-            && idle_for >= STALLED
-            && a.worked.is_some()
-        {
-            out.push(finding(
-                "stalled",
-                id,
-                format!("idle for {}m since it worked", idle_for.num_minutes()),
-            ));
+        if let Some(detail) = stalled(a, now, STALLED) {
+            out.push(finding("stalled", id, format!("{detail}{}", told(s, id))));
         }
         if matches!(
             a.state,
@@ -155,25 +204,10 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
                 ));
             }
         }
-        let Some(u) = &a.usage else { continue };
-        if a.state == AgentState::Working
-            && idle_for >= HUNG
-            && u.cpu_pct.is_some_and(|c| c < HUNG_CPU_PCT)
-            && wt.is_none_or(|(_, w)| now - w.since >= HUNG)
-        {
-            let still = wt.map_or(String::new(), |(_, w)| {
-                format!(", its worktree unchanged for {}", ago(now, w.since))
-            });
-            out.push(finding(
-                "hung",
-                id,
-                format!(
-                    "working for {} at {}% CPU{still}",
-                    ago(now, a.since),
-                    u.cpu_pct.unwrap_or(0)
-                ),
-            ));
+        if let Some(detail) = hung(s, a, now) {
+            out.push(finding("hung", id, format!("{detail}{}", told(s, id))));
         }
+        let Some(u) = &a.usage else { continue };
         if let (Some(rss), Some(cpu)) = (u.rss_kb, u.cpu_pct)
             && (rss >= HEAVY_RSS_KB || cpu >= HEAVY_CPU_PCT)
         {
@@ -625,6 +659,74 @@ mod tests {
         s.agents.insert("agent:h/s/mac".into(), a.clone());
         assert_eq!(worktree_of(&s, &a).map(|(k, _)| k.as_str()), Some("h:/w/a"));
         assert!(findings(&s, now).is_empty(), "no CPU reading is not 0% CPU");
+    }
+
+    #[test]
+    fn a_macos_sampled_agent_can_be_hung() {
+        // On macOS the numbers now come from `ps`, so the low-CPU read is real.
+        let now = Utc::now();
+        let mut s = State::default();
+        s.agents.insert(
+            "agent:h/s/mac".into(),
+            agent(
+                AgentState::Working,
+                now - Duration::hours(1),
+                "/w/a",
+                0,
+                1024,
+            ),
+        );
+        assert_eq!(kinds(&findings(&s, now)), vec![("hung", "agent:h/s/mac")]);
+    }
+
+    #[test]
+    fn a_stuck_finding_says_who_was_told() {
+        use crate::state::Role;
+        let now = Utc::now();
+        let mut s = State::default();
+        let role = |level: Level, lead: Option<&str>| Role {
+            level,
+            lead: lead.map(str::to_string),
+            domain: None,
+            by: "agent:h/s/root".into(),
+            since: now,
+        };
+        let mut a = agent(AgentState::Idle, now - Duration::minutes(20), "/w/a", 0, 1);
+        a.worked = Some(now - Duration::minutes(40));
+        s.agents.insert("agent:h/s/a".into(), a);
+        let detail = |s: &State| {
+            findings(s, now)
+                .into_iter()
+                .find(|f| f.kind == "stalled" && f.subject == "agent:h/s/a")
+                .map(|f| f.detail)
+        };
+        assert_eq!(
+            detail(&s).as_deref(),
+            Some("idle for 20m since it worked; nobody to tell")
+        );
+        s.roles.insert(
+            "agent:h/s/a".into(),
+            role(Level::Implementer, Some("agent:h/s/lead")),
+        );
+        assert_eq!(
+            detail(&s).as_deref(),
+            Some("idle for 20m since it worked; agent:h/s/lead told"),
+            "the lead wins over any root"
+        );
+        // No lead: an up root-coordinator is told; it is never the agent itself.
+        s.roles.get_mut("agent:h/s/a").unwrap().lead = None;
+        let mut root = agent(AgentState::Idle, now - Duration::minutes(20), "/w/b", 0, 1);
+        root.worked = Some(now - Duration::minutes(40));
+        s.agents.insert("agent:h/s/root".into(), root);
+        s.roles
+            .insert("agent:h/s/root".into(), role(Level::RootCoordinator, None));
+        assert_eq!(
+            detail(&s).as_deref(),
+            Some("idle for 20m since it worked; agent:h/s/root told")
+        );
+        let f = findings(&s, now);
+        let r = f.iter().find(|f| f.subject == "agent:h/s/root").unwrap();
+        assert_eq!(r.detail, "idle for 20m since it worked; nobody to tell");
     }
 
     #[test]
