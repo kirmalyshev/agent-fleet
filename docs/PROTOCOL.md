@@ -432,11 +432,12 @@ a label named x. Config errors name the line that is wrong: an unknown profile, 
 cycle, two defaults, no default.
 
 `agent-fleet spawn <owner/repo>#<issue>` reads the issue with `gh issue view` (`AGENT_FLEET_GH`
-names the binary), picks the rule — `--profile`, `--host` and `--level` override it — then walks
-the profile's fallback chain past a profile at `cap` (live agents of the profile for this repo plus pending
-requests) or whose kind's quota on the target host is exhausted — a quota counts as exhausted
-while a 100% window's reset is still ahead or the `exhausted` read is under 30 min old;
-every step lands in `why`. The brief renders in one pass over the template: tokens
+names the binary), picks the rule — `--profile`, `--host` and `--level` override it. A profile at
+`cap` (live agents of the profile for this repo plus pending requests) has no seat: the spawn is
+refused, never moved to another profile. A profile whose kind's quota on the target host is
+exhausted — while a 100% window's reset is still ahead or the `exhausted` read is under 30 min
+old — passes to its `fallback`, unless `--profile` named it: an explicit profile is started as
+named or refused. Every step lands in `why`. The brief renders in one pass over the template: tokens
 NAME, KIND (the profile name), PROGRAM (the kind), SLUG, ISSUE, TITLE, BRANCH, SCOPE, HOST,
 LEVEL, LEAD, HANDOFF (empty unless a handoff), the `[vars]` and `--set KEY=VALUE`; a value is
 never re-expanded and a placeholder with no value refuses the spawn. `--dry-run` prints the
