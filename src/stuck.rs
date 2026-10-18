@@ -38,11 +38,6 @@ pub const QUOTA_WAIT: Duration = Duration::minutes(30);
 /// A rate-limit line without a number waits this long before the `continue`.
 const RL_DEFAULT: Duration = Duration::minutes(5);
 
-fn tail_lines(s: &str, n: usize) -> String {
-    let lines: Vec<&str> = s.lines().collect();
-    lines[lines.len().saturating_sub(n)..].join("\n")
-}
-
 /// The last `n` non-empty screen lines, joined for a one-line message.
 fn last_n(s: &str, n: usize) -> String {
     s.lines()
@@ -57,10 +52,12 @@ fn last_n(s: &str, n: usize) -> String {
 }
 
 /// The "Press Enter to send queued" hint, on a UI chrome line — never in the agent's prose.
-fn send_hint(screen: &str) -> bool {
+fn send_hint(program: Option<&str>, screen: &str) -> bool {
+    let chrome = chrome_lines(program, screen);
     screen
         .lines()
-        .any(|l| chrome(l) && l.to_lowercase().contains("press enter to send queued"))
+        .enumerate()
+        .any(|(i, l)| chrome[i] && l.to_lowercase().contains("press enter to send queued"))
 }
 
 /// The message waiting in a Devin input box, read off the screen: the box is the
@@ -114,12 +111,78 @@ pub fn queued_text(screen: &str) -> Option<String> {
     Some(String::new())
 }
 
-/// A UI chrome line — the program's own text. `⏺`, `⎿` and `│` lines are Claude's/Devin's
-/// prose and tool output, `•` Codex's: a signal quoted there is the agent talking, not the
-/// program's state, and never matches.
-fn chrome(line: &str) -> bool {
-    let l = line.trim_start();
-    !(l.starts_with('⏺') || l.starts_with('⎿') || l.starts_with('│') || l.starts_with('•'))
+/// The program's own alert icons — `✱`/`▲`/`✗`/`✓`, or `[i]`/`[!]`/`[X]`/`[~]` on a
+/// legacy terminal. A notice opens with one of them and then its title.
+const ALERT_ICONS: [&str; 10] = ["[i]", "[!]", "[x]", "[~]", "✱", "▲", "✗", "✓", "⚠", "ℹ"];
+
+/// `line` opens with an alert icon.
+fn alert_icon(line: &str) -> bool {
+    let t = line.trim_start();
+    ALERT_ICONS
+        .iter()
+        .any(|i| t.get(..i.len()).is_some_and(|h| h.eq_ignore_ascii_case(i)))
+}
+
+/// The text past a leading alert icon — `▲ Quota exhausted` yields `Quota exhausted`;
+/// a line with no icon is itself, trimmed.
+fn notice_text(line: &str) -> &str {
+    let t = line.trim_start();
+    for icon in ALERT_ICONS {
+        if t.get(..icon.len())
+            .is_some_and(|h| h.eq_ignore_ascii_case(icon))
+        {
+            return t[icon.len()..].trim_start_matches('\u{fe0f}').trim_start();
+        }
+    }
+    t
+}
+
+/// Which lines of `screen` are the program's own UI, by position — not by first
+/// character. From the input box's top rule down (the box, the `Context:` footer, the
+/// status lines under it) everything is the program's. Above it, a `⏺`/`●`/`•`/`⎿`/`│`/
+/// `└`/`○`/`❯`/`❭`/`›`/`>` line opens an assistant or tool block that runs to the next
+/// blank line or the box; every line inside it is the agent's prose or its tool's
+/// output — a hard-wrapped line resumes at column 0 — and so is every indented line
+/// (a reply paragraph, printed file contents). The exception is a line opening with an
+/// alert icon: the program's notice keeps its shape wherever it sits.
+fn chrome_lines(program: Option<&str>, screen: &str) -> Vec<bool> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let rule = |l: &str| l.starts_with(&"─".repeat(10));
+    let prompt = |l: &str| {
+        let l = l.trim_start();
+        l.starts_with('❭') || l.starts_with('❯') || l.starts_with('›')
+    };
+    // the input box: the last rule directly above a ❭/❯/› prompt line; with its top
+    // scrolled off, the last rule at all still fences the footers below it
+    let top = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|&(i, l)| rule(l) && lines.get(i + 1).is_some_and(|l| prompt(l)))
+        .map(|(i, _)| i)
+        .or_else(|| lines.iter().rposition(|l| rule(l)));
+    let mut out = vec![true; lines.len()];
+    let mut block = false;
+    for (i, l) in lines.iter().enumerate() {
+        if top.is_some_and(|b| i >= b) {
+            break;
+        }
+        let t = l.trim_start();
+        if t.is_empty() {
+            block = false;
+            continue;
+        }
+        if t.starts_with(['⏺', '●', '•', '⎿', '│', '└', '○', '❯', '❭', '›', '>'])
+        {
+            block = true;
+            out[i] = false;
+        } else if program.is_none_or(|p| p == "devin") && alert_icon(t) {
+            // a notice keeps its shape even inside a block
+        } else if block || l.starts_with(char::is_whitespace) {
+            out[i] = false;
+        }
+    }
+    out
 }
 
 /// "reset(s) in ~?N", "retry after N" and friends: the short wait a rate-limit line names.
@@ -203,9 +266,6 @@ fn codex_context_pct(line: &str) -> Option<f64> {
 /// `Context: N / M tokens (P%)` is full at ≥90%, Claude's `Context left until
 /// auto-compact: P%` and Codex's `P% context left` at ≤10%.
 fn context_full(program: Option<&str>, line: &str) -> bool {
-    if !chrome(line) {
-        return false;
-    }
     let devin = devin_context_pct(line).is_some_and(|p| p >= 90.0);
     let claude = claude_context_pct(line).is_some_and(|p| p <= 10.0);
     let codex = codex_context_pct(line).is_some_and(|p| p <= 10.0);
@@ -217,35 +277,82 @@ fn context_full(program: Option<&str>, line: &str) -> bool {
     }
 }
 
-/// The line is the program's own out-of-quota banner, as it appears in its UI chrome.
-fn quota_on_screen(program: Option<&str>, line: &str) -> bool {
-    if !chrome(line) {
-        return false;
+/// The line is the program's own rate-limit line; `Some(wait)` is the parsed retry
+/// window. Devin's notices are Alert titles — a title leads its line, so a reply that
+/// mentions one mid-sentence is not a notice.
+fn rate_limit_on_screen(program: Option<&str>, line: &str) -> Option<Duration> {
+    let wait = retry_in(line);
+    if program == Some("devin") {
+        let t = notice_text(line).to_lowercase();
+        return (t.starts_with("rate limit") || t.starts_with("retry after") || wait.is_some())
+            .then(|| wait.unwrap_or(RL_DEFAULT));
     }
-    let pats: &[&str] = match program {
-        Some("devin") => &["quota exhausted"],
-        Some("claude") => &["usage limit", "limit reached"],
-        Some("codex") => &["usage limit"],
-        _ => &["quota exhausted", "usage limit", "limit reached"],
-    };
     let low = line.to_lowercase();
-    pats.iter().any(|p| low.contains(p))
+    (low.contains("rate limit") || low.contains("retry after") || wait.is_some())
+        .then(|| wait.unwrap_or(RL_DEFAULT))
+}
+
+/// The line is the program's own out-of-quota banner. For Devin — the one program
+/// whose replies render as bare indented prose — the pattern is an Alert title and
+/// leads its line past the icon.
+fn quota_on_screen(program: Option<&str>, line: &str) -> bool {
+    let low = line.to_lowercase();
+    let title = notice_text(line).to_lowercase();
+    let devin = ["quota exhausted", "usage limit", "usage paused"]
+        .iter()
+        .any(|p| title.starts_with(p));
+    let other = low.contains("usage limit") || low.contains("limit reached");
+    match program {
+        Some("devin") => devin,
+        Some("codex") => low.contains("usage limit"),
+        Some(_) => other,
+        None => devin || low.contains("quota exhausted") || other,
+    }
+}
+
+/// The line is the program's own error banner — for Devin an Alert title leading the
+/// line; its replies can quote one mid-sentence.
+fn error_on_screen(program: Option<&str>, line: &str) -> bool {
+    let low = line.to_lowercase();
+    let generic = low.contains("something went wrong")
+        || low.contains("send a message to continue")
+        || low.contains("api error");
+    let devin = [
+        "something went wrong",
+        "send a message to continue",
+        "api error",
+        "an internal error",
+        "an unexpected error",
+        "connection error",
+        "response truncated",
+    ]
+    .iter()
+    .any(|p| notice_text(line).to_lowercase().starts_with(p));
+    match program {
+        Some("devin") => devin,
+        Some(_) => generic,
+        None => devin || generic,
+    }
 }
 
 /// ONE cause for a stopped agent, read off `screen_tail` — only the program's own UI
-/// lines carry a signal; its prose (`⏺`/`⎿`/`│`/`•` lines) never does. `None` means the
-/// screen names nothing the host recognizes; `cause_of` maps that (and herdr's `blocked`)
-/// to the rest.
+/// lines carry a signal: everything inside an assistant or tool block, a reply
+/// paragraph or a printed file is the agent's prose and never does. `None` means the
+/// screen names nothing the host recognizes; `cause_of` maps that (and herdr's
+/// `blocked`) to the rest.
 pub fn stuck_cause(
     program: Option<&str>,
     screen_tail: &str,
     quota: Option<&Quota>,
     now: DateTime<Utc>,
 ) -> Option<Cause> {
-    let t6 = tail_lines(screen_tail, 6);
-    let t14 = tail_lines(screen_tail, 14);
-    if t6.lines().any(|l| {
-        chrome(l) && {
+    let lines: Vec<&str> = screen_tail.lines().collect();
+    let chrome = chrome_lines(program, screen_tail);
+    let ui = |i: usize| chrome.get(i).copied().unwrap_or(false);
+    let t6 = lines.len().saturating_sub(6);
+    let t14 = lines.len().saturating_sub(14);
+    if lines.iter().enumerate().skip(t6).any(|(i, l)| {
+        ui(i) && {
             let low = l.to_lowercase();
             low.contains("press enter to send queued")
                 || (low.contains("never put") && low.contains("secret") && low.contains("anywhere"))
@@ -257,12 +364,12 @@ pub fn stuck_cause(
             "a prompt waits in the input box",
         ));
     }
-    let rl = t14.lines().rev().filter(|l| chrome(l)).find_map(|l| {
-        let low = l.to_lowercase();
-        let wait = retry_in(l);
-        (low.contains("rate limit") || low.contains("retry after") || wait.is_some())
-            .then(|| wait.unwrap_or(RL_DEFAULT))
-    });
+    let rl = lines
+        .iter()
+        .enumerate()
+        .skip(t14)
+        .rev()
+        .find_map(|(i, l)| ui(i).then(|| rate_limit_on_screen(program, l)).flatten());
     if let Some(wait) = rl {
         return Some(Cause {
             kind: StuckCause::RateLimit,
@@ -272,7 +379,12 @@ pub fn stuck_cause(
     }
     // `quota` is the program saying it on screen — `agent.quota` only lends the spent
     // window's `resets_at`. An idle agent on an out-of-quota account is just idle.
-    if t14.lines().any(|l| quota_on_screen(program, l)) {
+    if lines
+        .iter()
+        .enumerate()
+        .skip(t14)
+        .any(|(i, l)| ui(i) && quota_on_screen(program, l))
+    {
         let until = quota.and_then(|q| {
             q.windows
                 .iter()
@@ -287,21 +399,28 @@ pub fn stuck_cause(
             until,
         });
     }
-    if let Some(line) = t14.lines().rev().find(|l| context_full(program, l)) {
+    if let Some(line) = lines
+        .iter()
+        .enumerate()
+        .skip(t14)
+        .rev()
+        .find(|(i, l)| ui(*i) && context_full(program, l))
+        .map(|(_, l)| *l)
+    {
         return Some(Cause {
             kind: StuckCause::ContextFull,
             detail: format!("context nearly full: {}", line.trim()),
             until: None,
         });
     }
-    if let Some(line) = t14.lines().rev().find(|l| {
-        chrome(l) && {
-            let low = l.to_lowercase();
-            low.contains("something went wrong")
-                || low.contains("send a message to continue")
-                || low.contains("api error")
-        }
-    }) {
+    if let Some(line) = lines
+        .iter()
+        .enumerate()
+        .skip(t14)
+        .rev()
+        .find(|(i, l)| ui(*i) && error_on_screen(program, l))
+        .map(|(_, l)| *l)
+    {
         return Some(Cause {
             kind: StuckCause::Error,
             detail: format!("error on screen: {}", line.trim()),
@@ -495,19 +614,16 @@ pub fn step(c: &Ctx, cause: &Cause, ep: &mut Episode) -> Option<Act> {
                 ""
             };
             match ep.step {
+                // The first move is always a bare Enter: it ships a queued prompt and
+                // sends a typed one. An Escape here could wipe a long pasted brief.
                 0 => {
                     ep.at = Some(now);
-                    if send_hint(screen) {
-                        ep.step = 1;
-                        Some(Act::Enter)
-                    } else {
-                        ep.step = 2;
-                        resend().or_else(|| held(s, why))
-                    }
+                    ep.step = 1;
+                    Some(Act::Enter)
                 }
                 1 if ep.at.is_some_and(|t| now - t >= UNSENT_RETRY) => {
                     ep.step = 2;
-                    if send_hint(screen) {
+                    if send_hint(a.kind.as_deref(), screen) {
                         tell(
                             s,
                             id,
@@ -1098,6 +1214,75 @@ mod tests {
     }
 
     #[test]
+    fn prose_blocks_and_replies_carry_no_signal() {
+        let now = Utc::now();
+        // A signal quoted in a wrapped reply, a continuation line, a printed file or
+        // a Devin reply is the agent talking — never the program's state.
+        for (prog, screen) in [
+            ("claude", "⏺ This change enforces a\n  usage limit per user"),
+            ("claude", "⏺ Summary:\n  - Added rate limit middleware"),
+            (
+                "claude",
+                "⏺ The client now retries on\n  API error responses",
+            ),
+            (
+                "codex",
+                "• The endpoint now returns\n  \"rate limit exceeded, retry after 30s\"",
+            ),
+            (
+                "claude",
+                "⏺ Read(src/rl.ts)\n  ⎿  Read 3 lines\n     export const RL = \"Rate limit reached\"",
+            ),
+            (
+                "devin",
+                " I added a Quota exhausted banner to the settings page.",
+            ),
+            (
+                "devin",
+                " The form now shows Something went wrong when the request fails.",
+            ),
+        ] {
+            assert!(
+                stuck_cause(Some(prog), screen, None, now).is_none(),
+                "{prog}: {screen}"
+            );
+        }
+        // a hard-wrapped continuation resumes at column 0 — still inside its block
+        for (prog, screen) in [
+            ("claude", "⏺ this change adds a\nusage limit per user"),
+            ("codex", "• the endpoint returns\nrate limit exceeded"),
+            (
+                "devin",
+                "I added a Quota exhausted banner to the settings page.",
+            ),
+            (
+                "devin",
+                "The form now shows Something went wrong when the request fails.",
+            ),
+        ] {
+            assert!(
+                stuck_cause(Some(prog), screen, None, now).is_none(),
+                "{prog}: {screen}"
+            );
+        }
+        // and a real notice — Devin's `▲ Quota exhausted` alert, icon and title —
+        // still lands, indented or not, inside a block or after a blank line
+        for (screen, want) in [
+            (" ▲ Quota exhausted", StuckCause::Quota),
+            ("▲ Quota exhausted", StuckCause::Quota),
+            (" [X] Quota exhausted", StuckCause::Quota),
+            ("⏺ done\n ▲ Usage limit reached", StuckCause::Quota),
+            (" ⏺ done\n\n ✗ Something went wrong", StuckCause::Error),
+        ] {
+            assert_eq!(
+                kind(stuck_cause(Some("devin"), screen, None, now)),
+                Some(want),
+                "{screen}"
+            );
+        }
+    }
+
+    #[test]
     fn the_screen_decides_and_unsent_trumps_noise() {
         let now = Utc::now();
         let c = stuck_cause(
@@ -1263,15 +1448,24 @@ mod tests {
             ),
             Some(Act::Tell { .. })
         ));
-        // a pasted brief with no hint is Escape+re-sent right away …
+        // a pasted brief with no hint still gets a bare Enter first — an Escape here
+        // could wipe a long, partly visible paste; the re-send is the retry pass
         let mut ep9 = Episode::default();
         let ep9 = ep9.for_cause(a.since, StuckCause::Unsent);
         let pasted = "──────────────\n❭ do it\n──────────────\nSWE-2 High · Context: 1 / 2,000 tokens (1%)\n";
-        match step(&ctx(pasted, now, None, false), &un, ep9) {
+        assert!(matches!(
+            step(&ctx(pasted, now, None, false), &un, ep9),
+            Some(Act::Enter)
+        ));
+        match step(
+            &ctx(pasted, now + Duration::seconds(61), None, false),
+            &un,
+            ep9,
+        ) {
             Some(Act::Resend(t)) => assert_eq!(t, "do it"),
             x => panic!("{x:?} is no resend"),
         }
-        // … but never while a doorbell to the agent is still undelivered
+        // … but a re-send never lands while a doorbell to the agent is undelivered
         let mut s2 = state_with_lead();
         s2.msgs.insert(
             "m1".into(),
@@ -1295,7 +1489,17 @@ mod tests {
             handoff: None,
             continued_before: false,
         };
-        assert!(matches!(step(&ctx2, &un, ep10), Some(Act::Tell { .. })));
+        assert!(matches!(step(&ctx2, &un, ep10), Some(Act::Enter)));
+        let ctx3 = Ctx {
+            s: &s2,
+            id,
+            a: &a,
+            screen: pasted,
+            now: now + Duration::seconds(61),
+            handoff: None,
+            continued_before: false,
+        };
+        assert!(matches!(step(&ctx3, &un, ep10), Some(Act::Tell { .. })));
         // permission/waiting/unknown never act
         for k in [
             StuckCause::Permission,

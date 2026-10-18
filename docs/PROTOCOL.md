@@ -308,8 +308,16 @@ and of a `working` one `doctor` calls `hung` — through herdr's `agent.read`, a
 cause with a pure classifier from its own screen text — `agent.quota` supplies the spent
 window's reset for `until` and gates the handoff target, but the account being out is not
 itself a cause; the program must say so on screen. A screen signal matches only on the
-program's own UI lines: a `⏺`, `⎿`, `│` or `•` line is
-the agent's prose or tool output, and a banner quoted there means nothing. The result lands
+program's own UI lines, by position: everything from the input box's top rule down (the
+box, the `Context:` footer, the status lines under it) is the program's; above it, a
+`⏺`/`●`/`•`/`⎿`/`│`/`└`/`○`/`❯`/`❭`/`›`/`>` line opens an assistant or tool block that
+runs to the next blank line or the box, and every line inside it — a hard-wrapped line
+resumes at column 0 — plus every indented line (a reply paragraph, printed file
+contents) is the agent's prose and never carries a signal. The exception is a line
+opening with the program's own alert icon (`✱`/`▲`/`✗`/`✓`, or `[i]`/`[!]`/`[X]`/`[~]`
+on a legacy terminal): a notice keeps its exact shape wherever it sits, and for Devin —
+whose replies are bare indented prose — the notice's title leads the line past the
+icon, so a reply quoting "Quota exhausted" mid-sentence is not a banner. The result lands
 in `agent.stuck` (`cause`, `detail`, `until`), written when the cause
 appears or changes, and once with no `cause` when the agent works again. State `stuck` is
 keyed by agent; `ps`, the TUI and the board show the cause next to the state, `doctor` puts
@@ -345,10 +353,11 @@ typing is not `unsent` yet:
   it shares the Claude account's limits, so a Claude agent out of quota is never handed to
   it on the same host.
 - `rate_limit`: wait; `continue` once after `until`.
-- `unsent`: one Enter, but only while the "Press Enter to send queued" hint is on screen;
-  with no hint, one Escape and the queued text re-sent; still there, tell the lead. A
-  prompt queued behind a running turn never gets the Escape, and nothing is re-sent while
-  a doorbell to the agent is still undelivered.
+- `unsent`: one Enter — always, since an Escape could wipe a long pasted brief. If the
+  prompt still sits there a retry-wait later: with the "Press Enter to send queued" hint
+  still up, tell the lead (a queued prompt waits on a running turn); with it gone, one
+  Escape and the queued text re-sent; still there, tell the lead. Nothing is re-sent
+  while a doorbell to the agent is still undelivered.
 - `context_full`: hand off to the profile's `fallback` with a HANDOFF note to read git
   status, git log and any STATE.md first.
 - `error`: `continue` once; if the error cause returns, tell the lead with the screen's
