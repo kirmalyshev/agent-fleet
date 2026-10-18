@@ -105,6 +105,10 @@ pub struct Quota {
     pub read_at: DateTime<Utc>,
     /// When the report was folded in.
     pub ts: DateTime<Utc>,
+    /// When the reports first showed the account out; kept while it stays out, absent
+    /// while it does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhausted_since: Option<DateTime<Utc>>,
 }
 
 /// An `exhausted` read stays believed this long — claude/codex only refresh while used.
@@ -524,14 +528,22 @@ impl State {
                 }
             },
             Known::AgentQuota(d) => {
+                let key = worktree_key(&d.host, &d.kind);
+                let out = d.exhausted || d.windows.iter().any(|w| w.used_pct >= 100.0);
                 self.quotas.insert(
-                    worktree_key(&d.host, &d.kind),
+                    key.clone(),
                     Quota {
                         windows: d.windows.clone(),
                         plan: d.plan.clone(),
                         exhausted: d.exhausted,
                         read_at: d.read_at,
                         ts,
+                        exhausted_since: out.then(|| {
+                            self.quotas
+                                .get(&key)
+                                .and_then(|q| q.exhausted_since)
+                                .unwrap_or(ts)
+                        }),
                     },
                 );
             }
@@ -834,6 +846,54 @@ mod tests {
             .into_event(),
         );
         assert!(s.signals.is_empty());
+    }
+
+    #[test]
+    fn exhausted_since_is_the_first_out_report_while_it_stays_out() {
+        let quota = |exhausted: bool, pct: f64, ts: DateTime<Utc>| {
+            let mut e = ev(
+                ActorKind::Host,
+                Known::AgentQuota(AgentQuota {
+                    host: "h".into(),
+                    kind: "devin".into(),
+                    windows: vec![QuotaWindow {
+                        name: "day".into(),
+                        used_pct: pct,
+                        resets_at: None,
+                    }],
+                    plan: None,
+                    exhausted,
+                    read_at: ts,
+                }),
+            )
+            .into_event();
+            e.ts = ts;
+            e
+        };
+        let t0 = Utc::now();
+        let mut s = State::default();
+        s.apply(&quota(false, 50.0, t0));
+        assert_eq!(s.quotas["h:devin"].exhausted_since, None);
+        // The first report showing the account out stamps it; later out reports keep it.
+        s.apply(&quota(true, 50.0, t0 + chrono::Duration::minutes(1)));
+        let t_out = t0 + chrono::Duration::minutes(1);
+        assert_eq!(
+            s.quotas["h:devin"].exhausted_since,
+            Some(t_out),
+            "the event that set exhausted"
+        );
+        s.apply(&quota(true, 50.0, t0 + chrono::Duration::minutes(5)));
+        assert_eq!(s.quotas["h:devin"].exhausted_since, Some(t_out));
+        // A 100% window counts too; a non-out report clears it, a new outage re-stamps.
+        s.apply(&quota(false, 100.0, t0 + chrono::Duration::minutes(6)));
+        assert_eq!(s.quotas["h:devin"].exhausted_since, Some(t_out));
+        s.apply(&quota(false, 50.0, t0 + chrono::Duration::minutes(7)));
+        assert_eq!(s.quotas["h:devin"].exhausted_since, None);
+        s.apply(&quota(true, 50.0, t0 + chrono::Duration::minutes(8)));
+        assert_eq!(
+            s.quotas["h:devin"].exhausted_since,
+            Some(t0 + chrono::Duration::minutes(8))
+        );
     }
 
     #[test]

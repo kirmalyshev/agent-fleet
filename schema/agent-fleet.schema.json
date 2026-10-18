@@ -2030,6 +2030,14 @@
             "exhausted": {
               "type": "boolean"
             },
+            "exhausted_since": {
+              "description": "When the reports first showed the account out; kept while it stays out, absent\nwhile it does not.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "plan": {
               "type": [
                 "string",

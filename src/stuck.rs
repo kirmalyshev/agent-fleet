@@ -420,6 +420,17 @@ pub fn stuck_cause(
     None
 }
 
+/// Every task `id` owns is finished — it has nothing left to be stuck on.
+fn task_closed(s: &State, id: &str) -> bool {
+    s.tasks
+        .values()
+        .any(|t| t.owner.as_deref() == Some(id) && t.state.is_terminal())
+        && !s
+            .tasks
+            .values()
+            .any(|t| t.owner.as_deref() == Some(id) && !t.state.is_terminal())
+}
+
 /// The cause the program's own signal names — the latest `agent.signal` stored for `id` —
 /// and for Devin, which has no hooks, the account-level quota read (`agent.quota` exhausted)
 /// while it sits idle. `prompt`/`turn_end`/`working` clear the stored signal in the fold, so
@@ -429,11 +440,14 @@ fn signal_cause(s: &State, id: &str, a: &Agent, now: DateTime<Utc>) -> Option<Ca
         Some(sig) => sig,
         None => {
             // Devin reports no hooks; its quota is account-level — `agent.quota` exhausted
-            // plus a stopped agent IS the structured signal.
+            // plus a stopped agent IS the structured signal. But only an episode that began
+            // at or after the account ran out can be stuck on it: an agent already idle
+            // (finished, waiting) when the outage started is just idle.
             if a.kind.as_deref() == Some("devin")
-                && s.quotas
-                    .get(&format!("{}:devin", a.host))
-                    .is_some_and(|q| q.exhausted_at(now))
+                && s.quotas.get(&format!("{}:devin", a.host)).is_some_and(|q| {
+                    q.exhausted_at(now) && q.exhausted_since.is_none_or(|t| a.since >= t)
+                })
+                && !task_closed(s, id)
             {
                 return Some(Cause {
                     kind: StuckCause::Quota,
@@ -444,6 +458,11 @@ fn signal_cause(s: &State, id: &str, a: &Agent, now: DateTime<Utc>) -> Option<Ca
             return None;
         }
     };
+    // A signal speaks for the turn it arrived in: anything older than the last working
+    // stretch is a replay, not a live cause.
+    if a.worked.is_some_and(|w| sig.since < w) {
+        return None;
+    }
     let with = |what: &str| match &sig.detail {
         Some(d) => format!("{what}: {d}"),
         None => what.to_string(),
@@ -597,7 +616,8 @@ pub fn step(c: &Ctx, cause: &Cause, ep: &mut Episode) -> Option<Act> {
                 return None;
             }
             ep.fired = true;
-            let far = cause.until.is_none_or(|u| u - now > QUOTA_WAIT);
+            // Only a KNOWN far reset earns the handoff; an unknown reset is told, not moved.
+            let far = cause.until.is_some_and(|u| u - now > QUOTA_WAIT);
             let until = cause
                 .until
                 .map(|u| crate::ui::at(now, u))
@@ -791,14 +811,7 @@ pub async fn check(
     }
     let tail = last_n(&screen, 5);
     // Never act on an agent whose work is finished.
-    let closed = s
-        .tasks
-        .values()
-        .any(|t| t.owner.as_deref() == Some(id) && t.state.is_terminal())
-        && !s
-            .tasks
-            .values()
-            .any(|t| t.owner.as_deref() == Some(id) && !t.state.is_terminal());
+    let closed = task_closed(s, id);
     // An agent `handoffs` just handed this pass is busy: its `spawn.requested` has not
     // folded back yet, so `replacement_open` alone would let a cause hand it off twice.
     let busy = handed.contains(id)
@@ -870,6 +883,15 @@ async fn run(
     let name = crate::host::short(id);
     match act {
         Act::Continue => {
+            // The log is the dedupe across restarts: one `continue` per episode, like a tell.
+            if events.iter().any(|e| {
+                e.ts > a.since
+                    && matches!(&e.body,
+                        Body::Known(Known::MsgSent(m))
+                            if m.kind == "CONTINUE" && m.reference == cause.kind.name() && m.to == id)
+            }) {
+                return;
+            }
             host.publish(host.presence(Known::MsgSent(MsgSent {
                 to: id.to_string(),
                 kind: "CONTINUE".into(),
@@ -938,6 +960,7 @@ mod tests {
             exhausted: true,
             read_at: Utc::now(),
             ts: Utc::now(),
+            exhausted_since: Some(Utc::now()),
         }
     }
 
@@ -1296,6 +1319,19 @@ mod tests {
             }
             x => panic!("{x:?} is no tell"),
         }
+        // an unknown reset is not "far" — a tell even with a vetted target
+        let mut ep2c = Episode::default();
+        let ep2c = ep2c.for_cause(a.since, StuckCause::Quota);
+        match step(
+            &ctx("", now, Some("haiku")),
+            &cause(StuckCause::Quota, None),
+            ep2c,
+        ) {
+            Some(Act::Tell { text, .. }) => {
+                assert!(text.contains("an unknown time"), "{text}")
+            }
+            x => panic!("{x:?} is no tell"),
+        }
         // a near reset → tell, even with a vetted target
         let mut ep2b = Episode::default();
         let ep2b = ep2b.for_cause(a.since, StuckCause::Quota);
@@ -1516,6 +1552,86 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn a_signal_acts_only_in_its_own_turn() {
+        let now = Utc::now();
+        let mut s = state_with_lead();
+        let id = "agent:h/s/a";
+        let sig = |s: &mut State, since: DateTime<Utc>| {
+            s.signals.insert(
+                id.into(),
+                crate::state::Signal {
+                    signal: "rate_limit".into(),
+                    detail: None,
+                    program: "claude".into(),
+                    since,
+                },
+            );
+        };
+        // The agent worked AFTER the signal arrived — a replayed event, not this turn's.
+        let mut a = agent(AgentState::Idle, false);
+        a.kind = Some("claude".into());
+        a.worked = Some(now - Duration::minutes(5));
+        a.since = now - Duration::minutes(2);
+        sig(&mut s, now - Duration::minutes(10));
+        assert!(signal_cause(&s, id, &a, now).is_none());
+        assert_eq!(
+            cause_of(&s, id, &a, None).kind,
+            StuckCause::Waiting,
+            "a stale rate_limit is no cause, and no continue"
+        );
+        // A signal at or after the last working stretch still names the cause.
+        sig(&mut s, now - Duration::minutes(4));
+        assert_eq!(
+            kind(signal_cause(&s, id, &a, now)),
+            Some(StuckCause::RateLimit)
+        );
+    }
+
+    #[test]
+    fn devins_quota_cause_needs_the_episode_to_start_inside_the_outage() {
+        let now = Utc::now();
+        let id = "agent:h/s/a";
+        let t_out = now - Duration::minutes(30);
+        let mut s = state_with_lead();
+        s.quotas.insert(
+            "h:devin".into(),
+            Quota {
+                windows: vec![],
+                plan: None,
+                exhausted: true,
+                read_at: now,
+                ts: t_out,
+                exhausted_since: Some(t_out),
+            },
+        );
+        // Idle since BEFORE the account ran out: just idle — waiting, not quota.
+        let mut a = agent(AgentState::Idle, true);
+        a.since = t_out - Duration::minutes(10);
+        assert!(signal_cause(&s, id, &a, now).is_none());
+        assert_eq!(cause_of(&s, id, &a, None).kind, StuckCause::Waiting);
+        // Idle since after the outage began: the quota cause.
+        a.since = t_out + Duration::minutes(5);
+        assert_eq!(kind(signal_cause(&s, id, &a, now)), Some(StuckCause::Quota));
+        // But a finished task is never a quota handoff — the work is done.
+        s.tasks.insert(
+            "task:p/1".into(),
+            crate::state::Task {
+                project: "p".into(),
+                title: "t".into(),
+                url: None,
+                state: TaskState::Completed,
+                since: t_out + Duration::minutes(5),
+                owner: Some(id.into()),
+                lead: None,
+                blocked_by: Default::default(),
+                handoffs: vec![],
+            },
+        );
+        assert!(signal_cause(&s, id, &a, now).is_none());
+        assert_eq!(cause_of(&s, id, &a, None).kind, StuckCause::Waiting);
     }
 
     impl std::fmt::Debug for Act {
