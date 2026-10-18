@@ -122,7 +122,11 @@ pub fn held(s: &State, id: &str) -> Option<String> {
                 return Some(d);
             }
         }
-        if let Some(dep) = t.blocked_by.first() {
+        if let Some(dep) = t
+            .blocked_by
+            .iter()
+            .find(|d| s.tasks.get(*d).is_none_or(|dt| !dt.state.is_terminal()))
+        {
             return Some(format!("held: waits for {dep}"));
         }
     }
