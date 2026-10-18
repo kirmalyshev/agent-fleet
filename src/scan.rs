@@ -20,7 +20,7 @@ pub struct Proc {
     pub deleted: bool,
 }
 
-/// Every process on this machine at one moment. Empty off Linux.
+/// Every process on this machine at one moment. Empty outside Linux and macOS.
 #[derive(Debug, Default)]
 pub struct Procs(pub HashMap<u32, Proc>);
 
@@ -68,7 +68,19 @@ impl Procs {
         Self(all)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    /// One `ps` call for the whole table; `comm` gives no cwd, so `cwd`/`deleted` stay empty.
+    #[cfg(target_os = "macos")]
+    pub fn read() -> Self {
+        let out = std::process::Command::new("ps")
+            .args(["-axo", "pid=,ppid=,rss=,time=,comm="])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+        Self(out.map(|s| parse_ps(&s)).unwrap_or_default())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub fn read() -> Self {
         Self::default()
     }
@@ -206,6 +218,52 @@ pub fn by_worktree(
         g.pids.sort_unstable();
     }
     out
+}
+
+/// `ps -axo pid=,ppid=,rss=,time=,comm=` → pid → Proc (macOS; `ps` reports no cwd).
+#[cfg(any(target_os = "macos", test))]
+pub fn parse_ps(s: &str) -> HashMap<u32, Proc> {
+    s.lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let (pid, ppid, rss_kb) = (
+                f.next()?.parse().ok()?,
+                f.next()?.parse().ok()?,
+                f.next()?.parse().ok()?,
+            );
+            let cpu_ms = parse_ps_time(f.next()?)?;
+            let comm = f.collect::<Vec<_>>().join(" ");
+            // macOS gives a path, and a login shell is `-zsh`.
+            let name = comm.rsplit('/').next()?.trim_start_matches('-').to_string();
+            Some((
+                pid,
+                Proc {
+                    ppid,
+                    cpu_ms,
+                    rss_kb,
+                    name,
+                    cwd: None,
+                    deleted: false,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// `ps` TIME, `[[dd-]hh:]mm:ss[.ss]` → milliseconds.
+#[cfg(any(target_os = "macos", test))]
+fn parse_ps_time(s: &str) -> Option<u64> {
+    let (days, s) = match s.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
+        None => (0, s),
+    };
+    let mut f = s.rsplitn(3, ':');
+    let sec = f.next()?;
+    let min: u64 = f.next()?.parse().ok()?;
+    let hour: u64 = f.next().map_or(Ok(0), |h| h.parse()).ok()?;
+    let (sec, frac) = sec.split_once('.').unwrap_or((sec, "0"));
+    let ms = frac.parse::<u64>().ok()? * 1000 / 10u64.pow(frac.len().min(19) as u32);
+    Some(((days * 24 + hour) * 3600 + min * 60 + sec.parse::<u64>().ok()?) * 1000 + ms)
 }
 
 /// `/proc/<pid>/stat` → (ppid, utime + stime + cutime + cstime ticks, rss pages).
@@ -604,6 +662,32 @@ mod tests {
         let s = "42 (a) b (c)) S 7 42 42 0 -1 4194560 100 0 0 0 150 50 10 5 20 0 3 0 1000 9000 512 rest";
         assert_eq!(parse_stat(s), Some((7, 215, 512)));
         assert_eq!(parse_stat("garbage"), None);
+    }
+
+    #[test]
+    fn ps_output_parses_every_time_shape() {
+        let s = "    1      0  12345   0:05.50 /sbin/launchd\n\
+                 \x20  42      1  20480  12:34:56 /opt/bin/herdr\n\
+                 \x20  99     42   4096 2-03:04:05 /usr/bin/claude\n\
+                 \x20 100     42    512   7:08.09 -zsh\n\
+                 \x20   7      1   1024   1:00.00 /opt/my tool/agent-fleet\n\
+                 \x20 bad line\n";
+        let t = Procs(parse_ps(s));
+        assert_eq!(t.0.len(), 5);
+        let p = |pid| &t.0[&pid];
+        assert_eq!(p(1).cpu_ms, 5_500);
+        assert_eq!(p(42).cpu_ms, (12 * 3600 + 34 * 60 + 56) * 1000);
+        assert_eq!(p(99).cpu_ms, ((2 * 24 + 3) * 3600 + 4 * 60 + 5) * 1000);
+        assert_eq!(p(100).cpu_ms, (7 * 60 + 8) * 1000 + 90);
+        assert_eq!(
+            (p(42).ppid, p(42).rss_kb, p(42).name.as_str()),
+            (1, 20480, "herdr")
+        );
+        assert_eq!(p(99).name, "claude", "a path yields its basename");
+        assert_eq!(p(7).name, "agent-fleet", "even one with a space in it");
+        assert_eq!(p(100).name, "zsh", "a login shell drops its dash");
+        assert!(p(1).cwd.is_none() && !p(1).deleted);
+        assert!(t.under(99, "herdr"), "the ancestor walk works off it");
     }
 
     #[test]
