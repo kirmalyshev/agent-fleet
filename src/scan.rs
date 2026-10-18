@@ -861,7 +861,6 @@ mod tests {
     async fn a_worktree_with_unpushed_and_dirty_work() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("r");
-        let r = repo.to_str().unwrap();
         let sh = |cmd: &str| {
             let ok = std::process::Command::new("sh")
                 .args(["-c", cmd])
@@ -878,6 +877,9 @@ mod tests {
             && git worktree add -q ../w -b feat && echo y > ../w/b.txt \
             && printf '[submodule \"lib\"]\\n\\tpath = lib\\n\\turl = x\\n' > ../w/.gitmodules && touch ../w/lib",
         );
+        // git resolves the repo path; on macOS the temp dir is reached through a symlink.
+        let repo = repo.canonicalize().unwrap();
+        let r = repo.to_str().unwrap();
         assert_eq!(repo_of(&format!("{}/../w", r)).await.as_deref(), Some(r));
         let mut wts = worktrees("h", r).await;
         wts.sort_by(|a, b| a.path.cmp(&b.path));
