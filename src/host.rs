@@ -740,15 +740,23 @@ impl Host {
             }
         }
         // Agent programs outside every herdr pane tree: every agent runs in herdr. Managed =
-        // any ancestor is `herdr`; the host's own tree (its `devin auth status` refresh) is out.
+        // any ancestor is `herdr`; the host's own tree (its `devin auth status` refresh) is
+        // out, and so is a program's own infrastructure — an `app-server`/`daemon`
+        // subcommand process and everything under it.
         let own: HashSet<u32> = procs.tree(std::process::id()).into_iter().collect();
+        let infra: HashSet<u32> = procs
+            .0
+            .iter()
+            .filter(|(_, p)| crate::kill::AGENTS.contains(&p.name.as_str()))
+            .filter(|&(&pid, _)| crate::scan::daemonish(pid))
+            .map(|(&pid, _)| pid)
+            .collect();
         let mut seen = HashSet::new();
         for (&pid, p) in &procs.0 {
-            // The program's own daemons (`codex app-server`, `claude daemon`) are not sessions.
             if !crate::kill::AGENTS.contains(&p.name.as_str())
                 || own.contains(&pid)
                 || procs.under(pid, "herdr")
-                || crate::scan::daemonish(pid)
+                || procs.under_any(pid, &infra)
             {
                 continue;
             }

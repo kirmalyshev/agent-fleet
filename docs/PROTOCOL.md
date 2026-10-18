@@ -402,8 +402,9 @@ exit (`claude -p`, `codex exec`) when the caller is itself in herdr (`HERDR_ENV=
 the caller's pane tree, so the host counts them as managed. And the host's process scan reports every
 agent-program process it finds outside all of herdr's pane trees as `agent.unmanaged` (a process
 is managed when any ancestor is `herdr`, the host's own process tree is excluded, and so is
-a program's own infrastructure — an `app-server` or `daemon` subcommand in its argv, as in
-`codex app-server daemon` or `claude daemon`; the
+a program's own infrastructure — an `app-server` or `daemon` in the subcommand slot (the
+first argument; a `daemon` inside a `-p` prompt is no daemon), as in `codex app-server
+daemon` or `claude daemon`, and everything under such a process; the
 process's directory is known on Linux only), re-sent without `program` once the process is gone;
 `agent-fleet doctor` shows them as `unmanaged` findings.
 

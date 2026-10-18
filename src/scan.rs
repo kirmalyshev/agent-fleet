@@ -102,6 +102,19 @@ impl Procs {
         out
     }
 
+    /// `pid` or an ancestor of it is in `pids` — e.g. a program under its own `app-server`.
+    pub fn under_any(&self, pid: u32, pids: &HashSet<u32>) -> bool {
+        let mut at = Some(pid);
+        for _ in 0..64 {
+            let Some(cur) = at else { return false };
+            if pids.contains(&cur) {
+                return true;
+            }
+            at = self.0.get(&cur).map(|p| p.ppid);
+        }
+        false
+    }
+
     /// `pid` or an ancestor of it has `name` — e.g. a process inside a herdr pane.
     pub fn under(&self, pid: u32, name: &str) -> bool {
         let mut at = Some(pid);
@@ -543,15 +556,15 @@ pub fn lock_changes<'a>(before: Option<&Lock>, now: &'a Lock) -> Vec<LockChange<
 
 /// `codex app-server daemon`, `claude daemon` and friends: an agent program's own
 /// infrastructure, not an agent session — `true` when `pid`'s argv carries an
-/// `app-server` or `daemon` subcommand.
+/// `app-server` or `daemon` in the subcommand slot. Only the first argument counts: a
+/// `daemon` inside a `-p` prompt (which `ps -o args=` shows unquoted) is no daemon.
 pub fn daemonish(pid: u32) -> bool {
     is_infra(&argv_of(pid))
 }
 
 fn is_infra(argv: &[String]) -> bool {
-    argv.iter()
-        .skip(1)
-        .any(|t| t == "app-server" || t == "daemon")
+    argv.get(1)
+        .is_some_and(|t| t == "app-server" || t == "daemon")
 }
 
 fn argv_of(pid: u32) -> Vec<String> {
@@ -949,5 +962,22 @@ mod tests {
             "/x/bin/claude",
             "--dangerously-skip-permissions"
         ])));
+        // a "daemon" inside a -p prompt is no daemon — ps splits the quoted argument
+        assert!(!is_infra(&argv(&[
+            "/x/bin/claude",
+            "-p",
+            "restart",
+            "the",
+            "daemon"
+        ])));
+        assert!(!is_infra(&argv(&["/x/bin/claude", "-p", "daemon"])));
+    }
+
+    #[test]
+    fn a_daemons_children_are_infrastructure_too() {
+        let t = procs(&[(1, 0, "codex"), (2, 1, "codex"), (3, 2, "codex")]);
+        let infra: HashSet<u32> = [1].into_iter().collect();
+        assert!(t.under_any(3, &infra));
+        assert!(!t.under_any(3, &HashSet::new()));
     }
 }
