@@ -333,11 +333,23 @@ fn b64(s: &str) -> Option<Vec<u8>> {
 /// `agent-fleet hook statusline [-- <cmd>…]`: Claude Code's status line, wrapped. The rate
 /// limits it is fed are stored for the host to publish; a wrapped command gets the same stdin
 /// and its stdout passes through. A status line must never break: every error is swallowed.
-pub fn statusline(cmd: &[String]) {
+/// When `context_window.used_percentage` is at the context-full mark and the process sits in
+/// a herdr pane, it also writes an `agent.signal` `context_full`, once per session.
+pub async fn statusline(
+    cmd: &[String],
+    paths: &Paths,
+    hub: Option<&str>,
+    token_file: Option<&Path>,
+    project: &str,
+    host: &str,
+) {
     let mut input = Vec::new();
     let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut input);
     if let Some(file) = claude_file() {
         store_limits(&input, &file);
+    }
+    if let Ok(v) = serde_json::from_slice::<Value>(&input) {
+        crate::signal::context_full(paths, hub, token_file, project, host, &v).await;
     }
     let Some((prog, args)) = cmd.split_first() else {
         return;

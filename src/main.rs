@@ -7,6 +7,7 @@ mod hub;
 mod kill;
 mod quota;
 mod scan;
+mod signal;
 mod spawn;
 mod state;
 mod stats;
@@ -419,6 +420,10 @@ enum HookCmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
+    /// Harness hook (Claude Code `StopFailure`/`Notification`/`PreCompact`/`Stop`/
+    /// `UserPromptSubmit`, and any harness whose payload matches): maps the hook JSON on
+    /// stdin to an `agent.signal` event and writes it. Never fails; outside herdr it exits 0.
+    Signal,
 }
 
 #[derive(Subcommand)]
@@ -518,6 +523,15 @@ fn short(id: &str) -> &str {
     id.rsplit('/').next().unwrap_or(id)
 }
 
+fn host_name(cli: &Cli) -> String {
+    cli.host_name.clone().unwrap_or_else(|| {
+        rustix::system::uname()
+            .nodename()
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
 struct Ctx {
     cli: Cli,
     paths: Paths,
@@ -525,12 +539,7 @@ struct Ctx {
 
 impl Ctx {
     fn host_name(&self) -> String {
-        self.cli.host_name.clone().unwrap_or_else(|| {
-            rustix::system::uname()
-                .nodename()
-                .to_string_lossy()
-                .into_owned()
-        })
+        host_name(&self.cli)
     }
 
     fn client(&self) -> Result<Client> {
@@ -694,16 +703,43 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if let Cmd::Hook { cmd } = &cli.cmd {
-        match cmd {
-            HookCmd::Bash => {
-                let mut input = String::new();
-                std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
-                if let Some(msg) = kill::hook(&input) {
-                    eprintln!("{msg}");
-                    std::process::exit(2);
+        // A hook must never break the program it wraps: its paths may be missing, and every
+        // error is swallowed inside.
+        if let Ok(paths) = Paths::from_env(&cli.instance) {
+            match cmd {
+                HookCmd::Bash => {
+                    let mut input = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+                    if let Some(msg) = kill::hook(&input) {
+                        eprintln!("{msg}");
+                        std::process::exit(2);
+                    }
+                }
+                HookCmd::Statusline { cmd } => {
+                    quota::statusline(
+                        cmd,
+                        &paths,
+                        cli.hub.as_deref(),
+                        cli.token_file.as_deref(),
+                        &cli.project,
+                        &host_name(&cli),
+                    )
+                    .await
+                }
+                HookCmd::Signal => {
+                    let mut input = String::new();
+                    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+                    signal::hook(
+                        &paths,
+                        cli.hub.as_deref(),
+                        cli.token_file.as_deref(),
+                        &cli.project,
+                        &host_name(&cli),
+                        &input,
+                    )
+                    .await;
                 }
             }
-            HookCmd::Statusline { cmd } => quota::statusline(cmd),
         }
         return Ok(());
     }
