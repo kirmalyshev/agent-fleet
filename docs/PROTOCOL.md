@@ -336,9 +336,10 @@ The fleet starts agents itself. `<checkout>/.agent-fleet/fleet.toml` in the proj
 `brief` template next to the file with `@@KEY@@` placeholders, an optional `ready` script run
 inside a new worktree before the agent starts, `[vars]` for extra tokens, `[profiles]` —
 a `kind` (the `agent.start`/`agent.quota` program), `args`, `unset_env`, a `prefix` for agent
-names, an optional fleet-wide `cap`, a `fallback`, and `handoff_min` — and `[[rules]]`, first
+names, an optional per-repo `cap`, a `fallback`, and `handoff_min` — and `[[rules]]`, first
 match wins, a rule with no `match` being the default. `match` keywords are case-insensitive
-whole words against the issue's title, the `--scope` text and its labels; `label:x` matches only
+whole words against the issue's title and labels — never the `--scope` text, which narrows the
+work and never picks the worker; `label:x` matches only
 a label named x. Config errors name the line that is wrong: an unknown profile, a fallback
 cycle, two defaults, no default.
 

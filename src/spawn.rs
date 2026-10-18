@@ -339,16 +339,13 @@ fn has_word(text: &str, word: &str) -> bool {
     })
 }
 
-/// The first keyword of the rule that hits, if any.
-fn rule_match(kws: &[String], issue: &Issue, scope: &str) -> Option<String> {
+/// The first keyword of the rule that hits, if any. Only the issue routes: `--scope` narrows the
+/// work and never picks the worker.
+fn rule_match(kws: &[String], issue: &Issue) -> Option<String> {
     for kw in kws {
         let hit = match kw.strip_prefix("label:") {
             Some(l) => issue.labels.iter().any(|x| x.eq_ignore_ascii_case(l)),
-            None => {
-                has_word(&issue.title, kw)
-                    || has_word(scope, kw)
-                    || issue.labels.iter().any(|l| has_word(l, kw))
-            }
+            None => has_word(&issue.title, kw) || issue.labels.iter().any(|l| has_word(l, kw)),
         };
         if hit {
             return Some(kw.clone());
@@ -380,7 +377,6 @@ pub struct Overrides<'a> {
 pub fn decide(
     cfg: &FleetConfig,
     issue: &Issue,
-    scope: &str,
     o: &Overrides<'_>,
     state: &State,
     local_host: &str,
@@ -399,14 +395,7 @@ pub fn decide(
                 .rules
                 .iter()
                 .enumerate()
-                .map(|(i, r)| {
-                    (
-                        i,
-                        r.keywords
-                            .as_deref()
-                            .and_then(|k| rule_match(k, issue, scope)),
-                    )
-                })
+                .map(|(i, r)| (i, r.keywords.as_deref().and_then(|k| rule_match(k, issue))))
                 .find(|(i, r)| {
                     cfg.rules[*i]
                         .keywords
@@ -1680,23 +1669,21 @@ profile = "devin"
     #[test]
     fn rules_match_words_and_labels() {
         let c = cfg(CFG).unwrap();
-        let pick = |t: &str, scope: &str, labels: &[&str]| {
+        let pick = |t: &str, labels: &[&str]| {
             decide(
                 &c,
                 &issue(t, labels),
-                scope,
                 &Overrides::default(),
                 &State::default(),
                 "h",
             )
             .unwrap()
         };
-        assert_eq!(pick("Fix the iOS thing", "", &[]).host, "mac.local");
-        assert_eq!(pick("bios update", "", &[]).profile, "devin"); // whole words: "ios" ≠ "bios"
-        assert_eq!(pick("x", "", &["mobile"]).host, "mac.local");
-        assert_eq!(pick("x", "", &["design"]).profile, "devin"); // label:design needs rule's label
-        assert_eq!(pick("do some research", "", &[]).profile, "opus");
-        assert_eq!(pick("x", "an audit", &[]).profile, "devin"); // audit only in a label rule? no—
+        assert_eq!(pick("Fix the iOS thing", &[]).host, "mac.local");
+        assert_eq!(pick("bios update", &[]).profile, "devin"); // whole words: "ios" ≠ "bios"
+        assert_eq!(pick("x", &["mobile"]).host, "mac.local");
+        assert_eq!(pick("x", &["design"]).profile, "devin"); // label:design needs rule's label
+        assert_eq!(pick("do some research", &[]).profile, "opus");
     }
 
     #[test]
@@ -1746,7 +1733,7 @@ profile = "devin"
         };
         up(&mut s, "agent:h/s/a", "devin");
         up(&mut s, "agent:h/s/b", "devin");
-        let d = decide(&c, &issue("x", &[]), "", &Overrides::default(), &s, "h").unwrap();
+        let d = decide(&c, &issue("x", &[]), &Overrides::default(), &s, "h").unwrap();
         assert_eq!(d.profile, "sonnet");
         assert!(d.why.contains("devin skipped: at cap 2"), "{}", d.why);
         // quota exhausted on the sonnet's kind → no fallback left: bail
@@ -1760,7 +1747,7 @@ profile = "devin"
                 ts: Utc::now(),
             },
         );
-        let e = decide(&c, &issue("x", &[]), "", &Overrides::default(), &s, "h")
+        let e = decide(&c, &issue("x", &[]), &Overrides::default(), &s, "h")
             .unwrap_err()
             .to_string();
         assert!(
@@ -2369,7 +2356,7 @@ profile = "devin"
             r.repo = "o/other".into();
             s.apply(&Envelope::new(actor(), "p", Known::SpawnRequested(Box::new(r))).into_event());
         }
-        let d = decide(&c, &issue("x", &[]), "", &Overrides::default(), &s, "h").unwrap();
+        let d = decide(&c, &issue("x", &[]), &Overrides::default(), &s, "h").unwrap();
         assert_eq!(d.profile, "devin", "{}", d.why);
     }
 
@@ -2383,7 +2370,7 @@ profile = "devin"
             r.agent = format!("agent:h/s/{n}");
             s.apply(&Envelope::new(actor(), "p", Known::SpawnRequested(Box::new(r))).into_event());
         }
-        let d = decide(&c, &issue("x", &[]), "", &Overrides::default(), &s, "h").unwrap();
+        let d = decide(&c, &issue("x", &[]), &Overrides::default(), &s, "h").unwrap();
         assert_eq!(d.profile, "sonnet", "{}", d.why);
         assert!(d.why.contains("at cap 2"), "{}", d.why);
         // A pending request older than the request max age does not count.
@@ -2394,7 +2381,7 @@ profile = "devin"
         oe.ts = Utc::now() - chrono::Duration::minutes(30);
         let mut s = State::default();
         s.apply(&oe);
-        let d = decide(&c, &issue("x", &[]), "", &Overrides::default(), &s, "h").unwrap();
+        let d = decide(&c, &issue("x", &[]), &Overrides::default(), &s, "h").unwrap();
         assert_eq!(d.profile, "devin", "{}", d.why);
     }
 
