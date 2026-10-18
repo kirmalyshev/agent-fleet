@@ -458,14 +458,17 @@ pub fn decide(
         if !full && !out {
             break;
         }
+        if full {
+            why.push(format!("{profile} at cap {}", p.cap.unwrap_or(0)));
+            bail!("no seat: {}; wait for one to free", why.join("; "));
+        }
         why.push(format!(
-            "{profile} skipped: {}",
-            if full {
-                format!("at cap {}", p.cap.unwrap_or(0))
-            } else {
-                format!("{} quota exhausted on {host}", p.kind)
-            }
+            "{profile} skipped: {} quota exhausted on {host}",
+            p.kind
         ));
+        if o.profile.is_some() {
+            bail!("--profile {profile} cannot start: {}", why.join("; "));
+        }
         match &p.fallback {
             Some(f) => profile = f.clone(),
             None => bail!("no profile can take it ({})", why.join("; ")),
@@ -1840,12 +1843,54 @@ profile = "devin"
                 .into_event(),
             );
         };
-        up(&mut s, "agent:h/s/a", "devin");
-        up(&mut s, "agent:h/s/b", "devin");
+        // quota exhausted on the devin's kind → its fallback takes it
+        s.quotas.insert(
+            "h:devin".into(),
+            crate::state::Quota {
+                windows: vec![],
+                plan: None,
+                exhausted: true,
+                read_at: Utc::now(),
+                ts: Utc::now(),
+            },
+        );
         let d = decide(&c, &issue("x", &[]), &Overrides::default(), &s, "h").unwrap();
         assert_eq!(d.profile, "sonnet");
-        assert!(d.why.contains("devin skipped: at cap 2"), "{}", d.why);
-        // quota exhausted on the sonnet's kind → no fallback left: bail
+        assert!(
+            d.why.contains("devin skipped: devin quota exhausted on h"),
+            "{}",
+            d.why
+        );
+        // an explicit --profile never falls back
+        let o = Overrides {
+            profile: Some("devin"),
+            ..Overrides::default()
+        };
+        let e = decide(&c, &issue("x", &[]), &o, &s, "h")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--profile devin cannot start"), "{e}");
+        // a full cap is no seat, never another profile
+        up(&mut s, "agent:h/s/a", "devin");
+        up(&mut s, "agent:h/s/b", "devin");
+        s.quotas.clear();
+        let e = decide(&c, &issue("x", &[]), &Overrides::default(), &s, "h")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("devin at cap 2; wait for one to free"), "{e}");
+        // quota exhausted on both kinds → no fallback left: bail
+        s.agents.clear();
+        s.spawns.clear();
+        s.quotas.insert(
+            "h:devin".into(),
+            crate::state::Quota {
+                windows: vec![],
+                plan: None,
+                exhausted: true,
+                read_at: Utc::now(),
+                ts: Utc::now(),
+            },
+        );
         s.quotas.insert(
             "h:claude".into(),
             crate::state::Quota {
@@ -2500,9 +2545,10 @@ profile = "devin"
             r.agent = format!("agent:h/s/{n}");
             s.apply(&Envelope::new(actor(), "p", Known::SpawnRequested(Box::new(r))).into_event());
         }
-        let d = decide(&c, &issue("x", &[]), &Overrides::default(), &s, "h").unwrap();
-        assert_eq!(d.profile, "sonnet", "{}", d.why);
-        assert!(d.why.contains("at cap 2"), "{}", d.why);
+        let e = decide(&c, &issue("x", &[]), &Overrides::default(), &s, "h")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("at cap 2"), "{e}");
         // A pending request older than the request max age does not count.
         let mut old = req(None);
         old.name = "stale".into();
