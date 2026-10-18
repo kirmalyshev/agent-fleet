@@ -718,10 +718,33 @@ pub async fn check(
         },
         &cause,
         ep,
-    ) {
+    ) && let Some(act) = downgrade(host.cfg.stuck_act, s, id, &cause, act)
+    {
         run(host, s, events, id, a, &cause, act).await;
     }
     Some((cause, tail))
+}
+
+/// With `--stuck-act` off the host never types into an agent and never hands its work off:
+/// each would-be action becomes one tell to the lead of what it would have done. `None`
+/// when there is nobody to tell.
+fn downgrade(act_ok: bool, s: &State, id: &str, cause: &Cause, act: Act) -> Option<Act> {
+    if act_ok {
+        return Some(act);
+    }
+    let name = crate::host::short(id);
+    let text = match act {
+        Act::Tell { .. } => return Some(act),
+        Act::Handoff { to, extra } => format!("{name} would be handed to {to} ({extra})"),
+        Act::Continue => format!("{name} would get a `continue` ({})", cause.detail),
+        Act::Enter | Act::Resend(_) => format!("{name} holds a prompt in its input box"),
+    };
+    tell(
+        s,
+        id,
+        cause.kind,
+        format!("{text} — stuck actions are off (--stuck-act)"),
+    )
 }
 
 async fn run(

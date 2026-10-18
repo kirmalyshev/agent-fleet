@@ -85,6 +85,9 @@ pub struct Config {
     pub locks: Vec<(String, PathBuf)>,
     /// Minutes an agent may idle/block after working before its lead is told it's stalled.
     pub stall_min: u64,
+    /// `host --stuck-act`: let the host act on a stuck cause itself — keystrokes and
+    /// handoffs. Off (the default) it only classifies, records `agent.stuck`, and tells.
+    pub stuck_act: bool,
 }
 
 #[derive(Clone)]
@@ -1147,6 +1150,7 @@ mod tests {
             checkouts: Default::default(),
             locks: Vec::new(),
             stall_min: 15,
+            stuck_act: false,
         };
         let client = Client::new("http://127.0.0.1:1", "t".into(), dir.join("spool.jsonl"));
         let host = Arc::new(Host::new(
@@ -1311,6 +1315,7 @@ mod tests {
             checkouts: Default::default(),
             locks: Vec::new(),
             stall_min: 15,
+            stuck_act: false,
         };
         let replica = Store::open(&cfg.replica).unwrap();
         replica

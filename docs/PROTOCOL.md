@@ -329,7 +329,9 @@ and `unknown` it also carries the screen's last lines.
 
 Each cause earns at most one action per episode, logged as events (`msg.sent`,
 `spawn.requested`), and never on an agent that is `working` unless `hung`, nor on one whose
-task is finished:
+task is finished. Actions that touch an agent — keystrokes and handoffs — only run under
+`host --stuck-act`; without it the host still classifies and records `agent.stuck`, and
+every would-be action becomes one tell to the lead naming what it would have done:
 
 - `quota` with `until` more than 30 min away or unknown: hand the work to the profile's
   `on_quota` (a fleet.toml key), but only when that profile's kind still has quota on this

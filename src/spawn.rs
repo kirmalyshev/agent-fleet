@@ -1999,7 +1999,7 @@ profile = "devin"
             "workspace": { "workspace_id": "ws2", "worktree": { "checkout_path": wt } } } })
     }
 
-    fn host_at(dir: &Path, sock: PathBuf) -> Arc<Host> {
+    fn host_at(dir: &Path, sock: PathBuf, stuck_act: bool) -> Arc<Host> {
         let cfg = Config {
             host: "h".into(),
             session: "s".into(),
@@ -2010,6 +2010,7 @@ profile = "devin"
             checkouts: [("o/r".to_string(), dir.join("co"))].into_iter().collect(),
             locks: Vec::new(),
             stall_min: 15,
+            stuck_act,
         };
         Arc::new(Host::new(
             cfg,
@@ -2120,7 +2121,11 @@ profile = "devin"
             })
     }
 
-    async fn run(dir: &Path, script: &[(&str, Vec<Value>)]) -> (Arc<Host>, Arc<Stub>) {
+    async fn run_with(
+        dir: &Path,
+        script: &[(&str, Vec<Value>)],
+        act: bool,
+    ) -> (Arc<Host>, Arc<Stub>) {
         let stub = Arc::new(Stub::default());
         stub.script
             .lock()
@@ -2128,8 +2133,18 @@ profile = "devin"
             .extend(script.iter().map(|(m, r)| (m.to_string(), r.clone())));
         let sock = dir.join("herdr.sock");
         tokio::spawn(stub.clone().serve(UnixListener::bind(&sock).unwrap()));
-        let host = host_at(dir, sock);
+        let host = host_at(dir, sock, act);
         (host, stub)
+    }
+
+    /// `run` with the host's stuck-action switch off — the production default.
+    async fn run(dir: &Path, script: &[(&str, Vec<Value>)]) -> (Arc<Host>, Arc<Stub>) {
+        run_with(dir, script, false).await
+    }
+
+    /// `run` with `--stuck-act` on: the host may type into agents and hand work off.
+    async fn run_act(dir: &Path, script: &[(&str, Vec<Value>)]) -> (Arc<Host>, Arc<Stub>) {
+        run_with(dir, script, true).await
     }
 
     #[tokio::test]
@@ -3310,6 +3325,39 @@ profile = "devin"
         assert_eq!(
             next_escalation(&s, &[send, del], "agent:h/s/a", min, now),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn stuck_actions_wait_for_stuck_act() {
+        let screen = json!({ "result": { "text": "Press Enter to send queued" } });
+        // Off: no keystroke into the agent — the lead gets a tell of what would be done.
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, stub) = run(dir.path(), &[("agent.read", vec![screen.clone()])]).await;
+        let s = stalled_state(Some("agent:h/s/lead"));
+        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
+        assert!(
+            !stub.calls().iter().any(|m| m == "agent.send_keys"),
+            "no typing without --stuck-act: {:?}",
+            stub.calls()
+        );
+        let got = msgs(&host);
+        assert!(
+            got.iter()
+                .any(|m| m.kind == "UNSENT" && m.to == "agent:h/s/lead"),
+            "a tell says what would be done: {got:?}"
+        );
+        // On: the Enter goes out.
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, stub) = run_act(dir.path(), &[("agent.read", vec![screen])]).await;
+        let s = stalled_state(Some("agent:h/s/lead"));
+        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
+        assert!(
+            stub.calls().iter().any(|m| m == "agent.send_keys"),
+            "with --stuck-act the Enter is typed: {:?}",
+            stub.calls()
         );
     }
 }

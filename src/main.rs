@@ -89,6 +89,10 @@ enum Cmd {
         /// Minutes an agent may idle or block after working before its lead is told STALLED.
         #[arg(long = "stall-min", default_value_t = spawn::STALL_MIN)]
         stall_min: u64,
+        /// Act on a stuck agent — Enter/Escape/continue keystrokes and handoffs. Off, the
+        /// host only classifies, records `agent.stuck`, and tells the lead.
+        #[arg(long)]
+        stuck_act: bool,
     },
     /// Protocol metadata.
     Api {
@@ -726,6 +730,7 @@ async fn main() -> Result<()> {
             repos,
             locks,
             stall_min,
+            stuck_act,
         } => {
             let cfg = host::Config {
                 host: ctx.host_name(),
@@ -747,6 +752,7 @@ async fn main() -> Result<()> {
                     .collect(),
                 locks: locks.clone(),
                 stall_min: *stall_min,
+                stuck_act: *stuck_act,
             };
             host::run(cfg, ctx.client()?).await?;
         }
