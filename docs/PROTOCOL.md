@@ -306,7 +306,9 @@ finding's detail says who was told, or that nobody was.
 Every 5 seconds the host reads the visible screen of each of its `idle` or `blocked` agents —
 and of a `working` one `doctor` calls `hung` — through herdr's `agent.read`, and names ONE
 cause with a pure classifier: the program's `agent.quota` first, then its own screen text.
-The result lands in `agent.stuck` (`cause`, `detail`, `until`), written when the cause
+A screen signal matches only on the program's own UI lines: a `⏺`, `⎿`, `│` or `•` line is
+the agent's prose or tool output, and a banner quoted there means nothing. The result lands
+in `agent.stuck` (`cause`, `detail`, `until`), written when the cause
 appears or changes, and once with no `cause` when the agent works again. State `stuck` is
 keyed by agent; `ps`, the TUI and the board show the cause next to the state, `doctor` puts
 it in the `hung`/`stalled` detail, and the push names it too — for `permission`, `waiting`
@@ -315,9 +317,9 @@ and `unknown` it also carries the screen's last lines.
 | Cause | Signal |
 |---|---|
 | `quota` | `agent.quota` says the program's account is out (`exhausted_at`), or the screen does: Devin "Quota exhausted", Claude "usage limit" / "limit reached … resets", Codex "usage limit". `until` is the spent window's `resets_at` when known. |
-| `rate_limit` | a short retry window on screen: "rate limit", "reset in N minutes", "retry after". `until` is the parsed wait (5 min when unparseable). |
+| `rate_limit` | a short retry window on a line about a limit: "rate limit", "reset in N minutes", "retry after". `until` is the parsed wait (5 min when unparseable). |
 | `unsent` | a prompt sits in the input box: "Press Enter to send queued", or a pasted brief never sent. |
-| `context_full` | the program's context is ≥90% full (a `Context:` line), or a context-low notice. |
+| `context_full` | the program's own footer says its context is nearly gone: Devin `Context: N / M tokens (P%)` at P ≥ 90, Claude `Context left until auto-compact: P%` at P ≤ 10, Codex `P% context left` at P ≤ 10. |
 | `error` | "Something went wrong", "Send a message to continue", an API error line. |
 | `permission` | herdr reports `blocked`: a permission or trust prompt waits. |
 | `resource` | its worktree holds or queues for a resource: "waiting for sim behind the e2e run, ~21m". A legitimate wait, never `hung` or `stalled`. |

@@ -107,70 +107,128 @@ pub fn queued_text(screen: &str) -> Option<String> {
     Some(String::new())
 }
 
+/// A UI chrome line — the program's own text. `⏺`, `⎿` and `│` lines are Claude's/Devin's
+/// prose and tool output, `•` Codex's: a signal quoted there is the agent talking, not the
+/// program's state, and never matches.
+fn chrome(line: &str) -> bool {
+    let l = line.trim_start();
+    !(l.starts_with('⏺') || l.starts_with('⎿') || l.starts_with('│') || l.starts_with('•'))
+}
+
 /// "reset(s) in ~?N", "retry after N" and friends: the short wait a rate-limit line names.
-fn retry_in(tail: &str) -> Option<Duration> {
-    let low = tail.to_lowercase();
-    let pos = low.find("reset")? + 5;
-    let rest = low[pos..].trim_start_matches(['s', ' ']).trim_start();
-    let rest = rest
-        .strip_prefix("in")?
+/// Only a line that is itself about a limit — "git reset in 3 steps" is not one.
+fn retry_in(line: &str) -> Option<Duration> {
+    let low = line.to_lowercase();
+    if !(low.contains("limit") || low.contains("retry") || low.contains("quota")) {
+        return None;
+    }
+    for needle in ["reset", "retry after"] {
+        let Some(pos) = low.find(needle) else {
+            continue;
+        };
+        let rest = low[pos + needle.len()..]
+            .trim_start_matches(['s', ' '])
+            .trim_start();
+        let rest = if needle == "reset" {
+            let Some(r) = rest.strip_prefix("in") else {
+                continue;
+            };
+            r.trim_start().trim_start_matches('~').trim_start()
+        } else {
+            rest
+        };
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let Ok(n) = digits.parse() else { continue };
+        let unit = rest[digits.len()..].trim_start();
+        return Some(match unit.chars().next() {
+            Some('s') => Duration::seconds(n),
+            Some('h') => Duration::hours(n),
+            _ => Duration::minutes(n),
+        });
+    }
+    None
+}
+
+/// Devin's footer `Context: N / M tokens (P%)`: the percent inside the parens.
+fn devin_context_pct(line: &str) -> Option<f64> {
+    let low = line.to_lowercase();
+    let rest = &low[low.find("context:")?..];
+    let t = rest.find("tokens")?;
+    if !rest[..t].contains('/') {
+        return None;
+    }
+    let p = rest[t..].find('(')? + t + 1;
+    rest[p..].split('%').next()?.trim().parse().ok()
+}
+
+/// Claude's `Context left until auto-compact: P%`.
+fn claude_context_pct(line: &str) -> Option<f64> {
+    let low = line.to_lowercase();
+    let rest = low.split("context left until auto-compact:").nth(1)?;
+    let rest = rest.trim_start();
+    let digits: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    rest[digits.len()..]
         .trim_start()
-        .trim_start_matches('~')
-        .trim_start();
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        .starts_with('%')
+        .then(|| digits.parse().ok())?
+}
+
+/// Codex's `P% context left` — a count DOWN, so small means full.
+fn codex_context_pct(line: &str) -> Option<f64> {
+    let low = line.to_lowercase();
+    let (before, _) = low.split_once("% context left")?;
+    let digits: Vec<char> = before
+        .trim_end()
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
     if digits.is_empty() {
         return None;
     }
-    let n: i64 = digits.parse().ok()?;
-    let unit = rest[digits.len()..].trim_start();
-    Some(match unit.chars().next() {
-        Some('s') => Duration::seconds(n),
-        Some('h') => Duration::hours(n),
-        _ => Duration::minutes(n),
-    })
+    digits.into_iter().rev().collect::<String>().parse().ok()
 }
 
-/// The line's context fullness: a Devin footer `Context: N / M tokens (XX%)` or a line
-/// naming context plus a percentage. Full at ≥90%.
-fn context_full(line: &str) -> bool {
-    let low = line.to_lowercase();
-    if !low.contains("context") {
+/// The line's context fullness, in the program's own anchored shape only: Devin's
+/// `Context: N / M tokens (P%)` is full at ≥90%, Claude's `Context left until
+/// auto-compact: P%` and Codex's `P% context left` at ≤10%.
+fn context_full(program: Option<&str>, line: &str) -> bool {
+    if !chrome(line) {
         return false;
     }
-    if low.contains("low") || low.contains("running out") || low.contains("nearly full") {
-        return true;
+    let devin = devin_context_pct(line).is_some_and(|p| p >= 90.0);
+    let claude = claude_context_pct(line).is_some_and(|p| p <= 10.0);
+    let codex = codex_context_pct(line).is_some_and(|p| p <= 10.0);
+    match program {
+        Some("devin") => devin,
+        Some("claude") => claude,
+        Some("codex") => codex,
+        _ => devin || claude || codex,
     }
-    let nums: Vec<f64> = line
-        .split(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .filter(|w| !w.is_empty())
-        .filter_map(|w| w.parse().ok())
-        .collect();
-    if let Some(pct) = line
-        .split('%')
-        .next()
-        .and_then(|w| w.rsplit(['(', ' ', '/']).find(|_| true))
-        .and_then(|w| w.parse::<f64>().ok())
-    {
-        return pct >= 90.0;
-    }
-    nums.windows(2).any(|w| w[1] > 1000.0 && w[0] / w[1] >= 0.9)
 }
 
-/// The screen's quota line: the program's own report that the account is out.
-fn quota_on_screen(program: Option<&str>, tail: &str) -> bool {
+/// The line is the program's own out-of-quota banner, as it appears in its UI chrome.
+fn quota_on_screen(program: Option<&str>, line: &str) -> bool {
+    if !chrome(line) {
+        return false;
+    }
     let pats: &[&str] = match program {
         Some("devin") => &["quota exhausted"],
         Some("claude") => &["usage limit", "limit reached"],
         Some("codex") => &["usage limit"],
         _ => &["quota exhausted", "usage limit", "limit reached"],
     };
-    let low = tail.to_lowercase();
+    let low = line.to_lowercase();
     pats.iter().any(|p| low.contains(p))
 }
 
-/// ONE cause for a stopped agent, read off `screen_tail` — the program's `agent.quota`
-/// first, then its own screen. `None` means the screen names nothing the host recognizes;
-/// `cause_of` maps that (and herdr's `blocked`) to the rest.
+/// ONE cause for a stopped agent, read off `screen_tail` — only the program's own UI
+/// lines carry a signal; its prose (`⏺`/`⎿`/`│`/`•` lines) never does. `None` means the
+/// screen names nothing the host recognizes; `cause_of` maps that (and herdr's `blocked`)
+/// to the rest.
 pub fn stuck_cause(
     program: Option<&str>,
     screen_tail: &str,
@@ -193,32 +251,39 @@ pub fn stuck_cause(
     }
     let t6 = tail_lines(screen_tail, 6);
     let t14 = tail_lines(screen_tail, 14);
-    let low6 = t6.to_lowercase();
-    if low6.contains("press enter to send queued")
-        || (low6.contains("never put") && low6.contains("secret") && low6.contains("anywhere"))
-        || queued_text(screen_tail).is_some_and(|t| !t.is_empty())
+    if t6.lines().any(|l| {
+        chrome(l) && {
+            let low = l.to_lowercase();
+            low.contains("press enter to send queued")
+                || (low.contains("never put") && low.contains("secret") && low.contains("anywhere"))
+        }
+    }) || queued_text(screen_tail).is_some_and(|t| !t.is_empty())
     {
         return Some(Cause::simple(
             StuckCause::Unsent,
             "a prompt waits in the input box",
         ));
     }
-    let low14 = t14.to_lowercase();
-    if low14.contains("rate limit") || low14.contains("retry after") || retry_in(&t14).is_some() {
-        let until = Some(now + retry_in(&t14).unwrap_or(RL_DEFAULT));
+    let rl = t14.lines().rev().filter(|l| chrome(l)).find_map(|l| {
+        let low = l.to_lowercase();
+        let wait = retry_in(l);
+        (low.contains("rate limit") || low.contains("retry after") || wait.is_some())
+            .then(|| wait.unwrap_or(RL_DEFAULT))
+    });
+    if let Some(wait) = rl {
         return Some(Cause {
             kind: StuckCause::RateLimit,
             detail: "a rate limit is on screen".into(),
-            until,
+            until: Some(now + wait),
         });
     }
-    if quota_on_screen(program, &t14) {
+    if t14.lines().any(|l| quota_on_screen(program, l)) {
         return Some(Cause::simple(
             StuckCause::Quota,
             "the program says its account is out of quota",
         ));
     }
-    if let Some(line) = t14.lines().rev().find(|l| context_full(l)) {
+    if let Some(line) = t14.lines().rev().find(|l| context_full(program, l)) {
         return Some(Cause {
             kind: StuckCause::ContextFull,
             detail: format!("context nearly full: {}", line.trim()),
@@ -226,10 +291,12 @@ pub fn stuck_cause(
         });
     }
     if let Some(line) = t14.lines().rev().find(|l| {
-        let low = l.to_lowercase();
-        low.contains("something went wrong")
-            || low.contains("send a message to continue")
-            || low.contains("api error")
+        chrome(l) && {
+            let low = l.to_lowercase();
+            low.contains("something went wrong")
+                || low.contains("send a message to continue")
+                || low.contains("api error")
+        }
     }) {
         return Some(Cause {
             kind: StuckCause::Error,
@@ -821,11 +888,13 @@ mod tests {
         assert_eq!(c.kind, StuckCause::ContextFull);
         let c = stuck_cause(
             Some("claude"),
-            "Context is running low — compact soon",
+            "Context left until auto-compact: 8%",
             None,
             now,
         )
         .unwrap();
+        assert_eq!(c.kind, StuckCause::ContextFull);
+        let c = stuck_cause(Some("codex"), "8% context left", None, now).unwrap();
         assert_eq!(c.kind, StuckCause::ContextFull);
         // error
         for screen in [
@@ -877,6 +946,61 @@ mod tests {
             )
             .kind,
             StuckCause::Unknown
+        );
+    }
+
+    #[test]
+    fn signals_come_from_chrome_lines_never_the_agents_prose() {
+        let now = Utc::now();
+        // The agent's own prose and tool output (`⏺`, `│`, `⎿`, `•` lines) can quote a
+        // banner without the program meaning it — none of these is a cause.
+        for (prog, screen) in [
+            (
+                "claude",
+                "⏺ I updated the React context so it follows the auth flow.",
+            ),
+            ("claude", "⏺ The context now allows a null user"),
+            ("claude", "⏺ See the context handling at line 120"),
+            ("codex", "• 100% context left · ? for shortcuts"),
+            ("codex", "• 96% context left"),
+            ("claude", "⏺ Added a usage limit check"),
+            ("devin", "⏺ the \"Quota exhausted\" banner"),
+            ("claude", "⏺ Added rate limit middleware"),
+            ("devin", "⏺ Fixed the API error toast"),
+            ("devin", "⏺ shows \"Something went wrong\""),
+            ("claude", "  ⎿  Something went wrong"),
+            ("devin", "│ usage limit"),
+            ("devin", "git reset in 3 steps"),
+        ] {
+            assert!(
+                stuck_cause(Some(prog), screen, None, now).is_none(),
+                "{prog}: {screen}"
+            );
+        }
+        // And the real chrome lines still classify.
+        assert_eq!(
+            kind(stuck_cause(Some("codex"), "8% context left", None, now)),
+            Some(StuckCause::ContextFull)
+        );
+        assert_eq!(
+            kind(stuck_cause(
+                Some("claude"),
+                "Context left until auto-compact: 8%",
+                None,
+                now
+            )),
+            Some(StuckCause::ContextFull)
+        );
+        // A codex count-down footer is not full at 96 or 100.
+        assert!(stuck_cause(Some("codex"), "96% context left", None, now).is_none());
+        assert!(
+            stuck_cause(
+                Some("codex"),
+                "100% context left · ? for shortcuts",
+                None,
+                now
+            )
+            .is_none()
         );
     }
 
