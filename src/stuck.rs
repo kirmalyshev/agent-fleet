@@ -469,10 +469,6 @@ pub fn step(c: &Ctx, cause: &Cause, ep: &mut Episode) -> Option<Act> {
             None
         }
         StuckCause::Unsent => {
-            // Like eait-watch: Enter only while the "Press Enter to send queued" hint is
-            // on screen; Escape + re-send only once it is gone, for a queued text we can
-            // name — never behind a running turn, and never while a doorbell to this
-            // agent is still undelivered.
             let resend = || -> Option<Act> {
                 if a.state == AgentState::Working || s.msgs.values().any(|m| m.to == id) {
                     return None;
