@@ -169,8 +169,17 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
             occupied.entry(key).or_default().push(id);
         }
         let idle_for = now - a.since;
+        let cause = s
+            .stuck
+            .get(id)
+            .map(|st| format!("; {}", st.cause.name()))
+            .unwrap_or_default();
         if let Some(detail) = stalled(a, now, STALLED) {
-            out.push(finding("stalled", id, format!("{detail}{}", told(s, id))));
+            out.push(finding(
+                "stalled",
+                id,
+                format!("{detail}{cause}{}", told(s, id)),
+            ));
         }
         if matches!(
             a.state,
@@ -205,7 +214,11 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
             }
         }
         if let Some(detail) = hung(s, a, now) {
-            out.push(finding("hung", id, format!("{detail}{}", told(s, id))));
+            out.push(finding(
+                "hung",
+                id,
+                format!("{detail}{cause}{}", told(s, id)),
+            ));
         }
         let Some(u) = &a.usage else { continue };
         if let (Some(rss), Some(cpu)) = (u.rss_kb, u.cpu_pct)

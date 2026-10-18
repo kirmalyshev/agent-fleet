@@ -68,6 +68,10 @@ pub struct Profile {
     /// Used when this profile is at cap or out of quota, and for a handoff.
     #[serde(default)]
     pub fallback: Option<String>,
+    /// Used when this profile's kind is out of quota and the reset is too far out to wait;
+    /// the work moves only when the target's kind still has quota on this host.
+    #[serde(default)]
+    pub on_quota: Option<String>,
     /// Minutes after a successful spawn within which the agent must reach `working`,
     /// or it is handed to the fallback profile. Default 5.
     #[serde(default)]
@@ -153,6 +157,14 @@ impl FleetConfig {
                 bail!(
                     "fleet.toml: profile {name:?} falls back to an unknown profile {f:?}{}",
                     line_of(src, &format!("fallback = \"{f}\""))
+                );
+            }
+            if let Some(o) = &p.on_quota
+                && !self.profiles.contains_key(o)
+            {
+                bail!(
+                    "fleet.toml: profile {name:?} hands quota overflow to an unknown profile {o:?}{}",
+                    line_of(src, &format!("on_quota = \"{o}\""))
                 );
             }
             for v in &p.unset_env {
@@ -1321,6 +1333,56 @@ pub fn replacement_open(state: &State, agent: &str) -> bool {
     })
 }
 
+/// The agent's task's title, read from the state or the issue itself.
+async fn task_title(state: &State, sp: &Spawn) -> String {
+    let issue = sp.request.issue;
+    let task = issue.map(|i| task_id(&sp.request.repo, i));
+    let title = task
+        .as_ref()
+        .and_then(|t| state.tasks.get(t))
+        .map(|t| t.title.clone())
+        .filter(|t| Some(t) != task.as_ref());
+    match (title, issue) {
+        (Some(t), _) => t,
+        (None, Some(i)) => gh_issue(&sp.request.repo, i)
+            .await
+            .map(|x| x.title)
+            .unwrap_or_else(|_| format!("#{i}")),
+        _ => String::new(),
+    }
+}
+
+/// The `spawn.requested` handing `sp`'s agent over to profile `to`: the agent's repo, issue,
+/// branch and existing worktree, with `replaces` naming it. Profiles and the brief come from
+/// the repo's OWN checkout, like every handoff.
+pub async fn hand_off(
+    host: &Arc<Host>,
+    state: &State,
+    sp: &Spawn,
+    to: &str,
+    extra: &str,
+) -> Result<()> {
+    let checkout = host
+        .cfg
+        .checkouts
+        .get(&sp.request.repo)
+        .with_context(|| format!("no checkout for {}", sp.request.repo))?;
+    let (cfg, cfg_dir) = load(checkout)?;
+    let req = handoff_request(&cfg, &cfg_dir, sp, to, extra, &task_title(state, sp).await)?;
+    if state.agents.contains_key(&req.agent) {
+        bail!("{} is already up", req.agent);
+    }
+    // The envelope's project is the original request's, so the task id it feeds is the same
+    // convention the requester used.
+    host.publish(Envelope::new(
+        host.actor(),
+        &sp.project,
+        Known::SpawnRequested(Box::new(req)),
+    ))
+    .await;
+    Ok(())
+}
+
 /// The auto-handoff scan: one handoff request per agent, deduped through the state's `replaces`.
 async fn handoffs(
     host: &Arc<Host>,
@@ -1350,7 +1412,7 @@ async fn handoffs(
         let Some(checkout) = host.cfg.checkouts.get(&sp.request.repo).cloned() else {
             continue;
         };
-        let (cfg, cfg_dir) = match load(&checkout) {
+        let (cfg, _) = match load(&checkout) {
             Ok(x) => x,
             Err(e) => {
                 if warned.insert(id.clone()) {
@@ -1369,49 +1431,9 @@ async fn handoffs(
         else {
             continue;
         };
-        let issue = sp.request.issue;
-        let task = issue.map(|i| task_id(&sp.request.repo, i));
-        let mut title = task
-            .as_ref()
-            .and_then(|t| state.tasks.get(t))
-            .map(|t| t.title.clone())
-            .filter(|t| Some(t) != task.as_ref());
-        if title.is_none()
-            && let Some(i) = issue
-        {
-            title = gh_issue(&sp.request.repo, i)
-                .await
-                .ok()
-                .map(|x| x.title)
-                .or_else(|| Some(format!("#{i}")));
-        }
-        match handoff_request(
-            &cfg,
-            &cfg_dir,
-            sp,
-            &fallback,
-            &extra,
-            title.as_deref().unwrap_or(""),
-        ) {
-            Ok(req) => {
-                if state.agents.contains_key(&req.agent) {
-                    if warned.insert(id.clone()) {
-                        eprintln!(
-                            "agent-fleet host: handoff for {id}: {} is already up",
-                            req.agent
-                        );
-                    }
-                    continue;
-                }
+        match hand_off(host, state, sp, &fallback, &extra).await {
+            Ok(()) => {
                 done.insert(id.clone());
-                // The envelope's project is the original request's, so the task id it feeds
-                // is the same convention the requester used.
-                host.publish(Envelope::new(
-                    host.actor(),
-                    &sp.project,
-                    Known::SpawnRequested(Box::new(req)),
-                ))
-                .await;
             }
             Err(e) => {
                 if warned.insert(id.clone()) {
@@ -1456,7 +1478,7 @@ fn select(
 /// nobody. An episode is the stretch since the agent's current state began; the log itself is
 /// the dedupe, so a restart does not re-report. `reported` keys episodes (`agent:ts`) already
 /// told this run.
-async fn stuck(host: &Arc<Host>, state: &State, events: &[Event], reported: &mut HashSet<String>) {
+async fn stuck(host: &Arc<Host>, state: &State, events: &[Event], seen: &mut crate::stuck::Seen) {
     let prefix = agent_prefix(&host.cfg.host, &host.cfg.session);
     let min = chrono::Duration::minutes(host.cfg.stall_min as i64);
     let now = Utc::now();
@@ -1464,17 +1486,29 @@ async fn stuck(host: &Arc<Host>, state: &State, events: &[Event], reported: &mut
         if !id.starts_with(&prefix) {
             continue;
         }
-        let Some((kind, text)) = crate::doctor::hung(state, a, now)
+        // Why the agent is stopped: read its screen, record `agent.stuck`, act once per episode.
+        let cause = crate::stuck::check(host, state, events, &mut seen.episodes, id, a, now).await;
+        let Some((kind, mut text)) = crate::doctor::hung(state, a, now)
             .map(|d| ("HUNG", d))
             .or_else(|| crate::doctor::stalled(a, now, min).map(|d| ("STALLED", d)))
         else {
             continue;
         };
+        if let Some((c, tail)) = &cause {
+            text = match c.kind {
+                StuckCause::Permission | StuckCause::Waiting | StuckCause::Unknown
+                    if !tail.is_empty() =>
+                {
+                    format!("{text}; {} — {tail}", c.kind.name())
+                }
+                _ => format!("{text}; {}", c.kind.name()),
+            };
+        }
         let Some(to) = crate::doctor::escalate(state, id) else {
             continue;
         };
         let key = format!("{id}:{}", a.since.timestamp());
-        if reported.contains(&key) {
+        if seen.reported.contains(&key) {
             continue;
         }
         if events.iter().any(|e| {
@@ -1483,7 +1517,7 @@ async fn stuck(host: &Arc<Host>, state: &State, events: &[Event], reported: &mut
                     Body::Known(Known::MsgSent(m))
                         if m.kind == kind && m.reference == short(id) && m.to == to)
         }) {
-            reported.insert(key);
+            seen.reported.insert(key);
             continue;
         }
         host.publish(host.presence(Known::MsgSent(MsgSent {
@@ -1493,7 +1527,7 @@ async fn stuck(host: &Arc<Host>, state: &State, events: &[Event], reported: &mut
             text,
         })))
         .await;
-        reported.insert(key);
+        seen.reported.insert(key);
     }
 }
 
@@ -1503,7 +1537,7 @@ pub async fn spawn_loop(host: Arc<Host>) {
     let mut seen: HashSet<String> = HashSet::new();
     let mut handed: HashSet<String> = HashSet::new();
     let mut warned: HashSet<String> = HashSet::new();
-    let mut stuck_seen: HashSet<String> = HashSet::new();
+    let mut stuck_seen = crate::stuck::Seen::default();
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
         let events = match host.replica.lock().unwrap().all() {
@@ -2863,14 +2897,26 @@ profile = "devin"
         // Episode 1 (idle since 30m ago): the log already holds this stretch's report.
         let mut s = stalled_state(Some("agent:h/s/lead"));
         s.agents.get_mut("agent:h/s/a").unwrap().since = Utc::now() - chrono::Duration::minutes(30);
-        stuck(&host, &s, &[old.clone()], &mut HashSet::new()).await;
+        stuck(
+            &host,
+            &s,
+            &[old.clone()],
+            &mut crate::stuck::Seen::default(),
+        )
+        .await;
         assert!(msgs(&host).is_empty(), "one report per episode");
         // Episode 2: the agent worked and went idle again — the old report predates it.
         let mut s = stalled_state(Some("agent:h/s/lead"));
         let a = s.agents.get_mut("agent:h/s/a").unwrap();
         a.since = Utc::now() - chrono::Duration::minutes(20);
         a.worked = Some(Utc::now() - chrono::Duration::minutes(22));
-        stuck(&host, &s, &[old.clone()], &mut HashSet::new()).await;
+        stuck(
+            &host,
+            &s,
+            &[old.clone()],
+            &mut crate::stuck::Seen::default(),
+        )
+        .await;
         let got = msgs(&host);
         assert_eq!(got.len(), 1, "a new episode reports again");
         let m = &got[0];
@@ -2881,7 +2927,7 @@ profile = "devin"
         // And the replica's own msg.sent dedupes a second pass in the same episode.
         let mut events: Vec<Event> = host.replica.lock().unwrap().all().unwrap().to_vec();
         events.push(old);
-        stuck(&host, &s, &events, &mut HashSet::new()).await;
+        stuck(&host, &s, &events, &mut crate::stuck::Seen::default()).await;
         assert_eq!(msgs(&host).len(), 1);
     }
 
@@ -2904,7 +2950,13 @@ profile = "devin"
         .into_event();
         old.ts = Utc::now() - chrono::Duration::minutes(50);
         let s = hung_state(Some("agent:h/s/lead"));
-        stuck(&host, &s, &[old.clone()], &mut HashSet::new()).await;
+        stuck(
+            &host,
+            &s,
+            &[old.clone()],
+            &mut crate::stuck::Seen::default(),
+        )
+        .await;
         let got = msgs(&host);
         assert_eq!(got.len(), 1);
         let m = &got[0];
@@ -2914,7 +2966,7 @@ profile = "devin"
         // The replica's own msg.sent dedupes a second pass in the same stretch.
         let mut events: Vec<Event> = host.replica.lock().unwrap().all().unwrap().to_vec();
         events.push(old);
-        stuck(&host, &s, &events, &mut HashSet::new()).await;
+        stuck(&host, &s, &events, &mut crate::stuck::Seen::default()).await;
         assert_eq!(msgs(&host).len(), 1);
     }
 
@@ -2926,18 +2978,18 @@ profile = "devin"
         // A declared lead is told first, even with a root coordinator up.
         let mut s = stalled_state(Some("agent:h/s/lead"));
         up_root(&mut s);
-        stuck(&host, &s, &[], &mut HashSet::new()).await;
+        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
         let got = msgs(&host);
         assert_eq!((got.len(), got[0].to.as_str()), (1, "agent:h/s/lead"));
         // No lead: the up root-coordinator is told.
         let mut s = stalled_state(None);
         up_root(&mut s);
-        stuck(&host, &s, &[], &mut HashSet::new()).await;
+        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
         let got = msgs(&host);
         assert_eq!((got.len(), got[1].to.as_str()), (2, "agent:h/s/root"));
         // No lead and no up root: nobody.
         let s = stalled_state(None);
-        stuck(&host, &s, &[], &mut HashSet::new()).await;
+        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
         assert_eq!(msgs(&host).len(), 2);
         // The stalled root coordinator itself is never told — never by itself.
         let mut s = stalled_state(None);
@@ -2954,7 +3006,7 @@ profile = "devin"
                 since: Utc::now(),
             },
         );
-        stuck(&host, &s, &[], &mut HashSet::new()).await;
+        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
         assert_eq!(msgs(&host).len(), 2);
     }
 
@@ -2965,16 +3017,16 @@ profile = "devin"
         let (host, _stub) = run(dir.path(), &[]).await;
         // no role at all and no root up
         let s = stalled_state(None);
-        stuck(&host, &s, &[], &mut HashSet::new()).await;
+        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
         // role but never worked
         let mut s = stalled_state(Some("agent:h/s/lead"));
         s.agents.get_mut("agent:h/s/a").unwrap().worked = None;
-        stuck(&host, &s, &[], &mut HashSet::new()).await;
+        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
         // role, worked, but idle only 5m — under --stall-min
         let mut s = stalled_state(Some("agent:h/s/lead"));
         let a = s.agents.get_mut("agent:h/s/a").unwrap();
         a.since = Utc::now() - chrono::Duration::minutes(5);
-        stuck(&host, &s, &[], &mut HashSet::new()).await;
+        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
         // an agent of another session is not this host's
         let mut s = stalled_state(Some("agent:h/s/lead"));
         let a = s.agents.remove("agent:h/s/a").unwrap();
@@ -2990,7 +3042,7 @@ profile = "devin"
                 since: Utc::now(),
             },
         );
-        stuck(&host, &s, &[], &mut HashSet::new()).await;
+        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
         assert!(msgs(&host).is_empty());
     }
 
@@ -3020,7 +3072,8 @@ profile = "devin"
     #[tokio::test]
     async fn reclaim_never_removes_a_worktree_an_agent_uses() {
         let dir = tempfile::tempdir().unwrap();
-        let co = checkout(dir.path());
+        // git worktree list resolves symlinks; on macOS the temp dir is reached through one.
+        let co = checkout(dir.path()).canonicalize().unwrap();
         for args in [
             vec!["branch", "dv-7"],
             vec!["worktree", "add", "wt-live", "dv-7"],

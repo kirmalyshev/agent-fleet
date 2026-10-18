@@ -11,6 +11,7 @@ mod spawn;
 mod state;
 mod stats;
 mod store;
+mod stuck;
 mod tui;
 mod ui;
 

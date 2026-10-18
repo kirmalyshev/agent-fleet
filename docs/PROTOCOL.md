@@ -301,6 +301,48 @@ to the root coordinator. An episode is the stretch since the agent's current sta
 deduped against `msg.sent` already in the log — a restart does not re-report — and each
 finding's detail says who was told, or that nobody was.
 
+## Stuck causes
+
+Every 5 seconds the host reads the visible screen of each of its `idle` or `blocked` agents —
+and of a `working` one `doctor` calls `hung` — through herdr's `agent.read`, and names ONE
+cause with a pure classifier: the program's `agent.quota` first, then its own screen text.
+The result lands in `agent.stuck` (`cause`, `detail`, `until`), written when the cause
+appears or changes, and once with no `cause` when the agent works again. State `stuck` is
+keyed by agent; `ps`, the TUI and the board show the cause next to the state, `doctor` puts
+it in the `hung`/`stalled` detail, and the push names it too — for `permission`, `waiting`
+and `unknown` it also carries the screen's last lines.
+
+| Cause | Signal |
+|---|---|
+| `quota` | `agent.quota` says the program's account is out (`exhausted_at`), or the screen does: Devin "Quota exhausted", Claude "usage limit" / "limit reached … resets", Codex "usage limit". `until` is the spent window's `resets_at` when known. |
+| `rate_limit` | a short retry window on screen: "rate limit", "reset in N minutes", "retry after". `until` is the parsed wait (5 min when unparseable). |
+| `unsent` | a prompt sits in the input box: "Press Enter to send queued", or a pasted brief never sent. |
+| `context_full` | the program's context is ≥90% full (a `Context:` line), or a context-low notice. |
+| `error` | "Something went wrong", "Send a message to continue", an API error line. |
+| `permission` | herdr reports `blocked`: a permission or trust prompt waits. |
+| `waiting` | idle after it worked, nothing else on screen (finished, or asked something). |
+| `unknown` | none of the above. |
+
+Each cause earns at most one action per episode, logged as events (`msg.sent`,
+`spawn.requested`), and never on an agent that is `working` unless `hung`, nor on one whose
+task is finished:
+
+- `quota` with `until` more than 30 min away or unknown: hand the work to the profile's
+  `on_quota` (a fleet.toml key), but only when that profile's kind still has quota on this
+  host; otherwise tell the lead it is out of quota and no fallback has quota. `until` within
+  30 min: tell the lead it waits, then send `continue` once after `until`. Note a `haiku`
+  profile's kind is `claude`: it shares the Claude account's limits, so a Claude agent out
+  of quota is never handed to it on the same host — the check above enforces it.
+- `rate_limit`: wait; `continue` once after `until`.
+- `unsent`: one Enter; still unsent 60 s later, one Escape and the queued text re-sent;
+  still there, tell the lead. A prompt queued behind a running turn never gets the Escape.
+- `context_full`: hand off to the profile's `fallback` with a HANDOFF note to read git
+  status, git log and any STATE.md first.
+- `error`: `continue` once; if the error cause returns, tell the lead with the screen's
+  last lines.
+- `permission`, `waiting`, `unknown`: the `HUNG`/`STALLED` push tells the lead, with the
+  cause and the screen's last lines.
+
 ## Killing processes
 
 `agent-fleet kill <pid>…` is how an agent stops a process. It reads the process table (`ps`) and
