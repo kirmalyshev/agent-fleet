@@ -290,6 +290,15 @@ how many worktrees may hold any of a set of resources at once.
 | `refused` | `agent-fleet kill` refused a pid in the last hour, with the reason |
 | `role` | an agent's declared lead is down, the lead's level is not above its own, or a second root coordinator is up |
 | `quota` | a program's quota is exhausted, or a window ≥ 90% used resets in the future |
+| `stalled` | an agent idle or blocked for 15 min after it last worked |
+
+`hung` and `stalled` are also pushed, not only read: the host writes one `msg.sent` per episode
+— `HUNG` or `STALLED`, ref the agent's name, the finding's own detail for text — to the agent's
+declared lead, else to an up `root-coordinator` (from `state.roles`), else nobody; it never
+messages an agent about itself. A hand-started agent has no role and no lead, so its notices go
+to the root coordinator. An episode is the stretch since the agent's current state began,
+deduped against `msg.sent` already in the log — a restart does not re-report — and each
+finding's detail says who was told, or that nobody was.
 
 ## Killing processes
 
