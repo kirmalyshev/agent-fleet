@@ -640,6 +640,7 @@ pub async fn check(
     s: &State,
     events: &[Event],
     eps: &mut HashMap<String, Episode>,
+    handed: &HashSet<String>,
     id: &str,
     a: &Agent,
     now: DateTime<Utc>,
@@ -692,8 +693,11 @@ pub async fn check(
             .tasks
             .values()
             .any(|t| t.owner.as_deref() == Some(id) && !t.state.is_terminal());
-    let busy = matches!(cause.kind, StuckCause::Quota | StuckCause::ContextFull)
-        && crate::spawn::replacement_open(s, id);
+    // An agent `handoffs` just handed this pass is busy: its `spawn.requested` has not
+    // folded back yet, so `replacement_open` alone would let a cause hand it off twice.
+    let busy = handed.contains(id)
+        || (matches!(cause.kind, StuckCause::Quota | StuckCause::ContextFull)
+            && crate::spawn::replacement_open(s, id));
     // A grace stretch: the cause is classified and recorded from the first pass, but the
     // host acts or tells only once the agent has sat in this state for --stall-min — a
     // human half-typing a prompt is not "unsent" before that.

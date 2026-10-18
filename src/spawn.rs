@@ -1478,7 +1478,13 @@ fn select(
 /// nobody. An episode is the stretch since the agent's current state began; the log itself is
 /// the dedupe, so a restart does not re-report. `reported` keys episodes (`agent:ts`) already
 /// told this run.
-async fn stuck(host: &Arc<Host>, state: &State, events: &[Event], seen: &mut crate::stuck::Seen) {
+async fn stuck(
+    host: &Arc<Host>,
+    state: &State,
+    events: &[Event],
+    seen: &mut crate::stuck::Seen,
+    handed: &HashSet<String>,
+) {
     let prefix = agent_prefix(&host.cfg.host, &host.cfg.session);
     let min = chrono::Duration::minutes(host.cfg.stall_min as i64);
     let now = Utc::now();
@@ -1487,7 +1493,8 @@ async fn stuck(host: &Arc<Host>, state: &State, events: &[Event], seen: &mut cra
             continue;
         }
         // Why the agent is stopped: read its screen, record `agent.stuck`, act once per episode.
-        let cause = crate::stuck::check(host, state, events, &mut seen.episodes, id, a, now).await;
+        let cause =
+            crate::stuck::check(host, state, events, &mut seen.episodes, handed, id, a, now).await;
         // An intentional hold and a resource wait are no stall: no push, no escalation.
         let suppressed = cause
             .as_ref()
@@ -1648,7 +1655,7 @@ pub async fn spawn_loop(host: Arc<Host>) {
             }
         }
         handoffs(&host, &state, &events, &mut handed, &mut warned).await;
-        stuck(&host, &state, &events, &mut stuck_seen).await;
+        stuck(&host, &state, &events, &mut stuck_seen, &handed).await;
     }
 }
 
@@ -2984,6 +2991,7 @@ profile = "devin"
             &s,
             &[old.clone()],
             &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
         )
         .await;
         assert!(msgs(&host).is_empty(), "one report per episode");
@@ -2997,6 +3005,7 @@ profile = "devin"
             &s,
             &[old.clone()],
             &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
         )
         .await;
         let got = msgs(&host);
@@ -3009,7 +3018,14 @@ profile = "devin"
         // And the replica's own msg.sent dedupes a second pass in the same episode.
         let mut events: Vec<Event> = host.replica.lock().unwrap().all().unwrap().to_vec();
         events.push(old);
-        stuck(&host, &s, &events, &mut crate::stuck::Seen::default()).await;
+        stuck(
+            &host,
+            &s,
+            &events,
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
         assert_eq!(msgs(&host).len(), 1);
     }
 
@@ -3037,6 +3053,7 @@ profile = "devin"
             &s,
             &[old.clone()],
             &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
         )
         .await;
         let got = msgs(&host);
@@ -3048,7 +3065,14 @@ profile = "devin"
         // The replica's own msg.sent dedupes a second pass in the same stretch.
         let mut events: Vec<Event> = host.replica.lock().unwrap().all().unwrap().to_vec();
         events.push(old);
-        stuck(&host, &s, &events, &mut crate::stuck::Seen::default()).await;
+        stuck(
+            &host,
+            &s,
+            &events,
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
         assert_eq!(msgs(&host).len(), 1);
     }
 
@@ -3060,18 +3084,39 @@ profile = "devin"
         // A declared lead is told first, even with a root coordinator up.
         let mut s = stalled_state(Some("agent:h/s/lead"));
         up_root(&mut s);
-        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
         let got = msgs(&host);
         assert_eq!((got.len(), got[0].to.as_str()), (1, "agent:h/s/lead"));
         // No lead: the up root-coordinator is told.
         let mut s = stalled_state(None);
         up_root(&mut s);
-        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
         let got = msgs(&host);
         assert_eq!((got.len(), got[1].to.as_str()), (2, "agent:h/s/root"));
         // No lead and no up root: nobody.
         let s = stalled_state(None);
-        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
         assert_eq!(msgs(&host).len(), 2);
         // The stalled root coordinator itself is never told — never by itself.
         let mut s = stalled_state(None);
@@ -3088,7 +3133,14 @@ profile = "devin"
                 since: Utc::now(),
             },
         );
-        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
         assert_eq!(msgs(&host).len(), 2);
     }
 
@@ -3099,16 +3151,37 @@ profile = "devin"
         let (host, _stub) = run(dir.path(), &[]).await;
         // no role at all and no root up
         let s = stalled_state(None);
-        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
         // role but never worked
         let mut s = stalled_state(Some("agent:h/s/lead"));
         s.agents.get_mut("agent:h/s/a").unwrap().worked = None;
-        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
         // role, worked, but idle only 5m — under --stall-min
         let mut s = stalled_state(Some("agent:h/s/lead"));
         let a = s.agents.get_mut("agent:h/s/a").unwrap();
         a.since = Utc::now() - chrono::Duration::minutes(5);
-        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
         // an agent of another session is not this host's
         let mut s = stalled_state(Some("agent:h/s/lead"));
         let a = s.agents.remove("agent:h/s/a").unwrap();
@@ -3124,7 +3197,14 @@ profile = "devin"
                 since: Utc::now(),
             },
         );
-        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
         assert!(msgs(&host).is_empty());
     }
 
@@ -3344,7 +3424,14 @@ profile = "devin"
         .await;
         let mut s = stalled_state(Some("agent:h/s/lead"));
         s.agents.get_mut("agent:h/s/a").unwrap().since = Utc::now() - chrono::Duration::minutes(5);
-        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
         let evs = host.replica.lock().unwrap().all().unwrap().to_vec();
         assert!(
             evs.iter().any(|e| matches!(&e.body,
@@ -3403,6 +3490,7 @@ profile = "devin"
             &quota_state(),
             &[],
             &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
         )
         .await;
         assert_eq!(reqs(&host), 0, "no handoff onto the same account");
@@ -3421,9 +3509,89 @@ profile = "devin"
             &quota_state(),
             &[],
             &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
         )
         .await;
         assert_eq!(reqs(&host), 1, "the handoff went to the other account");
+    }
+
+    #[tokio::test]
+    async fn a_just_handed_agent_is_busy_in_the_same_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        std::fs::write(co.join(".agent-fleet/b.md"), "do it").unwrap();
+        // a: up 20m, never worked, spawn answered 10m ago — handoffs() hands it to the
+        // fallback. Its screen says context_full — check would hand it off AGAIN without
+        // the just-handed set.
+        let (host, _stub) = run_act(
+            dir.path(),
+            &[(
+                "agent.read",
+                vec![json!({ "result": {
+                    "text": "SWE-2 High · Context: 190,000 / 200,000 tokens (95%)" } })],
+            )],
+        )
+        .await;
+        let mut s = State::default();
+        s.agents.insert(
+            "agent:h/s/a".into(),
+            crate::state::Agent {
+                host: "h".into(),
+                kind: Some("devin".into()),
+                pane: None,
+                state: AgentState::Idle,
+                since: Utc::now() - chrono::Duration::minutes(20),
+                worked: None,
+                usage: None,
+            },
+        );
+        let mut r = req(None);
+        r.agent = "agent:h/s/a".into();
+        r.name = "a".into();
+        r.issue = None;
+        r.worktree = Some("/w/a".into());
+        let req_ev = Envelope::new(actor(), "p", Known::SpawnRequested(Box::new(r))).into_event();
+        let mut res_ev = Envelope::new(
+            actor(),
+            "p",
+            Known::SpawnResult(SpawnResult {
+                agent: "agent:h/s/a".into(),
+                ok: true,
+                pane: Some("w:1".into()),
+                worktree: Some("/w/a".into()),
+                error: None,
+            }),
+        )
+        .re(&req_ev.id)
+        .into_event();
+        res_ev.ts = Utc::now() - chrono::Duration::minutes(10);
+        let events = [req_ev, res_ev];
+        for e in &events {
+            s.apply(e);
+        }
+        let count = |host: &Host| {
+            host.replica
+                .lock()
+                .unwrap()
+                .all()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(&e.body, Body::Known(Known::SpawnRequested(_))))
+                .count()
+        };
+        let mut handed = HashSet::new();
+        handoffs(&host, &s, &events, &mut handed, &mut HashSet::new()).await;
+        assert!(handed.contains("agent:h/s/a"), "handoffs marked it");
+        assert_eq!(count(&host), 1);
+        stuck(
+            &host,
+            &s,
+            &events,
+            &mut crate::stuck::Seen::default(),
+            &handed,
+        )
+        .await;
+        assert_eq!(count(&host), 1, "no second handoff in the same pass");
     }
 
     #[tokio::test]
@@ -3434,7 +3602,14 @@ profile = "devin"
         let _co = checkout(dir.path());
         let (host, stub) = run(dir.path(), &[("agent.read", vec![screen.clone()])]).await;
         let s = stalled_state(Some("agent:h/s/lead"));
-        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
         assert!(
             !stub.calls().iter().any(|m| m == "agent.send_keys"),
             "no typing without --stuck-act: {:?}",
@@ -3451,7 +3626,14 @@ profile = "devin"
         let _co = checkout(dir.path());
         let (host, stub) = run_act(dir.path(), &[("agent.read", vec![screen])]).await;
         let s = stalled_state(Some("agent:h/s/lead"));
-        stuck(&host, &s, &[], &mut crate::stuck::Seen::default()).await;
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
         assert!(
             stub.calls().iter().any(|m| m == "agent.send_keys"),
             "with --stuck-act the Enter is typed: {:?}",
