@@ -11,8 +11,8 @@ kind = "devin"                   # program, matches agent.up kind and agent.quot
 args = []                        # extra args for herdr agent.start
 prefix = "dv-"                   # default agent name = prefix + issue number
 cap = 2                          # live agents of this profile for this repo; absent = no cap
-fallback = "sonnet"              # used when this one is out of quota (never at cap, never under --profile), and for a handoff
-on_quota = "haiku"               # used when its kind is out of quota >30m out; haiku must still have quota on this host
+fallback = "sonnet"              # spawn-time routing when this kind's quota is out, and the default for `agent-fleet handoff`
+on_quota = "haiku"               # the ONLY automatic handoff: a stuck agent whose kind is out >30m out; haiku must still have quota on this host
 handoff_min = 5                  # see Handoff
 [profiles.sonnet]
 kind = "claude"
