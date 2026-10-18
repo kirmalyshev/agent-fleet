@@ -321,7 +321,9 @@ enforce it. `agent-fleet hook bash` (the Claude Code / Devin CLI `PreToolUse` ho
 shell command that starts `claude`, `devin` or `codex` for a session — behind `sudo`, `nohup`,
 `xargs`, `timeout`, `sh -c`, `eval`, `env` or `&` — and points at `agent-fleet spawn` and `herdr
 agent start`; the read-only and admin forms (`--version`, `--help`, `auth status`, `doctor`,
-`models`, `mcp list`/`mcp get`, `update --check`) pass. And the host's process scan reports every
+`models`, `mcp list`/`mcp get`, `update --check`) pass, and so do one-shot runs that answer and
+exit (`claude -p`, `codex exec`) when the caller is itself in herdr (`HERDR_ENV=1`): they run in
+the caller's pane tree, so the host counts them as managed. And the host's process scan reports every
 agent-program process it finds outside all of herdr's pane trees as `agent.unmanaged` (Linux
 only — the check walks /proc ancestors; a process is managed when any ancestor is `herdr`, and
 the host's own process tree is excluded), re-sent without `program` once the process is gone;
