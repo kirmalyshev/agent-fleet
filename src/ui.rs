@@ -71,6 +71,34 @@ pub fn resources(s: &State, now: DateTime<Utc>) -> String {
     out
 }
 
+/// `<host>:<kind>  plan  5h 45% (resets 22:10) · week 8%  read 3m ago  EXHAUSTED`.
+pub fn quotas(s: &State, now: DateTime<Utc>) -> String {
+    let mut out = String::new();
+    for (key, q) in &s.quotas {
+        let windows = q
+            .windows
+            .iter()
+            .map(|w| match w.resets_at {
+                Some(r) => format!("{} {:.0}% (resets {})", w.name, w.used_pct, at(now, r)),
+                None => format!("{} {:.0}%", w.name, w.used_pct),
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let _ = writeln!(
+            out,
+            "{key:<20} {:<8}{windows}  read {} ago{}",
+            q.plan.as_deref().unwrap_or("-"),
+            ago(now, q.read_at),
+            if q.exhausted_at(now) {
+                "  EXHAUSTED"
+            } else {
+                ""
+            },
+        );
+    }
+    out
+}
+
 fn state_name<T: serde::Serialize>(v: T) -> String {
     serde_json::to_value(v)
         .ok()
@@ -78,10 +106,24 @@ fn state_name<T: serde::Serialize>(v: T) -> String {
         .unwrap_or_default()
 }
 
+fn short(id: &str) -> &str {
+    id.rsplit('/').next().unwrap_or(id)
+}
+
+/// `kind` for views: `kind·profile` when the fleet spawned the agent.
+pub fn kind_profile(s: &State, id: &str, kind: Option<&str>) -> String {
+    match (kind, s.profile_of(id)) {
+        (Some(k), Some(p)) => format!("{k}·{p}"),
+        (Some(k), None) => k.to_string(),
+        (None, Some(p)) => format!("?·{p}"),
+        (None, None) => "-".into(),
+    }
+}
+
 pub fn ps(s: &State, now: DateTime<Utc>) -> String {
     let mut out = format!(
-        "{:<44} {:<8} {:>7}  {:<8} TASK\n",
-        "AGENT", "STATE", "FOR", "KIND"
+        "{:<44} {:<8} {:>7}  {:<14} {:<9} {:<12} TASK\n",
+        "AGENT", "STATE", "FOR", "KIND", "ROLE", "LEAD"
     );
     for (id, a) in &s.agents {
         let task = s
@@ -91,12 +133,17 @@ pub fn ps(s: &State, now: DateTime<Utc>) -> String {
             .map(|(t, _)| t.as_str())
             .collect::<Vec<_>>()
             .join(",");
+        let role = s.roles.get(id);
         let _ = writeln!(
             out,
-            "{id:<44} {:<8} {:>7}  {:<8} {}",
+            "{id:<44} {:<8} {:>7}  {:<14} {:<9} {:<12} {}",
             state_name(a.state),
             ago(now, a.since),
-            a.kind.as_deref().unwrap_or("-"),
+            kind_profile(s, id, a.kind.as_deref()),
+            role.map(|r| r.level.short()).unwrap_or(""),
+            role.and_then(|r| r.lead.as_deref())
+                .map(short)
+                .unwrap_or(""),
             if task.is_empty() { "-" } else { &task }
         );
     }
@@ -107,7 +154,61 @@ pub fn ps(s: &State, now: DateTime<Utc>) -> String {
     if !res.is_empty() {
         let _ = write!(out, "\n{:<24} HOLDER / QUEUE\n{res}", "RESOURCE");
     }
+    let q = quotas(s, now);
+    if !q.is_empty() {
+        let _ = write!(out, "\n{:<20} PLAN    WINDOWS\n{q}", "QUOTA");
+    }
     out
+}
+
+/// `agent-fleet role <agent>` and the TUI's agent detail: the level and domain, the chain of
+/// leads up to the root, and the direct reports. Empty when no role is declared.
+pub fn role_lines(s: &State, id: &str, now: DateTime<Utc>) -> Vec<String> {
+    let Some(r) = s.roles.get(id) else {
+        return Vec::new();
+    };
+    let domain = r
+        .domain
+        .as_ref()
+        .map(|d| format!(" · {d}"))
+        .unwrap_or_default();
+    let mut lines = vec![format!(
+        "{id}  {}{domain}  ({} ago, by {})",
+        r.level,
+        ago(now, r.since),
+        r.by
+    )];
+    let chain: Vec<String> = s
+        .chain(id)
+        .iter()
+        .map(|l| {
+            s.roles.get(*l).map_or_else(
+                || short(l).to_string(),
+                |r| format!("{} ({})", short(l), r.level.short()),
+            )
+        })
+        .collect();
+    if !chain.is_empty() {
+        lines.push(format!("  reports to {}", chain.join(" → ")));
+    }
+    let reports: Vec<String> = s
+        .reports(id)
+        .iter()
+        .map(|k| format!("{} ({})", short(k), s.roles[*k].level.short()))
+        .collect();
+    if !reports.is_empty() {
+        lines.push(format!("  reports: {}", reports.join(", ")));
+    }
+    lines
+}
+
+/// `agent-fleet role <agent>` as text.
+pub fn role(s: &State, id: &str, now: DateTime<Utc>) -> String {
+    let lines = role_lines(s, id, now);
+    if lines.is_empty() {
+        return format!("{id}: no role declared\n");
+    }
+    lines.join("\n") + "\n"
 }
 
 pub fn tasks(s: &State, all: bool, now: DateTime<Utc>) -> String {
@@ -393,6 +494,153 @@ pub fn stats(v: &serde_json::Value) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ps_shows_role_and_lead() {
+        use crate::event::{AgentState, Level};
+        use crate::state::{Agent, Role};
+        let now = Utc::now();
+        let mut s = State::default();
+        for (id, state) in [
+            ("agent:h/s/root", AgentState::Working),
+            ("agent:h/s/lead-a", AgentState::Idle),
+            ("agent:h/s/impl-1", AgentState::Working),
+            ("agent:h/s/spare", AgentState::Idle),
+        ] {
+            s.agents.insert(
+                id.into(),
+                Agent {
+                    host: "h".into(),
+                    kind: Some("claude".into()),
+                    pane: None,
+                    state,
+                    since: now,
+                    worked: None,
+                    usage: None,
+                },
+            );
+        }
+        let role = |level, lead: Option<&str>| Role {
+            level,
+            lead: lead.map(str::to_string),
+            domain: None,
+            by: "agent:h/s/root".into(),
+            since: now,
+        };
+        s.roles
+            .insert("agent:h/s/root".into(), role(Level::RootCoordinator, None));
+        s.roles.insert(
+            "agent:h/s/lead-a".into(),
+            role(Level::DomainLead, Some("agent:h/s/root")),
+        );
+        s.roles.insert(
+            "agent:h/s/impl-1".into(),
+            role(Level::Implementer, Some("agent:h/s/lead-a")),
+        );
+        let out = ps(&s, now);
+        assert!(out.lines().next().unwrap().contains("ROLE"));
+        let row = |id: &str| out.lines().find(|l| l.starts_with(id)).unwrap_or("?");
+        assert!(row("agent:h/s/root").contains("root      "));
+        assert!(row("agent:h/s/lead-a").contains("domain    root"));
+        assert!(row("agent:h/s/impl-1").contains("impl      lead-a"));
+        assert!(
+            !row("agent:h/s/spare").contains("impl"),
+            "no role, empty cells"
+        );
+    }
+
+    #[test]
+    fn role_view_shows_the_chain_and_reports() {
+        use crate::event::{AgentState, Level};
+        use crate::state::{Agent, Role};
+        let now = Utc::now();
+        let mut s = State::default();
+        s.agents.insert(
+            "agent:h/s/impl-1".into(),
+            Agent {
+                host: "h".into(),
+                kind: None,
+                pane: None,
+                state: AgentState::Working,
+                since: now,
+                worked: None,
+                usage: None,
+            },
+        );
+        let mk = |level, lead: Option<&str>, domain: Option<&str>| Role {
+            level,
+            lead: lead.map(str::to_string),
+            domain: domain.map(str::to_string),
+            by: "agent:h/s/root".into(),
+            since: now,
+        };
+        s.roles.insert(
+            "agent:h/s/root".into(),
+            mk(Level::RootCoordinator, None, None),
+        );
+        s.roles.insert(
+            "agent:h/s/lead-a".into(),
+            mk(Level::DomainLead, Some("agent:h/s/root"), Some("payments")),
+        );
+        s.roles.insert(
+            "agent:h/s/impl-1".into(),
+            mk(Level::Implementer, Some("agent:h/s/lead-a"), None),
+        );
+        s.roles.insert(
+            "agent:h/s/impl-2".into(),
+            mk(Level::Implementer, Some("agent:h/s/lead-a"), None),
+        );
+        let out = role(&s, "agent:h/s/lead-a", now);
+        assert!(out.contains("agent:h/s/lead-a  domain-lead · payments"));
+        assert!(out.contains("root (root)"));
+        assert!(out.contains("impl-1 (impl), impl-2 (impl)"), "{out}");
+        assert!(role(&s, "agent:h/s/nobody", now).contains("no role declared"));
+    }
+
+    #[test]
+    fn ps_shows_quotas() {
+        use crate::event::*;
+        let now = Utc::now();
+        let quota = |kind: &str, exhausted: bool| {
+            Envelope::new(
+                Actor {
+                    kind: ActorKind::Host,
+                    id: "host:h".into(),
+                },
+                "s",
+                Known::AgentQuota(AgentQuota {
+                    host: "h".into(),
+                    kind: kind.into(),
+                    windows: vec![
+                        QuotaWindow {
+                            name: "5h".into(),
+                            used_pct: 45.0,
+                            resets_at: Some(now + chrono::Duration::hours(3)),
+                        },
+                        QuotaWindow {
+                            name: "week".into(),
+                            used_pct: 8.0,
+                            resets_at: Some(now + chrono::Duration::days(2)),
+                        },
+                    ],
+                    plan: Some("Pro".into()),
+                    exhausted,
+                    read_at: now - chrono::Duration::minutes(3),
+                }),
+            )
+            .into_event()
+        };
+        let s = State::fold(&[quota("claude", false), quota("devin", true)]);
+        assert_eq!(s.quotas.len(), 2);
+        let out = ps(&s, now);
+        assert!(out.contains("QUOTA"), "{out}");
+        let row = |k: &str| out.lines().find(|l| l.contains(k)).unwrap_or("?");
+        assert!(row("h:claude").contains("Pro"));
+        assert!(row("h:claude").contains("5h 45% (resets "));
+        assert!(row("h:claude").contains("week 8%"));
+        assert!(row("h:claude").contains("read 3m ago"));
+        assert!(row("h:devin").ends_with("  EXHAUSTED"));
+    }
 
     #[test]
     fn ago_buckets() {

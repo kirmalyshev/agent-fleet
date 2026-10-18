@@ -54,7 +54,7 @@ const TABS: [(Tab, &str); 5] = [
 enum Pending {
     Kill(Vec<u32>, String),
     Remove { repo: String, path: String },
-    Task(String, Known, &'static str),
+    Task(String, Box<Known>, &'static str),
 }
 
 enum Mode {
@@ -106,7 +106,7 @@ fn agent_color(s: AgentState) -> Color {
 fn kind_color(kind: &str) -> Color {
     match kind {
         "hung" | "orphan" | "duplicate" | "breach" => Color::Red,
-        "heavy" | "unpushed" | "forgotten" | "queued" | "refused" => Color::Yellow,
+        "heavy" | "unpushed" | "forgotten" | "queued" | "refused" | "quota" => Color::Yellow,
         _ => DIM,
     }
 }
@@ -130,7 +130,9 @@ impl App {
             Tab::Worktrees => self.worktree_keys().len(),
             Tab::Tasks => self.state.tasks.len(),
             Tab::Findings => self.found.len(),
-            Tab::Resources => self.state.resources.len() + self.state.limits.len(),
+            Tab::Resources => {
+                self.state.resources.len() + self.state.limits.len() + self.state.quotas.len()
+            }
         }
     }
 
@@ -306,6 +308,7 @@ fn jump(app: &mut App) {
         app.tables[Tab::Worktrees as usize].select(Some(i));
     } else if let Some(i) = (app.state.resources.keys())
         .chain(app.state.limits.keys())
+        .chain(app.state.quotas.keys())
         .position(|k| *k == subject)
     {
         app.tab = Tab::Resources;
@@ -353,7 +356,10 @@ async fn action(app: &mut App, c: char, fleet: &impl Fleet) {
                     "release",
                 ),
             };
-            app.mode = Mode::Confirm(format!("{verb} {task}?"), Pending::Task(task, body, verb));
+            app.mode = Mode::Confirm(
+                format!("{verb} {task}?"),
+                Pending::Task(task, Box::new(body), verb),
+            );
         }
         (Tab::Worktrees, 'K') => {
             let Some(key) = app.worktree_keys().get(at).cloned() else {
@@ -427,7 +433,7 @@ pub fn hook(repo: &str) -> Option<std::path::PathBuf> {
 
 async fn act(fleet: &impl Fleet, pending: Pending) -> String {
     match pending {
-        Pending::Task(task, body, verb) => match fleet.task(&task, body).await {
+        Pending::Task(task, body, verb) => match fleet.task(&task, *body).await {
             Ok(id) => format!("{verb}: {id}"),
             Err(e) => format!("{verb} failed: {e:#}"),
         },
@@ -690,11 +696,13 @@ fn agents(app: &App, now: DateTime<Utc>) -> View<'_> {
                     )
                 });
             let n = app.findings_for(id).len();
+            let role = s.roles.get(id).map(|r| r.level.short()).unwrap_or_default();
             Row::new(vec![
                 Cell::from(short(id).to_string()),
                 Cell::from(a.host.clone()),
                 Cell::from(state_name(a.state)).fg(agent_color(a.state)),
                 Cell::from(ago(now, a.since)),
+                Cell::from(role),
                 Cell::from(cpu),
                 Cell::from(mem),
                 Cell::from(owned(id)),
@@ -713,9 +721,12 @@ fn agents(app: &App, now: DateTime<Utc>) -> View<'_> {
                     state_name(a.state),
                     ago(now, a.since),
                     a.pane.as_deref().unwrap_or("-"),
-                    a.kind.as_deref().unwrap_or("-")
+                    crate::ui::kind_profile(s, id, a.kind.as_deref())
                 )),
             ])];
+            if let Some(sp) = s.spawn_of(id) {
+                l.push(Line::raw(format!("spawn: {}", sp.request.why)));
+            }
             if let Some(u) = &a.usage {
                 let cost = match (u.procs, u.rss_kb, u.cpu_pct) {
                     (Some(p), Some(r), Some(c)) => format!("{p} processes, {}, {c}% CPU · ", mb(r)),
@@ -727,19 +738,21 @@ fn agents(app: &App, now: DateTime<Utc>) -> View<'_> {
                     ago(now, u.ts)
                 )));
             }
+            l.extend(crate::ui::role_lines(s, id, now).into_iter().map(Line::raw));
             l.extend(finding_lines(app, id));
             l
         }
     };
     (
         vec![
-            "AGENT", "HOST", "STATE", "FOR", "CPU", "MEM", "TASK", "BRANCH", "!",
+            "AGENT", "HOST", "STATE", "FOR", "ROLE", "CPU", "MEM", "TASK", "BRANCH", "!",
         ],
         vec![
             Constraint::Length(18),
             Constraint::Length(12),
             Constraint::Length(8),
             Constraint::Length(7),
+            Constraint::Length(9),
             Constraint::Length(5),
             Constraint::Length(6),
             Constraint::Length(14),
@@ -1025,8 +1038,57 @@ fn resources(app: &App, now: DateTime<Utc>) -> View<'_> {
             Cell::from(String::new()),
         ])
     }));
+    rows.extend(s.quotas.iter().map(|(key, q)| {
+        let windows = q
+            .windows
+            .iter()
+            .map(|w| format!("{} {:.0}%", w.name, w.used_pct))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        Row::new(vec![
+            Cell::from(key.clone()),
+            Cell::from(if q.exhausted_at(now) {
+                format!("EXHAUSTED · {windows}")
+            } else {
+                windows
+            })
+            .fg(if q.exhausted_at(now) {
+                Color::Red
+            } else {
+                Color::Reset
+            }),
+            Cell::from(ago(now, q.read_at)),
+            Cell::from(q.plan.clone().unwrap_or_default()).fg(DIM),
+        ])
+    }));
     let at = app.at();
-    let about = if let Some((key, r)) = s.resources.iter().nth(at) {
+    let quotas_at = at.saturating_sub(s.resources.len() + s.limits.len());
+    let about = if let Some((key, q)) = s.quotas.iter().nth(quotas_at)
+        && at >= s.resources.len() + s.limits.len()
+    {
+        let mut lines = vec![Line::styled(key.clone(), Style::new().bold())];
+        for w in &q.windows {
+            let resets = w.resets_at.map_or(String::new(), |r| {
+                format!(", resets {}", crate::ui::at(now, r))
+            });
+            lines.push(Line::raw(format!(
+                "{}: {:.0}% used{resets}",
+                w.name, w.used_pct
+            )));
+        }
+        lines.push(Line::raw(format!(
+            "plan {} · read {} ago{}",
+            q.plan.as_deref().unwrap_or("-"),
+            ago(now, q.read_at),
+            if q.exhausted_at(now) {
+                " · EXHAUSTED"
+            } else {
+                ""
+            }
+        )));
+        lines.extend(finding_lines(app, key));
+        lines
+    } else if let Some((key, r)) = s.resources.iter().nth(at) {
         let mut lines = vec![Line::styled(home(key), Style::new().bold())];
         match &r.holder {
             Some(h) => lines.push(Line::raw(format!("held by {}", crate::ui::hold(now, h)))),
@@ -1175,6 +1237,7 @@ mod tests {
                 pane: Some("w:1".into()),
                 state: AgentState::Idle,
                 since: now - chrono::Duration::hours(3),
+                worked: None,
                 usage: None,
             },
         );

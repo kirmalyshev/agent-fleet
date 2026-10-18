@@ -49,6 +49,85 @@
           ],
           "type": "object"
         },
+        "AgentQuota": {
+          "additionalProperties": false,
+          "description": "The usage quota one agent program reports on a host, e.g. claude's `5h` and `week` windows.\nEach machine is logged in to its own account, so the quota is per host. Sent when anything\nbut `read_at` changes, and once at host start.",
+          "properties": {
+            "exhausted": {
+              "description": "The program reports it is out of quota.",
+              "type": "boolean"
+            },
+            "host": {
+              "type": "string"
+            },
+            "kind": {
+              "description": "The agent program, e.g. `claude`; a plain string, so a new program needs no schema change.",
+              "type": "string"
+            },
+            "plan": {
+              "description": "The account's plan, when the program reports it, e.g. `plus`, `Pro`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "read_at": {
+              "description": "When the numbers were read at the source: their staleness, not the scan's.",
+              "format": "date-time",
+              "type": "string"
+            },
+            "windows": {
+              "items": {
+                "$ref": "#/$defs/QuotaWindow"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "host",
+            "kind",
+            "windows",
+            "read_at"
+          ],
+          "type": "object"
+        },
+        "AgentRole": {
+          "additionalProperties": false,
+          "description": "An agent's declared level and the lead it reports to. Without `level` the agent's role is\nremoved.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "domain": {
+              "description": "What a domain lead owns, e.g. `payments`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "lead": {
+              "description": "Whom the agent reports to.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "level": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Level"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "agent"
+          ],
+          "type": "object"
+        },
         "AgentState": {
           "description": "An agent's lifecycle state, as the terminal multiplexer reports it.",
           "enum": [
@@ -73,6 +152,46 @@
           "required": [
             "agent",
             "state"
+          ],
+          "type": "object"
+        },
+        "AgentUnmanaged": {
+          "additionalProperties": false,
+          "description": "An agent program running outside every herdr pane tree on `host`, reported by the host's\nprocess scan. `procs: 0`-style clearing: the next scan without it sends the same event minus\n`program`.",
+          "properties": {
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "program": {
+              "description": "The program (`claude`, `devin`, `codex`); absent clears the report.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "since": {
+              "description": "When it was first seen unmanaged.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "host",
+            "pid"
           ],
           "type": "object"
         },
@@ -406,6 +525,16 @@
           ],
           "type": "object"
         },
+        "Level": {
+          "description": "An agent's declared level of responsibility, low to high.",
+          "enum": [
+            "implementer",
+            "implementation-lead",
+            "domain-lead",
+            "root-coordinator"
+          ],
+          "type": "string"
+        },
         "MsgDelivered": {
           "additionalProperties": false,
           "description": "The `msg.sent` named by `re` reached the agent, which then turned `observed`.",
@@ -464,6 +593,33 @@
             "kind",
             "ref",
             "text"
+          ],
+          "type": "object"
+        },
+        "QuotaWindow": {
+          "additionalProperties": false,
+          "description": "One quota window: `used_pct` of the limit spent, resetting at `resets_at`.",
+          "properties": {
+            "name": {
+              "description": "The window's name, e.g. `5h`, `day`, `week`.",
+              "type": "string"
+            },
+            "resets_at": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "used_pct": {
+              "description": "0–100.",
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "name",
+            "used_pct"
           ],
           "type": "object"
         },
@@ -569,6 +725,135 @@
           "required": [
             "host",
             "resource"
+          ],
+          "type": "object"
+        },
+        "SpawnRequested": {
+          "additionalProperties": false,
+          "description": "`agent-fleet spawn` (or `handoff`) asks the host agent on `host` to create a worktree (or a\nworkspace in an existing one), start the agent and give it the brief. The requester and the\nhost may be on different machines.",
+          "properties": {
+            "agent": {
+              "description": "The full id it will have: `agent:<host>/<session>/<name>`.",
+              "type": "string"
+            },
+            "branch": {
+              "type": "string"
+            },
+            "brief": {
+              "description": "The rendered brief.",
+              "type": "string"
+            },
+            "host": {
+              "type": "string"
+            },
+            "issue": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "lead": {
+              "description": "Whom the agent reports to; absent means the requester.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "level": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Level"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The `agent.role` level declared once the agent is up."
+            },
+            "name": {
+              "description": "The agent's name in its session.",
+              "type": "string"
+            },
+            "profile": {
+              "description": "The routing profile that was picked. The host resolves its `kind`, `args`, `unset_env`\nand the checkout's `ready` script from its OWN `.agent-fleet/fleet.toml` — a request\nnever carries executable configuration.",
+              "type": "string"
+            },
+            "replaces": {
+              "description": "An agent to close once the new one has taken its brief (a handoff).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "repo": {
+              "description": "`owner/repo`; the host maps it to a checkout (`host --repo owner/repo=<dir>`).",
+              "type": "string"
+            },
+            "session": {
+              "description": "The herdr session it runs in.",
+              "type": "string"
+            },
+            "why": {
+              "description": "Every step of the routing decision, for the views.",
+              "type": "string"
+            },
+            "worktree": {
+              "description": "An existing checkout: open a workspace there instead of creating a worktree.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "name",
+            "agent",
+            "host",
+            "session",
+            "repo",
+            "branch",
+            "profile",
+            "brief",
+            "why"
+          ],
+          "type": "object"
+        },
+        "SpawnResult": {
+          "additionalProperties": false,
+          "description": "The `spawn.requested` named by `re`, answered by the host that ran it.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ok": {
+              "type": "boolean"
+            },
+            "pane": {
+              "description": "The pane the agent runs in.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "worktree": {
+              "description": "The worktree or checkout the agent works in.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "agent",
+            "ok"
           ],
           "type": "object"
         },
@@ -857,6 +1142,38 @@
             },
             "type": {
               "const": "agent.usage",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/AgentRole"
+            },
+            "type": {
+              "const": "agent.role",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/AgentQuota"
+            },
+            "type": {
+              "const": "agent.quota",
               "type": "string"
             }
           },
@@ -1185,6 +1502,54 @@
             "data"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/SpawnRequested"
+            },
+            "type": {
+              "const": "spawn.requested",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/SpawnResult"
+            },
+            "type": {
+              "const": "spawn.result",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/AgentUnmanaged"
+            },
+            "type": {
+              "const": "agent.unmanaged",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -1268,6 +1633,14 @@
                 }
               ],
               "default": null
+            },
+            "worked": {
+              "description": "When it was last seen `working`; a stall is an idle stretch after this.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -1431,6 +1804,16 @@
           ],
           "type": "object"
         },
+        "Level": {
+          "description": "An agent's declared level of responsibility, low to high.",
+          "enum": [
+            "implementer",
+            "implementation-lead",
+            "domain-lead",
+            "root-coordinator"
+          ],
+          "type": "string"
+        },
         "Msg": {
           "properties": {
             "from": {
@@ -1476,6 +1859,70 @@
           "required": [
             "procs",
             "ts"
+          ],
+          "type": "object"
+        },
+        "Quota": {
+          "description": "A program's usage quota on one host, as its last `agent.quota` reported it.",
+          "properties": {
+            "exhausted": {
+              "type": "boolean"
+            },
+            "plan": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "read_at": {
+              "description": "When the numbers were read at the source: how stale they are.",
+              "format": "date-time",
+              "type": "string"
+            },
+            "ts": {
+              "description": "When the report was folded in.",
+              "format": "date-time",
+              "type": "string"
+            },
+            "windows": {
+              "items": {
+                "$ref": "#/$defs/QuotaWindow"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "windows",
+            "exhausted",
+            "read_at",
+            "ts"
+          ],
+          "type": "object"
+        },
+        "QuotaWindow": {
+          "additionalProperties": false,
+          "description": "One quota window: `used_pct` of the limit spent, resetting at `resets_at`.",
+          "properties": {
+            "name": {
+              "description": "The window's name, e.g. `5h`, `day`, `week`.",
+              "type": "string"
+            },
+            "resets_at": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "used_pct": {
+              "description": "0–100.",
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "name",
+            "used_pct"
           ],
           "type": "object"
         },
@@ -1583,6 +2030,214 @@
           ],
           "type": "object"
         },
+        "Role": {
+          "description": "An agent's declared level and the lead it reports to; `by` and `since` record the\n`agent.role` event that set it.",
+          "properties": {
+            "by": {
+              "description": "The actor that declared it.",
+              "type": "string"
+            },
+            "domain": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "lead": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "level": {
+              "$ref": "#/$defs/Level"
+            },
+            "since": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "level",
+            "by",
+            "since"
+          ],
+          "type": "object"
+        },
+        "Spawn": {
+          "description": "A `spawn.requested` and the `spawn.result` that answered it. `by` and `project` come from the\nrequest's envelope.",
+          "properties": {
+            "answered": {
+              "description": "The answering event's `ts`; finished spawns are pruned 24 h after it.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "by": {
+              "description": "Who asked (the request's actor id).",
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            },
+            "request": {
+              "$ref": "#/$defs/SpawnRequested"
+            },
+            "result": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SpawnResult"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "since": {
+              "description": "The request's `ts`.",
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "request",
+            "by",
+            "project",
+            "since"
+          ],
+          "type": "object"
+        },
+        "SpawnRequested": {
+          "additionalProperties": false,
+          "description": "`agent-fleet spawn` (or `handoff`) asks the host agent on `host` to create a worktree (or a\nworkspace in an existing one), start the agent and give it the brief. The requester and the\nhost may be on different machines.",
+          "properties": {
+            "agent": {
+              "description": "The full id it will have: `agent:<host>/<session>/<name>`.",
+              "type": "string"
+            },
+            "branch": {
+              "type": "string"
+            },
+            "brief": {
+              "description": "The rendered brief.",
+              "type": "string"
+            },
+            "host": {
+              "type": "string"
+            },
+            "issue": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "lead": {
+              "description": "Whom the agent reports to; absent means the requester.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "level": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Level"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The `agent.role` level declared once the agent is up."
+            },
+            "name": {
+              "description": "The agent's name in its session.",
+              "type": "string"
+            },
+            "profile": {
+              "description": "The routing profile that was picked. The host resolves its `kind`, `args`, `unset_env`\nand the checkout's `ready` script from its OWN `.agent-fleet/fleet.toml` — a request\nnever carries executable configuration.",
+              "type": "string"
+            },
+            "replaces": {
+              "description": "An agent to close once the new one has taken its brief (a handoff).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "repo": {
+              "description": "`owner/repo`; the host maps it to a checkout (`host --repo owner/repo=<dir>`).",
+              "type": "string"
+            },
+            "session": {
+              "description": "The herdr session it runs in.",
+              "type": "string"
+            },
+            "why": {
+              "description": "Every step of the routing decision, for the views.",
+              "type": "string"
+            },
+            "worktree": {
+              "description": "An existing checkout: open a workspace there instead of creating a worktree.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "name",
+            "agent",
+            "host",
+            "session",
+            "repo",
+            "branch",
+            "profile",
+            "brief",
+            "why"
+          ],
+          "type": "object"
+        },
+        "SpawnResult": {
+          "additionalProperties": false,
+          "description": "The `spawn.requested` named by `re`, answered by the host that ran it.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ok": {
+              "type": "boolean"
+            },
+            "pane": {
+              "description": "The pane the agent runs in.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "worktree": {
+              "description": "The worktree or checkout the agent works in.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "agent",
+            "ok"
+          ],
+          "type": "object"
+        },
         "Task": {
           "properties": {
             "blocked_by": {
@@ -1652,6 +2307,40 @@
             "canceled"
           ],
           "type": "string"
+        },
+        "Unmanaged": {
+          "description": "An agent program the host's scan saw outside every herdr pane tree.",
+          "properties": {
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "program": {
+              "type": "string"
+            },
+            "since": {
+              "description": "First seen unmanaged.",
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "host",
+            "pid",
+            "program",
+            "since"
+          ],
+          "type": "object"
         },
         "Usage": {
           "properties": {
@@ -1884,6 +2573,14 @@
           "description": "Undelivered doorbells by the id of their `msg.sent`.",
           "type": "object"
         },
+        "quotas": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Quota"
+          },
+          "default": {},
+          "description": "Usage quotas of the agent programs by `<host>:<kind>`.",
+          "type": "object"
+        },
         "refused_kills": {
           "default": [],
           "description": "The latest kills `agent-fleet kill` refused, oldest first; at most `MAX_REFUSED`.",
@@ -1900,6 +2597,22 @@
           "description": "Held or queued-for resources by `<host>:<resource>`.",
           "type": "object"
         },
+        "roles": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Role"
+          },
+          "default": {},
+          "description": "Declared roles by agent id; kept apart from `agents`, so a role survives `agent.down`.",
+          "type": "object"
+        },
+        "spawns": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Spawn"
+          },
+          "default": {},
+          "description": "Spawn requests by their `spawn.requested` id; answered ones are kept for 24 h.",
+          "type": "object"
+        },
         "tasks": {
           "additionalProperties": {
             "$ref": "#/$defs/Task"
@@ -1911,6 +2624,14 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "unmanaged": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Unmanaged"
+          },
+          "default": {},
+          "description": "Agent programs outside herdr on each host, keyed `<host>:<pid>`.",
+          "type": "object"
         },
         "worktree_procs": {
           "additionalProperties": {

@@ -7,8 +7,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::event::{
-    AgentState, Body, Event, Known, ResourceHold, ResourceLimit, TYPE_VERSION, TaskState,
-    WorktreeProcs, WorktreeState,
+    AgentState, Body, Event, Known, Level, QuotaWindow, ResourceHold, ResourceLimit,
+    SpawnRequested, SpawnResult, TYPE_VERSION, TaskState, WorktreeProcs, WorktreeState,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -17,6 +17,12 @@ pub struct State {
     pub last: Option<String>,
     pub hosts: BTreeMap<String, Host>,
     pub agents: BTreeMap<String, Agent>,
+    /// Declared roles by agent id; kept apart from `agents`, so a role survives `agent.down`.
+    #[serde(default)]
+    pub roles: BTreeMap<String, Role>,
+    /// Usage quotas of the agent programs by `<host>:<kind>`.
+    #[serde(default)]
+    pub quotas: BTreeMap<String, Quota>,
     pub tasks: BTreeMap<String, Task>,
     /// Open blockers by the id of their `blocker.raised`.
     pub blockers: BTreeMap<String, Blocker>,
@@ -37,6 +43,12 @@ pub struct State {
     /// The latest kills `agent-fleet kill` refused, oldest first; at most `MAX_REFUSED`.
     #[serde(default)]
     pub refused_kills: Vec<RefusedKill>,
+    /// Spawn requests by their `spawn.requested` id; answered ones are kept for 24 h.
+    #[serde(default)]
+    pub spawns: BTreeMap<String, Spawn>,
+    /// Agent programs outside herdr on each host, keyed `<host>:<pid>`.
+    #[serde(default)]
+    pub unmanaged: BTreeMap<String, Unmanaged>,
     /// Events this binary cannot fold (an unknown type, or a known type at a newer `v`): kept in
     /// the log, skipped here.
     pub unknown: u64,
@@ -57,8 +69,49 @@ pub struct Agent {
     pub pane: Option<String>,
     pub state: AgentState,
     pub since: DateTime<Utc>,
+    /// When it was last seen `working`; a stall is an idle stretch after this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worked: Option<DateTime<Utc>>,
     #[serde(default)]
     pub usage: Option<Usage>,
+}
+
+/// An agent's declared level and the lead it reports to; `by` and `since` record the
+/// `agent.role` event that set it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Role {
+    pub level: Level,
+    pub lead: Option<String>,
+    pub domain: Option<String>,
+    /// The actor that declared it.
+    pub by: String,
+    pub since: DateTime<Utc>,
+}
+
+/// A program's usage quota on one host, as its last `agent.quota` reported it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Quota {
+    pub windows: Vec<QuotaWindow>,
+    pub plan: Option<String>,
+    pub exhausted: bool,
+    /// When the numbers were read at the source: how stale they are.
+    pub read_at: DateTime<Utc>,
+    /// When the report was folded in.
+    pub ts: DateTime<Utc>,
+}
+
+/// An `exhausted` read stays believed this long — claude/codex only refresh while used.
+pub const QUOTA_STALE: chrono::Duration = chrono::Duration::minutes(30);
+
+impl Quota {
+    /// Out of quota at `now`: a 100% window whose reset is still ahead, or a fresh `exhausted`
+    /// read. A stale exhausted flag does not block spawning forever.
+    pub fn exhausted_at(&self, now: DateTime<Utc>) -> bool {
+        self.windows
+            .iter()
+            .any(|w| w.used_pct >= 100.0 && w.resets_at.is_some_and(|r| r > now))
+            || (self.exhausted && now - self.read_at <= QUOTA_STALE)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -162,6 +215,39 @@ pub struct Ask {
     pub since: DateTime<Utc>,
 }
 
+/// An agent program the host's scan saw outside every herdr pane tree.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Unmanaged {
+    pub host: String,
+    pub pid: u32,
+    pub program: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// First seen unmanaged.
+    pub since: DateTime<Utc>,
+}
+
+/// A `spawn.requested` and the `spawn.result` that answered it. `by` and `project` come from the
+/// request's envelope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Spawn {
+    pub request: SpawnRequested,
+    /// Who asked (the request's actor id).
+    pub by: String,
+    pub project: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<SpawnResult>,
+    /// The request's `ts`.
+    pub since: DateTime<Utc>,
+    /// The answering event's `ts`; finished spawns are pruned 24 h after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered: Option<DateTime<Utc>>,
+}
+
+/// How long an answered spawn stays in the state, measured against later events' `ts` (the
+/// reducer has no clock).
+pub const SPAWN_KEPT: chrono::Duration = chrono::Duration::hours(24);
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Msg {
     pub from: String,
@@ -202,6 +288,42 @@ impl State {
         t.owner.as_deref()
     }
 
+    /// The leads above `id`, nearest first, following declared roles; a cycle ends the walk.
+    pub fn chain(&self, id: &str) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        let mut at = self.roles.get(id).and_then(|r| r.lead.as_deref());
+        while let Some(lead) = at {
+            if out.contains(&lead) {
+                break;
+            }
+            out.push(lead);
+            at = self.roles.get(lead).and_then(|r| r.lead.as_deref());
+        }
+        out
+    }
+
+    /// The agents that report to `id`, by declared role.
+    pub fn reports(&self, id: &str) -> Vec<&String> {
+        self.roles
+            .iter()
+            .filter(|(_, r)| r.lead.as_deref() == Some(id))
+            .map(|(k, _)| k)
+            .collect()
+    }
+
+    /// The latest `spawn.requested` for `agent`, if the fleet spawned it.
+    pub fn spawn_of(&self, agent: &str) -> Option<&Spawn> {
+        self.spawns
+            .values()
+            .filter(|s| s.request.agent == agent)
+            .max_by_key(|s| s.since)
+    }
+
+    /// The profile the latest `spawn.requested` for `agent` named, for cap counting.
+    pub fn profile_of(&self, agent: &str) -> Option<&str> {
+        self.spawn_of(agent).map(|s| s.request.profile.as_str())
+    }
+
     pub fn apply(&mut self, e: &Event) {
         self.last = Some(e.id.clone());
         // A newer version of a known type may mean something else: skip it like an unknown type.
@@ -212,15 +334,24 @@ impl State {
         let ts = e.ts;
         match k {
             Known::AgentUp(d) => {
+                // A re-up (host or herdr restart) keeps what the entry already knows: the last
+                // working time, the current stretch when the state did not change, the usage.
+                let old = self.agents.get(&d.agent);
                 self.agents.insert(
                     d.agent.clone(),
                     Agent {
                         host: d.host.clone(),
-                        kind: d.kind.clone(),
+                        kind: d.kind.clone().or_else(|| old.and_then(|a| a.kind.clone())),
                         pane: d.pane.clone(),
                         state: d.state,
-                        since: ts,
-                        usage: None,
+                        since: match old {
+                            Some(a) if a.state == d.state => a.since,
+                            _ => ts,
+                        },
+                        worked: (d.state == AgentState::Working)
+                            .then_some(ts)
+                            .or_else(|| old.and_then(|a| a.worked)),
+                        usage: old.and_then(|a| a.usage.clone()),
                     },
                 );
             }
@@ -307,15 +438,46 @@ impl State {
             }
             Known::AgentState(d) => {
                 // Only `agent.up` brings an agent in: a late state change never revives a downed one.
-                if let Some(a) = self.agents.get_mut(&d.agent)
-                    && a.state != d.state
-                {
-                    a.state = d.state;
-                    a.since = ts;
+                if let Some(a) = self.agents.get_mut(&d.agent) {
+                    if d.state == AgentState::Working {
+                        a.worked = Some(ts);
+                    }
+                    if a.state != d.state {
+                        a.state = d.state;
+                        a.since = ts;
+                    }
                 }
             }
             Known::AgentDown(d) => {
                 self.agents.remove(&d.agent);
+            }
+            Known::AgentQuota(d) => {
+                self.quotas.insert(
+                    worktree_key(&d.host, &d.kind),
+                    Quota {
+                        windows: d.windows.clone(),
+                        plan: d.plan.clone(),
+                        exhausted: d.exhausted,
+                        read_at: d.read_at,
+                        ts,
+                    },
+                );
+            }
+            Known::AgentRole(d) => {
+                if let Some(level) = d.level {
+                    self.roles.insert(
+                        d.agent.clone(),
+                        Role {
+                            level,
+                            lead: d.lead.clone(),
+                            domain: d.domain.clone(),
+                            by: e.actor.id.clone(),
+                            since: ts,
+                        },
+                    );
+                } else {
+                    self.roles.remove(&d.agent);
+                }
             }
             Known::HostHealth(d) => {
                 self.hosts.insert(
@@ -435,7 +597,57 @@ impl State {
                     t.handoffs.push(id);
                 }
             }
+            Known::SpawnRequested(d) => {
+                self.spawns.insert(
+                    e.id.clone(),
+                    Spawn {
+                        request: *d.clone(),
+                        by: e.actor.id.clone(),
+                        project: e.project.clone(),
+                        result: None,
+                        since: ts,
+                        answered: None,
+                    },
+                );
+            }
+            Known::AgentUnmanaged(d) => {
+                let key = format!("{}:{}", d.host, d.pid);
+                match &d.program {
+                    Some(program) => {
+                        self.unmanaged.insert(
+                            key,
+                            Unmanaged {
+                                host: d.host.clone(),
+                                pid: d.pid,
+                                program: program.clone(),
+                                cwd: d.cwd.clone(),
+                                since: d.since.unwrap_or(ts),
+                            },
+                        );
+                    }
+                    None => {
+                        self.unmanaged.remove(&key);
+                    }
+                }
+            }
+            Known::SpawnResult(d) => {
+                if let Some(re) = &e.re
+                    && let Some(s) = self.spawns.get_mut(re)
+                    && s.result.is_none()
+                {
+                    s.result = Some(d.clone());
+                    s.answered = Some(ts);
+                }
+            }
         }
+        // The reducer has no clock: a spawn is pruned once a later event's `ts` is more than
+        // SPAWN_KEPT past its answer (or its request, when it was never answered) — but never
+        // while its agent is still up, so cap counting cannot lose sight of it.
+        let agents = &self.agents;
+        self.spawns.retain(|_, s| {
+            agents.contains_key(&s.request.agent)
+                || e.ts - s.answered.unwrap_or(s.since) <= SPAWN_KEPT
+        });
     }
 
     fn task_for(&mut self, e: &Event) -> Option<&mut Task> {
@@ -484,6 +696,71 @@ mod tests {
     }
 
     #[test]
+    fn a_re_up_keeps_worked_and_an_unchanged_since() {
+        let mut s = State::default();
+        let up = |state, ts| {
+            let mut e = ev(
+                ActorKind::Host,
+                Known::AgentUp(AgentUp {
+                    agent: "agent:h/s/a".into(),
+                    host: "h".into(),
+                    kind: Some("devin".into()),
+                    state,
+                    pane: None,
+                }),
+            )
+            .into_event();
+            e.ts = ts;
+            e
+        };
+        let t0 = Utc::now();
+        s.apply(&up(AgentState::Working, t0));
+        // a re-up while working: since stays (same state), worked moves to the newer sighting
+        s.apply(&up(AgentState::Working, t0 + chrono::Duration::minutes(1)));
+        let a = &s.agents["agent:h/s/a"];
+        assert_eq!(a.since, t0);
+        assert_eq!(a.worked, Some(t0 + chrono::Duration::minutes(1)));
+        // a re-up now idle: worked survives, since moves (state changed)
+        s.apply(&up(AgentState::Idle, t0 + chrono::Duration::minutes(30)));
+        let a = &s.agents["agent:h/s/a"];
+        assert_eq!(a.worked, Some(t0 + chrono::Duration::minutes(1)));
+        assert_eq!(a.since, t0 + chrono::Duration::minutes(30));
+    }
+
+    #[test]
+    fn an_unmanaged_report_folds_and_clears() {
+        let mut s = State::default();
+        let seen = ev(
+            ActorKind::Host,
+            Known::AgentUnmanaged(AgentUnmanaged {
+                host: "h".into(),
+                pid: 42,
+                program: Some("claude".into()),
+                cwd: Some("/tmp".into()),
+                since: None,
+            }),
+        )
+        .into_event();
+        s.apply(&seen);
+        let u = &s.unmanaged["h:42"];
+        assert_eq!(u.program, "claude");
+        assert_eq!(u.since, seen.ts);
+        let clear = ev(
+            ActorKind::Host,
+            Known::AgentUnmanaged(AgentUnmanaged {
+                host: "h".into(),
+                pid: 42,
+                program: None,
+                cwd: None,
+                since: None,
+            }),
+        )
+        .into_event();
+        s.apply(&clear);
+        assert!(s.unmanaged.is_empty());
+    }
+
+    #[test]
     fn presence() {
         let a = "agent:h/s/a".to_string();
         let up = ev(
@@ -517,6 +794,81 @@ mod tests {
         );
         let s = State::fold(events.iter().chain([&down.into_event()]));
         assert!(s.agents.is_empty());
+    }
+
+    #[test]
+    fn a_role_is_declared_overwritten_and_removed() {
+        let a = "agent:h/s/a".to_string();
+        let role = |level: Option<Level>, by| {
+            ev(
+                by,
+                Known::AgentRole(AgentRole {
+                    agent: a.clone(),
+                    level,
+                    lead: Some("agent:h/s/lead".into()),
+                    domain: Some("payments".into()),
+                }),
+            )
+            .into_event()
+        };
+        let mut s = State::default();
+        s.apply(&role(Some(Level::DomainLead), ActorKind::Host));
+        let r = &s.roles[&a];
+        assert_eq!(r.level, Level::DomainLead);
+        assert_eq!(r.lead.as_deref(), Some("agent:h/s/lead"));
+        assert_eq!(r.by, "host:h");
+
+        s.apply(&role(Some(Level::Implementer), ActorKind::Agent));
+        assert_eq!(s.roles[&a].level, Level::Implementer);
+        assert_eq!(s.roles[&a].by, "agent:h/s/a");
+
+        s.apply(
+            &ev(
+                ActorKind::Host,
+                Known::AgentDown(AgentDown {
+                    agent: a.clone(),
+                    reason: None,
+                }),
+            )
+            .into_event(),
+        );
+        assert!(s.roles.contains_key(&a), "a role survives agent.down");
+
+        s.apply(&role(None, ActorKind::Agent));
+        assert!(s.roles.is_empty());
+    }
+
+    #[test]
+    fn the_chain_walks_leads_and_stops_at_a_cycle() {
+        let a = |name| format!("agent:h/s/{name}");
+        let role = |level, lead: Option<&str>| AgentRole {
+            agent: a("x"),
+            level,
+            lead: lead.map(str::to_string),
+            domain: None,
+        };
+        let set = |id: &str, level, lead: Option<&str>| {
+            let mut d = role(Some(level), lead);
+            d.agent = id.to_string();
+            ev(ActorKind::Agent, Known::AgentRole(d)).into_event()
+        };
+        let events: Vec<Event> = [
+            set(&a("impl"), Level::Implementer, Some(&a("lead"))),
+            set(&a("lead"), Level::DomainLead, Some(&a("root"))),
+            set(&a("root"), Level::RootCoordinator, None),
+            set(&a("loop-a"), Level::Implementer, Some(&a("loop-b"))),
+            set(&a("loop-b"), Level::Implementer, Some(&a("loop-a"))),
+        ]
+        .into_iter()
+        .collect();
+        let s = State::fold(&events);
+        assert_eq!(s.chain(&a("impl")), [a("lead").as_str(), "agent:h/s/root"]);
+        assert_eq!(
+            s.chain(&a("loop-a")),
+            ["agent:h/s/loop-b", "agent:h/s/loop-a"]
+        );
+        let reports: Vec<&str> = s.reports(&a("lead")).iter().map(|s| s.as_str()).collect();
+        assert_eq!(reports, ["agent:h/s/impl"]);
     }
 
     #[test]

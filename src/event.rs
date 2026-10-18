@@ -62,6 +62,41 @@ impl TaskState {
     }
 }
 
+/// An agent's declared level of responsibility, low to high.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum Level {
+    Implementer,
+    ImplementationLead,
+    DomainLead,
+    RootCoordinator,
+}
+
+impl Level {
+    /// The short label views show, e.g. `impl-lead`.
+    pub fn short(self) -> &'static str {
+        match self {
+            Self::Implementer => "impl",
+            Self::ImplementationLead => "impl-lead",
+            Self::DomainLead => "domain",
+            Self::RootCoordinator => "root",
+        }
+    }
+}
+
+impl std::fmt::Display for Level {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Implementer => "implementer",
+            Self::ImplementationLead => "implementation-lead",
+            Self::DomainLead => "domain-lead",
+            Self::RootCoordinator => "root-coordinator",
+        })
+    }
+}
+
 /// Every event: the envelope fields plus a `type` tag and its `data`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[schemars(rename = "Event")]
@@ -126,6 +161,10 @@ pub enum Known {
     HostHealth(HostHealth),
     #[serde(rename = "agent.usage")]
     AgentUsage(AgentUsage),
+    #[serde(rename = "agent.role")]
+    AgentRole(AgentRole),
+    #[serde(rename = "agent.quota")]
+    AgentQuota(AgentQuota),
     #[serde(rename = "worktree.state")]
     WorktreeState(WorktreeState),
     #[serde(rename = "worktree.gone")]
@@ -166,6 +205,12 @@ pub enum Known {
     MsgDelivered(MsgDelivered),
     #[serde(rename = "handoff")]
     Handoff(Handoff),
+    #[serde(rename = "spawn.requested")]
+    SpawnRequested(Box<SpawnRequested>),
+    #[serde(rename = "spawn.result")]
+    SpawnResult(SpawnResult),
+    #[serde(rename = "agent.unmanaged")]
+    AgentUnmanaged(AgentUnmanaged),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -247,6 +292,54 @@ pub struct AgentUsage {
     /// Where the agent works.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+}
+
+/// An agent's declared level and the lead it reports to. Without `level` the agent's role is
+/// removed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRole {
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<Level>,
+    /// Whom the agent reports to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead: Option<String>,
+    /// What a domain lead owns, e.g. `payments`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+}
+
+/// The usage quota one agent program reports on a host, e.g. claude's `5h` and `week` windows.
+/// Each machine is logged in to its own account, so the quota is per host. Sent when anything
+/// but `read_at` changes, and once at host start.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentQuota {
+    pub host: String,
+    /// The agent program, e.g. `claude`; a plain string, so a new program needs no schema change.
+    pub kind: String,
+    pub windows: Vec<QuotaWindow>,
+    /// The account's plan, when the program reports it, e.g. `plus`, `Pro`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    /// The program reports it is out of quota.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exhausted: bool,
+    /// When the numbers were read at the source: their staleness, not the scan's.
+    pub read_at: DateTime<Utc>,
+}
+
+/// One quota window: `used_pct` of the limit spent, resetting at `resets_at`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaWindow {
+    /// The window's name, e.g. `5h`, `day`, `week`.
+    pub name: String,
+    /// 0–100.
+    pub used_pct: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<DateTime<Utc>>,
 }
 
 /// A git worktree on a host, as its last scan found it. Sent when it changes.
@@ -448,6 +541,80 @@ pub struct MsgDelivered {
     pub attempts: Option<u32>,
 }
 
+/// An agent program running outside every herdr pane tree on `host`, reported by the host's
+/// process scan. `procs: 0`-style clearing: the next scan without it sends the same event minus
+/// `program`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentUnmanaged {
+    pub host: String,
+    pub pid: u32,
+    /// The program (`claude`, `devin`, `codex`); absent clears the report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// When it was first seen unmanaged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<DateTime<Utc>>,
+}
+
+/// `agent-fleet spawn` (or `handoff`) asks the host agent on `host` to create a worktree (or a
+/// workspace in an existing one), start the agent and give it the brief. The requester and the
+/// host may be on different machines.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnRequested {
+    /// The agent's name in its session.
+    pub name: String,
+    /// The full id it will have: `agent:<host>/<session>/<name>`.
+    pub agent: String,
+    pub host: String,
+    /// The herdr session it runs in.
+    pub session: String,
+    /// `owner/repo`; the host maps it to a checkout (`host --repo owner/repo=<dir>`).
+    pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u64>,
+    pub branch: String,
+    /// The routing profile that was picked. The host resolves its `kind`, `args`, `unset_env`
+    /// and the checkout's `ready` script from its OWN `.agent-fleet/fleet.toml` — a request
+    /// never carries executable configuration.
+    pub profile: String,
+    /// The rendered brief.
+    pub brief: String,
+    /// The `agent.role` level declared once the agent is up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<Level>,
+    /// Whom the agent reports to; absent means the requester.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead: Option<String>,
+    /// An existing checkout: open a workspace there instead of creating a worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    /// An agent to close once the new one has taken its brief (a handoff).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<String>,
+    /// Every step of the routing decision, for the views.
+    pub why: String,
+}
+
+/// The `spawn.requested` named by `re`, answered by the host that ran it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SpawnResult {
+    pub agent: String,
+    pub ok: bool,
+    /// The pane the agent runs in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
+    /// The worktree or checkout the agent works in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Handoff {
@@ -471,6 +638,8 @@ impl Known {
             Self::AgentDown(_) => "agent.down",
             Self::HostHealth(_) => "host.health",
             Self::AgentUsage(_) => "agent.usage",
+            Self::AgentRole(_) => "agent.role",
+            Self::AgentQuota(_) => "agent.quota",
             Self::WorktreeState(_) => "worktree.state",
             Self::WorktreeGone(_) => "worktree.gone",
             Self::WorktreeProcs(_) => "worktree.procs",
@@ -491,6 +660,9 @@ impl Known {
             Self::MsgSent(_) => "msg.sent",
             Self::MsgDelivered(_) => "msg.delivered",
             Self::Handoff(_) => "handoff",
+            Self::SpawnRequested(_) => "spawn.requested",
+            Self::SpawnResult(_) => "spawn.result",
+            Self::AgentUnmanaged(_) => "agent.unmanaged",
         }
     }
 
@@ -508,8 +680,10 @@ impl Known {
             | Self::WorktreeProcs(_)
             | Self::ResourceTaken(_)
             | Self::ResourceWaiting(_)
-            | Self::ResourceReleased(_) => &[Host],
-            Self::MsgDelivered(_) => &[Host],
+            | Self::ResourceReleased(_)
+            | Self::AgentQuota(_)
+            | Self::AgentUnmanaged(_) => &[Host],
+            Self::MsgDelivered(_) | Self::SpawnResult(_) => &[Host],
             Self::AskRaised(_) | Self::Handoff(_) => &[Agent],
             _ => &[Agent, Host],
         }
@@ -531,7 +705,10 @@ impl Known {
     }
 
     fn needs_re(&self) -> bool {
-        matches!(self, Self::BlockerResolved(_) | Self::MsgDelivered(_))
+        matches!(
+            self,
+            Self::BlockerResolved(_) | Self::MsgDelivered(_) | Self::SpawnResult(_)
+        )
     }
 }
 
@@ -649,15 +826,21 @@ pub fn parse_strict(raw: &Value) -> Result<Envelope<Known>, Reject> {
             "project and actor.id must be set".into(),
         ));
     }
-    let recipient = match &e.body {
-        Known::MsgSent(m) => Some(&m.to),
-        Known::Handoff(h) => Some(&h.to),
-        Known::TaskAssigned(a) => Some(&a.agent),
-        _ => None,
+    let recipients: Vec<&String> = match &e.body {
+        Known::MsgSent(m) => vec![&m.to],
+        Known::Handoff(h) => vec![&h.to],
+        Known::TaskAssigned(a) => vec![&a.agent],
+        Known::AgentRole(r) => r.lead.iter().chain([&r.agent]).collect(),
+        Known::SpawnRequested(s) => s
+            .lead
+            .iter()
+            .chain(s.replaces.iter())
+            .chain([&s.agent])
+            .collect(),
+        Known::SpawnResult(r) => vec![&r.agent],
+        _ => vec![],
     };
-    if let Some(to) = recipient
-        && !is_agent_id(to)
-    {
+    if let Some(to) = recipients.into_iter().find(|to| !is_agent_id(to)) {
         return Err(Reject::BadRequest(format!(
             "{to:?} is not an agent id (agent:<host>/<session>/<name>)"
         )));
