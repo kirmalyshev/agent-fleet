@@ -99,6 +99,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `spawn.result` | agent, ok, pane?, worktree?, error? | re = the request | host |
 | | `agent.unmanaged` | host, pid, program?, cwd?, since? — no `program` clears the report | | host |
 | | `agent.stuck` | agent, cause?, detail, until? — no `cause` clears the record | | host |
+| | `agent.signal` | agent, program, signal, detail? — `prompt`/`turn_end` clear the agent's stored signal | | agent |
 
 Task states follow the A2A task lifecycle names, so tools that know A2A read them as-is.
 
@@ -167,7 +168,8 @@ ULID that arrives late is still returned after the cursor, so a follower never m
 `GET /state` returns `hosts`, `agents` (state + since), `roles` (level, lead, domain, by, since)
 keyed by agent id, `spawns` (the request, who asked, the result) keyed by `spawn.requested` id
 — kept for 24 h after its answer (or its request, when unanswered), and never while the agent
-is still up — `quotas` (windows, plan, exhausted, read_at) keyed by `<host>:<kind>`,
+is still up — `quotas` (windows, plan, exhausted, read_at, exhausted_since — when the reports
+first showed the account out) keyed by `<host>:<kind>`,
 `tasks` (state + since, owner, lead,
 blocked_by, handoffs), open `blockers` and `asks` (with their context link) keyed by their raising event id, undelivered
 `msgs` keyed by their `msg.sent` id, the id of the `last` event folded, and the `unknown` count.
@@ -303,76 +305,117 @@ finding's detail says who was told, or that nobody was.
 
 ## Stuck causes
 
-Every 5 seconds the host reads the visible screen of each of its `idle` or `blocked` agents —
-and of a `working` one `doctor` calls `hung` — through herdr's `agent.read`, and names ONE
-cause with a pure classifier from its own screen text — `agent.quota` supplies the spent
-window's reset for `until` and gates the handoff target, but the account being out is not
-itself a cause; the program must say so on screen. A screen signal matches only on the
-program's own UI lines, by position: everything from the input box's top rule down (the
-box, the `Context:` footer, the status lines under it) is the program's; above it, a
-`⏺`/`●`/`•`/`⎿`/`│`/`└`/`○`/`❯`/`❭`/`›`/`>` line opens an assistant or tool block that
-runs to the next blank line or the box, and every line inside it — a hard-wrapped line
-resumes at column 0 — plus every indented line (a reply paragraph, printed file
-contents) is the agent's prose and never carries a signal. The exception is a line
-opening with the program's own alert icon (`✱`/`▲`/`✗`/`✓`, or `[i]`/`[!]`/`[X]`/`[~]`
-on a legacy terminal): a notice keeps its exact shape wherever it sits, and for Devin —
-whose replies are bare indented prose — the notice's title leads the line past the
-icon, so a reply quoting "Quota exhausted" mid-sentence is not a banner. The result lands
-in `agent.stuck` (`cause`, `detail`, `until`), written when the cause
-appears or changes, and once with no `cause` when the agent works again. State `stuck` is
-keyed by agent; `ps`, the TUI and the board show the cause next to the state, `doctor` puts
-it in the `hung`/`stalled` detail, and the push names it too — for `permission`, `waiting`
-and `unknown` it also carries the screen's last lines.
+Every 5 seconds the host looks at each of its `idle` or `blocked` agents — and at a
+`working` one `doctor` calls `hung` — and names ONE cause. The cause is authoritative only
+when it comes from a structured signal: the agent's own `agent.signal` (the latest one
+stored for the agent — `prompt`, `turn_end` and turning `working` clear it, so what remains
+belongs to this episode, and one older than the last working stretch is a replay), or herdr's
+`blocked` and the fleet's own holds. For Devin, which
+emits no hooks, an exhausted `agent.quota` for `<host>:devin` plus the agent sitting idle
+*is* the structured quota signal — but only when the agent's current stop began after the
+account ran out and its task is still open: an agent already idle or finished is just idle. The screen is still read, but only as a hint: it may
+ride along in the message to the lead ("screen hints …"), and it never decides a cause or
+drives an action. The result lands in `agent.stuck` (`cause`, `detail`, `until`), written
+when the cause appears or changes, and once with no `cause` when the agent works again.
+State `stuck` is keyed by agent; `ps`, the TUI and the board show the cause next to the
+state, `doctor` puts it in the `hung`/`stalled` detail, and the push names it too — for
+`permission`, `waiting` and `unknown` it also carries the screen's last lines.
 
 | Cause | Signal |
 |---|---|
-| `quota` | the program's own quota line on screen: Devin "Quota exhausted", Claude "usage limit" / "limit reached … resets", Codex "usage limit". `until` is the spent window's `resets_at` (from `agent.quota`) when known. |
-| `rate_limit` | a short retry window on a line about a limit: "rate limit", "reset in N minutes", "retry after". `until` is the parsed wait (5 min when unparseable). |
-| `unsent` | a prompt sits in the input box: "Press Enter to send queued", or a pasted brief never sent. |
-| `context_full` | the program's own footer says its context is nearly gone: Devin `Context: N / M tokens (P%)` at P ≥ 90, Claude `Context left until auto-compact: P%` at P ≤ 10, Codex `P% context left` at P ≤ 10. |
-| `error` | "Something went wrong", "Send a message to continue", an API error line. |
-| `permission` | herdr reports `blocked`: a permission or trust prompt waits. |
+| `quota` | `agent.signal` `quota`, or for Devin an exhausted `agent.quota` for `<host>:devin`. `until` is the spent window's `resets_at` (from `agent.quota`) when known. |
+| `rate_limit` | `agent.signal` `rate_limit`. `until` is the wait named in `detail` (5 min when unparseable). |
+| `question` | `agent.signal` `question` — the program is asking the principal; `detail` is its text. |
+| `context_full` | `agent.signal` `context_full` (the statusline wrapper at ≥ 90% context) or `compacting`. |
+| `error` | `agent.signal` `error`. |
+| `account` | `agent.signal` `account` — billing, hold or auth; no retry cures it. |
+| `permission` | `agent.signal` `permission`, or herdr reports `blocked`: a permission or trust prompt waits. |
 | `resource` | its worktree holds or queues for a resource: "waiting for sim behind the e2e run, ~21m". A legitimate wait, never `hung` or `stalled`. |
 | `held` | its open task is deliberately held: an open `blocker.raised` (with `what`/`owner`/`unblocks_when`) or an unfinished `task.dep`. |
-| `waiting` | idle after it worked, nothing else on screen (finished, or asked something). |
-| `unknown` | none of the above. |
+| `waiting` | idle after it worked, no signal (finished, or asked something) — also `agent.signal` `idle`. |
+| `unknown` | none of the above — including a spawned agent that never reached `working`. |
 
 Each cause earns at most one action per episode, logged as events (`msg.sent`,
 `spawn.requested`), and never on an agent that is `working` unless `hung`, nor on one whose
-task is finished. Actions that touch an agent — keystrokes and handoffs — only run under
-`host --stuck-act`; without it the host still classifies and records `agent.stuck`, and
-every would-be action becomes one tell to the lead naming what it would have done. And
-nothing acts or tells before the state has lasted `--stall-min`: a prompt a human is still
-typing is not `unsent` yet:
+task is finished. Actions that touch an agent — a `continue` doorbell, a handoff — only
+run under `host --stuck-act`; without it the host still classifies and records `agent.stuck`,
+and every would-be action becomes one tell to the lead naming what it would have done. And
+nothing acts or tells before the state has lasted `--stall-min`:
 
-- `quota` with `until` more than 30 min away or unknown: hand the work to the profile's
+- `quota` with `until` KNOWN and more than 30 min away: hand the work to the profile's
   `on_quota` (a fleet.toml key), but only when that profile's kind still has quota on this
-  host; otherwise tell the lead it is out of quota and no fallback has quota. `until` within
-  30 min: tell the lead it waits, then send `continue` once after `until`. A target whose
-  kind is the agent's own is never a quota handoff — a `haiku` profile's kind is `claude`,
-  it shares the Claude account's limits, so a Claude agent out of quota is never handed to
-  it on the same host.
+  host. `until` within 30 min or unknown: tell the lead it is out of quota until `until` —
+  an unknown reset is not a reason to move the work. A target whose kind is the agent's own
+  is never a quota handoff —
+  a `haiku` profile's kind is `claude`, it shares the Claude account's limits, so a Claude
+  agent out of quota is never handed to it on the same host.
 - `rate_limit`: wait; `continue` once after `until`.
-- `unsent`: one Enter — always, since an Escape could wipe a long pasted brief. If the
-  prompt still sits there a retry-wait later: with the "Press Enter to send queued" hint
-  still up, tell the lead (a queued prompt waits on a running turn); with it gone, one
-  Escape and the queued text re-sent; still there, tell the lead. Nothing is re-sent
-  while a doorbell to the agent is still undelivered.
-- `context_full`: hand off to the profile's `fallback` with a HANDOFF note to read git
-  status, git log and any STATE.md first.
-- `error`: `continue` once; if the error cause returns, tell the lead with the screen's
-  last lines.
+- `question`: tell the lead, and list it on the board under "Waiting for the principal" —
+  the principal's only channel is the board; nothing pushes.
 - `resource`: no action — the wait is legitimate — until it beats 2× the holder's stated
   ETA (a "~21m" in its scope) or 60 min; then one tell to the lead.
 - `held`: nothing at all — no push, no escalation; `doctor` shows `held`, not `stalled`.
 - `permission`, `waiting`, `unknown`: the `HUNG`/`STALLED` push tells the lead, with the
   cause and the screen's last lines.
+- `context_full`, `error`, `account`, `unsent` (screen hint only) and the never-started
+  agent: one tell to the lead. No keystrokes, no handoffs — those two were the dangerous
+  guesses: an Escape could wipe a long pasted brief, and an automatic handoff on anything
+  but quota spawned agents the fleet could not pay for.
 
 When a stalled agent's tell got no reaction — the lead stayed idle/done for `--stall-min`
 after the `HUNG`/`STALLED` push, an escalation, or the agent's own message was delivered —
 the host sends ONE `ESCALATED` `msg.sent` to the lead's own lead, and so on up the
 `agent.role` chain to an up root-coordinator, never past it. Each hop waits its own
 `--stall-min` and dedupes like every tell: once per episode, by the log.
+
+## Signals
+
+`agent.signal` is the structured channel a program speaks through. `agent-fleet hook signal`
+reads a harness's hook JSON on stdin and writes the event — identified from the herdr
+environment exactly as `agent-fleet`'s own `me` does (`HERDR_ENV`, `HERDR_PANE_ID`,
+`HERDR_SESSION`, `HERDR_SOCKET_PATH`, and `agent.get` for the pane's name and program).
+Outside herdr, on unmapped events, on any error — argument errors included — it exits 0
+silently. The event lands in the spool first and the client then flushes what the budget
+allows: a hub that never answers still cannot lose the signal, and the whole pass is capped
+at one second so the hooked program is never slowed. Claude Code is the complete map;
+Devin CLI and Codex match where their hook payloads share the shape.
+
+| Hook | Maps to `signal` |
+|---|---|
+| `StopFailure` `error: rate_limit` | `rate_limit` |
+| `StopFailure` `error: overloaded`, `server_error`, anything else | `error` |
+| `StopFailure` `error: billing_error`, `account_on_hold`, `authentication_failed`, `oauth_org_not_allowed` | `account` |
+| `Notification` `permission_prompt` | `permission` |
+| `Notification` `idle_prompt` | `idle` |
+| `Notification` `agent_needs_input`, `elicitation_dialog`, `elicitation_url_dialog` | `question` (`detail` = `message`) |
+| `Notification` `quota_auto_resume_stale`, `quota_auto_resume_disabled` | `quota` |
+| `Notification` `quota_auto_resume_fired` | `resumed` |
+| `PreCompact` `trigger: auto` | `compacting` |
+| `Stop` | `turn_end` |
+| `UserPromptSubmit` | `prompt` |
+| statusline `context_window.used_percentage` ≥ 90 | `context_full`, once per session (deduped in `claude-context-full.json` next to `claude-rate-limits.json`, keyed by `session_id`) |
+
+`StopFailure`'s `detail` is `error_details` plus the first line of `last_assistant_message`.
+`prompt` and `turn_end` mark a new episode: they clear the stored signal instead of storing
+one. An unknown hook event writes nothing.
+
+Install all of them in the project's `.claude/settings.json` (Devin CLI reads the same file).
+Every command ends in `|| true`: a Stop or UserPromptSubmit hook exiting 2 blocks Claude
+Code, and an older `agent-fleet` without `hook signal` exits 2 on the unknown subcommand —
+the `|| true` keeps an old binary from blocking the program it hooks.
+
+```json
+{ "hooks": {
+  "Stop":             [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ],
+  "StopFailure":      [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ],
+  "Notification":     [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ],
+  "PreCompact":       [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ],
+  "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ] } }
+```
+
+`agent-fleet hook statusline` stays the status-line wrapper: it stores the `rate_limits`
+it is fed for the host's `agent.quota` read, emits `context_full` as above when the process
+sits in a herdr pane, and passes the input on to the command it wraps.
 
 ## Killing processes
 
@@ -396,8 +439,12 @@ against an agent set on evading it.
 
 ```json
 { "hooks": { "PreToolUse": [ { "matcher": "Bash|exec",
-  "hooks": [ { "type": "command", "command": "agent-fleet hook bash" } ] } ] } }
+  "hooks": [ { "type": "command",
+    "command": "command -v agent-fleet >/dev/null 2>&1 || exit 0; agent-fleet hook bash" } ] } ] } }
 ```
+
+The guard passes everything when the binary is absent, and an exit 2 refusal still
+blocks the tool call when it is there.
 
 ## Every agent runs in herdr
 
@@ -467,9 +514,12 @@ took and answers `ok=false`; a request older than 15 min when first seen is answ
 
 `agent-fleet handoff <agent> [--to <profile>] [--note TEXT]` gives the agent's issue, branch and
 existing worktree to a new agent of `--to` (default: its profile's fallback) with a HANDOFF note.
-The host does the same itself, once per agent on its own host and session, when its spawn
-record's profile has a fallback and the agent never reached `working` — either its kind is out
-of quota on this host, or `handoff_min` minutes passed since its successful spawn. An agent
+The host does the same itself only for the quota case and only under `--stuck-act` — an agent
+that never reached `working` whose kind went out of quota on this host before it stopped, with
+the reset known and far out, goes to `on_quota` as under
+Stuck causes; without `--stuck-act` the would-be handoff is a tell, deduped like every tell.
+Any other never-started agent (`handoff_min` minutes since its successful spawn
+without reaching `working`) is a tell to the lead, never a handoff. An agent
 that worked, is `working` or `done`, or whose task closed is never handed off; a replacement
 request that failed does not block a retry.
 

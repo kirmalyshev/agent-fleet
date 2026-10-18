@@ -1284,10 +1284,12 @@ fn agent_prefix(host: &str, session: &str) -> String {
     format!("agent:{host}/{session}/")
 }
 
-/// Why `id` should be handed to its profile's fallback at `now`, or None. An agent that worked,
-/// is working or done, or whose task closed is never handed off — an idle agent that finished
-/// its work stays put.
-fn handoff_reason(
+/// Why an agent that never reached `working` needs a look, or None. An agent that worked,
+/// is working or done, or whose task closed is never reported — an idle agent that finished
+/// its work stays put. The cause mirrors a stuck signal's: `quota` when the program's
+/// account is out on this host (the reset comes from the spent window), `unknown` when it
+/// simply never started.
+fn never_started(
     state: &State,
     events: &[Event],
     a: &crate::state::Agent,
@@ -1295,7 +1297,7 @@ fn handoff_reason(
     prof: &Profile,
     host: &str,
     now: DateTime<Utc>,
-) -> Option<String> {
+) -> Option<(StuckCause, Option<DateTime<Utc>>, String)> {
     let id = &sp.request.agent;
     let task_done = sp
         .request
@@ -1311,18 +1313,35 @@ fn handoff_reason(
     {
         return None;
     }
-    if state
+    // The idle must postdate the outage: an agent already stopped when the account ran out
+    // did not stop for quota — it is the plain never-started case below.
+    if let Some(q) = state
         .quotas
         .get(&format!("{host}:{}", prof.kind))
-        .is_some_and(|q| q.exhausted_at(now))
+        .filter(|q| q.exhausted_at(now) && q.exhausted_since.is_none_or(|t| a.since >= t))
     {
-        return Some(format!("{} quota on {host} is exhausted", prof.kind));
+        let until = q
+            .windows
+            .iter()
+            .filter(|w| w.used_pct >= 100.0)
+            .filter_map(|w| w.resets_at)
+            .filter(|r| *r > now)
+            .min();
+        return Some((
+            StuckCause::Quota,
+            until,
+            format!("{} quota on {host} is exhausted", prof.kind),
+        ));
     }
     let min = chrono::Duration::minutes(prof.handoff_min.unwrap_or(5) as i64);
     if sp.answered.is_some_and(|t| now - t > min) {
-        return Some(format!(
-            "never reached working within {}m",
-            prof.handoff_min.unwrap_or(5)
+        return Some((
+            StuckCause::Unknown,
+            None,
+            format!(
+                "never reached working within {}m",
+                prof.handoff_min.unwrap_or(5)
+            ),
         ));
     }
     None
@@ -1386,7 +1405,9 @@ pub async fn hand_off(
     Ok(())
 }
 
-/// The auto-handoff scan: one handoff request per agent, deduped through the state's `replaces`.
+/// The never-started scan: a spawned agent that never reached `working` is reported to the
+/// lead — except the one case the fleet acts on: its program is out of quota with the reset
+/// far out, so the work moves to the profile's `on_quota` (deduped through `replaces`).
 async fn handoffs(
     host: &Arc<Host>,
     state: &State,
@@ -1427,23 +1448,69 @@ async fn handoffs(
         let Some(prof) = cfg.profiles.get(&sp.request.profile) else {
             continue;
         };
-        let Some(fallback) = prof.fallback.clone() else {
-            continue;
-        };
-        let Some(extra) = handoff_reason(state, events, a, sp, prof, &host.cfg.host, Utc::now())
+        let now = Utc::now();
+        let Some((cause, until, why)) =
+            never_started(state, events, a, sp, prof, &host.cfg.host, now)
         else {
             continue;
         };
-        match hand_off(host, state, sp, &fallback, &extra).await {
-            Ok(()) => {
-                done.insert(id.clone());
-            }
-            Err(e) => {
-                if warned.insert(id.clone()) {
-                    eprintln!("agent-fleet host: handoff for {id}: {e:#}");
+        let name = crate::host::short(id);
+        let mut text = match cause {
+            StuckCause::Quota => format!(
+                "{name} is out of quota until {}",
+                until
+                    .map(|u| crate::ui::at(now, u))
+                    .unwrap_or_else(|| "an unknown time".into())
+            ),
+            _ => format!("{name} {why}"),
+        };
+        if cause == StuckCause::Quota {
+            // Only a KNOWN far reset earns the handoff; an unknown reset is told, not moved.
+            let far = until.is_some_and(|u| u - now > crate::stuck::QUOTA_WAIT);
+            if far && let Some(to) = crate::stuck::on_quota(host, state, id, now) {
+                if host.cfg.stuck_act {
+                    match hand_off(host, state, sp, &to, &why).await {
+                        Ok(()) => {
+                            done.insert(id.clone());
+                        }
+                        Err(e) => {
+                            if warned.insert(id.clone()) {
+                                eprintln!("agent-fleet host: handoff for {id}: {e:#}");
+                            }
+                        }
+                    }
+                    continue;
                 }
+                // --stuck-act off: the handoff becomes a would-be tell, deduped in the log
+                // like every tell.
+                text = format!(
+                    "{name} would be handed to {to} ({why}) — stuck actions are off (--stuck-act)"
+                );
             }
         }
+        // Everything else is a tell: one per episode, deduped through the log.
+        let Some(to) = crate::doctor::escalate(state, id) else {
+            continue;
+        };
+        let kind = match cause {
+            StuckCause::Quota => "QUOTA",
+            _ => "NEVER_STARTED",
+        };
+        if events.iter().any(|e| {
+            e.ts > a.since
+                && matches!(&e.body,
+                    Body::Known(Known::MsgSent(m))
+                        if m.to == to && m.kind == kind && m.reference == name)
+        }) {
+            continue;
+        }
+        host.publish(host.presence(Known::MsgSent(MsgSent {
+            to: to.to_string(),
+            kind: kind.into(),
+            reference: name.to_string(),
+            text,
+        })))
+        .await;
     }
 }
 
@@ -1852,6 +1919,7 @@ profile = "devin"
                 exhausted: true,
                 read_at: Utc::now(),
                 ts: Utc::now(),
+                exhausted_since: Some(Utc::now()),
             },
         );
         let d = decide(&c, &issue("x", &[]), &Overrides::default(), &s, "h").unwrap();
@@ -1889,6 +1957,7 @@ profile = "devin"
                 exhausted: true,
                 read_at: Utc::now(),
                 ts: Utc::now(),
+                exhausted_since: Some(Utc::now()),
             },
         );
         s.quotas.insert(
@@ -1899,6 +1968,7 @@ profile = "devin"
                 exhausted: true,
                 read_at: Utc::now(),
                 ts: Utc::now(),
+                exhausted_since: Some(Utc::now()),
             },
         );
         let e = decide(&c, &issue("x", &[]), &Overrides::default(), &s, "h")
@@ -2501,6 +2571,7 @@ profile = "devin"
                 exhausted,
                 read_at: Utc::now() - chrono::Duration::minutes(mins_ago),
                 ts: Utc::now(),
+                exhausted_since: exhausted.then(Utc::now),
             }
         };
         let now = Utc::now();
@@ -2740,21 +2811,31 @@ profile = "devin"
                 exhausted: true,
                 read_at: Utc::now(),
                 ts: Utc::now(),
+                exhausted_since: Some(Utc::now()),
             },
         );
         let sp = mk(&mut s, AgentState::Done);
         let a = s.agents["agent:h/s/dv-7"].clone();
         assert_eq!(
-            handoff_reason(&s, &[], &a, &sp, &prof, "h", Utc::now()),
+            never_started(&s, &[], &a, &sp, &prof, "h", Utc::now()),
             None,
-            "a Done agent is never handed off"
+            "a Done agent is never reported"
         );
-        // idle, never worked, quota out → hands off
+        // idle, never worked, quota out → the quota cause
         s.agents.get_mut("agent:h/s/dv-7").unwrap().state = AgentState::Idle;
         let a = s.agents["agent:h/s/dv-7"].clone();
-        let why = handoff_reason(&s, &[], &a, &sp, &prof, "h", Utc::now()).unwrap();
+        let (kind, _, why) = never_started(&s, &[], &a, &sp, &prof, "h", Utc::now()).unwrap();
+        assert_eq!(kind, StuckCause::Quota, "{why}");
         assert!(why.contains("quota"), "{why}");
-        // an agent that ever reached working is never handed off — even via agent.up
+        // … unless the agent was already stopped when the account ran out: then the
+        // outage explains nothing and the plain never-started report stands
+        s.quotas.get_mut("h:devin").unwrap().exhausted_since =
+            Some(Utc::now() + chrono::Duration::minutes(1));
+        let (kind, _, why) = never_started(&s, &[], &a, &sp, &prof, "h", Utc::now()).unwrap();
+        assert_eq!(kind, StuckCause::Unknown, "{why}");
+        assert!(why.contains("never reached working"), "{why}");
+        s.quotas.get_mut("h:devin").unwrap().exhausted_since = Some(Utc::now());
+        // an agent that ever reached working is never reported — even via agent.up
         let up = Envelope::new(
             actor(),
             "p",
@@ -2768,10 +2849,10 @@ profile = "devin"
         )
         .into_event();
         assert_eq!(
-            handoff_reason(&s, &[up], &a, &sp, &prof, "h", Utc::now()),
+            never_started(&s, &[up], &a, &sp, &prof, "h", Utc::now()),
             None
         );
-        // a completed task is never handed off
+        // a completed task is never reported
         s.tasks.insert(
             task_id("o/r", 7),
             crate::state::Task {
@@ -2787,21 +2868,22 @@ profile = "devin"
             },
         );
         assert_eq!(
-            handoff_reason(&s, &[], &a, &sp, &prof, "h", Utc::now()),
+            never_started(&s, &[], &a, &sp, &prof, "h", Utc::now()),
             None,
-            "a finished task is never handed off"
+            "a finished task is never reported"
         );
         s.tasks.clear();
         s.quotas.clear();
-        let why = handoff_reason(&s, &[], &a, &sp, &prof, "h", Utc::now()).unwrap();
+        let (kind, _, why) = never_started(&s, &[], &a, &sp, &prof, "h", Utc::now()).unwrap();
+        assert_eq!(kind, StuckCause::Unknown, "{why}");
         assert!(why.contains("never reached working"), "{why}");
         // a.worked set (kept across a host re-up) counts as reached working, events or not
         let mut a2 = a.clone();
         a2.worked = Some(Utc::now() - chrono::Duration::minutes(3));
         assert_eq!(
-            handoff_reason(&s, &[], &a2, &sp, &prof, "h", Utc::now()),
+            never_started(&s, &[], &a2, &sp, &prof, "h", Utc::now()),
             None,
-            "an agent that ever worked is never handed off"
+            "an agent that ever worked is never reported"
         );
     }
 
@@ -2935,6 +3017,19 @@ profile = "devin"
     }
 
     // ---------- the stall report ----------
+
+    /// An `agent.signal` folded straight into the state, as the hook's write would fold.
+    fn signal(s: &mut State, id: &str, sig: &str, detail: Option<&str>) {
+        s.signals.insert(
+            id.into(),
+            crate::state::Signal {
+                signal: sig.into(),
+                detail: detail.map(str::to_string),
+                program: "claude".into(),
+                since: Utc::now(),
+            },
+        );
+    }
 
     /// An idle-20m agent that worked 40m ago, with `lead` optional.
     fn stalled_state(lead: Option<&str>) -> State {
@@ -3563,8 +3658,8 @@ profile = "devin"
         let evs = host.replica.lock().unwrap().all().unwrap().to_vec();
         assert!(
             evs.iter().any(|e| matches!(&e.body,
-                Body::Known(Known::AgentStuck(st)) if st.cause == Some(crate::event::StuckCause::Unsent))),
-            "the cause is still recorded"
+                Body::Known(Known::AgentStuck(st)) if st.cause == Some(crate::event::StuckCause::Waiting))),
+            "the cause is still recorded — the screen's unsent read is a hint only"
         );
         assert!(
             !stub.calls().iter().any(|m| m == "agent.send_keys"),
@@ -3589,6 +3684,22 @@ profile = "devin"
         let quota_state = || {
             let mut s = stalled_state(Some("agent:h/s/lead"));
             s.agents.get_mut("agent:h/s/a").unwrap().kind = Some("claude".into());
+            // The spent window's far reset is what makes the quota cause a handoff.
+            s.quotas.insert(
+                "h:claude".into(),
+                crate::state::Quota {
+                    windows: vec![QuotaWindow {
+                        name: "5h".into(),
+                        used_pct: 100.0,
+                        resets_at: Some(Utc::now() + chrono::Duration::hours(2)),
+                    }],
+                    plan: None,
+                    exhausted: true,
+                    read_at: Utc::now(),
+                    ts: Utc::now(),
+                    exhausted_since: Some(Utc::now() - chrono::Duration::minutes(30)),
+                },
+            );
             let mut r = req(None);
             r.agent = "agent:h/s/a".into();
             r.name = "a".into();
@@ -3608,14 +3719,15 @@ profile = "devin"
                 .filter(|e| matches!(&e.body, Body::Known(Known::SpawnRequested(_))))
                 .count()
         };
-        let screen = vec![json!({ "result": { "text": "usage limit reached" } })];
         // haiku is claude too — the same account, never a quota handoff
         let dir = tempfile::tempdir().unwrap();
         scene(dir.path(), &cfg("haiku", "claude"));
-        let (host, _stub) = run_act(dir.path(), &[("agent.read", screen.clone())]).await;
+        let (host, _stub) = run_act(dir.path(), &[]).await;
+        let mut s = quota_state();
+        signal(&mut s, "agent:h/s/a", "quota", None);
         stuck(
             &host,
-            &quota_state(),
+            &s,
             &[],
             &mut crate::stuck::Seen::default(),
             &HashSet::new(),
@@ -3625,16 +3737,18 @@ profile = "devin"
         let got = msgs(&host);
         assert!(
             got.iter()
-                .any(|m| m.kind == "QUOTA" && m.text.contains("no fallback has quota")),
+                .any(|m| m.kind == "QUOTA" && m.text.contains("out of quota until")),
             "the lead is told instead: {got:?}"
         );
         // a different kind with quota free is handed to
         let dir = tempfile::tempdir().unwrap();
         scene(dir.path(), &cfg("dv", "devin"));
-        let (host, _stub) = run_act(dir.path(), &[("agent.read", screen)]).await;
+        let (host, _stub) = run_act(dir.path(), &[]).await;
+        let mut s = quota_state();
+        signal(&mut s, "agent:h/s/a", "quota", None);
         stuck(
             &host,
-            &quota_state(),
+            &s,
             &[],
             &mut crate::stuck::Seen::default(),
             &HashSet::new(),
@@ -3646,20 +3760,18 @@ profile = "devin"
     #[tokio::test]
     async fn the_first_seen_deadline_stands_while_the_cause_does() {
         let t0 = Utc::now() + chrono::Duration::minutes(12);
-        // rate_limit: the screen re-parses "resets in ~12 minutes" to now+12m every pass;
-        // the recorded until wins and agent.stuck is not republished for a moved until.
+        // rate_limit: the signal's wait is recomputed every pass; the recorded until wins and
+        // agent.stuck is not republished for a moved until.
         let dir = tempfile::tempdir().unwrap();
         let _co = checkout(dir.path());
-        let (host, _stub) = run_act(
-            dir.path(),
-            &[(
-                "agent.read",
-                vec![json!({ "result": { "text":
-                    "Rate limit reached, resets in ~12 minutes" } })],
-            )],
-        )
-        .await;
+        let (host, _stub) = run_act(dir.path(), &[]).await;
         let mut s = stalled_state(Some("agent:h/s/lead"));
+        signal(
+            &mut s,
+            "agent:h/s/a",
+            "rate_limit",
+            Some("resets in ~12 minutes"),
+        );
         s.stuck.insert(
             "agent:h/s/a".into(),
             crate::state::Stuck {
@@ -3699,15 +3811,9 @@ profile = "devin"
         )
         .unwrap();
         std::fs::write(co.join(".agent-fleet/b.md"), "do it").unwrap();
-        let (host, _stub) = run_act(
-            dir.path(),
-            &[(
-                "agent.read",
-                vec![json!({ "result": { "text": "Quota exhausted" } })],
-            )],
-        )
-        .await;
+        let (host, _stub) = run_act(dir.path(), &[]).await;
         let mut s = stalled_state(Some("agent:h/s/lead"));
+        signal(&mut s, "agent:h/s/a", "quota", None);
         let mut r = req(None);
         r.agent = "agent:h/s/a".into();
         r.name = "a".into();
@@ -3750,20 +3856,32 @@ profile = "devin"
     async fn a_just_handed_agent_is_busy_in_the_same_pass() {
         let dir = tempfile::tempdir().unwrap();
         let co = checkout(dir.path());
-        std::fs::write(co.join(".agent-fleet/b.md"), "do it").unwrap();
-        // a: up 20m, never worked, spawn answered 10m ago — handoffs() hands it to the
-        // fallback. Its screen says context_full — check would hand it off AGAIN without
-        // the just-handed set.
-        let (host, _stub) = run_act(
-            dir.path(),
-            &[(
-                "agent.read",
-                vec![json!({ "result": {
-                    "text": "SWE-2 High · Context: 190,000 / 200,000 tokens (95%)" } })],
-            )],
+        std::fs::write(
+            co.join(".agent-fleet/fleet.toml"),
+            "session = \"s\"\nbrief = \"b.md\"\n[profiles.devin]\nkind = \"devin\"\non_quota = \"sonnet\"\nprefix = \"dv-\"\n[profiles.sonnet]\nkind = \"claude\"\nprefix = \"s-\"\n[[rules]]\nprofile = \"devin\"\n",
         )
-        .await;
+        .unwrap();
+        std::fs::write(co.join(".agent-fleet/b.md"), "do it").unwrap();
+        // a: up 20m, never worked, spawn answered 10m ago, devin quota out with a far
+        // reset — handoffs() hands it to on_quota. It also carries a quota signal — check
+        // would hand it off AGAIN without the just-handed set.
+        let (host, _stub) = run_act(dir.path(), &[]).await;
         let mut s = State::default();
+        s.quotas.insert(
+            "h:devin".into(),
+            crate::state::Quota {
+                windows: vec![QuotaWindow {
+                    name: "day".into(),
+                    used_pct: 100.0,
+                    resets_at: Some(Utc::now() + chrono::Duration::hours(2)),
+                }],
+                plan: None,
+                exhausted: true,
+                read_at: Utc::now(),
+                ts: Utc::now(),
+                exhausted_since: Some(Utc::now() - chrono::Duration::minutes(30)),
+            },
+        );
         s.agents.insert(
             "agent:h/s/a".into(),
             crate::state::Agent {
@@ -3800,6 +3918,7 @@ profile = "devin"
         for e in &events {
             s.apply(e);
         }
+        signal(&mut s, "agent:h/s/a", "quota", None);
         let count = |host: &Host| {
             host.replica
                 .lock()
@@ -3827,12 +3946,24 @@ profile = "devin"
 
     #[tokio::test]
     async fn stuck_actions_wait_for_stuck_act() {
-        let screen = json!({ "result": { "text": "Press Enter to send queued" } });
-        // Off: no keystroke into the agent — the lead gets a tell of what would be done.
+        // A rate_limit signal whose wait is already past earns a `continue` doorbell —
+        // but only with --stuck-act; off, the lead gets a tell of what would be done.
+        let signal_past = |s: &mut State| {
+            s.signals.insert(
+                "agent:h/s/a".into(),
+                crate::state::Signal {
+                    signal: "rate_limit".into(),
+                    detail: None,
+                    program: "claude".into(),
+                    since: Utc::now() - chrono::Duration::minutes(10),
+                },
+            );
+        };
         let dir = tempfile::tempdir().unwrap();
         let _co = checkout(dir.path());
-        let (host, stub) = run(dir.path(), &[("agent.read", vec![screen.clone()])]).await;
-        let s = stalled_state(Some("agent:h/s/lead"));
+        let (host, _stub) = run(dir.path(), &[]).await;
+        let mut s = stalled_state(Some("agent:h/s/lead"));
+        signal_past(&mut s);
         stuck(
             &host,
             &s,
@@ -3841,34 +3972,342 @@ profile = "devin"
             &HashSet::new(),
         )
         .await;
+        let got = msgs(&host);
+        assert!(
+            got.iter().any(|m| m.kind == "RATE_LIMIT"
+                && m.to == "agent:h/s/lead"
+                && m.text.contains("would get a `continue`")),
+            "a tell says what would be done: {got:?}"
+        );
+        assert!(!got.iter().any(|m| m.kind == "CONTINUE"), "no act: {got:?}");
+        // On: the `continue` doorbell goes to the agent itself.
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run_act(dir.path(), &[]).await;
+        let mut s = stalled_state(Some("agent:h/s/lead"));
+        signal_past(&mut s);
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
+        let got = msgs(&host);
+        assert!(
+            got.iter()
+                .any(|m| m.kind == "CONTINUE" && m.to == "agent:h/s/a"),
+            "with --stuck-act the continue is sent: {got:?}"
+        );
+        // A restart forgets the episode: the log alone keeps the `continue` once.
+        let events: Vec<Event> = host.replica.lock().unwrap().all().unwrap().to_vec();
+        let mut s = stalled_state(Some("agent:h/s/lead"));
+        signal_past(&mut s);
+        stuck(
+            &host,
+            &s,
+            &events,
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
+        let got = msgs(&host);
+        assert_eq!(
+            got.iter()
+                .filter(|m| m.kind == "CONTINUE" && m.to == "agent:h/s/a")
+                .count(),
+            1,
+            "the continue is deduped in the log, not only in memory: {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_never_started_agent_is_told_not_handed_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run_act(dir.path(), &[]).await;
+        let mut s = stalled_state(Some("agent:h/s/lead"));
+        s.agents.get_mut("agent:h/s/a").unwrap().worked = None;
+        let mut r = req(None);
+        r.agent = "agent:h/s/a".into();
+        r.name = "a".into();
+        let req_ev = Envelope::new(actor(), "p", Known::SpawnRequested(Box::new(r))).into_event();
+        let mut res_ev = Envelope::new(
+            actor(),
+            "p",
+            Known::SpawnResult(SpawnResult {
+                agent: "agent:h/s/a".into(),
+                ok: true,
+                pane: Some("w:1".into()),
+                worktree: Some("/w/a".into()),
+                error: None,
+            }),
+        )
+        .re(&req_ev.id)
+        .into_event();
+        res_ev.ts = Utc::now() - chrono::Duration::minutes(10);
+        let events = [req_ev, res_ev];
+        for e in &events {
+            s.apply(e);
+        }
+        let reqs = |host: &Host| {
+            host.replica
+                .lock()
+                .unwrap()
+                .all()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(&e.body, Body::Known(Known::SpawnRequested(_))))
+                .count()
+        };
+        let mut handed = HashSet::new();
+        handoffs(&host, &s, &events, &mut handed, &mut HashSet::new()).await;
+        assert!(handed.is_empty(), "no automatic handoff");
+        assert_eq!(reqs(&host), 0);
+        let got = msgs(&host);
+        assert!(
+            got.iter().any(|m| m.kind == "NEVER_STARTED"
+                && m.to == "agent:h/s/lead"
+                && m.text.contains("never reached working")),
+            "the lead is told: {got:?}"
+        );
+        // the log dedupes a second pass of the same episode
+        let events: Vec<Event> = host.replica.lock().unwrap().all().unwrap().to_vec();
+        handoffs(&host, &s, &events, &mut handed, &mut HashSet::new()).await;
+        assert_eq!(msgs(&host).len(), got.len());
+    }
+
+    #[tokio::test]
+    async fn a_never_started_quota_handoff_waits_for_stuck_act() {
+        // Same setup as the same-pass handoff test, but the host runs without
+        // --stuck-act: the quota handoff becomes a would-be tell, log-deduped.
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        std::fs::write(
+            co.join(".agent-fleet/fleet.toml"),
+            "session = \"s\"\nbrief = \"b.md\"\n[profiles.devin]\nkind = \"devin\"\non_quota = \"sonnet\"\nprefix = \"dv-\"\n[profiles.sonnet]\nkind = \"claude\"\nprefix = \"s-\"\n[[rules]]\nprofile = \"devin\"\n",
+        )
+        .unwrap();
+        std::fs::write(co.join(".agent-fleet/b.md"), "do it").unwrap();
+        let (host, _stub) = run(dir.path(), &[]).await;
+        let mut s = State::default();
+        s.quotas.insert(
+            "h:devin".into(),
+            crate::state::Quota {
+                windows: vec![QuotaWindow {
+                    name: "day".into(),
+                    used_pct: 100.0,
+                    resets_at: Some(Utc::now() + chrono::Duration::hours(2)),
+                }],
+                plan: None,
+                exhausted: true,
+                read_at: Utc::now(),
+                ts: Utc::now(),
+                exhausted_since: Some(Utc::now() - chrono::Duration::minutes(30)),
+            },
+        );
+        s.agents.insert(
+            "agent:h/s/a".into(),
+            crate::state::Agent {
+                host: "h".into(),
+                kind: Some("devin".into()),
+                pane: None,
+                state: AgentState::Idle,
+                since: Utc::now() - chrono::Duration::minutes(20),
+                worked: None,
+                usage: None,
+            },
+        );
+        let mut r = req(None);
+        r.agent = "agent:h/s/a".into();
+        r.name = "a".into();
+        r.issue = None;
+        r.worktree = Some("/w/a".into());
+        let req_ev = Envelope::new(actor(), "p", Known::SpawnRequested(Box::new(r))).into_event();
+        let mut res_ev = Envelope::new(
+            actor(),
+            "p",
+            Known::SpawnResult(SpawnResult {
+                agent: "agent:h/s/a".into(),
+                ok: true,
+                pane: Some("w:1".into()),
+                worktree: Some("/w/a".into()),
+                error: None,
+            }),
+        )
+        .re(&req_ev.id)
+        .into_event();
+        res_ev.ts = Utc::now() - chrono::Duration::minutes(10);
+        let events = [req_ev, res_ev];
+        for e in &events {
+            s.apply(e);
+        }
+        // a role for the tell to reach
+        s.roles.insert(
+            "agent:h/s/a".into(),
+            crate::state::Role {
+                level: Level::Implementer,
+                lead: Some("agent:h/s/lead".into()),
+                domain: None,
+                by: "agent:h/s/x".into(),
+                since: Utc::now(),
+            },
+        );
+        let mut handed = HashSet::new();
+        handoffs(&host, &s, &events, &mut handed, &mut HashSet::new()).await;
+        let reqs = |host: &Host| {
+            host.replica
+                .lock()
+                .unwrap()
+                .all()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(&e.body, Body::Known(Known::SpawnRequested(_))))
+                .count()
+        };
+        assert_eq!(reqs(&host), 0, "no handoff without --stuck-act");
+        let got = msgs(&host);
+        assert!(
+            got.iter().any(|m| m.kind == "QUOTA"
+                && m.to == "agent:h/s/lead"
+                && m.text.contains("would be handed to sonnet")
+                && m.text.contains("--stuck-act")),
+            "one would-be tell: {got:?}"
+        );
+        // deduped through the log on the next pass
+        let events: Vec<Event> = host.replica.lock().unwrap().all().unwrap().to_vec();
+        handoffs(&host, &s, &events, &mut handed, &mut HashSet::new()).await;
+        assert_eq!(msgs(&host).len(), got.len(), "the would-be tell is once");
+    }
+
+    #[tokio::test]
+    async fn a_signal_beats_the_screen_hint() {
+        // The screen shows a quota line but the program signaled an error: the recorded
+        // cause is the signal's, and the screen read rides the tell as a hint only.
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run_act(
+            dir.path(),
+            &[(
+                "agent.read",
+                vec![json!({ "result": { "text": "▲ Quota exhausted" } })],
+            )],
+        )
+        .await;
+        let mut s = stalled_state(Some("agent:h/s/lead"));
+        signal(&mut s, "agent:h/s/a", "error", Some("HTTP 500"));
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
+        let evs = host.replica.lock().unwrap().all().unwrap().to_vec();
+        assert!(
+            evs.iter().any(|e| matches!(&e.body,
+                Body::Known(Known::AgentStuck(st)) if st.cause == Some(crate::event::StuckCause::Error))),
+            "the signal names the cause: {evs:?}"
+        );
+        let got = msgs(&host);
+        assert!(
+            got.iter().any(|m| m.kind == "ERROR"
+                && m.text.contains("HTTP 500")
+                && m.text.contains("screen hints")),
+            "the hint rides the tell: {got:?}"
+        );
+        assert!(!got.iter().any(|m| m.kind == "QUOTA"), "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn devins_exhausted_account_is_the_quota_signal() {
+        // Devin emits no hooks; an idle devin agent plus an exhausted <host>:devin quota
+        // IS the structured quota signal — the screen stays a hint.
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run_act(dir.path(), &[]).await;
+        let mut s = stalled_state(Some("agent:h/s/lead"));
+        s.quotas.insert(
+            "h:devin".into(),
+            crate::state::Quota {
+                windows: vec![QuotaWindow {
+                    name: "cycle".into(),
+                    used_pct: 100.0,
+                    resets_at: Some(Utc::now() + chrono::Duration::minutes(10)),
+                }],
+                plan: None,
+                exhausted: true,
+                read_at: Utc::now(),
+                ts: Utc::now(),
+                exhausted_since: Some(Utc::now() - chrono::Duration::minutes(30)),
+            },
+        );
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
+        let evs = host.replica.lock().unwrap().all().unwrap().to_vec();
+        assert!(
+            evs.iter().any(|e| matches!(&e.body,
+                Body::Known(Known::AgentStuck(st)) if st.cause == Some(crate::event::StuckCause::Quota))),
+            "agent.quota + idle is the quota signal: {evs:?}"
+        );
+        // a near reset: a tell, no handoff
+        let got = msgs(&host);
+        assert!(
+            got.iter()
+                .any(|m| m.kind == "QUOTA" && m.text.contains("out of quota until")),
+            "{got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_full_tells_and_never_hands_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        // Even with an on_quota target configured, context_full earns only a tell.
+        std::fs::write(
+            co.join(".agent-fleet/fleet.toml"),
+            "session = \"s\"\nbrief = \"b.md\"\n[profiles.devin]\nkind = \"devin\"\non_quota = \"sonnet\"\nfallback = \"sonnet\"\nprefix = \"dv-\"\n[profiles.sonnet]\nkind = \"claude\"\nprefix = \"s-\"\n[[rules]]\nprofile = \"devin\"\n",
+        )
+        .unwrap();
+        let (host, stub) = run_act(dir.path(), &[]).await;
+        let mut s = stalled_state(Some("agent:h/s/lead"));
+        signal(
+            &mut s,
+            "agent:h/s/a",
+            "context_full",
+            Some("context 95% used"),
+        );
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
+        let evs = host.replica.lock().unwrap().all().unwrap().to_vec();
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(&e.body, Body::Known(Known::SpawnRequested(_)))),
+            "no automatic handoff"
+        );
         assert!(
             !stub.calls().iter().any(|m| m == "agent.send_keys"),
-            "no typing without --stuck-act: {:?}",
-            stub.calls()
+            "no keystrokes"
         );
         let got = msgs(&host);
         assert!(
             got.iter()
-                .any(|m| m.kind == "UNSENT" && m.to == "agent:h/s/lead"),
-            "a tell says what would be done: {got:?}"
-        );
-        // On: the Enter goes out.
-        let dir = tempfile::tempdir().unwrap();
-        let _co = checkout(dir.path());
-        let (host, stub) = run_act(dir.path(), &[("agent.read", vec![screen])]).await;
-        let s = stalled_state(Some("agent:h/s/lead"));
-        stuck(
-            &host,
-            &s,
-            &[],
-            &mut crate::stuck::Seen::default(),
-            &HashSet::new(),
-        )
-        .await;
-        assert!(
-            stub.calls().iter().any(|m| m == "agent.send_keys"),
-            "with --stuck-act the Enter is typed: {:?}",
-            stub.calls()
+                .any(|m| m.kind == "CONTEXT_FULL" && m.text.contains("context nearly full")),
+            "the lead is told: {got:?}"
         );
     }
 }

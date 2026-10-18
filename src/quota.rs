@@ -333,11 +333,37 @@ fn b64(s: &str) -> Option<Vec<u8>> {
 /// `agent-fleet hook statusline [-- <cmd>…]`: Claude Code's status line, wrapped. The rate
 /// limits it is fed are stored for the host to publish; a wrapped command gets the same stdin
 /// and its stdout passes through. A status line must never break: every error is swallowed.
-pub fn statusline(cmd: &[String]) {
+/// When `context_window.used_percentage` is at the context-full mark and the process sits in
+/// a herdr pane, it also writes an `agent.signal` `context_full`, once per session.
+/// `paths` absent (the instance directory could not be made) only mutes the signal write —
+/// the limits file and the wrapped command still run.
+pub async fn statusline(
+    cmd: &[String],
+    paths: Option<&Paths>,
+    hub: Option<&str>,
+    token_file: Option<&Path>,
+    project: &str,
+    host: &str,
+) {
     let mut input = Vec::new();
     let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut input);
+    statusline_input(&input, cmd, paths, hub, token_file, project, host).await;
+}
+
+async fn statusline_input(
+    input: &[u8],
+    cmd: &[String],
+    paths: Option<&Paths>,
+    hub: Option<&str>,
+    token_file: Option<&Path>,
+    project: &str,
+    host: &str,
+) {
     if let Some(file) = claude_file() {
-        store_limits(&input, &file);
+        store_limits(input, &file);
+    }
+    if let (Ok(v), Some(paths)) = (serde_json::from_slice::<Value>(input), paths) {
+        crate::signal::context_full(paths, hub, token_file, project, host, &v).await;
     }
     let Some((prog, args)) = cmd.split_first() else {
         return;
@@ -351,7 +377,7 @@ pub fn statusline(cmd: &[String]) {
         return;
     };
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = std::io::Write::write_all(&mut stdin, &input);
+        let _ = std::io::Write::write_all(&mut stdin, input);
     }
     let _ = child.wait();
 }
@@ -558,6 +584,29 @@ mod tests {
         assert_eq!(q.windows[0].used_pct, 100.0);
         assert_eq!(q.windows[1].used_pct, 50.0);
         assert_eq!(q.plan, None);
+    }
+
+    #[tokio::test]
+    async fn the_wrapped_statusline_runs_without_instance_paths() {
+        // The instance directory failing to exist must not mute the status line itself:
+        // the wrapped command still gets the stdin and runs.
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let cmd = vec!["sh".into(), "-c".into(), format!("cat > {}", out.display())];
+        statusline_input(
+            br#"{"session_id":"s1","context_window":{"used_percentage":10}}"#,
+            &cmd,
+            None,
+            None,
+            None,
+            "p",
+            "h",
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            r#"{"session_id":"s1","context_window":{"used_percentage":10}}"#
+        );
     }
 
     #[test]

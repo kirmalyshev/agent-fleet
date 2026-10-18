@@ -52,6 +52,10 @@ pub struct State {
     /// Why a stopped agent is stopped, as its host read it off the screen, keyed by agent id.
     #[serde(default)]
     pub stuck: BTreeMap<String, Stuck>,
+    /// The latest `agent.signal` per agent, keyed by agent id; cleared when a `prompt` or
+    /// `turn_end` signal opens a new episode, and when the agent turns `working` or goes down.
+    #[serde(default)]
+    pub signals: BTreeMap<String, Signal>,
     /// Events this binary cannot fold (an unknown type, or a known type at a newer `v`): kept in
     /// the log, skipped here.
     pub unknown: u64,
@@ -101,6 +105,10 @@ pub struct Quota {
     pub read_at: DateTime<Utc>,
     /// When the report was folded in.
     pub ts: DateTime<Utc>,
+    /// When the reports first showed the account out; kept while it stays out, absent
+    /// while it does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhausted_since: Option<DateTime<Utc>>,
 }
 
 /// An `exhausted` read stays believed this long — claude/codex only refresh while used.
@@ -227,6 +235,17 @@ pub struct Stuck {
     /// When the condition lifts, if the cause names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until: Option<DateTime<Utc>>,
+    pub since: DateTime<Utc>,
+}
+
+/// An agent's latest program-reported signal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Signal {
+    pub signal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The program that reported it.
+    pub program: String,
     pub since: DateTime<Utc>,
 }
 
@@ -364,7 +383,10 @@ impl State {
                             _ => ts,
                         },
                         worked: (d.state == AgentState::Working)
-                            .then_some(ts)
+                            .then(|| {
+                                self.signals.remove(&d.agent);
+                                ts
+                            })
                             .or_else(|| old.and_then(|a| a.worked)),
                         usage: old.and_then(|a| a.usage.clone()),
                     },
@@ -456,6 +478,7 @@ impl State {
                 if let Some(a) = self.agents.get_mut(&d.agent) {
                     if d.state == AgentState::Working {
                         a.worked = Some(ts);
+                        self.signals.remove(&d.agent);
                     }
                     if a.state != d.state {
                         a.state = d.state;
@@ -466,6 +489,27 @@ impl State {
             Known::AgentDown(d) => {
                 self.agents.remove(&d.agent);
                 self.stuck.remove(&d.agent);
+                self.signals.remove(&d.agent);
+            }
+            Known::AgentSignal(d) => {
+                // `prompt`/`turn_end` open a new episode: the stored signal is cleared, and
+                // a stale event that arrives out of order never rewinds a newer one.
+                let stale = self.signals.get(&d.agent).is_some_and(|s| s.since > ts);
+                if matches!(d.signal.as_str(), "prompt" | "turn_end") {
+                    if !stale {
+                        self.signals.remove(&d.agent);
+                    }
+                } else if !stale {
+                    self.signals.insert(
+                        d.agent.clone(),
+                        Signal {
+                            signal: d.signal.clone(),
+                            detail: d.detail.clone(),
+                            program: d.program.clone(),
+                            since: ts,
+                        },
+                    );
+                }
             }
             Known::AgentStuck(d) => match &d.cause {
                 Some(cause) => {
@@ -484,14 +528,22 @@ impl State {
                 }
             },
             Known::AgentQuota(d) => {
+                let key = worktree_key(&d.host, &d.kind);
+                let out = d.exhausted || d.windows.iter().any(|w| w.used_pct >= 100.0);
                 self.quotas.insert(
-                    worktree_key(&d.host, &d.kind),
+                    key.clone(),
                     Quota {
                         windows: d.windows.clone(),
                         plan: d.plan.clone(),
                         exhausted: d.exhausted,
                         read_at: d.read_at,
                         ts,
+                        exhausted_since: out.then(|| {
+                            self.quotas
+                                .get(&key)
+                                .and_then(|q| q.exhausted_since)
+                                .unwrap_or(ts)
+                        }),
                     },
                 );
             }
@@ -725,6 +777,123 @@ mod tests {
 
     fn agent_ev(body: Known) -> Envelope<Known> {
         ev(ActorKind::Agent, body).task("task:p/1")
+    }
+
+    #[test]
+    fn a_signal_folds_latest_and_episode_marks_clear_it() {
+        let sig = |signal: &str, detail: Option<&str>| {
+            agent_ev(Known::AgentSignal(AgentSignal {
+                agent: "agent:h/s/a".into(),
+                program: "claude".into(),
+                signal: signal.into(),
+                detail: detail.map(str::to_string),
+            }))
+            .into_event()
+        };
+        let mut s = State::default();
+        s.apply(&sig("permission", None));
+        assert_eq!(s.signals["agent:h/s/a"].signal, "permission");
+        // a newer signal replaces; an older one arriving late does not rewind
+        s.apply(&sig("question", Some("which?")));
+        assert_eq!(s.signals["agent:h/s/a"].signal, "question");
+        assert_eq!(s.signals["agent:h/s/a"].detail.as_deref(), Some("which?"));
+        let mut old = sig("error", Some("late"));
+        old.ts = s.signals["agent:h/s/a"].since - chrono::Duration::minutes(1);
+        s.apply(&old);
+        assert_eq!(s.signals["agent:h/s/a"].signal, "question");
+        // prompt and turn_end open a new episode: the stored signal clears
+        s.apply(&sig("turn_end", None));
+        assert!(s.signals.is_empty());
+        s.apply(&sig("rate_limit", None));
+        s.apply(&sig("prompt", None));
+        assert!(s.signals.is_empty());
+        // and turning working or going down clears it too
+        let up = |state| {
+            ev(
+                ActorKind::Host,
+                Known::AgentState(AgentStateChanged {
+                    agent: "agent:h/s/a".into(),
+                    state,
+                }),
+            )
+            .into_event()
+        };
+        s.apply(
+            &ev(
+                ActorKind::Host,
+                Known::AgentUp(AgentUp {
+                    agent: "agent:h/s/a".into(),
+                    host: "h".into(),
+                    kind: Some("claude".into()),
+                    state: AgentState::Idle,
+                    pane: None,
+                }),
+            )
+            .into_event(),
+        );
+        s.apply(&sig("error", Some("e")));
+        s.apply(&up(AgentState::Working));
+        assert!(s.signals.is_empty());
+        s.apply(&sig("error", Some("e")));
+        s.apply(
+            &ev(
+                ActorKind::Host,
+                Known::AgentDown(AgentDown {
+                    agent: "agent:h/s/a".into(),
+                    reason: None,
+                }),
+            )
+            .into_event(),
+        );
+        assert!(s.signals.is_empty());
+    }
+
+    #[test]
+    fn exhausted_since_is_the_first_out_report_while_it_stays_out() {
+        let quota = |exhausted: bool, pct: f64, ts: DateTime<Utc>| {
+            let mut e = ev(
+                ActorKind::Host,
+                Known::AgentQuota(AgentQuota {
+                    host: "h".into(),
+                    kind: "devin".into(),
+                    windows: vec![QuotaWindow {
+                        name: "day".into(),
+                        used_pct: pct,
+                        resets_at: None,
+                    }],
+                    plan: None,
+                    exhausted,
+                    read_at: ts,
+                }),
+            )
+            .into_event();
+            e.ts = ts;
+            e
+        };
+        let t0 = Utc::now();
+        let mut s = State::default();
+        s.apply(&quota(false, 50.0, t0));
+        assert_eq!(s.quotas["h:devin"].exhausted_since, None);
+        // The first report showing the account out stamps it; later out reports keep it.
+        s.apply(&quota(true, 50.0, t0 + chrono::Duration::minutes(1)));
+        let t_out = t0 + chrono::Duration::minutes(1);
+        assert_eq!(
+            s.quotas["h:devin"].exhausted_since,
+            Some(t_out),
+            "the event that set exhausted"
+        );
+        s.apply(&quota(true, 50.0, t0 + chrono::Duration::minutes(5)));
+        assert_eq!(s.quotas["h:devin"].exhausted_since, Some(t_out));
+        // A 100% window counts too; a non-out report clears it, a new outage re-stamps.
+        s.apply(&quota(false, 100.0, t0 + chrono::Duration::minutes(6)));
+        assert_eq!(s.quotas["h:devin"].exhausted_since, Some(t_out));
+        s.apply(&quota(false, 50.0, t0 + chrono::Duration::minutes(7)));
+        assert_eq!(s.quotas["h:devin"].exhausted_since, None);
+        s.apply(&quota(true, 50.0, t0 + chrono::Duration::minutes(8)));
+        assert_eq!(
+            s.quotas["h:devin"].exhausted_since,
+            Some(t0 + chrono::Duration::minutes(8))
+        );
     }
 
     #[test]

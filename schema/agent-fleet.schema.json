@@ -128,6 +128,35 @@
           ],
           "type": "object"
         },
+        "AgentSignal": {
+          "additionalProperties": false,
+          "description": "A structured signal from the agent's own program — a harness hook (`agent-fleet hook\nsignal` / the statusline wrapper) writes it. `prompt` and `turn_end` open a new episode:\nthe fold drops the agent's stored signal on them. `detail` carries the program's own\ntext (an error message, a question) when there is one.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "program": {
+              "description": "The agent program, e.g. `claude`; a plain string, so a new program needs no schema change.",
+              "type": "string"
+            },
+            "signal": {
+              "description": "What the program said: `rate_limit`, `error`, `account`, `permission`, `idle`,\n`question`, `quota`, `resumed`, `compacting`, `context_full`, `prompt`, `turn_end`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "agent",
+            "program",
+            "signal"
+          ],
+          "type": "object"
+        },
         "AgentState": {
           "description": "An agent's lifecycle state, as the terminal multiplexer reports it.",
           "enum": [
@@ -923,7 +952,17 @@
             },
             {
               "const": "permission",
-              "description": "A permission or trust prompt (herdr reports `blocked`).",
+              "description": "A permission or trust prompt (herdr reports `blocked`, or the program signaled one).",
+              "type": "string"
+            },
+            {
+              "const": "question",
+              "description": "The program is asking the operator something.",
+              "type": "string"
+            },
+            {
+              "const": "account",
+              "description": "The program reports an account problem (billing, hold, auth).",
               "type": "string"
             },
             {
@@ -1657,6 +1696,22 @@
             "data"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/AgentSignal"
+            },
+            "type": {
+              "const": "agent.signal",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -1975,6 +2030,14 @@
             "exhausted": {
               "type": "boolean"
             },
+            "exhausted_since": {
+              "description": "When the reports first showed the account out; kept while it stays out, absent\nwhile it does not.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "plan": {
               "type": [
                 "string",
@@ -2167,6 +2230,34 @@
           "required": [
             "level",
             "by",
+            "since"
+          ],
+          "type": "object"
+        },
+        "Signal": {
+          "description": "An agent's latest program-reported signal.",
+          "properties": {
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "program": {
+              "description": "The program that reported it.",
+              "type": "string"
+            },
+            "signal": {
+              "type": "string"
+            },
+            "since": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "signal",
+            "program",
             "since"
           ],
           "type": "object"
@@ -2405,7 +2496,17 @@
             },
             {
               "const": "permission",
-              "description": "A permission or trust prompt (herdr reports `blocked`).",
+              "description": "A permission or trust prompt (herdr reports `blocked`, or the program signaled one).",
+              "type": "string"
+            },
+            {
+              "const": "question",
+              "description": "The program is asking the operator something.",
+              "type": "string"
+            },
+            {
+              "const": "account",
+              "description": "The program reports an account problem (billing, hold, auth).",
               "type": "string"
             },
             {
@@ -2795,6 +2896,14 @@
           },
           "default": {},
           "description": "Declared roles by agent id; kept apart from `agents`, so a role survives `agent.down`.",
+          "type": "object"
+        },
+        "signals": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Signal"
+          },
+          "default": {},
+          "description": "The latest `agent.signal` per agent, keyed by agent id; cleared when a `prompt` or\n`turn_end` signal opens a new episode, and when the agent turns `working` or goes down.",
           "type": "object"
         },
         "spawns": {

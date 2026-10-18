@@ -7,6 +7,7 @@ mod hub;
 mod kill;
 mod quota;
 mod scan;
+mod signal;
 mod spawn;
 mod state;
 mod stats;
@@ -419,6 +420,14 @@ enum HookCmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
+    /// Harness hook (Claude Code `StopFailure`/`Notification`/`PreCompact`/`Stop`/
+    /// `UserPromptSubmit`, and any harness whose payload matches): maps the hook JSON on
+    /// stdin to an `agent.signal` event and writes it. Never fails; outside herdr it exits 0.
+    Signal {
+        /// Ignored: a hook exits 0 on any error, argument errors included.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -518,6 +527,15 @@ fn short(id: &str) -> &str {
     id.rsplit('/').next().unwrap_or(id)
 }
 
+fn host_name(cli: &Cli) -> String {
+    cli.host_name.clone().unwrap_or_else(|| {
+        rustix::system::uname()
+            .nodename()
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
 struct Ctx {
     cli: Cli,
     paths: Paths,
@@ -525,12 +543,7 @@ struct Ctx {
 
 impl Ctx {
     fn host_name(&self) -> String {
-        self.cli.host_name.clone().unwrap_or_else(|| {
-            rustix::system::uname()
-                .nodename()
-                .to_string_lossy()
-                .into_owned()
-        })
+        host_name(&self.cli)
     }
 
     fn client(&self) -> Result<Client> {
@@ -694,6 +707,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if let Cmd::Hook { cmd } = &cli.cmd {
+        // A hook must never break the program it wraps: every error is swallowed inside, and
+        // the bash guard and the wrapped status line run even when the instance directory
+        // cannot be made.
+        let paths = Paths::from_env(&cli.instance).ok();
         match cmd {
             HookCmd::Bash => {
                 let mut input = String::new();
@@ -703,7 +720,36 @@ async fn main() -> Result<()> {
                     std::process::exit(2);
                 }
             }
-            HookCmd::Statusline { cmd } => quota::statusline(cmd),
+            HookCmd::Statusline { cmd } => {
+                quota::statusline(
+                    cmd,
+                    paths.as_ref(),
+                    cli.hub.as_deref(),
+                    cli.token_file.as_deref(),
+                    &cli.project,
+                    &host_name(&cli),
+                )
+                .await;
+                // Exit without the runtime's teardown: a lookup stuck on a blocking thread
+                // (a hung DNS) would hold the process past the hook's budget.
+                std::process::exit(0);
+            }
+            HookCmd::Signal { .. } => {
+                let mut input = String::new();
+                let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+                if let Some(paths) = &paths {
+                    signal::hook(
+                        paths,
+                        cli.hub.as_deref(),
+                        cli.token_file.as_deref(),
+                        &cli.project,
+                        &host_name(&cli),
+                        &input,
+                    )
+                    .await;
+                }
+                std::process::exit(0);
+            }
         }
         return Ok(());
     }
@@ -1314,5 +1360,15 @@ mod tests {
         assert_eq!(parse_repo("foo=2").unwrap(), (None, PathBuf::from("foo=2")));
         // `/p=2`: the left side starts with '/', so it is a path.
         assert_eq!(parse_repo("/p=2").unwrap(), (None, PathBuf::from("/p=2")));
+    }
+
+    #[test]
+    fn hook_signal_eats_any_arguments() {
+        // Exit 2 from a Stop or UserPromptSubmit hook blocks Claude Code — `hook signal`
+        // parses whatever comes after `signal` and always exits 0.
+        assert!(Cli::try_parse_from(["agent-fleet", "hook", "signal"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["agent-fleet", "hook", "signal", "--bogus", "x", "-f"]).is_ok()
+        );
     }
 }

@@ -1033,6 +1033,7 @@ mod tests {
             exhausted,
             read_at: now,
             ts: now,
+            exhausted_since: exhausted.then_some(now),
         };
         s.quotas.insert(
             "h:claude".into(),

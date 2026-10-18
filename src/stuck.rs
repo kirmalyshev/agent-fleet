@@ -30,10 +30,8 @@ impl Cause {
     }
 }
 
-/// The wait between the Enter and the Escape + re-send for an unsent prompt.
-pub const UNSENT_RETRY: Duration = Duration::seconds(60);
-/// An out-of-quota agent whose reset is at most this far out waits it; further out its work
-/// moves to the profile's `on_quota`.
+/// An out-of-quota agent whose reset is at most this far out is just reported; further out
+/// its work moves to the profile's `on_quota`.
 pub const QUOTA_WAIT: Duration = Duration::minutes(30);
 /// A rate-limit line without a number waits this long before the `continue`.
 const RL_DEFAULT: Duration = Duration::minutes(5);
@@ -49,15 +47,6 @@ fn last_n(s: &str, n: usize) -> String {
         .rev()
         .collect::<Vec<_>>()
         .join(" | ")
-}
-
-/// The "Press Enter to send queued" hint, on a UI chrome line — never in the agent's prose.
-fn send_hint(program: Option<&str>, screen: &str) -> bool {
-    let chrome = chrome_lines(program, screen);
-    screen
-        .lines()
-        .enumerate()
-        .any(|(i, l)| chrome[i] && l.to_lowercase().contains("press enter to send queued"))
 }
 
 /// The message waiting in a Devin input box, read off the screen: the box is the
@@ -338,8 +327,9 @@ fn error_on_screen(program: Option<&str>, line: &str) -> bool {
 /// ONE cause for a stopped agent, read off `screen_tail` — only the program's own UI
 /// lines carry a signal: everything inside an assistant or tool block, a reply
 /// paragraph or a printed file is the agent's prose and never does. `None` means the
-/// screen names nothing the host recognizes; `cause_of` maps that (and herdr's
-/// `blocked`) to the rest.
+/// screen names nothing the host recognizes. The result is a HINT: it may be shown to
+/// the lead in a message, but it never drives an action — only the program's own
+/// `agent.signal` does that.
 pub fn stuck_cause(
     program: Option<&str>,
     screen_tail: &str,
@@ -430,9 +420,104 @@ pub fn stuck_cause(
     None
 }
 
+/// Every task `id` owns is finished — it has nothing left to be stuck on.
+fn task_closed(s: &State, id: &str) -> bool {
+    s.tasks
+        .values()
+        .any(|t| t.owner.as_deref() == Some(id) && t.state.is_terminal())
+        && !s
+            .tasks
+            .values()
+            .any(|t| t.owner.as_deref() == Some(id) && !t.state.is_terminal())
+}
+
+/// The cause the program's own signal names — the latest `agent.signal` stored for `id` —
+/// and for Devin, which has no hooks, the account-level quota read (`agent.quota` exhausted)
+/// while it sits idle. `prompt`/`turn_end`/`working` clear the stored signal in the fold, so
+/// whatever remains belongs to this episode. `resumed` and unmapped signals name no cause.
+fn signal_cause(s: &State, id: &str, a: &Agent, now: DateTime<Utc>) -> Option<Cause> {
+    let sig = match s.signals.get(id) {
+        Some(sig) => sig,
+        None => {
+            // Devin reports no hooks; its quota is account-level — `agent.quota` exhausted
+            // plus a stopped agent IS the structured signal. But only an episode that began
+            // at or after the account ran out can be stuck on it: an agent already idle
+            // (finished, waiting) when the outage started is just idle.
+            if a.kind.as_deref() == Some("devin")
+                && s.quotas.get(&format!("{}:devin", a.host)).is_some_and(|q| {
+                    q.exhausted_at(now) && q.exhausted_since.is_none_or(|t| a.since >= t)
+                })
+                && !task_closed(s, id)
+            {
+                return Some(Cause {
+                    kind: StuckCause::Quota,
+                    detail: "the program's account is out of quota".into(),
+                    until: None,
+                });
+            }
+            return None;
+        }
+    };
+    // A signal speaks for the turn it arrived in: anything older than the last working
+    // stretch is a replay, not a live cause.
+    if a.worked.is_some_and(|w| sig.since < w) {
+        return None;
+    }
+    let with = |what: &str| match &sig.detail {
+        Some(d) => format!("{what}: {d}"),
+        None => what.to_string(),
+    };
+    Some(match sig.signal.as_str() {
+        "quota" => Cause {
+            kind: StuckCause::Quota,
+            detail: "the program reported its quota exhausted".into(),
+            until: None,
+        },
+        "rate_limit" => Cause {
+            kind: StuckCause::RateLimit,
+            detail: with("rate limited"),
+            until: Some(
+                sig.since
+                    + sig
+                        .detail
+                        .as_deref()
+                        .and_then(retry_in)
+                        .unwrap_or(RL_DEFAULT),
+            ),
+        },
+        "permission" => Cause::simple(StuckCause::Permission, "a permission prompt waits"),
+        "question" => Cause {
+            kind: StuckCause::Question,
+            detail: with("it asks the principal"),
+            until: None,
+        },
+        "context_full" => Cause {
+            kind: StuckCause::ContextFull,
+            detail: with("context nearly full"),
+            until: None,
+        },
+        "compacting" => Cause::simple(
+            StuckCause::ContextFull,
+            "the program is compacting its context",
+        ),
+        "error" => Cause {
+            kind: StuckCause::Error,
+            detail: with("error"),
+            until: None,
+        },
+        "account" => Cause {
+            kind: StuckCause::Account,
+            detail: with("account problem"),
+            until: None,
+        },
+        "idle" => Cause::simple(StuckCause::Waiting, "the program reports it is idle"),
+        _ => return None,
+    })
+}
+
 /// The cause for a stopped agent: an intentional hold first, then herdr's `blocked` (a
-/// permission or trust prompt) and a legitimate resource wait, then a recognized screen,
-/// and `waiting` once the agent has worked, `unknown` before that.
+/// permission or trust prompt) and a legitimate resource wait, then the program's own
+/// signal, and `waiting` once the agent has worked, `unknown` before that.
 pub fn cause_of(s: &State, id: &str, a: &Agent, detected: Option<Cause>) -> Cause {
     if let Some(detail) = crate::doctor::held(s, id) {
         return Cause {
@@ -463,13 +548,11 @@ pub fn cause_of(s: &State, id: &str, a: &Agent, detected: Option<Cause>) -> Caus
 // ---------- the action, once per episode ----------
 
 /// Per-agent episode state: the stretch since the agent's current state began, reset when
-/// the state or the cause changes. Each step field makes one action once-per-episode.
+/// the state or the cause changes. Each flag makes one action once-per-episode.
 #[derive(Debug, Default)]
 pub struct Episode {
     key: i64,
     cause: Option<StuckCause>,
-    step: u8,
-    at: Option<DateTime<Utc>>,
     fired: bool,
     continued: bool,
 }
@@ -488,13 +571,11 @@ impl Episode {
 }
 
 /// What the host does for a cause; every variant lands in the log as an event or a key.
+/// Only a structured signal ever earns one: `continue` for a rate limit, a handoff for
+/// quota far out. Everything else is a tell to the lead.
 pub enum Act {
     /// `continue` once, as a doorbell to the agent itself.
     Continue,
-    /// One Enter, to ship the prompt sitting in the box.
-    Enter,
-    /// One Escape and the queued text re-sent.
-    Resend(String),
     /// A `msg.sent` to the lead (`to`), `kind` the cause's name.
     Tell {
         to: String,
@@ -514,71 +595,48 @@ fn tell(s: &State, id: &str, kind: StuckCause, text: String) -> Option<Act> {
     })
 }
 
-/// The facts `step` reads for one pass: the agent, its screen and the caller's lookups —
-/// `handoff` is the profile the agent may be handed to (`on_quota` for `quota`, `fallback`
-/// for `context_full`), `continued_before` a `CONTINUE` doorbell for `error` in the log.
+/// The facts `step` reads for one pass: the agent, the screen hint text for the message, and
+/// the caller's lookups — `handoff` is the vetted `on_quota` profile a `quota` cause may be
+/// handed to.
 pub struct Ctx<'a> {
     pub s: &'a State,
     pub id: &'a str,
     pub a: &'a Agent,
-    pub screen: &'a str,
+    pub hint: &'a str,
     pub now: DateTime<Utc>,
     pub handoff: Option<&'a str>,
-    pub continued_before: bool,
 }
 
 /// The one action a cause earns this pass, or `None`.
 pub fn step(c: &Ctx, cause: &Cause, ep: &mut Episode) -> Option<Act> {
-    let (s, id, a, screen, now) = (c.s, c.id, c.a, c.screen, c.now);
+    let (s, id, a, now) = (c.s, c.id, c.a, c.now);
     match cause.kind {
         StuckCause::Quota => {
-            let far = cause.until.is_none_or(|u| u - now > QUOTA_WAIT);
-            if far {
-                if ep.fired {
-                    return None;
-                }
-                ep.fired = true;
-                let until = cause
-                    .until
-                    .map(|u| crate::ui::at(now, u))
-                    .unwrap_or_else(|| "an unknown time".into());
-                return match c.handoff {
-                    Some(to) => Some(Act::Handoff {
-                        to: to.to_string(),
-                        extra: format!(
-                            "out of {} quota until {until}",
-                            a.kind.as_deref().unwrap_or("its program's")
-                        ),
-                    }),
-                    None => tell(
-                        s,
-                        id,
-                        cause.kind,
-                        format!(
-                            "{} is out of quota until {until}; no fallback has quota",
-                            crate::host::short(id),
-                        ),
+            if ep.fired {
+                return None;
+            }
+            ep.fired = true;
+            // Only a KNOWN far reset earns the handoff; an unknown reset is told, not moved.
+            let far = cause.until.is_some_and(|u| u - now > QUOTA_WAIT);
+            let until = cause
+                .until
+                .map(|u| crate::ui::at(now, u))
+                .unwrap_or_else(|| "an unknown time".into());
+            if far && c.handoff.is_some() {
+                return Some(Act::Handoff {
+                    to: c.handoff?.to_string(),
+                    extra: format!(
+                        "out of {} quota until {until}",
+                        a.kind.as_deref().unwrap_or("its program's")
                     ),
-                };
+                });
             }
-            if !ep.fired {
-                ep.fired = true;
-                return tell(
-                    s,
-                    id,
-                    cause.kind,
-                    format!(
-                        "{} is out of quota; it waits until {}",
-                        crate::host::short(id),
-                        crate::ui::at(now, cause.until?)
-                    ),
-                );
-            }
-            if !ep.continued && cause.until.is_some_and(|u| now >= u) {
-                ep.continued = true;
-                return Some(Act::Continue);
-            }
-            None
+            tell(
+                s,
+                id,
+                cause.kind,
+                format!("{} is out of quota until {until}", crate::host::short(id)),
+            )
         }
         StuckCause::RateLimit => {
             if !ep.continued && cause.until.is_none_or(|u| now >= u) {
@@ -586,112 +644,6 @@ pub fn step(c: &Ctx, cause: &Cause, ep: &mut Episode) -> Option<Act> {
                 return Some(Act::Continue);
             }
             None
-        }
-        StuckCause::Unsent => {
-            let resend = || -> Option<Act> {
-                if a.state == AgentState::Working || s.msgs.values().any(|m| m.to == id) {
-                    return None;
-                }
-                let t = queued_text(screen).unwrap_or_default();
-                (!t.is_empty()).then_some(Act::Resend(t))
-            };
-            let held = |s: &State, why: &str| {
-                tell(
-                    s,
-                    id,
-                    cause.kind,
-                    format!(
-                        "{} holds a prompt in its input box; nothing re-sent{why}",
-                        crate::host::short(id)
-                    ),
-                )
-            };
-            let why = if a.state == AgentState::Working {
-                " (it is behind a running turn)"
-            } else if s.msgs.values().any(|m| m.to == id) {
-                " (a doorbell to it is still pending)"
-            } else {
-                ""
-            };
-            match ep.step {
-                // The first move is always a bare Enter: it ships a queued prompt and
-                // sends a typed one. An Escape here could wipe a long pasted brief.
-                0 => {
-                    ep.at = Some(now);
-                    ep.step = 1;
-                    Some(Act::Enter)
-                }
-                1 if ep.at.is_some_and(|t| now - t >= UNSENT_RETRY) => {
-                    ep.step = 2;
-                    if send_hint(a.kind.as_deref(), screen) {
-                        tell(
-                            s,
-                            id,
-                            cause.kind,
-                            format!(
-                                "{} still shows the send-queued hint after Enter",
-                                crate::host::short(id)
-                            ),
-                        )
-                    } else {
-                        resend().or_else(|| held(s, why))
-                    }
-                }
-                2 => {
-                    ep.step = 3;
-                    tell(
-                        s,
-                        id,
-                        cause.kind,
-                        format!(
-                            "{} still holds a prompt in its input box after Enter and a re-send",
-                            crate::host::short(id)
-                        ),
-                    )
-                }
-                _ => None,
-            }
-        }
-        StuckCause::ContextFull => {
-            if ep.fired {
-                return None;
-            }
-            ep.fired = true;
-            match c.handoff {
-                Some(to) => Some(Act::Handoff {
-                    to: to.to_string(),
-                    extra: "its context is nearly full — read git status, git log and any STATE.md first".into(),
-                }),
-                None => tell(
-                    s,
-                    id,
-                    cause.kind,
-                    format!(
-                        "{} is out of context and has no fallback: {}",
-                        crate::host::short(id),
-                        cause.detail
-                    ),
-                ),
-            }
-        }
-        StuckCause::Error => {
-            if ep.fired {
-                return None;
-            }
-            ep.fired = true;
-            if c.continued_before {
-                return tell(
-                    s,
-                    id,
-                    cause.kind,
-                    format!(
-                        "{} errored again: {}",
-                        crate::host::short(id),
-                        last_n(screen, 5)
-                    ),
-                );
-            }
-            Some(Act::Continue)
         }
         StuckCause::Resource => {
             if ep.fired {
@@ -711,8 +663,23 @@ pub fn step(c: &Ctx, cause: &Cause, ep: &mut Episode) -> Option<Act> {
                 format!("{} {}", crate::host::short(id), cause.detail),
             )
         }
-        StuckCause::Permission | StuckCause::Waiting | StuckCause::Unknown | StuckCause::Held => {
+        // A held task and a resource wait are silent; `permission`, `waiting` and `unknown`
+        // are covered by the HUNG/STALLED push, which already names the cause.
+        StuckCause::Held | StuckCause::Permission | StuckCause::Waiting | StuckCause::Unknown => {
             None
+        }
+        // question, context_full, error, account, unsent: one tell to the lead per episode.
+        _ => {
+            if ep.fired {
+                return None;
+            }
+            ep.fired = true;
+            tell(
+                s,
+                id,
+                cause.kind,
+                format!("{}: {}{}", crate::host::short(id), cause.detail, c.hint),
+            )
         }
     }
 }
@@ -745,39 +712,30 @@ fn minute(t: Option<DateTime<Utc>>) -> Option<i64> {
     t.map(|t| t.timestamp() / 60)
 }
 
-/// The profile `id` may be handed to for `kind`, when this host can use it. `quota` reads
-/// `on_quota` and refuses a profile whose kind is the agent's own — a haiku shares the
-/// claude account, so a claude agent is never handed to it here — or out on this host;
-/// `context_full` reads `fallback`. `None` while a replacement is already open.
-fn handoff_target(
-    host: &Host,
-    s: &State,
-    id: &str,
-    kind: StuckCause,
-    now: DateTime<Utc>,
-) -> Option<String> {
+/// The `on_quota` profile `id` may be handed to, when this host can use it: never a profile
+/// whose kind is the agent's own — a haiku shares the claude account, so a claude agent is
+/// never handed to it here — or one out on this host. `None` while a replacement is open.
+pub fn on_quota(host: &Host, s: &State, id: &str, now: DateTime<Utc>) -> Option<String> {
+    if crate::spawn::replacement_open(s, id) {
+        return None;
+    }
     let sp = s.spawn_of(id)?;
     let checkout = host.cfg.checkouts.get(&sp.request.repo)?;
     let (cfg, _) = crate::spawn::load(checkout).ok()?;
     let prof = cfg.profiles.get(&sp.request.profile)?;
-    let to = match kind {
-        StuckCause::Quota => prof.on_quota.as_deref()?,
-        _ => prof.fallback.as_deref()?,
-    };
+    let to = prof.on_quota.as_deref()?;
     let target = cfg.profiles.get(to)?;
-    if kind == StuckCause::Quota {
-        let mine = s
-            .agents
-            .get(id)
-            .and_then(|a| a.kind.as_deref())
-            .unwrap_or(&prof.kind);
-        if target.kind == mine
-            || s.quotas
-                .get(&format!("{}:{}", host.cfg.host, target.kind))
-                .is_some_and(|q| q.exhausted_at(now))
-        {
-            return None;
-        }
+    let mine = s
+        .agents
+        .get(id)
+        .and_then(|a| a.kind.as_deref())
+        .unwrap_or(&prof.kind);
+    if target.kind == mine
+        || s.quotas
+            .get(&format!("{}:{}", host.cfg.host, target.kind))
+            .is_some_and(|q| q.exhausted_at(now))
+    {
+        return None;
     }
     Some(to.to_string())
 }
@@ -816,12 +774,21 @@ pub async fn check(
         .kind
         .as_deref()
         .and_then(|k| s.quotas.get(&format!("{}:{k}", host.cfg.host)));
-    let mut cause = cause_of(
-        s,
-        id,
-        a,
-        stuck_cause(a.kind.as_deref(), &screen, quota, now),
-    );
+    // The screen read is a hint only: it may ride along in the message to the lead, never
+    // decide the cause or drive an action.
+    let hint = stuck_cause(a.kind.as_deref(), &screen, quota, now);
+    let mut cause = cause_of(s, id, a, signal_cause(s, id, a, now));
+    // A quota cause takes `until` from the spent window's `resets_at`.
+    if cause.kind == StuckCause::Quota && cause.until.is_none() {
+        cause.until = quota.and_then(|q| {
+            q.windows
+                .iter()
+                .filter(|w| w.used_pct >= 100.0)
+                .filter_map(|w| w.resets_at)
+                .filter(|r| *r > now)
+                .min()
+        });
+    }
     // The deadline is first-seen: while the cause stands, `s.stuck`'s `until` wins — a
     // recomputed countdown would republish `agent.stuck` every pass and push the wait out
     // forever (or lose it on a restart and turn a near quota wait into a handoff).
@@ -844,47 +811,35 @@ pub async fn check(
     }
     let tail = last_n(&screen, 5);
     // Never act on an agent whose work is finished.
-    let closed = s
-        .tasks
-        .values()
-        .any(|t| t.owner.as_deref() == Some(id) && t.state.is_terminal())
-        && !s
-            .tasks
-            .values()
-            .any(|t| t.owner.as_deref() == Some(id) && !t.state.is_terminal());
+    let closed = task_closed(s, id);
     // An agent `handoffs` just handed this pass is busy: its `spawn.requested` has not
     // folded back yet, so `replacement_open` alone would let a cause hand it off twice.
     let busy = handed.contains(id)
-        || (matches!(cause.kind, StuckCause::Quota | StuckCause::ContextFull)
-            && crate::spawn::replacement_open(s, id));
+        || (cause.kind == StuckCause::Quota && crate::spawn::replacement_open(s, id));
     // A grace stretch: the cause is classified and recorded from the first pass, but the
-    // host acts or tells only once the agent has sat in this state for --stall-min — a
-    // human half-typing a prompt is not "unsent" before that.
+    // host acts or tells only once the agent has sat in this state for --stall-min.
     if closed || busy || now - a.since < Duration::minutes(host.cfg.stall_min as i64) {
         return Some((cause, tail));
     }
-    let handoff = match cause.kind {
-        StuckCause::Quota | StuckCause::ContextFull => handoff_target(host, s, id, cause.kind, now),
-        _ => None,
-    };
-    let continued_before = events.iter().any(|e| {
-        matches!(&e.body,
-            Body::Known(Known::MsgSent(m))
-                if m.to == id && m.kind == "CONTINUE" && m.reference == "error")
-    });
+    let handoff = (cause.kind == StuckCause::Quota)
+        .then(|| on_quota(host, s, id, now))
+        .flatten();
     let ep = eps
         .entry(id.to_string())
         .or_default()
         .for_cause(a.since, cause.kind);
+    let screen_hint = match &hint {
+        Some(h) if h.kind != cause.kind => format!(" · screen hints {}", h.detail),
+        _ => String::new(),
+    };
     if let Some(act) = step(
         &Ctx {
             s,
             id,
             a,
-            screen: &screen,
+            hint: &screen_hint,
             now,
             handoff: handoff.as_deref(),
-            continued_before,
         },
         &cause,
         ep,
@@ -907,7 +862,6 @@ fn downgrade(act_ok: bool, s: &State, id: &str, cause: &Cause, act: Act) -> Opti
         Act::Tell { .. } => return Some(act),
         Act::Handoff { to, extra } => format!("{name} would be handed to {to} ({extra})"),
         Act::Continue => format!("{name} would get a `continue` ({})", cause.detail),
-        Act::Enter | Act::Resend(_) => format!("{name} holds a prompt in its input box"),
     };
     tell(
         s,
@@ -927,38 +881,23 @@ async fn run(
     act: Act,
 ) {
     let name = crate::host::short(id);
-    let sock = &host.cfg.herdr_socket;
     match act {
         Act::Continue => {
+            // The log is the dedupe across restarts: one `continue` per episode, like a tell.
+            if events.iter().any(|e| {
+                e.ts > a.since
+                    && matches!(&e.body,
+                        Body::Known(Known::MsgSent(m))
+                            if m.kind == "CONTINUE" && m.reference == cause.kind.name() && m.to == id)
+            }) {
+                return;
+            }
             host.publish(host.presence(Known::MsgSent(MsgSent {
                 to: id.to_string(),
                 kind: "CONTINUE".into(),
                 reference: cause.kind.name().into(),
                 text: "continue where you stopped".into(),
             })))
-            .await;
-        }
-        Act::Enter => {
-            let _ = herdr_call(
-                sock,
-                "agent.send_keys",
-                json!({ "target": name, "keys": ["enter"] }),
-            )
-            .await;
-        }
-        Act::Resend(text) => {
-            let _ = herdr_call(
-                sock,
-                "agent.send_keys",
-                json!({ "target": name, "keys": ["escape"] }),
-            )
-            .await;
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let _ = herdr_call(
-                sock,
-                "agent.prompt",
-                json!({ "target": name, "text": text }),
-            )
             .await;
         }
         Act::Tell { to, kind, text } => {
@@ -1021,6 +960,7 @@ mod tests {
             exhausted: true,
             read_at: Utc::now(),
             ts: Utc::now(),
+            exhausted_since: Some(Utc::now()),
         }
     }
 
@@ -1326,6 +1266,10 @@ mod tests {
         }
     }
 
+    fn near_q(now: DateTime<Utc>) -> Cause {
+        cause(StuckCause::Quota, Some(now + Duration::minutes(10)))
+    }
+
     fn state_with_lead() -> State {
         let mut s = State::default();
         s.roles.insert(
@@ -1347,160 +1291,105 @@ mod tests {
         let s = state_with_lead();
         let a = agent(AgentState::Idle, true);
         let id = "agent:h/s/a";
-        let ctx = |screen, now, handoff, cont| Ctx {
+        let ctx = |hint: &'static str, now, handoff: Option<&'static str>| Ctx {
             s: &s,
             id,
             a: &a,
-            screen,
+            hint,
             now,
             handoff,
-            continued_before: cont,
         };
         let mut ep = Episode::default();
         let ep = ep.for_cause(a.since, StuckCause::Quota);
-        // far-out quota with a fallback that has quota → handoff
+        // far-out quota with an on_quota target that has quota → handoff
         let far = cause(StuckCause::Quota, Some(now + Duration::hours(2)));
         assert!(matches!(
-            step(&ctx("", now, Some("haiku"), false), &far, ep),
+            step(&ctx("", now, Some("haiku")), &far, ep),
             Some(Act::Handoff { .. })
         ));
         // a second pass in the same episode does nothing
-        assert!(step(&ctx("", now, Some("haiku"), false), &far, ep).is_none());
-        // the fallback's kind is out → tell the lead
+        assert!(step(&ctx("", now, Some("haiku")), &far, ep).is_none());
+        // no vetted target → tell the lead, never hand off
         let mut ep2 = Episode::default();
         let ep2 = ep2.for_cause(a.since, StuckCause::Quota);
-        match step(&ctx("", now, None, false), &far, ep2) {
+        match step(&ctx("", now, None), &far, ep2) {
             Some(Act::Tell { to, kind, text }) => {
                 assert_eq!((to.as_str(), kind.as_str()), ("agent:h/s/lead", "QUOTA"));
-                assert!(text.contains("no fallback has quota"), "{text}");
+                assert!(text.contains("out of quota until"), "{text}");
             }
             x => panic!("{x:?} is no tell"),
         }
-        // quota near: tell once, then continue once after until
+        // an unknown reset is not "far" — a tell even with a vetted target
+        let mut ep2c = Episode::default();
+        let ep2c = ep2c.for_cause(a.since, StuckCause::Quota);
+        match step(
+            &ctx("", now, Some("haiku")),
+            &cause(StuckCause::Quota, None),
+            ep2c,
+        ) {
+            Some(Act::Tell { text, .. }) => {
+                assert!(text.contains("an unknown time"), "{text}")
+            }
+            x => panic!("{x:?} is no tell"),
+        }
+        // a near reset → tell, even with a vetted target
+        let mut ep2b = Episode::default();
+        let ep2b = ep2b.for_cause(a.since, StuckCause::Quota);
+        assert!(matches!(
+            step(&ctx("", now, Some("haiku")), &near_q(now), ep2b),
+            Some(Act::Tell { .. })
+        ));
+        // quota near: one tell, no continue ever
         let mut ep3 = Episode::default();
         let ep3 = ep3.for_cause(a.since, StuckCause::Quota);
         let near = cause(StuckCause::Quota, Some(now + Duration::minutes(10)));
         assert!(matches!(
-            step(&ctx("", now, None, false), &near, ep3),
+            step(&ctx("", now, None), &near, ep3),
             Some(Act::Tell { .. })
         ));
         let past = now + Duration::minutes(11);
-        assert!(matches!(
-            step(&ctx("", past, None, false), &near, ep3),
-            Some(Act::Continue)
-        ));
-        assert!(step(&ctx("", past, None, false), &near, ep3).is_none());
+        assert!(step(&ctx("", past, None), &near, ep3).is_none());
         // rate limit: nothing before until, continue once after
         let mut ep4 = Episode::default();
         let ep4 = ep4.for_cause(a.since, StuckCause::RateLimit);
         let rl = cause(StuckCause::RateLimit, Some(now + Duration::minutes(5)));
-        assert!(step(&ctx("", now, None, false), &rl, ep4).is_none());
+        assert!(step(&ctx("", now, None), &rl, ep4).is_none());
         let later = now + Duration::minutes(6);
         assert!(matches!(
-            step(&ctx("", later, None, false), &rl, ep4),
+            step(&ctx("", later, None), &rl, ep4),
             Some(Act::Continue)
         ));
-        assert!(step(&ctx("", later, None, false), &rl, ep4).is_none());
-        // error: continue the first time, tell the lead when it recurs
-        let mut ep5 = Episode::default();
-        let ep5 = ep5.for_cause(a.since, StuckCause::Error);
-        let err = cause(StuckCause::Error, None);
-        assert!(matches!(
-            step(&ctx("", now, None, false), &err, ep5),
-            Some(Act::Continue)
-        ));
-        let mut ep6 = Episode::default();
-        let ep6 = ep6.for_cause(a.since, StuckCause::Error);
-        match step(&ctx("l1\nl2\nl3\nl4\nl5\nl6", now, None, true), &err, ep6) {
-            Some(Act::Tell { kind, text, .. }) => {
-                assert_eq!(kind, "ERROR");
-                assert!(text.contains("l6") && text.contains("l2"), "{text}");
+        assert!(step(&ctx("", later, None), &rl, ep4).is_none());
+        // an unknown rate-limit wait defaults to 5 min — the caller sets `until`
+        // error, question, context_full, account, unsent: one tell each, never a keystroke,
+        // never a handoff — even with a target on the context
+        for k in [
+            StuckCause::Error,
+            StuckCause::Question,
+            StuckCause::ContextFull,
+            StuckCause::Account,
+            StuckCause::Unsent,
+        ] {
+            let mut e = Episode::default();
+            let e = e.for_cause(a.since, k);
+            match step(&ctx("", now, Some("haiku")), &cause(k, None), e) {
+                Some(Act::Tell { kind, .. }) => assert_eq!(kind, k.name().to_uppercase()),
+                x => panic!("{k:?}: {x:?} is no tell"),
             }
+            assert!(step(&ctx("", now, Some("haiku")), &cause(k, None), e).is_none());
+        }
+        // the tell carries the screen hint when it differs
+        let mut e = Episode::default();
+        let e = e.for_cause(a.since, StuckCause::Question);
+        match step(
+            &ctx(" · screen hints a quota line", now, None),
+            &cause(StuckCause::Question, None),
+            e,
+        ) {
+            Some(Act::Tell { text, .. }) => assert!(text.contains("screen hints"), "{text}"),
             x => panic!("{x:?} is no tell"),
         }
-        // context_full → handoff to fallback; unsent → Enter then Escape+resend
-        let mut ep7 = Episode::default();
-        let ep7 = ep7.for_cause(a.since, StuckCause::ContextFull);
-        assert!(matches!(
-            step(
-                &ctx("", now, Some("sonnet"), false),
-                &cause(StuckCause::ContextFull, None),
-                ep7
-            ),
-            Some(Act::Handoff { .. })
-        ));
-        let mut ep8 = Episode::default();
-        let ep8 = ep8.for_cause(a.since, StuckCause::Unsent);
-        let un = cause(StuckCause::Unsent, None);
-        let box_ = "○ do it\n──────────────\n❭ Press Enter to send queued\n──────────────\nSWE-2 High · Context: 1 / 2,000 tokens (1%)\n";
-        assert!(matches!(
-            step(&ctx(box_, now, None, false), &un, ep8),
-            Some(Act::Enter)
-        ));
-        assert!(step(&ctx(box_, now, None, false), &un, ep8).is_none());
-        // the hint is still up 60 s on: no re-send while "press enter to send queued"
-        // shows — the lead is told instead
-        assert!(matches!(
-            step(
-                &ctx(box_, now + Duration::seconds(61), None, false),
-                &un,
-                ep8
-            ),
-            Some(Act::Tell { .. })
-        ));
-        // a pasted brief with no hint still gets a bare Enter first — an Escape here
-        // could wipe a long, partly visible paste; the re-send is the retry pass
-        let mut ep9 = Episode::default();
-        let ep9 = ep9.for_cause(a.since, StuckCause::Unsent);
-        let pasted = "──────────────\n❭ do it\n──────────────\nSWE-2 High · Context: 1 / 2,000 tokens (1%)\n";
-        assert!(matches!(
-            step(&ctx(pasted, now, None, false), &un, ep9),
-            Some(Act::Enter)
-        ));
-        match step(
-            &ctx(pasted, now + Duration::seconds(61), None, false),
-            &un,
-            ep9,
-        ) {
-            Some(Act::Resend(t)) => assert_eq!(t, "do it"),
-            x => panic!("{x:?} is no resend"),
-        }
-        // … but a re-send never lands while a doorbell to the agent is undelivered
-        let mut s2 = state_with_lead();
-        s2.msgs.insert(
-            "m1".into(),
-            crate::state::Msg {
-                from: "agent:h/s/lead".into(),
-                to: "agent:h/s/a".into(),
-                kind: "FYI".into(),
-                reference: "x".into(),
-                text: "hi".into(),
-                since: now,
-            },
-        );
-        let mut ep10 = Episode::default();
-        let ep10 = ep10.for_cause(a.since, StuckCause::Unsent);
-        let ctx2 = Ctx {
-            s: &s2,
-            id,
-            a: &a,
-            screen: pasted,
-            now,
-            handoff: None,
-            continued_before: false,
-        };
-        assert!(matches!(step(&ctx2, &un, ep10), Some(Act::Enter)));
-        let ctx3 = Ctx {
-            s: &s2,
-            id,
-            a: &a,
-            screen: pasted,
-            now: now + Duration::seconds(61),
-            handoff: None,
-            continued_before: false,
-        };
-        assert!(matches!(step(&ctx3, &un, ep10), Some(Act::Tell { .. })));
-        // permission/waiting/unknown never act
+        // permission/waiting/unknown never act — the stalled/hung push covers them
         for k in [
             StuckCause::Permission,
             StuckCause::Waiting,
@@ -1508,7 +1397,7 @@ mod tests {
         ] {
             let mut e = Episode::default();
             let e = e.for_cause(a.since, k);
-            assert!(step(&ctx("", now, None, false), &cause(k, None), e).is_none());
+            assert!(step(&ctx("", now, None), &cause(k, None), e).is_none());
         }
     }
 
@@ -1555,10 +1444,9 @@ mod tests {
                     s: &s,
                     id,
                     a: &a,
-                    screen: "",
+                    hint: "",
                     now,
-                    handoff: None,
-                    continued_before: false
+                    handoff: None
                 },
                 &hc,
                 ep
@@ -1625,10 +1513,9 @@ mod tests {
                     s: &s2,
                     id,
                     a: &aq,
-                    screen: "",
+                    hint: "",
                     now,
-                    handoff: None,
-                    continued_before: false
+                    handoff: None
                 },
                 &rc,
                 ep2
@@ -1642,10 +1529,9 @@ mod tests {
                 s: &s2,
                 id,
                 a: &aq,
-                screen: "",
+                hint: "",
                 now: later,
                 handoff: None,
-                continued_before: false,
             },
             &rc,
             ep2,
@@ -1657,10 +1543,9 @@ mod tests {
                     s: &s2,
                     id,
                     a: &aq,
-                    screen: "",
+                    hint: "",
                     now: later,
-                    handoff: None,
-                    continued_before: false
+                    handoff: None
                 },
                 &rc,
                 ep2
@@ -1669,12 +1554,90 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_signal_acts_only_in_its_own_turn() {
+        let now = Utc::now();
+        let mut s = state_with_lead();
+        let id = "agent:h/s/a";
+        let sig = |s: &mut State, since: DateTime<Utc>| {
+            s.signals.insert(
+                id.into(),
+                crate::state::Signal {
+                    signal: "rate_limit".into(),
+                    detail: None,
+                    program: "claude".into(),
+                    since,
+                },
+            );
+        };
+        // The agent worked AFTER the signal arrived — a replayed event, not this turn's.
+        let mut a = agent(AgentState::Idle, false);
+        a.kind = Some("claude".into());
+        a.worked = Some(now - Duration::minutes(5));
+        a.since = now - Duration::minutes(2);
+        sig(&mut s, now - Duration::minutes(10));
+        assert!(signal_cause(&s, id, &a, now).is_none());
+        assert_eq!(
+            cause_of(&s, id, &a, None).kind,
+            StuckCause::Waiting,
+            "a stale rate_limit is no cause, and no continue"
+        );
+        // A signal at or after the last working stretch still names the cause.
+        sig(&mut s, now - Duration::minutes(4));
+        assert_eq!(
+            kind(signal_cause(&s, id, &a, now)),
+            Some(StuckCause::RateLimit)
+        );
+    }
+
+    #[test]
+    fn devins_quota_cause_needs_the_episode_to_start_inside_the_outage() {
+        let now = Utc::now();
+        let id = "agent:h/s/a";
+        let t_out = now - Duration::minutes(30);
+        let mut s = state_with_lead();
+        s.quotas.insert(
+            "h:devin".into(),
+            Quota {
+                windows: vec![],
+                plan: None,
+                exhausted: true,
+                read_at: now,
+                ts: t_out,
+                exhausted_since: Some(t_out),
+            },
+        );
+        // Idle since BEFORE the account ran out: just idle — waiting, not quota.
+        let mut a = agent(AgentState::Idle, true);
+        a.since = t_out - Duration::minutes(10);
+        assert!(signal_cause(&s, id, &a, now).is_none());
+        assert_eq!(cause_of(&s, id, &a, None).kind, StuckCause::Waiting);
+        // Idle since after the outage began: the quota cause.
+        a.since = t_out + Duration::minutes(5);
+        assert_eq!(kind(signal_cause(&s, id, &a, now)), Some(StuckCause::Quota));
+        // But a finished task is never a quota handoff — the work is done.
+        s.tasks.insert(
+            "task:p/1".into(),
+            crate::state::Task {
+                project: "p".into(),
+                title: "t".into(),
+                url: None,
+                state: TaskState::Completed,
+                since: t_out + Duration::minutes(5),
+                owner: Some(id.into()),
+                lead: None,
+                blocked_by: Default::default(),
+                handoffs: vec![],
+            },
+        );
+        assert!(signal_cause(&s, id, &a, now).is_none());
+        assert_eq!(cause_of(&s, id, &a, None).kind, StuckCause::Waiting);
+    }
+
     impl std::fmt::Debug for Act {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
                 Self::Continue => write!(f, "Continue"),
-                Self::Enter => write!(f, "Enter"),
-                Self::Resend(t) => write!(f, "Resend({t})"),
                 Self::Tell { kind, .. } => write!(f, "Tell({kind})"),
                 Self::Handoff { to, .. } => write!(f, "Handoff({to})"),
             }
