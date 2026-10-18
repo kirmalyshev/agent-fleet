@@ -697,10 +697,15 @@ fn agents(app: &App, now: DateTime<Utc>) -> View<'_> {
                 });
             let n = app.findings_for(id).len();
             let role = s.roles.get(id).map(|r| r.level.short()).unwrap_or_default();
+            let stuck = s
+                .stuck
+                .get(id)
+                .map(|st| format!("·{}", st.cause.name()))
+                .unwrap_or_default();
             Row::new(vec![
                 Cell::from(short(id).to_string()),
                 Cell::from(a.host.clone()),
-                Cell::from(state_name(a.state)).fg(agent_color(a.state)),
+                Cell::from(format!("{}{}", state_name(a.state), stuck)).fg(agent_color(a.state)),
                 Cell::from(ago(now, a.since)),
                 Cell::from(role),
                 Cell::from(cpu),
@@ -724,6 +729,13 @@ fn agents(app: &App, now: DateTime<Utc>) -> View<'_> {
                     crate::ui::kind_profile(s, id, a.kind.as_deref())
                 )),
             ])];
+            if let Some(st) = s.stuck.get(id) {
+                l.push(Line::raw(format!(
+                    "stuck: {} — {}",
+                    st.cause.name(),
+                    st.detail
+                )));
+            }
             if let Some(sp) = s.spawn_of(id) {
                 l.push(Line::raw(format!("spawn: {}", sp.request.why)));
             }
