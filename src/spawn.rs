@@ -62,7 +62,7 @@ pub struct Profile {
     /// The default agent name is prefix + issue number.
     #[serde(default)]
     pub prefix: String,
-    /// Live agents of this profile across the fleet; absent = no cap.
+    /// Live agents of this profile for this repo; absent = no cap.
     #[serde(default)]
     pub cap: Option<u32>,
     /// Used when this profile is at cap or out of quota, and for a handoff.
@@ -240,6 +240,8 @@ pub fn find() -> Result<(FleetConfig, PathBuf)> {
 /// What `gh issue view` brings: the title and labels the rules match on.
 #[derive(Debug, Clone)]
 pub struct Issue {
+    /// `owner/repo`: a profile's cap counts only this repo's agents.
+    pub repo: String,
     pub number: u64,
     pub title: String,
     pub labels: Vec<String>,
@@ -269,6 +271,7 @@ pub async fn gh_issue(repo: &str, n: u64) -> Result<Issue> {
     }
     let v: Value = serde_json::from_slice(&out.stdout).context("gh issue view: bad JSON")?;
     Ok(Issue {
+        repo: repo.to_string(),
         number: n,
         title: v["title"].as_str().unwrap_or_default().to_string(),
         labels: v["labels"]
@@ -432,7 +435,8 @@ pub fn decide(
             let live = state
                 .agents
                 .keys()
-                .filter(|a| state.profile_of(a) == Some(profile.as_str()))
+                .filter_map(|a| state.spawn_of(a))
+                .filter(|s| s.request.profile == profile && s.request.repo == issue.repo)
                 .count();
             let pending = state
                 .spawns
@@ -440,6 +444,7 @@ pub fn decide(
                 .filter(|s| {
                     s.result.is_none()
                         && s.request.profile == profile
+                        && s.request.repo == issue.repo
                         && Utc::now() - s.since <= REQUEST_MAX_AGE
                 })
                 .count();
@@ -1632,6 +1637,7 @@ profile = "devin"
 
     fn issue(title: &str, labels: &[&str]) -> Issue {
         Issue {
+            repo: "o/r".into(),
             number: 7,
             title: title.into(),
             labels: labels.iter().map(|l| l.to_string()).collect(),
@@ -2350,6 +2356,21 @@ profile = "devin"
         assert!(q(false, 100.0, Some(now + chrono::Duration::hours(1)), 600).exhausted_at(now));
         assert!(!q(false, 100.0, Some(now - chrono::Duration::hours(1)), 10).exhausted_at(now));
         assert!(!q(false, 50.0, None, 10).exhausted_at(now));
+    }
+
+    #[test]
+    fn another_repos_agents_do_not_fill_the_cap() {
+        let c = cfg(CFG).unwrap();
+        let mut s = State::default();
+        for n in ["a", "b"] {
+            let mut r = req(None);
+            r.name = n.into();
+            r.agent = format!("agent:h/s/{n}");
+            r.repo = "o/other".into();
+            s.apply(&Envelope::new(actor(), "p", Known::SpawnRequested(Box::new(r))).into_event());
+        }
+        let d = decide(&c, &issue("x", &[]), "", &Overrides::default(), &s, "h").unwrap();
+        assert_eq!(d.profile, "devin", "{}", d.why);
     }
 
     #[test]
