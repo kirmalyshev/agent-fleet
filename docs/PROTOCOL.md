@@ -55,7 +55,8 @@ means degraded visibility, not stopped work.
 ```
 
 Ids are stable strings: `agent:<host>/<session>/<name>`, `host:<name>`, `human:<handle>`,
-`task:<project>/<name>`. `<host>` is `AGENT_FLEET_HOST` (default: the system hostname); `agent-fleet host`
+`task:<project>/<name>`; an issue's task is `task:<repo name>/<issue>`, so a spawn's assignment and the
+agent's own `AGENT_FLEET_PROJECT=<repo name> task add <issue>` name the same task. `<host>` is `AGENT_FLEET_HOST` (default: the system hostname); `agent-fleet host`
 and the CLI on one machine read the same setting, so an agent's writes and its presence carry
 the same id. `actor.id` must start with its kind (`agent:`, `host:`).
 
@@ -372,7 +373,7 @@ that works: `agent.wait` for `idle` (2 min),
 `agent.prompt` waiting for working|blocked|done (30 s), one Enter and another wait (15 s) on a
 stall, then one re-send — never twice to an agent that started working. On success the host
 writes `agent.role` (level, lead from the request) and `task.assigned` for
-`task:<project>/<repo>#<issue>` (a 409 is not a failure), answers `spawn.result`, and closes a
+`task:<repo name>/<issue>` (a 409 is not a failure), answers `spawn.result`, and closes a
 `replaces` agent's pane and workspace — never its worktree. Any failure undoes what the spawn
 took and answers `ok=false`; a request older than 15 min when first seen is answered `expired`.
 

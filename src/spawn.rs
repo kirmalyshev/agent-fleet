@@ -513,9 +513,15 @@ pub fn render(template: &str, vals: &BTreeMap<String, String>) -> Result<String>
     Ok(out)
 }
 
-/// `task:<project>/<repo>#<issue>` — the id convention `task add` already uses.
-pub fn task_id(project: &str, repo: &str, issue: u64) -> String {
-    format!("task:{project}/{repo}#{issue}")
+/// The project an `owner/repo` issue's task lives in: the repo's name.
+pub fn task_project(repo: &str) -> &str {
+    repo.rsplit('/').next().unwrap_or(repo)
+}
+
+/// `task:<repo name>/<issue>`: the one id an issue has, whether a spawn assigns it or the agent
+/// runs `AGENT_FLEET_PROJECT=<repo name> agent-fleet task add <issue>`.
+pub fn task_id(repo: &str, issue: u64) -> String {
+    format!("task:{}/{issue}", task_project(repo))
 }
 
 /// The HANDOFF paragraph a takeover brief opens with.
@@ -1125,7 +1131,7 @@ async fn undo(host: &Host, r: &SpawnRequested, made: &Made) {
 /// `task.assigned` for the spawned agent's issue. A 409 means another agent holds the task —
 /// not a failure — and anything else only warns: the agent already has its brief.
 async fn assign_issue(host: &Host, sp: &Spawn, issue: u64) {
-    let task = task_id(&sp.project, &sp.request.repo, issue);
+    let task = task_id(&sp.request.repo, issue);
     let lead = sp
         .request
         .lead
@@ -1134,7 +1140,7 @@ async fn assign_issue(host: &Host, sp: &Spawn, issue: u64) {
         .or_else(|| is_agent_id(&sp.by).then(|| sp.by.clone()));
     let e = Envelope::new(
         host.actor(),
-        &sp.project,
+        task_project(&sp.request.repo),
         Known::TaskAssigned(TaskAssigned {
             agent: sp.request.agent.clone(),
             lead,
@@ -1279,7 +1285,7 @@ fn handoff_reason(
     let task_done = sp
         .request
         .issue
-        .map(|i| task_id(&sp.project, &sp.request.repo, i))
+        .map(|i| task_id(&sp.request.repo, i))
         .and_then(|t| state.tasks.get(&t).map(|t| t.state))
         .is_some_and(|st| st.is_terminal());
     if a.worked.is_some()
@@ -1364,7 +1370,7 @@ async fn handoffs(
             continue;
         };
         let issue = sp.request.issue;
-        let task = issue.map(|i| task_id(&sp.project, &sp.request.repo, i));
+        let task = issue.map(|i| task_id(&sp.request.repo, i));
         let mut title = task
             .as_ref()
             .and_then(|t| state.tasks.get(t))
@@ -2346,6 +2352,12 @@ profile = "devin"
     }
 
     #[test]
+    fn an_issue_has_one_task_id() {
+        assert_eq!(task_id("owner/repo", 7), "task:repo/7");
+        assert_eq!(task_project("owner/repo"), "repo");
+    }
+
+    #[test]
     fn another_repos_agents_do_not_fill_the_cap() {
         let c = cfg(CFG).unwrap();
         let mut s = State::default();
@@ -2597,9 +2609,9 @@ profile = "devin"
         );
         // a completed task is never handed off
         s.tasks.insert(
-            task_id("p", "o/r", 7),
+            task_id("o/r", 7),
             crate::state::Task {
-                project: "p".into(),
+                project: "r".into(),
                 title: "t".into(),
                 url: None,
                 state: TaskState::Completed,
