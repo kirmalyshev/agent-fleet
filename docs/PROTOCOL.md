@@ -348,6 +348,12 @@ task is finished:
 - `permission`, `waiting`, `unknown`: the `HUNG`/`STALLED` push tells the lead, with the
   cause and the screen's last lines.
 
+When a stalled agent's tell got no reaction — the lead stayed idle/done for `--stall-min`
+after the `HUNG`/`STALLED` push, an escalation, or the agent's own message was delivered —
+the host sends ONE `ESCALATED` `msg.sent` to the lead's own lead, and so on up the
+`agent.role` chain to an up root-coordinator, never past it. Each hop waits its own
+`--stall-min` and dedupes like every tell: once per episode, by the log.
+
 ## Killing processes
 
 `agent-fleet kill <pid>…` is how an agent stops a process. It reads the process table (`ps`) and
