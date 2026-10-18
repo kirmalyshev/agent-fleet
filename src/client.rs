@@ -270,6 +270,16 @@ impl Client {
         }
     }
 
+    /// Puts `e` in the spool without sending anything: for a writer on a budget — the event
+    /// is safe before any network wait, and `flush_spool` sends it when the hub answers.
+    pub fn queue(&self, e: &Envelope<Known>) -> Result<()> {
+        let raw = self.check(e)?;
+        if let Known::TaskAssigned(_) = e.body {
+            bail!("task.assigned is exclusive: use write_exclusive, it is never spooled");
+        }
+        self.spool_append(&raw)
+    }
+
     /// An exclusive write needs the sequencer: with the hub unreachable it fails instead of spooling.
     /// It also waits for the spool: overtaking a spooled release would earn a false 409.
     pub async fn write_exclusive(&self, e: &Envelope<Known>) -> Result<bool> {

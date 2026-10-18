@@ -423,7 +423,11 @@ enum HookCmd {
     /// Harness hook (Claude Code `StopFailure`/`Notification`/`PreCompact`/`Stop`/
     /// `UserPromptSubmit`, and any harness whose payload matches): maps the hook JSON on
     /// stdin to an `agent.signal` event and writes it. Never fails; outside herdr it exits 0.
-    Signal,
+    Signal {
+        /// Ignored: a hook exits 0 on any error, argument errors included.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -703,34 +707,39 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if let Cmd::Hook { cmd } = &cli.cmd {
-        // A hook must never break the program it wraps: its paths may be missing, and every
-        // error is swallowed inside.
-        if let Ok(paths) = Paths::from_env(&cli.instance) {
-            match cmd {
-                HookCmd::Bash => {
-                    let mut input = String::new();
-                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
-                    if let Some(msg) = kill::hook(&input) {
-                        eprintln!("{msg}");
-                        std::process::exit(2);
-                    }
+        // A hook must never break the program it wraps: every error is swallowed inside, and
+        // the bash guard and the wrapped status line run even when the instance directory
+        // cannot be made.
+        let paths = Paths::from_env(&cli.instance).ok();
+        match cmd {
+            HookCmd::Bash => {
+                let mut input = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+                if let Some(msg) = kill::hook(&input) {
+                    eprintln!("{msg}");
+                    std::process::exit(2);
                 }
-                HookCmd::Statusline { cmd } => {
-                    quota::statusline(
-                        cmd,
-                        &paths,
-                        cli.hub.as_deref(),
-                        cli.token_file.as_deref(),
-                        &cli.project,
-                        &host_name(&cli),
-                    )
-                    .await
-                }
-                HookCmd::Signal => {
-                    let mut input = String::new();
-                    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+            }
+            HookCmd::Statusline { cmd } => {
+                quota::statusline(
+                    cmd,
+                    paths.as_ref(),
+                    cli.hub.as_deref(),
+                    cli.token_file.as_deref(),
+                    &cli.project,
+                    &host_name(&cli),
+                )
+                .await;
+                // Exit without the runtime's teardown: a lookup stuck on a blocking thread
+                // (a hung DNS) would hold the process past the hook's budget.
+                std::process::exit(0);
+            }
+            HookCmd::Signal { .. } => {
+                let mut input = String::new();
+                let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+                if let Some(paths) = &paths {
                     signal::hook(
-                        &paths,
+                        paths,
                         cli.hub.as_deref(),
                         cli.token_file.as_deref(),
                         &cli.project,
@@ -739,6 +748,7 @@ async fn main() -> Result<()> {
                     )
                     .await;
                 }
+                std::process::exit(0);
             }
         }
         return Ok(());
@@ -1350,5 +1360,15 @@ mod tests {
         assert_eq!(parse_repo("foo=2").unwrap(), (None, PathBuf::from("foo=2")));
         // `/p=2`: the left side starts with '/', so it is a path.
         assert_eq!(parse_repo("/p=2").unwrap(), (None, PathBuf::from("/p=2")));
+    }
+
+    #[test]
+    fn hook_signal_eats_any_arguments() {
+        // Exit 2 from a Stop or UserPromptSubmit hook blocks Claude Code — `hook signal`
+        // parses whatever comes after `signal` and always exits 0.
+        assert!(Cli::try_parse_from(["agent-fleet", "hook", "signal"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["agent-fleet", "hook", "signal", "--bogus", "x", "-f"]).is_ok()
+        );
     }
 }

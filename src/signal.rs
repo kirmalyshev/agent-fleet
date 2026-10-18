@@ -103,8 +103,25 @@ async fn emit(
     let Some((agent, program)) = who(host).await else {
         return;
     };
-    let token = cli_token(paths, token_file);
-    let Some(token) = token else { return };
+    let Some(token) = cli_token(paths, token_file) else {
+        return;
+    };
+    send(paths, hub, token, project, agent, program, signal, detail).await;
+}
+
+/// The `agent.signal` write itself: spooled first, so a hub that never answers inside the
+/// budget costs the flush, never the signal — the next write replays it.
+#[allow(clippy::too_many_arguments)]
+async fn send(
+    paths: &Paths,
+    hub: Option<&str>,
+    token: String,
+    project: &str,
+    agent: String,
+    program: String,
+    signal: &str,
+    detail: Option<String>,
+) {
     let client = crate::client::Client::new(
         hub.map(str::to_string)
             .unwrap_or_else(|| paths.hub_url())
@@ -125,7 +142,9 @@ async fn emit(
             detail,
         }),
     );
-    let _ = client.write(&e).await;
+    if client.queue(&e).is_ok() {
+        let _ = client.flush_spool().await;
+    }
 }
 
 fn cli_token(paths: &Paths, token_file: Option<&Path>) -> Option<String> {
@@ -220,8 +239,12 @@ fn remember(file: &Path, session: &str) {
             })
         })
         .unwrap_or_default();
+    // The list is oldest first; re-reporting a session refreshes its place, and the cap
+    // always evicts the oldest, not whichever side the last write left at the front.
+    sessions.retain(|s| s != session);
     sessions.push(session.to_string());
-    let sessions: Vec<String> = sessions.into_iter().rev().take(1000).collect();
+    let over = sessions.len().saturating_sub(1000);
+    sessions.drain(..over);
     let body = json!({ "sessions": sessions }).to_string();
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -357,5 +380,72 @@ mod tests {
         remember(&f, "s1");
         assert!(reported(&f, "s1"));
         assert!(!reported(&f, "s2"));
+    }
+
+    #[test]
+    fn the_session_cap_evicts_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("cf.json");
+        for i in 0..1005 {
+            remember(&f, &format!("s{i}"));
+        }
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        let sessions: Vec<&str> = v["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s.as_str())
+            .collect();
+        assert_eq!(sessions.len(), 1000);
+        assert_eq!(sessions[0], "s5", "the five oldest are evicted");
+        assert_eq!(sessions[999], "s1004");
+        // A re-reported session refreshes its place instead of duplicating.
+        remember(&f, "s5");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        let sessions: Vec<&str> = v["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s.as_str())
+            .collect();
+        assert_eq!(sessions.len(), 1000);
+        assert_eq!(sessions[999], "s5");
+    }
+
+    #[tokio::test]
+    async fn a_hung_hub_still_keeps_the_signal() {
+        // A hub that accepts and never answers: the write budget ends, but the event was
+        // spooled first — a timeout never loses a signal.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            dir: dir.path().to_path_buf(),
+        };
+        let hang = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub = format!("http://{}", hang.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((s, _)) = hang.accept().await {
+                std::mem::forget(s);
+            }
+        });
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(300),
+            send(
+                &paths,
+                Some(hub.as_str()),
+                "tok".into(),
+                "p",
+                "agent:h/s/a".into(),
+                "claude".into(),
+                "turn_end",
+                None,
+            ),
+        )
+        .await;
+        assert!(timed_out.is_err(), "the flush hangs past the budget");
+        let spooled = std::fs::read_to_string(paths.spool()).unwrap();
+        assert!(
+            spooled.contains("agent.signal") && spooled.contains("agent:h/s/a"),
+            "the signal is spooled, not lost: {spooled}"
+        );
     }
 }
