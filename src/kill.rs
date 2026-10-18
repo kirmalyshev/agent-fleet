@@ -16,7 +16,8 @@ pub struct Proc {
 pub type Table = HashMap<u32, Proc>;
 
 /// Programs that are agents wherever they run.
-const AGENTS: &[&str] = &["claude", "devin", "codex"];
+/// The agent programs: anything running one of these outside a herdr pane is unmanaged.
+pub(crate) const AGENTS: &[&str] = &["claude", "devin", "codex"];
 /// Terminal multiplexers whose panes hold agents.
 const MUX: &[&str] = &["herdr"];
 
@@ -174,9 +175,32 @@ pub fn judge(
 
 /// The words of each simple command in a shell line, roughly: quotes group words, separators
 /// (`;` `&` `|` newline, parentheses, backticks) split commands.
+/// The `EOF` of `<<EOF`, `<<-EOF`, `<< EOF` or `cat<<EOF` — the word is already unquoted.
+/// `<<<` (here-string) has no body, and `<<` inside a quoted word is not a redirect.
+fn heredoc_marker(w: &str) -> Option<Option<String>> {
+    let i = w.find("<<")?;
+    let rest = &w[i + 2..];
+    if rest.starts_with('<') || rest.starts_with(' ') {
+        return None;
+    }
+    let rest = rest.strip_prefix('-').unwrap_or(rest);
+    if rest.is_empty() {
+        Some(None) // `<< EOF`: the delimiter is the next word
+    } else if rest
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'|'))
+    {
+        Some(Some(rest.to_string()))
+    } else {
+        None
+    }
+}
+
 fn commands(line: &str) -> Vec<Vec<String>> {
     let (mut cmds, mut cmd, mut word) = (Vec::new(), Vec::new(), String::new());
     let mut quoted = false;
+    // Heredoc delimiters queued by `<<` markers; while set, whole lines are body, not commands.
+    let mut heredoc: std::collections::VecDeque<String> = Default::default();
     let mut chars = line.chars().peekable();
     let end_word = |cmd: &mut Vec<String>, word: &mut String, quoted: &mut bool| {
         if !word.is_empty() || *quoted {
@@ -184,7 +208,24 @@ fn commands(line: &str) -> Vec<Vec<String>> {
         }
         *quoted = false;
     };
-    while let Some(c) = chars.next() {
+    loop {
+        if let Some(d) = heredoc.front() {
+            // The whole line is heredoc body (or the delimiter that ends it).
+            let mut l = String::new();
+            for c in chars.by_ref() {
+                if c == '\n' {
+                    break;
+                }
+                l.push(c);
+            }
+            if l.trim_start_matches('\t') == *d {
+                heredoc.pop_front();
+            }
+            continue;
+        }
+        let Some(c) = chars.next() else {
+            break;
+        };
         match c {
             '\'' => {
                 quoted = true;
@@ -213,6 +254,20 @@ fn commands(line: &str) -> Vec<Vec<String>> {
                 }
                 end_word(&mut cmd, &mut word, &mut quoted);
                 if !cmd.is_empty() {
+                    let mut it = cmd
+                        .iter()
+                        .skip_while(|w| !matches!(heredoc_marker(w), Some(Some(_)) | Some(None)));
+                    while let Some(w) = it.next() {
+                        match heredoc_marker(w) {
+                            Some(Some(d)) => heredoc.push_back(d),
+                            Some(None) => {
+                                if let Some(n) = it.next() {
+                                    heredoc.push_back(n.clone());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     cmds.push(std::mem::take(&mut cmd));
                 }
             }
@@ -227,6 +282,28 @@ fn commands(line: &str) -> Vec<Vec<String>> {
 }
 
 const KILLERS: &[&str] = &["kill", "pkill", "killall"];
+/// Wrapper options that take the next word as their value, per wrapper (`sudo -n` is a flag,
+/// `nice -n 5` takes one).
+fn value_opts(wrapper: &str) -> &'static [&'static str] {
+    match wrapper {
+        "timeout" => &["-k", "-s"],
+        "nice" => &["-n"],
+        "exec" => &["-a"],
+        "sudo" | "doas" => &["-u", "-g", "-h", "-p", "-C"],
+        "env" => &["-u", "-S", "-C"],
+        "stdbuf" => &["-i", "-o", "-e"],
+        "xargs" => &["-n", "-s", "-P", "-I", "-i", "-L", "-d"],
+        _ => &[],
+    }
+}
+
+/// `timeout`'s duration: `10`, `10.5s`, `2m`, `1h`, `1d`.
+fn is_duration(w: &str) -> bool {
+    let (num, unit) = w
+        .find(|c: char| c.is_ascii_alphabetic())
+        .map_or((w, ""), |i| w.split_at(i));
+    !num.is_empty() && num.parse::<f64>().is_ok() && matches!(unit, "" | "s" | "m" | "h" | "d")
+}
 /// Words that run the command after them.
 const WRAPPERS: &[&str] = &[
     "sudo", "doas", "nohup", "command", "builtin", "exec", "env", "nice", "setsid", "time",
@@ -246,14 +323,10 @@ fn is_assignment(w: &str) -> bool {
     })
 }
 
-/// The first raw kill in a shell line: `kill`, `pkill` or `killall` run as a command, also behind
-/// `sudo`/`xargs`/`timeout`…, inside `sh -c`, `eval`, `find -exec` and `ssh <host> …`. `kill -0`
-/// and `kill -l` signal nothing and pass. Best effort, not a sandbox: it guards against a slip.
-pub fn raw_kill(line: &str) -> Option<String> {
-    raw_kill_in(line, 0)
-}
-
-fn raw_kill_in(line: &str, depth: u32) -> Option<String> {
+/// Each simple command in `line` gets `hit` on its argv stripped of assignments and wrappers;
+/// `hit` also sees what `sh -c`, `eval`, `ssh <host>` and `find -exec` hide inside, recursed 4
+/// deep. Best effort, not a sandbox: it guards against a slip.
+fn scan_cmds(line: &str, depth: u32, hit: &impl Fn(&[String]) -> Option<String>) -> Option<String> {
     if depth > 4 {
         return None;
     }
@@ -262,12 +335,23 @@ fn raw_kill_in(line: &str, depth: u32) -> Option<String> {
         loop {
             match w.first().map(|s| base(s)) {
                 Some(f) if is_assignment(f) => w = &w[1..],
+                // `command -v|-V` asks where a program lives; it runs nothing.
+                Some("command") if matches!(w.get(1).map(String::as_str), Some("-v" | "-V")) => {
+                    break;
+                }
                 Some(f) if WRAPPERS.contains(&f) => {
+                    let opts = value_opts(f);
                     w = &w[1..];
-                    while w.first().is_some_and(|a| {
-                        a.starts_with('-') || is_assignment(a) || a.parse::<f64>().is_ok()
-                    }) {
-                        w = &w[1..];
+                    while let Some(a) = w.first() {
+                        if a.starts_with('-') {
+                            // Options that take a value lose it too: `sudo -u bob`, `exec -a x`,
+                            // `env -u FOO`, `timeout -k 2`.
+                            w = &w[if opts.contains(&a.as_str()) { 2 } else { 1 }.min(w.len())..];
+                        } else if is_assignment(a) || a.parse::<f64>().is_ok() || is_duration(a) {
+                            w = &w[1..];
+                        } else {
+                            break;
+                        }
                     }
                 }
                 _ => break,
@@ -276,13 +360,8 @@ fn raw_kill_in(line: &str, depth: u32) -> Option<String> {
         let Some(first) = w.first().map(|s| base(s)) else {
             continue;
         };
-        if KILLERS.contains(&first) {
-            let harmless = first == "kill"
-                && w.get(1)
-                    .is_some_and(|a| matches!(a.as_str(), "-0" | "-l" | "-L"));
-            if !harmless {
-                return Some(w.join(" "));
-            }
+        if let Some(found) = hit(w) {
+            return Some(found);
         }
         let inner: Vec<String> = if SHELLS.contains(&first) {
             w.iter()
@@ -307,11 +386,77 @@ fn raw_kill_in(line: &str, depth: u32) -> Option<String> {
                 .map(|(i, _)| w[i + 1..].join(" "))
                 .collect()
         };
-        if let Some(hit) = inner.iter().find_map(|s| raw_kill_in(s, depth + 1)) {
-            return Some(hit);
+        if let Some(found) = inner.iter().find_map(|s| scan_cmds(s, depth + 1, hit)) {
+            return Some(found);
         }
     }
     None
+}
+
+/// The first raw kill in a shell line: `kill`, `pkill` or `killall` run as a command, also behind
+/// `sudo`/`xargs`/`timeout`…, inside `sh -c`, `eval`, `find -exec` and `ssh <host> …`. `kill -0`
+/// and `kill -l` signal nothing and pass.
+pub fn raw_kill(line: &str) -> Option<String> {
+    scan_cmds(line, 0, &|w: &[String]| {
+        let first = base(&w[0]);
+        let harmless = first == "kill"
+            && w.get(1)
+                .is_some_and(|a| matches!(a.as_str(), "-0" | "-l" | "-L"));
+        (KILLERS.contains(&first) && !harmless).then(|| w.join(" "))
+    })
+}
+
+/// The read-only and admin forms of an agent program — anything else starts a session.
+fn agent_admin(args: &[String]) -> bool {
+    match args {
+        [] => false,
+        [f] => matches!(
+            f.as_str(),
+            "--version" | "-V" | "-v" | "version" | "--help" | "-h" | "help" | "doctor" | "models"
+        ),
+        [f, r, ..] => match f.as_str() {
+            "doctor" | "models" => true,
+            "auth" => r == "status",
+            "mcp" => r == "list" || r == "get",
+            "update" => r == "--check",
+            _ => false,
+        },
+    }
+}
+
+/// `npx`/`bunx`/`pnpm|bun|yarn dlx` running an agent package still starts it outside herdr.
+fn agent_pkg(w: &[String]) -> bool {
+    let known = |pkg: Option<&String>| {
+        pkg.is_some_and(|p| {
+            let name = match p.rfind('@') {
+                Some(i) if i > 0 => &p[..i],
+                _ => p.as_str(),
+            };
+            matches!(name, "@anthropic-ai/claude-code" | "@openai/codex")
+        })
+    };
+    match base(&w[0]) {
+        "npx" | "bunx" | "pnpx" => known(first_arg(&w[1..])),
+        "pnpm" | "bun" | "yarn" => {
+            w.get(1).is_some_and(|s| s == "dlx") && known(first_arg(&w[2..]))
+        }
+        _ => false,
+    }
+}
+
+/// The first word that is not an option.
+fn first_arg(w: &[String]) -> Option<&String> {
+    w.iter().find(|a| !a.starts_with('-'))
+}
+
+/// A command that starts an agent program outside herdr — `claude`, `devin` or `codex` run for a
+/// session, or an agent package via npx/bunx/dlx, wherever it hides. `herdr agent start` and the
+/// admin forms pass.
+pub fn agent_start(line: &str) -> Option<String> {
+    scan_cmds(line, 0, &|w: &[String]| {
+        ((AGENTS.contains(&base(&w[0])) && !agent_admin(&w[1..])) || agent_pkg(w))
+            .then(|| w.join(" "))
+    })
 }
 
 pub const HOOK_REFUSAL: &str = "agent-fleet: raw kill, pkill and killall are blocked for fleet agents. \
@@ -319,17 +464,26 @@ Use `agent-fleet kill <pid>...` (find pids with pgrep): it refuses agents, their
 everything above them, your own ancestors and other agents' processes, and kills your own \
 processes and orphans `agent-fleet doctor` proved, TERM then KILL. `kill -0` passes.";
 
+pub const UNMANAGED_REFUSAL: &str = "agent-fleet: every agent runs in herdr. Spawn one with \
+`agent-fleet spawn <owner/repo>#<issue>`, or start it in a pane with \
+`herdr agent start <name> --kind <program> --pane <pane>`. The read-only and admin forms \
+(--version, --help, auth status, doctor, models, mcp list|get, update --check) pass.";
+
 /// The PreToolUse hook for Claude Code and Devin CLI (same format): the tool call on stdin,
-/// refused with exit 2 when it is a shell command running a raw kill. Anything it cannot read
-/// passes.
+/// refused with exit 2 when it is a shell command running a raw kill or starting an agent
+/// program outside herdr. Anything it cannot read passes.
 pub fn hook(stdin: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(stdin).ok()?;
     // Claude Code's shell tool is `Bash`, Devin CLI's is `exec`; both put the line in `command`.
     if !matches!(v["tool_name"].as_str(), Some("Bash" | "exec")) {
         return None;
     }
-    let hit = raw_kill(v["tool_input"]["command"].as_str()?)?;
-    Some(format!("{HOOK_REFUSAL}\nBlocked: {hit}"))
+    let line = v["tool_input"]["command"].as_str()?;
+    if let Some(hit) = raw_kill(line) {
+        return Some(format!("{HOOK_REFUSAL}\nBlocked: {hit}"));
+    }
+    let hit = agent_start(line)?;
+    Some(format!("{UNMANAGED_REFUSAL}\nBlocked: {hit}"))
 }
 
 #[cfg(test)]
@@ -500,6 +654,85 @@ mod tests {
         ] {
             assert_eq!(raw_kill(line), None, "false alarm: {line}");
         }
+    }
+
+    #[test]
+    fn an_agent_started_outside_herdr_is_blocked() {
+        for line in [
+            "claude",
+            "claude -p 'fix it'",
+            "devin -p 'do x'",
+            "codex exec 'y'",
+            "/usr/local/bin/claude -p x",
+            "nohup devin -p x &",
+            "bash -c \"claude -p x\"",
+            "sudo claude",
+            "timeout 10 codex exec go",
+            "FOO=1 claude -p x",
+            "eval claude -p x",
+            "echo hi | xargs devin -p",
+            "claude --dangerously-skip-permissions",
+            "claude mcp serve",
+            "timeout 10s claude",
+            "sudo -u bob claude",
+            "env -u FOO claude",
+            "exec -a x devin -p y",
+            "npx @anthropic-ai/claude-code",
+            "npx -y @anthropic-ai/claude-code@2",
+            "bunx @openai/codex exec go",
+            "pnpm dlx @anthropic-ai/claude-code",
+            "yarn dlx @openai/codex",
+            "timeout -k 2 30s claude",
+        ] {
+            assert!(agent_start(line).is_some(), "{line}");
+        }
+        for line in [
+            "claude --version",
+            "claude -V",
+            "claude version",
+            "claude --help",
+            "claude -h",
+            "claude help",
+            "claude auth status",
+            "claude doctor",
+            "claude doctor extra",
+            "claude models",
+            "claude mcp list",
+            "claude mcp get srv",
+            "codex update --check",
+            "herdr agent start a --kind claude --pane p1",
+            "echo claude",
+            "cat claude.md",
+            "git commit -m 'the claude fix'",
+            "kill -0 1",
+            "claude -v",
+            "command -v claude",
+            "command -V codex",
+            "FOO=1 command -v devin",
+            "npx cowsay hi",
+            "pnpm dlx prettier x",
+            "cat > /tmp/f <<'EOF'\nclaude -p x\nEOF\necho done",
+            "echo a << b",
+        ] {
+            assert_eq!(agent_start(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn the_hook_blocks_bare_agent_programs_too() {
+        let call = |cmd: &str| {
+            hook(
+                &serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": cmd } })
+                    .to_string(),
+            )
+        };
+        let refused = call("devin -p 'go'").unwrap();
+        assert!(refused.contains("every agent runs in herdr"), "{refused}");
+        assert!(refused.contains("agent-fleet spawn"), "{refused}");
+        assert!(call("claude --version").is_none());
+        assert!(call("herdr agent start a --kind devin --pane p1").is_none());
+        // a raw kill still wins over an agent line in the same command
+        assert!(call("kill 9; claude -p x").unwrap().contains("raw kill"));
     }
 
     #[test]

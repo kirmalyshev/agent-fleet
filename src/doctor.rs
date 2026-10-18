@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
-use crate::event::AgentState;
+use crate::event::{AgentState, Level};
 use crate::state::{Agent, Hold, State, Worktree};
-use crate::ui::{ago, dur, hold};
+use crate::ui::{ago, at, dur, hold};
 
 /// Idle, done or blocked this long: the agent is stale.
 pub const STALE: Duration = Duration::hours(2);
@@ -24,6 +24,14 @@ pub const ABANDONED: Duration = Duration::days(3);
 pub const REFUSED: Duration = Duration::hours(1);
 /// Queued this long for a resource: worth a look at who holds it.
 pub const QUEUED: Duration = Duration::minutes(10);
+/// A quota window this full with its reset still ahead: slow down or it will run out.
+pub const QUOTA_PCT: f64 = 90.0;
+/// A spawn request unanswered this long means its host is not listening.
+pub const SPAWN_UNANSWERED: Duration = Duration::minutes(5);
+/// Idle or blocked this long after working, with no lead to tell: same as `host --stall-min`.
+pub const STALLED: Duration = Duration::minutes(crate::spawn::STALL_MIN as i64);
+/// A failed spawn stays a finding this long.
+pub const SPAWN_FAILED: Duration = Duration::hours(1);
 /// Files every branch touches; sharing them is not duplicate work.
 const SHARED_BY_ALL: &[&str] = &[
     "bun.lock",
@@ -37,7 +45,7 @@ const SHARED_BY_ALL: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Finding {
     /// `stale`, `hung`, `heavy`, `duplicate`, `forgotten`, `unpushed`, `orphan`, `breach`,
-    /// `queued`, `refused`.
+    /// `queued`, `refused`, `role`, `quota`, `spawn`, `unmanaged`, `stalled`.
     pub kind: &'static str,
     /// The agent id or `<host>:<path>` it is about.
     pub subject: String,
@@ -105,6 +113,16 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
             occupied.entry(key).or_default().push(id);
         }
         let idle_for = now - a.since;
+        if matches!(a.state, AgentState::Idle | AgentState::Blocked)
+            && idle_for >= STALLED
+            && a.worked.is_some()
+        {
+            out.push(finding(
+                "stalled",
+                id,
+                format!("idle for {}m since it worked", idle_for.num_minutes()),
+            ));
+        }
         if matches!(
             a.state,
             AgentState::Idle | AgentState::Done | AgentState::Blocked
@@ -120,6 +138,22 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
                     ago(now, a.since)
                 ),
             ));
+        }
+        if let Some(r) = s.roles.get(id)
+            && let Some(lead) = &r.lead
+        {
+            if !s.agents.contains_key(lead) {
+                out.push(finding("role", id, format!("its lead {lead} is down")));
+            }
+            if let Some(l) = s.roles.get(lead)
+                && l.level <= r.level
+            {
+                out.push(finding(
+                    "role",
+                    id,
+                    format!("reports to {lead}, a {}, but is a {}", l.level, r.level),
+                ));
+            }
         }
         let Some(u) = &a.usage else { continue };
         if a.state == AgentState::Working
@@ -152,6 +186,29 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
                     cpu,
                     u.procs.unwrap_or(0)
                 ),
+            ));
+        }
+    }
+    let roots: Vec<&String> = s
+        .agents
+        .keys()
+        .filter(|id| {
+            s.roles
+                .get(*id)
+                .is_some_and(|r| r.level == Level::RootCoordinator)
+        })
+        .collect();
+    if roots.len() > 1 {
+        let all = roots
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        for extra in roots.iter().skip(1) {
+            out.push(finding(
+                "role",
+                *extra,
+                format!("{} root coordinators are up: {all}", roots.len()),
             ));
         }
     }
@@ -327,6 +384,63 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
             ),
         ));
     }
+    for u in s.unmanaged.values() {
+        out.push(finding(
+            "unmanaged",
+            format!("{}:pid {}", u.host, u.pid),
+            format!(
+                "{} running outside herdr in {} for {}",
+                u.program,
+                u.cwd.as_deref().unwrap_or("?"),
+                ago(now, u.since)
+            ),
+        ));
+    }
+    for (key, q) in &s.quotas {
+        if q.exhausted {
+            out.push(finding(
+                "quota",
+                key,
+                format!("out of quota (read {} ago)", ago(now, q.read_at)),
+            ));
+        } else if let Some(w) = q
+            .windows
+            .iter()
+            .find(|w| w.used_pct >= QUOTA_PCT && w.resets_at.is_some_and(|r| r > now))
+        {
+            out.push(finding(
+                "quota",
+                key,
+                format!(
+                    "{} {:.0}% used until {}",
+                    w.name,
+                    w.used_pct,
+                    at(now, w.resets_at.unwrap())
+                ),
+            ));
+        }
+    }
+    for sp in s.spawns.values() {
+        match &sp.result {
+            None if now - sp.since >= SPAWN_UNANSWERED => out.push(finding(
+                "spawn",
+                &sp.request.agent,
+                format!(
+                    "host {} has not picked it up ({} ago)",
+                    sp.request.host,
+                    ago(now, sp.since)
+                ),
+            )),
+            Some(r) if !r.ok && sp.answered.is_some_and(|t| now - t < SPAWN_FAILED) => {
+                out.push(finding(
+                    "spawn",
+                    &r.agent,
+                    format!("spawn failed: {}", r.error.as_deref().unwrap_or("?")),
+                ));
+            }
+            _ => {}
+        }
+    }
     for (key, r) in &s.resources {
         for w in r.waiting.iter().filter(|w| now - w.since >= QUEUED) {
             let behind = r
@@ -356,6 +470,7 @@ mod tests {
             pane: None,
             state,
             since,
+            worked: None,
             usage: Some(Usage {
                 rss_kb: Some(rss_kb),
                 cpu_pct: Some(cpu),
@@ -564,6 +679,162 @@ mod tests {
             vec![("queued", "h:sim")],
             "expired"
         );
+    }
+
+    #[test]
+    fn a_role_finding_when_the_lead_is_down() {
+        use crate::state::Role;
+        let now = Utc::now();
+        let mut s = State::default();
+        s.agents.insert(
+            "agent:h/s/worker".into(),
+            agent(AgentState::Working, now, "/w/a", 50, 1),
+        );
+        s.roles.insert(
+            "agent:h/s/worker".into(),
+            Role {
+                level: Level::Implementer,
+                lead: Some("agent:h/s/lead".into()),
+                domain: None,
+                by: "agent:h/s/lead".into(),
+                since: now,
+            },
+        );
+        // A role for an agent that is not up is no finding on its own.
+        s.roles.insert(
+            "agent:h/s/ghost".into(),
+            Role {
+                level: Level::Implementer,
+                lead: Some("agent:h/s/lead".into()),
+                domain: None,
+                by: "agent:h/s/lead".into(),
+                since: now,
+            },
+        );
+        let f = findings(&s, now);
+        assert_eq!(kinds(&f), vec![("role", "agent:h/s/worker")]);
+        assert_eq!(f[0].detail, "its lead agent:h/s/lead is down");
+    }
+
+    #[test]
+    fn a_role_finding_when_the_lead_is_not_above() {
+        use crate::state::Role;
+        let now = Utc::now();
+        let mut s = State::default();
+        for id in ["agent:h/s/worker", "agent:h/s/lead"] {
+            s.agents
+                .insert(id.into(), agent(AgentState::Working, now, "/w/a", 50, 1));
+        }
+        let role = |lead: Option<&str>| Role {
+            level: Level::DomainLead,
+            lead: lead.map(str::to_string),
+            domain: None,
+            by: "agent:h/s/root".into(),
+            since: now,
+        };
+        s.roles
+            .insert("agent:h/s/worker".into(), role(Some("agent:h/s/lead")));
+        s.roles.insert("agent:h/s/lead".into(), role(None));
+        let f = findings(&s, now);
+        assert_eq!(kinds(&f), vec![("role", "agent:h/s/worker")]);
+        assert_eq!(
+            f[0].detail,
+            "reports to agent:h/s/lead, a domain-lead, but is a domain-lead"
+        );
+    }
+
+    #[test]
+    fn a_role_finding_for_each_extra_root_coordinator() {
+        use crate::state::Role;
+        let now = Utc::now();
+        let mut s = State::default();
+        for id in ["agent:h/s/root-a", "agent:h/s/root-b", "agent:h/s/root-c"] {
+            s.agents
+                .insert(id.into(), agent(AgentState::Working, now, "/w/a", 50, 1));
+            s.roles.insert(
+                id.into(),
+                Role {
+                    level: Level::RootCoordinator,
+                    lead: None,
+                    domain: None,
+                    by: "agent:h/s/root-a".into(),
+                    since: now,
+                },
+            );
+        }
+        let f = findings(&s, now);
+        let subjects: Vec<&str> = f.iter().map(|f| f.subject.as_str()).collect();
+        assert_eq!(subjects, ["agent:h/s/root-b", "agent:h/s/root-c"]);
+        assert!(f[0].detail.contains("3 root coordinators are up"));
+    }
+
+    #[test]
+    fn an_unmanaged_agent_is_a_finding() {
+        let now = Utc::now();
+        let mut s = State::default();
+        s.unmanaged.insert(
+            "h:77".into(),
+            crate::state::Unmanaged {
+                host: "h".into(),
+                pid: 77,
+                program: "devin".into(),
+                cwd: Some("/w/x".into()),
+                since: now - Duration::minutes(10),
+            },
+        );
+        let f = findings(&s, now);
+        let u = f.iter().find(|f| f.kind == "unmanaged").unwrap();
+        assert_eq!(u.subject, "h:pid 77");
+        assert!(u.detail.contains("devin") && u.detail.contains("/w/x"));
+    }
+
+    #[test]
+    fn a_quota_finding_when_exhausted_or_nearly_full() {
+        use crate::event::QuotaWindow;
+        use crate::state::Quota;
+        let now = Utc::now();
+        let mut s = State::default();
+        let quota = |exhausted, windows: Vec<(&str, f64, Option<DateTime<Utc>>)>| Quota {
+            windows: windows
+                .into_iter()
+                .map(|(name, used_pct, resets_at)| QuotaWindow {
+                    name: name.into(),
+                    used_pct,
+                    resets_at,
+                })
+                .collect(),
+            plan: None,
+            exhausted,
+            read_at: now,
+            ts: now,
+        };
+        s.quotas.insert(
+            "h:claude".into(),
+            quota(false, vec![("5h", 95.0, Some(now + Duration::hours(1)))]),
+        );
+        s.quotas
+            .insert("h:codex".into(), quota(true, vec![("5h", 100.0, None)]));
+        // Nearly full but already reset: no finding.
+        s.quotas.insert(
+            "h2:claude".into(),
+            quota(false, vec![("5h", 99.0, Some(now - Duration::minutes(1)))]),
+        );
+        // Nearly full with no reset known: no finding.
+        s.quotas
+            .insert("h3:claude".into(), quota(false, vec![("day", 99.0, None)]));
+        // Room to run: no finding.
+        s.quotas.insert(
+            "h:devin".into(),
+            quota(false, vec![("week", 50.0, Some(now + Duration::days(3)))]),
+        );
+        let f = findings(&s, now);
+        assert_eq!(
+            kinds(&f),
+            vec![("quota", "h:claude"), ("quota", "h:codex")],
+            "{f:#?}"
+        );
+        assert!(f[0].detail.contains("5h 95% used until"), "{}", f[0].detail);
+        assert!(f[1].detail.contains("out of quota"), "{}", f[1].detail);
     }
 
     #[test]

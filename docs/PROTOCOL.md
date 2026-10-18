@@ -73,9 +73,11 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `agent.down` | agent, reason? | | host |
 | | `host.health` | host, disk_free, disk_total, agents, stats? (every minute) | | host |
 | | `agent.usage` | agent, rss_kb?, cpu_pct?, procs?, cwd? (each scan; the numbers on Linux only) | | host |
+| | `agent.role` | agent, level? (`root-coordinator` `domain-lead` `implementation-lead` `implementer`; absent `level` removes the role), lead?, domain? | | agent, host |
 | machine | `worktree.state` | host, path, repo, branch?, head, unpushed, dirty, files[] (only what still differs from the default branch), last_commit, in_main? (on change) | | host |
 | | `worktree.gone` | host, path | | host |
 | | `worktree.procs` | host, path, procs, rss_kb, cpu_pct, names[], pids[], orphaned (each scan; `procs: 0` once when they end) | | host |
+| | `agent.quota` | host, kind, windows[] ({name, used_pct, resets_at?}), plan?, exhausted, read_at (each minute, when anything but `read_at` changes) | | host |
 | resource | `resource.taken` | host, resource, pid, cwd?, scope?, since | | host |
 | | `resource.waiting` | host, resource, pid, cwd?, scope?, since | | host |
 | | `resource.released` | host, resource, pid? (without `pid`: nobody holds or waits) | | host |
@@ -92,15 +94,34 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | comms | `msg.sent` | to, kind, ref, text | | agent, host |
 | | `msg.delivered` | to, observed, rung?, attempts? | re = the send | host |
 | | `handoff` | to, next, done?, evidence[], learned? | task | agent |
+| spawn | `spawn.requested` | name, agent, host, session, repo, issue?, branch, profile, brief, level?, lead?, worktree?, replaces?, why | | agent, host |
+| | `spawn.result` | agent, ok, pane?, worktree?, error? | re = the request | host |
+| | `agent.unmanaged` | host, pid, program?, cwd?, since? — no `program` clears the report | | host |
 
 Task states follow the A2A task lifecycle names, so tools that know A2A read them as-is.
+
+`agent.role` declares an agent's level of responsibility — `root-coordinator`, then `domain-lead`,
+`implementation-lead`, `implementer` — and the lead it reports to, with `domain` naming what a
+domain lead owns. Whoever spawns the agent, or the agent itself, writes it
+(`agent-fleet role <agent> <level> --lead <lead> --domain <domain>`); it is never guessed from a
+name or a pane. A role can be declared before the agent's first `agent.up`, survives the agent
+going down and coming back, and only an `agent.role` without `level` removes it.
+
+`agent.quota` is the usage quota of one agent program on one host — each machine is logged in to
+its own account, so `kind` (`claude`, `codex`, `devin`, or anything new) is scoped per host.
+The host samples three sources every minute: the newest session log under
+`~/.codex/sessions` for codex, the machine-wide `claude-rate-limits.json` in the fleet data
+directory root for claude (written by `agent-fleet hook statusline`, the status-line wrapper
+that stores the `rate_limits` it is fed and passes the input on to the command it wraps), and
+the newest cached `devin auth status` under `~/.cache/devin/cli` for devin. `read_at` stamps the
+data itself, not the scan, so the views can say how stale the numbers are.
 
 ## Rules the hub enforces
 
 - **Strict on write.** `POST /events` accepts only known types at `v: 1`, with no unknown fields
   in the envelope or in `data`, with the envelope fields the type needs, at most 64 KiB, and from
   an allowed actor kind, and with every recipient (`msg.sent.to`, `handoff.to`,
-  `task.assigned.agent`) a full agent id. A malformed or oversized event is `400`; a forbidden actor (any `human`,
+  `task.assigned.agent`, `agent.role.agent`, `agent.role.lead`) a full agent id. A malformed or oversized event is `400`; a forbidden actor (any `human`,
   any `hub`, or a kind not in the table) is `403`. Clients apply the same rules before sending,
   so an invalid event is refused locally and never spooled.
 - **Exclusive assignment.** `task.assigned` for a task that already has an owner and is not
@@ -141,7 +162,11 @@ ULID that arrives late is still returned after the cursor, so a follower never m
 
 ## State
 
-`GET /state` returns `hosts`, `agents` (state + since), `tasks` (state + since, owner, lead,
+`GET /state` returns `hosts`, `agents` (state + since), `roles` (level, lead, domain, by, since)
+keyed by agent id, `spawns` (the request, who asked, the result) keyed by `spawn.requested` id
+— kept for 24 h after its answer (or its request, when unanswered), and never while the agent
+is still up — `quotas` (windows, plan, exhausted, read_at) keyed by `<host>:<kind>`,
+`tasks` (state + since, owner, lead,
 blocked_by, handoffs), open `blockers` and `asks` (with their context link) keyed by their raising event id, undelivered
 `msgs` keyed by their `msg.sent` id, the id of the `last` event folded, and the `unknown` count.
 
@@ -261,6 +286,8 @@ how many worktrees may hold any of a set of resources at once.
 | `breach` | more worktrees hold a rule's resources than its `max`, while the rule lasts |
 | `queued` | a process waiting 10 min for a resource, with who holds it |
 | `refused` | `agent-fleet kill` refused a pid in the last hour, with the reason |
+| `role` | an agent's declared lead is down, the lead's level is not above its own, or a second root coordinator is up |
+| `quota` | a program's quota is exhausted, or a window ≥ 90% used resets in the future |
 
 ## Killing processes
 
@@ -286,6 +313,73 @@ against an agent set on evading it.
 { "hooks": { "PreToolUse": [ { "matcher": "Bash|exec",
   "hooks": [ { "type": "command", "command": "agent-fleet hook bash" } ] } ] } }
 ```
+
+## Every agent runs in herdr
+
+Agents are pane processes: the fleet knows an agent only because herdr hosts it. Two guards
+enforce it. `agent-fleet hook bash` (the Claude Code / Devin CLI `PreToolUse` hook) refuses a
+shell command that starts `claude`, `devin` or `codex` for a session — behind `sudo`, `nohup`,
+`xargs`, `timeout`, `sh -c`, `eval`, `env` or `&` — and points at `agent-fleet spawn` and `herdr
+agent start`; the read-only and admin forms (`--version`, `--help`, `auth status`, `doctor`,
+`models`, `mcp list`/`mcp get`, `update --check`) pass. And the host's process scan reports every
+agent-program process it finds outside all of herdr's pane trees as `agent.unmanaged` (Linux
+only — the check walks /proc ancestors; a process is managed when any ancestor is `herdr`, and
+the host's own process tree is excluded), re-sent without `program` once the process is gone;
+`agent-fleet doctor` shows them as `unmanaged` findings.
+
+## Spawning
+
+The fleet starts agents itself. `<checkout>/.agent-fleet/fleet.toml` in the project says how
+(`docs/fleet.example.toml` ships one): a `session`, a `base` ref (default `origin/main`), a
+`brief` template next to the file with `@@KEY@@` placeholders, an optional `ready` script run
+inside a new worktree before the agent starts, `[vars]` for extra tokens, `[profiles]` —
+a `kind` (the `agent.start`/`agent.quota` program), `args`, `unset_env`, a `prefix` for agent
+names, an optional fleet-wide `cap`, a `fallback`, and `handoff_min` — and `[[rules]]`, first
+match wins, a rule with no `match` being the default. `match` keywords are case-insensitive
+whole words against the issue's title, the `--scope` text and its labels; `label:x` matches only
+a label named x. Config errors name the line that is wrong: an unknown profile, a fallback
+cycle, two defaults, no default.
+
+`agent-fleet spawn <owner/repo>#<issue>` reads the issue with `gh issue view` (`AGENT_FLEET_GH`
+names the binary), picks the rule — `--profile`, `--host` and `--level` override it — then walks
+the profile's fallback chain past a profile at `cap` (live agents of the profile plus pending
+requests) or whose kind's quota on the target host is exhausted — a quota counts as exhausted
+while a 100% window's reset is still ahead or the `exhausted` read is under 30 min old;
+every step lands in `why`. The brief renders in one pass over the template: tokens
+NAME, KIND (the profile name), PROGRAM (the kind), SLUG, ISSUE, TITLE, BRANCH, SCOPE, HOST,
+LEVEL, LEAD, HANDOFF (empty unless a handoff), the `[vars]` and `--set KEY=VALUE`; a value is
+never re-expanded and a placeholder with no value refuses the spawn. `--dry-run` prints the
+decision and the brief and writes nothing; otherwise `spawn.requested` is written and the CLI
+follows the hub until `spawn.result` arrives (10 min, `--no-wait` skips the wait).
+
+The host agent serves requests naming its host and session, against a checkout given as
+`--repo <owner/repo>=<dir>` (a bare `--repo <dir>` watches a checkout and derives the slug from
+its `origin` remote). A request names the `profile`; the host reads `kind`, `args`, `unset_env`,
+`base` and the checkout's `ready` from its OWN `.agent-fleet/fleet.toml` — a request never
+carries executable configuration, and a handoff's worktree is not a config source — and refuses
+(`ok=false`) a `name` or `branch` that starts with `-`, or a `branch` `git check-ref-format
+--branch` rejects. For a new worktree it fetches
+`origin`, calls `worktree.create` (label `<name> #<issue>`, no focus, trust the repository); a
+create that fails on an existing branch is retried once after reclaiming it, and only when it
+holds no work — no commit the remotes lack, a clean tree. With `worktree` set on the request (a
+handoff), it opens a `workspace.create` there instead and never removes the worktree. Then
+`ready` runs (new worktrees only, 15 min), each `unset_env` is typed into the pane's shell,
+`agent.start` retries `agent_pane_busy` for 10 tries 2 s apart, and the brief goes out the way
+that works: `agent.wait` for `idle` (2 min),
+`agent.prompt` waiting for working|blocked|done (30 s), one Enter and another wait (15 s) on a
+stall, then one re-send — never twice to an agent that started working. On success the host
+writes `agent.role` (level, lead from the request) and `task.assigned` for
+`task:<project>/<repo>#<issue>` (a 409 is not a failure), answers `spawn.result`, and closes a
+`replaces` agent's pane and workspace — never its worktree. Any failure undoes what the spawn
+took and answers `ok=false`; a request older than 15 min when first seen is answered `expired`.
+
+`agent-fleet handoff <agent> [--to <profile>] [--note TEXT]` gives the agent's issue, branch and
+existing worktree to a new agent of `--to` (default: its profile's fallback) with a HANDOFF note.
+The host does the same itself, once per agent on its own host and session, when its spawn
+record's profile has a fallback and the agent never reached `working` — either its kind is out
+of quota on this host, or `handoff_min` minutes passed since its successful spawn. An agent
+that worked, is `working` or `done`, or whose task closed is never handed off; a replacement
+request that failed does not block a retry.
 
 ## The operator's screen
 

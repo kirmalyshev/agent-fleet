@@ -1,0 +1,36 @@
+session = "work"                 # herdr session agents run in
+base = "origin/main"             # branch point for a new worktree
+brief = "brief.md"               # template next to fleet.toml; @@KEY@@ placeholders
+ready = "scripts/worktree-ready.sh"   # optional; run inside a NEW worktree with its path as $1, before the agent starts
+
+[vars]                           # extra brief tokens
+ORG = "example"
+
+[profiles.devin]
+kind = "devin"                   # program, matches agent.up kind and agent.quota kind
+args = []                        # extra args for herdr agent.start
+prefix = "dv-"                   # default agent name = prefix + issue number
+cap = 2                          # live agents of this profile across the fleet; absent = no cap
+fallback = "sonnet"              # used when this one is at cap, out of quota, or for a handoff
+handoff_min = 5                  # see Handoff
+[profiles.sonnet]
+kind = "claude"
+args = ["--model", "sonnet", "--dangerously-skip-permissions"]
+unset_env = ["CLAUDE_CONFIG_DIR"]   # cleared in the pane's shell before the agent starts
+prefix = "s-"
+[profiles.opus]
+kind = "claude"
+args = ["--model", "opus", "--dangerously-skip-permissions"]
+unset_env = ["CLAUDE_CONFIG_DIR"]
+prefix = "o-"
+
+[[rules]]                        # first match wins; a rule with no `match` is the default
+match = ["ios", "simulator", "label:mobile"]
+profile = "devin"
+host = "mac.local"               # optional; default: the host running the CLI
+level = "implementer"            # agent.role level declared for the new agent (default implementer)
+[[rules]]
+match = ["research", "design", "audit", "label:design"]
+profile = "opus"
+[[rules]]
+profile = "devin"

@@ -9,18 +9,28 @@ One Rust binary, no runtime. Linux and macOS. Agents run in [herdr](https://herd
 ```
 agent-fleet hub                 the log, the fold, the sequencer (HTTP + SSE on 127.0.0.1)
 agent-fleet host                one per machine and herdr session: presence from herdr, disk, a replica, doorbells
-agent-fleet ps                  what every agent is doing, and who holds or waits for each resource
+agent-fleet ps                  what every agent is doing, who holds or waits for each resource,
+                          each agent program's quota
 agent-fleet task add|done|rm|ls|show
                           claim (exclusive: 409 if taken), finish, cancel or release, list, inspect
 agent-fleet dep add|rm          task A is blocked by task B
+agent-fleet role <agent> [<level>]
+                          declare or show an agent's level and the lead it reports to
 agent-fleet block / unblock     raise and resolve blockers
 agent-fleet ask                 a question for an operator
 agent-fleet resource limit|unlimit
                           a capacity rule over the locks hosts report (host --lock name=dir)
+agent-fleet spawn <owner/repo>#<issue>
+                          route an issue to a profile and host (.agent-fleet/fleet.toml),
+                          run it on that host and follow until spawn.result
+agent-fleet handoff <agent> [--to <profile>]
+                          give an agent's issue, branch and worktree to a new agent
 agent-fleet tell <agent> <TYPE> <ref> <text>
                           ring an agent's doorbell; delivered = it was seen working afterwards
 agent-fleet kill <pid>...       stop your own processes or proved orphans; refuses agents and their ancestors
 agent-fleet hook bash           PreToolUse hook (Claude Code, Devin CLI): blocks raw kill/pkill/killall
+agent-fleet hook statusline     Claude Code status-line wrapper: stores rate_limits for the host,
+                          runs a wrapped status line on the same input
 agent-fleet state --json        the folded state
 agent-fleet tui                 the fleet on one screen, live: agents, worktrees, tasks, findings,
                           with tell, focus, task done/release/cancel, remove a worktree, kill orphans
@@ -29,7 +39,8 @@ agent-fleet ui                  the board in the browser, live: a tree of reposi
 agent-fleet ui --text           the board: agents, tasks, blockers, asks, undelivered doorbells, hosts
 agent-fleet stats               doorbell latency and loss, event lag, host and hub vitals
 agent-fleet doctor              stale, hung or heavy agents, duplicate work, forgotten worktrees,
-                          unpushed commits, orphaned processes, capacity breaches, long queues, refused kills
+                          unpushed commits, orphaned processes, capacity breaches, long queues,
+                          refused kills, broken role chains, exhausted quotas, stuck spawns
 agent-fleet instances           one fleet per project or product: each has its own hub, log and token
 agent-fleet bench               load-test a throwaway hub: latency, throughput, follower lag, 409 races
 agent-fleet api schema          JSON Schema of events and state (schema/agent-fleet.schema.json)

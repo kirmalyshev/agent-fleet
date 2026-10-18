@@ -90,6 +90,21 @@ impl Procs {
         out
     }
 
+    /// `pid` or an ancestor of it has `name` — e.g. a process inside a herdr pane.
+    pub fn under(&self, pid: u32, name: &str) -> bool {
+        let mut at = Some(pid);
+        for _ in 0..64 {
+            let Some(p) = at.and_then(|p| self.0.get(&p)) else {
+                return false;
+            };
+            if p.name == name {
+                return true;
+            }
+            at = Some(p.ppid);
+        }
+        false
+    }
+
     /// Resident memory (KiB) and CPU so far (ms) of `pids`.
     pub fn sum(&self, pids: &[u32]) -> (u64, u64) {
         pids.iter()
@@ -487,6 +502,44 @@ pub fn cwd_of(pid: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn procs(list: &[(u32, u32, &str)]) -> Procs {
+        Procs(
+            list.iter()
+                .map(|&(pid, ppid, name)| {
+                    (
+                        pid,
+                        Proc {
+                            ppid,
+                            cpu_ms: 0,
+                            rss_kb: 0,
+                            name: name.into(),
+                            cwd: None,
+                            deleted: false,
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn under_walks_the_parent_chain() {
+        // herdr(1) → shell(10) → claude(11); stray claude(20); host(30) → devin(31)
+        let t = procs(&[
+            (1, 0, "herdr"),
+            (10, 1, "zsh"),
+            (11, 10, "claude"),
+            (20, 0, "claude"),
+            (30, 0, "agent-fleet"),
+            (31, 30, "devin"),
+        ]);
+        assert!(t.under(11, "herdr"));
+        assert!(!t.under(20, "herdr"));
+        assert!(!t.under(11, "agent-fleet"));
+        assert!(t.under(31, "agent-fleet"));
+        assert!(!t.under(999, "herdr"));
+    }
 
     #[test]
     fn a_lock_reads_its_holder_and_live_waiters_and_diffs_into_changes() {

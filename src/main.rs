@@ -5,7 +5,9 @@ mod event;
 mod host;
 mod hub;
 mod kill;
+mod quota;
 mod scan;
+mod spawn;
 mod state;
 mod stats;
 mod store;
@@ -15,7 +17,7 @@ mod ui;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use serde_json::json;
@@ -68,18 +70,24 @@ enum Cmd {
         #[arg(long)]
         db: Option<PathBuf>,
     },
-    /// Run the host agent for one herdr session: presence, disk, replica, doorbell delivery.
+    /// Run the host agent for one herdr session: presence, disk, replica, doorbell delivery,
+    /// and spawn requests for this host.
     Host {
         #[arg(long, env = "HERDR_SOCKET_PATH")]
         herdr_socket: PathBuf,
         #[arg(long, env = "HERDR_SESSION")]
         session: String,
-        /// A repository whose worktrees to watch even when no agent works in it. Repeatable.
-        #[arg(long = "repo")]
-        repos: Vec<String>,
+        /// A repository whose worktrees to watch even when no agent works in it, as
+        /// `<owner/repo>=<checkout>` also the checkout a `spawn.requested` runs against.
+        /// Repeatable.
+        #[arg(long = "repo", value_parser = parse_repo)]
+        repos: Vec<(Option<String>, PathBuf)>,
         /// A lock directory to report as a resource, `<name>=<dir>`. Repeatable.
         #[arg(long = "lock", value_parser = parse_lock)]
         locks: Vec<(String, PathBuf)>,
+        /// Minutes an agent may idle or block after working before its lead is told STALLED.
+        #[arg(long = "stall-min", default_value_t = spawn::STALL_MIN)]
+        stall_min: u64,
     },
     /// Protocol metadata.
     Api {
@@ -149,6 +157,71 @@ enum Cmd {
         recommendation: Option<String>,
         #[arg(long)]
         context: Option<String>,
+    },
+    /// Declare an agent's level of responsibility (root-coordinator, domain-lead,
+    /// implementation-lead, implementer), or with no level show its role, its chain of leads
+    /// and its direct reports.
+    Role {
+        /// `me`, a full `agent:` id, or the short name of an agent that is up.
+        agent: String,
+        /// `root-coordinator`, `domain-lead`, `implementation-lead` or `implementer`.
+        #[arg(value_name = "LEVEL", value_parser = parse_level)]
+        level: Option<Level>,
+        /// Whom the agent reports to [default: the caller, when it is not the subject].
+        #[arg(long, conflicts_with = "clear")]
+        lead: Option<String>,
+        /// What a domain lead owns, e.g. `payments`.
+        #[arg(long, conflicts_with = "clear")]
+        domain: Option<String>,
+        /// Remove the agent's role.
+        #[arg(long, conflicts_with = "level")]
+        clear: bool,
+    },
+    /// Spawn an agent on an issue: the project's `.agent-fleet/fleet.toml` picks the profile
+    /// and host, the host agent runs it (worktree, env scrub, agent start, the brief) and
+    /// answers `spawn.result`. Follows the hub until the result arrives (10 min).
+    Spawn {
+        /// `<owner/repo>#<issue>`
+        target: String,
+        /// Extra context for the rules and the `@@SCOPE@@` token.
+        #[arg(long)]
+        scope: Option<String>,
+        /// The agent's name [default: the profile's prefix + the issue number].
+        #[arg(long)]
+        name: Option<String>,
+        /// The new worktree's branch [default: the name].
+        #[arg(long)]
+        branch: Option<String>,
+        /// Skip the rules and use this profile.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Spawn on this host [default: the rule's, else this machine].
+        #[arg(long)]
+        host: Option<String>,
+        /// The agent.role level [default: the rule's, else implementer].
+        #[arg(long, value_parser = parse_level)]
+        level: Option<Level>,
+        /// An extra brief token, `KEY=VALUE`. Repeatable.
+        #[arg(long = "set", value_parser = parse_set)]
+        set: Vec<(String, String)>,
+        /// Print the decision and the rendered brief; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Write `spawn.requested` and return without waiting for the result.
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Hand an agent's issue, branch and existing worktree to a new agent of `--to`
+    /// (default: its profile's fallback), then close the replaced agent's pane and workspace.
+    Handoff {
+        /// The agent: a name or full id with a spawn record.
+        agent: String,
+        /// The profile to hand to.
+        #[arg(long = "to")]
+        to: Option<String>,
+        /// Added to the handoff note.
+        #[arg(long)]
+        note: Option<String>,
     },
     /// Ring an agent's doorbell: `[agent-fleet <from>→<to>] TYPE ref: text (event <id>)`.
     Tell {
@@ -333,6 +406,14 @@ enum HookCmd {
     /// PreToolUse hook for Claude Code and Devin CLI: reads the tool call on stdin and refuses
     /// (exit 2) a shell command that runs a raw kill, pkill or killall.
     Bash,
+    /// Claude Code status-line command: records the `rate_limits` it is fed for the host to
+    /// publish as `agent.quota`, then runs an optional wrapped command on the same stdin and
+    /// passes its stdout through. Always exits 0.
+    Statusline {
+        /// The status line to wrap, as `-- <cmd> <args>…`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -374,6 +455,14 @@ fn parse_until(s: &str) -> Result<DateTime<Utc>, String> {
         .ok_or_else(|| format!("{s} does not exist today"))
 }
 
+fn parse_level(s: &str) -> Result<Level, String> {
+    serde_json::from_value(json!(s)).map_err(|_| {
+        format!(
+            "not a level: {s} (root-coordinator, domain-lead, implementation-lead, implementer)"
+        )
+    })
+}
+
 fn parse_lock(s: &str) -> Result<(String, PathBuf), String> {
     match s.split_once('=') {
         Some((name, dir)) if !name.is_empty() && !dir.is_empty() => {
@@ -381,6 +470,37 @@ fn parse_lock(s: &str) -> Result<(String, PathBuf), String> {
         }
         _ => Err(format!("not <name>=<dir>: {s}")),
     }
+}
+
+/// `owner/repo` exactly: one slash, two non-empty parts, not a path.
+fn is_repo_slug(s: &str) -> bool {
+    !s.starts_with('/') && s.split('/').count() == 2 && s.split('/').all(|p| !p.is_empty())
+}
+
+/// `<owner/repo>=<checkout>` (watched and spawnable) or a bare `<dir>` (watched only). An `=`
+/// whose left side is not `owner/repo` is part of the path.
+fn parse_repo(s: &str) -> Result<(Option<String>, PathBuf), String> {
+    match s.split_once('=') {
+        Some((slug, dir)) if is_repo_slug(slug) && !dir.is_empty() => {
+            Ok((Some(slug.to_string()), PathBuf::from(dir)))
+        }
+        _ if !s.is_empty() => Ok((None, PathBuf::from(s))),
+        _ => Err(format!("not <owner/repo>=<dir> or <dir>: {s}")),
+    }
+}
+
+fn parse_set(s: &str) -> Result<(String, String), String> {
+    let Some((k, v)) = s.split_once('=') else {
+        return Err(format!("not KEY=VALUE: {s}"));
+    };
+    if k.is_empty()
+        || !k
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    {
+        return Err(format!("brief keys are A-Z, 0-9 and _: {k}"));
+    }
+    Ok((k.to_string(), v.to_string()))
 }
 
 #[derive(Subcommand)]
@@ -521,6 +641,24 @@ impl Ctx {
         }
     }
 
+    /// `me`, a full `agent:` id, or the short name of an agent that is up. A role can be
+    /// declared before an agent's first `agent.up`, so a name that is not up is an error that
+    /// asks for the full id.
+    async fn role_agent(&self, name: &str) -> Result<String> {
+        if name == "me" {
+            return Ok(self.me().await?.id);
+        }
+        self.resolve_agent(name).await.map_err(|err| {
+            if err.to_string().starts_with("no agent named") {
+                anyhow::anyhow!(
+                    "{err:#}; pass the full id (agent:<host>/<session>/<name>) to declare a role before the agent's first agent.up"
+                )
+            } else {
+                err
+            }
+        })
+    }
+
     async fn write(&self, e: Envelope<Known>) -> Result<String> {
         let (ty, id) = (e.body.type_name(), e.id.clone());
         match self.client()?.write(&e).await? {
@@ -550,12 +688,17 @@ async fn main() -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&api_schema())?);
         return Ok(());
     }
-    if let Cmd::Hook { cmd: HookCmd::Bash } = cli.cmd {
-        let mut input = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
-        if let Some(msg) = kill::hook(&input) {
-            eprintln!("{msg}");
-            std::process::exit(2);
+    if let Cmd::Hook { cmd } = &cli.cmd {
+        match cmd {
+            HookCmd::Bash => {
+                let mut input = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+                if let Some(msg) = kill::hook(&input) {
+                    eprintln!("{msg}");
+                    std::process::exit(2);
+                }
+            }
+            HookCmd::Statusline { cmd } => quota::statusline(cmd),
         }
         return Ok(());
     }
@@ -581,6 +724,7 @@ async fn main() -> Result<()> {
             session,
             repos,
             locks,
+            stall_min,
         } => {
             let cfg = host::Config {
                 host: ctx.host_name(),
@@ -588,8 +732,20 @@ async fn main() -> Result<()> {
                 herdr_socket: herdr_socket.clone(),
                 replica: ctx.paths.replica(),
                 data_dir: ctx.paths.dir.clone(),
-                repos: repos.clone(),
+                repos: repos
+                    .iter()
+                    .map(|(_, d)| d.to_string_lossy().into_owned())
+                    .collect(),
+                checkouts: repos
+                    .iter()
+                    .filter_map(|(slug, d)| {
+                        slug.clone()
+                            .or_else(|| spawn::slug_of(d))
+                            .map(|s| (s, d.clone()))
+                    })
+                    .collect(),
                 locks: locks.clone(),
+                stall_min: *stall_min,
             };
             host::run(cfg, ctx.client()?).await?;
         }
@@ -868,6 +1024,228 @@ async fn main() -> Result<()> {
             };
             ctx.task_event(task, Known::AskRaised(body)).await?;
         }
+        Cmd::Role {
+            agent,
+            level,
+            lead,
+            domain,
+            clear,
+        } => {
+            let id = ctx.role_agent(agent).await?;
+            if let (None, false) = (level, clear) {
+                print!("{}", ui::role(&ctx.state().await?, &id, now));
+                return Ok(());
+            }
+            let me = ctx.me().await?;
+            let data = if *clear {
+                AgentRole {
+                    agent: id,
+                    level: None,
+                    lead: None,
+                    domain: None,
+                }
+            } else {
+                let level = level.unwrap();
+                let lead = if level == Level::RootCoordinator {
+                    if lead.is_some() {
+                        bail!("a root-coordinator takes no lead; drop --lead");
+                    }
+                    None
+                } else {
+                    match lead {
+                        Some(l) => Some(ctx.role_agent(l).await?),
+                        None if id != me.id => Some(me.id.clone()),
+                        None => bail!("who does {id} report to? a {level} needs --lead <agent>"),
+                    }
+                };
+                AgentRole {
+                    agent: id,
+                    level: Some(level),
+                    lead,
+                    domain: domain.clone(),
+                }
+            };
+            ctx.write(Envelope::new(me, &ctx.cli.project, Known::AgentRole(data)))
+                .await?;
+        }
+        Cmd::Spawn {
+            target,
+            scope,
+            name,
+            branch,
+            profile,
+            host,
+            level,
+            set,
+            dry_run,
+            no_wait,
+        } => {
+            let (repo, issue_n) = spawn::parse_target(target)?;
+            let issue = spawn::gh_issue(&repo, issue_n).await?;
+            let (cfg, cfg_dir) = spawn::find()?;
+            // With no fleet state, caps and quotas are consulted as empty — say so.
+            let (state, note) = ctx.snapshot_state().await.unwrap_or_else(|e| {
+                (
+                    State::default(),
+                    Some(format!(
+                        "no fleet state ({e:#}); caps and quotas not consulted"
+                    )),
+                )
+            });
+            if let Some(n) = note {
+                eprintln!("agent-fleet: {n}");
+            }
+            let d = spawn::decide(
+                &cfg,
+                &issue,
+                scope.as_deref().unwrap_or(""),
+                &spawn::Overrides {
+                    profile: profile.as_deref(),
+                    host: host.as_deref(),
+                    level: *level,
+                },
+                &state,
+                &ctx.host_name(),
+            )?;
+            let prof = &cfg.profiles[&d.profile];
+            let name = name
+                .clone()
+                .unwrap_or_else(|| format!("{}{}", prof.prefix, issue.number));
+            if name.is_empty() || name.contains(['/', ':', ' ']) {
+                bail!("agent name {:?} is not usable in an agent id", name);
+            }
+            let branch = branch.clone().unwrap_or_else(|| name.clone());
+            let agent = format!("agent:{}/{}/{name}", d.host, cfg.session);
+            if state.agents.contains_key(&agent) {
+                bail!("{agent} is already up");
+            }
+            if state.spawns.values().any(|s| {
+                s.result.is_none()
+                    && s.request.agent == agent
+                    && Utc::now() - s.since <= spawn::REQUEST_MAX_AGE
+            }) {
+                bail!("a spawn for {agent} is already pending");
+            }
+            let me = ctx.me().await;
+            let lead = match &me {
+                Ok(a) => a.id.clone(),
+                Err(_) if *dry_run => "?".into(),
+                Err(e) => return Err(anyhow::anyhow!("{e:#}")),
+            };
+            let mut vals = cfg.vars.clone();
+            for (k, v) in set {
+                vals.insert(k.clone(), v.clone());
+            }
+            for (k, v) in [
+                ("NAME", name.as_str()),
+                ("KIND", d.profile.as_str()),
+                ("PROGRAM", prof.kind.as_str()),
+                ("SLUG", repo.as_str()),
+                ("ISSUE", &issue.number.to_string()),
+                ("TITLE", issue.title.as_str()),
+                ("BRANCH", branch.as_str()),
+                ("SCOPE", scope.as_deref().unwrap_or("")),
+                ("HOST", d.host.as_str()),
+                ("LEVEL", &d.level.to_string()),
+                ("LEAD", lead.as_str()),
+                ("HANDOFF", ""),
+            ] {
+                vals.insert(k.into(), v.to_string());
+            }
+            let src = std::fs::read_to_string(cfg_dir.join(&cfg.brief))
+                .with_context(|| format!("read {}", cfg_dir.join(&cfg.brief).display()))?;
+            let brief = spawn::render(spawn::brief_body(&src), &vals)?;
+            if *dry_run {
+                println!("spawn {repo}#{} \"{}\"", issue.number, issue.title);
+                println!("rule      {}", d.why);
+                println!("profile   {} (kind {})", d.profile, prof.kind);
+                println!("host      {}", d.host);
+                println!("session   {}", cfg.session);
+                println!("name      {name}");
+                println!("branch    {branch}");
+                println!("level     {}", d.level);
+                println!("lead      {lead}");
+                println!("--- brief ---");
+                print!("{brief}");
+                return Ok(());
+            }
+            let me = me.map_err(|e| anyhow::anyhow!("{e:#}"))?;
+            let req = SpawnRequested {
+                name,
+                agent,
+                host: d.host.clone(),
+                session: cfg.session.clone(),
+                repo: repo.clone(),
+                issue: Some(issue.number),
+                branch,
+                profile: d.profile.clone(),
+                brief,
+                level: Some(d.level),
+                lead: Some(lead),
+                worktree: None,
+                replaces: None,
+                why: d.why.clone(),
+            };
+            let id = ctx
+                .write(Envelope::new(
+                    me,
+                    &ctx.cli.project,
+                    Known::SpawnRequested(Box::new(req)),
+                ))
+                .await?;
+            if !no_wait {
+                spawn::wait_result(&ctx.client()?, &id).await?;
+            }
+        }
+        Cmd::Handoff { agent, to, note } => {
+            let state = ctx.state().await?;
+            let Some(sp) = spawn::find_spawn(&state, agent).cloned() else {
+                bail!("{agent} has no spawn record; it was not spawned by the fleet");
+            };
+            if spawn::replacement_open(&state, &sp.request.agent) {
+                bail!("{} was already handed off", sp.request.name);
+            }
+            let (cfg, cfg_dir) = spawn::find()?;
+            let to = match to {
+                Some(t) => t.clone(),
+                None => cfg
+                    .profiles
+                    .get(&sp.request.profile)
+                    .and_then(|p| p.fallback.clone())
+                    .with_context(|| {
+                        format!(
+                            "profile {:?} has no fallback; pass --to",
+                            sp.request.profile
+                        )
+                    })?,
+            };
+            let title = match sp.request.issue {
+                Some(i) => spawn::gh_issue(&sp.request.repo, i)
+                    .await
+                    .map(|x| x.title)
+                    .unwrap_or_else(|_| format!("#{i}")),
+                None => String::new(),
+            };
+            let req = spawn::handoff_request(
+                &cfg,
+                &cfg_dir,
+                &sp,
+                &to,
+                note.as_deref().unwrap_or(""),
+                &title,
+            )?;
+            if state.agents.contains_key(&req.agent) {
+                bail!("{} is already up", req.agent);
+            }
+            let id = ctx
+                .write(Envelope::new(
+                    ctx.me().await?,
+                    &sp.project,
+                    Known::SpawnRequested(Box::new(req)),
+                ))
+                .await?;
+            spawn::wait_result(&ctx.client()?, &id).await?;
+        }
         Cmd::Tell {
             agent,
             kind,
@@ -890,4 +1268,25 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_repo_arg_with_an_equals_inside_a_path_stays_a_path() {
+        assert_eq!(
+            parse_repo("o/r=/co/dir").unwrap(),
+            (Some("o/r".into()), PathBuf::from("/co/dir"))
+        );
+        assert_eq!(
+            parse_repo("/plain/dir").unwrap(),
+            (None, PathBuf::from("/plain/dir"))
+        );
+        // `foo=2` is a path containing '=', not a slug: `foo` has no slash.
+        assert_eq!(parse_repo("foo=2").unwrap(), (None, PathBuf::from("foo=2")));
+        // `/p=2`: the left side starts with '/', so it is a path.
+        assert_eq!(parse_repo("/p=2").unwrap(), (None, PathBuf::from("/p=2")));
+    }
 }

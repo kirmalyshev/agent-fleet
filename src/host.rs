@@ -1,7 +1,7 @@
 //! `agent-fleet host`: one per machine and herdr session. Presence from herdr, disk health, a local replica of the log,
 //! and doorbell delivery into herdr agents.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -79,8 +79,12 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Repositories whose worktrees to watch besides the ones agents work in.
     pub repos: Vec<String>,
+    /// `owner/repo` → the local checkout a `spawn.requested` is executed against.
+    pub checkouts: BTreeMap<String, PathBuf>,
     /// Lock directories to report as resources: (name, directory).
     pub locks: Vec<(String, PathBuf)>,
+    /// Minutes an agent may idle/block after working before its lead is told it's stalled.
+    pub stall_min: u64,
 }
 
 #[derive(Clone)]
@@ -93,15 +97,15 @@ struct Local {
     epoch: u64,
 }
 
-struct Host {
-    cfg: Config,
-    client: Client,
-    replica: Mutex<Store>,
+pub(crate) struct Host {
+    pub(crate) cfg: Config,
+    pub(crate) client: Client,
+    pub(crate) replica: Mutex<Store>,
     /// herdr pane id → the agent in it.
     panes: Mutex<HashMap<String, Local>>,
     next_epoch: AtomicU64,
     /// Wakes the delivery loop.
-    wake: Notify,
+    pub(crate) wake: Notify,
     /// Fires after an `agent.state` is recorded.
     seen: Notify,
     started: Instant,
@@ -128,12 +132,35 @@ const LOCKS_EVERY: Duration = Duration::from_secs(5);
 /// How often the host samples agents' processes and the worktrees.
 const SCAN_EVERY: Duration = Duration::from_secs(300);
 
+/// How often the host reads each agent program's usage quota.
+const QUOTA_EVERY: Duration = Duration::from_secs(60);
+
+/// `devin auth status` refreshes devin's cached quota; run at most this often.
+const DEVIN_STATUS_EVERY: Duration = Duration::from_secs(15 * 60);
+
 fn backoff(d: Duration) -> Duration {
     (d * 2).min(Duration::from_secs(60))
 }
 
+/// What the quota sampler remembers between reads.
+#[derive(Default)]
+struct Quotas {
+    /// The last published read per program, for change detection (`read_at` aside).
+    published: HashMap<String, AgentQuota>,
+    /// Sources already reported missing this run.
+    missing: HashSet<String>,
+    /// When `devin auth status` last ran.
+    devin_status: Option<Instant>,
+}
+
+/// `name` is a runnable file on PATH.
+fn on_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
+}
+
 impl Host {
-    fn new(cfg: Config, client: Client, replica: Store) -> Self {
+    pub(crate) fn new(cfg: Config, client: Client, replica: Store) -> Self {
         Self {
             cfg,
             client,
@@ -162,7 +189,7 @@ impl Host {
         }
     }
 
-    fn actor(&self) -> Actor {
+    pub(crate) fn actor(&self) -> Actor {
         Actor {
             kind: ActorKind::Host,
             id: format!("host:{}", self.cfg.host),
@@ -176,7 +203,7 @@ impl Host {
     /// Writes to the hub (or the spool) and to the local replica, so this host sees its own
     /// writes even while the hub is down. Copies merge by id, so the later echo is a no-op.
     /// Returns whether the event was written. One that was not stays out of the replica.
-    async fn publish(&self, e: Envelope<Known>) -> bool {
+    pub(crate) async fn publish(&self, e: Envelope<Known>) -> bool {
         let ty = e.body.type_name();
         match self.client.write(&e).await {
             Ok(Sent::Spooled(why)) => {
@@ -196,7 +223,7 @@ impl Host {
         true
     }
 
-    fn presence(&self, body: Known) -> Envelope<Known> {
+    pub(crate) fn presence(&self, body: Known) -> Envelope<Known> {
         Envelope::new(self.actor(), self.cfg.session.clone(), body)
     }
 
@@ -485,13 +512,82 @@ impl Host {
     async fn scan_loop(self: Arc<Self>) {
         // agent → (cpu ms so far, when sampled); CPU % needs two samples.
         let mut prev: HashMap<String, (u64, Instant)> = HashMap::new();
+        let mut quotas = Quotas::default();
         let start = tokio::time::Instant::now() + Duration::from_secs(10);
         let mut tick = tokio::time::interval_at(start, SCAN_EVERY);
+        let mut qt = tokio::time::interval_at(start, QUOTA_EVERY);
         loop {
-            tick.tick().await;
-            if let Err(err) = self.scan_once(&mut prev).await {
-                bump(&self.n.herdr_errors);
-                eprintln!("agent-fleet host: scan: {err:#}");
+            tokio::select! {
+                _ = tick.tick() => {
+                    if let Err(err) = self.scan_once(&mut prev).await {
+                        bump(&self.n.herdr_errors);
+                        eprintln!("agent-fleet host: scan: {err:#}");
+                    }
+                }
+                _ = qt.tick() => self.quota_once(&mut quotas).await,
+            }
+        }
+    }
+
+    /// Every `QUOTA_EVERY`: each agent program's usage quota on this machine, sent when
+    /// anything but `read_at` changed — and once at start. A source that is not there is
+    /// skipped; each is logged as missing at most once per host start.
+    async fn quota_once(&self, q: &mut Quotas) {
+        // The devin CLI refreshes its own cache when a Devin starts; nudge it otherwise.
+        if q.devin_status
+            .is_none_or(|t| t.elapsed() >= DEVIN_STATUS_EVERY)
+            && on_path("devin")
+        {
+            q.devin_status = Some(Instant::now());
+            tokio::spawn(async {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    tokio::process::Command::new("devin")
+                        .args(["auth", "status"])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .kill_on_drop(true)
+                        .output(),
+                )
+                .await;
+            });
+        }
+        let host = &self.cfg.host;
+        for (kind, read) in [
+            (
+                "codex",
+                crate::quota::codex_sessions().map(|d| crate::quota::codex(host, &d)),
+            ),
+            (
+                "claude",
+                crate::quota::claude_file().map(|f| crate::quota::claude(host, &f)),
+            ),
+            (
+                "devin",
+                crate::quota::devin_cache().map(|d| crate::quota::devin(host, &d)),
+            ),
+        ] {
+            match read.flatten() {
+                Some(quota) => {
+                    q.missing.remove(kind);
+                    let new = q
+                        .published
+                        .get(kind)
+                        .is_none_or(|was| crate::quota::changed(was, &quota));
+                    if new
+                        && self
+                            .publish(self.presence(Known::AgentQuota(quota.clone())))
+                            .await
+                    {
+                        q.published.insert(kind.to_string(), quota);
+                    }
+                }
+                None => {
+                    if q.missing.insert(kind.to_string()) {
+                        eprintln!("agent-fleet host: no {kind} quota source on this machine");
+                    }
+                }
             }
         }
     }
@@ -508,25 +604,10 @@ impl Host {
         let mut sampled = HashSet::new();
         for a in list["agents"].as_array().into_iter().flatten() {
             let pane = a["pane_id"].as_str().unwrap_or_default();
-            let Some(agent) = self
-                .panes
-                .lock()
-                .unwrap()
-                .get(pane)
-                .map(|l| l.agent.clone())
-            else {
-                continue;
-            };
             let cwd = a["foreground_cwd"]
                 .as_str()
                 .or(a["cwd"].as_str())
                 .map(str::to_string);
-            if let Some(repo) = match &cwd {
-                Some(c) => scan::repo_of(c).await,
-                None => None,
-            } {
-                repos.insert(repo);
-            }
             let target = json!({ "pane_id": pane });
             let info = match herdr_call(&self.cfg.herdr_socket, "pane.process_info", target).await {
                 Ok(info) => info,
@@ -540,6 +621,23 @@ impl Host {
                 continue;
             };
             let tree = procs.tree(shell as u32);
+            // Every pane herdr reports is managed, whether or not the fleet knows its agent yet.
+            agent_pids.extend(&tree);
+            let Some(agent) = self
+                .panes
+                .lock()
+                .unwrap()
+                .get(pane)
+                .map(|l| l.agent.clone())
+            else {
+                continue;
+            };
+            if let Some(repo) = match &cwd {
+                Some(c) => scan::repo_of(c).await,
+                None => None,
+            } {
+                repos.insert(repo);
+            }
             if tree.is_empty() {
                 // No process table here (macOS): where the agent works still places it in a worktree.
                 if cwd.is_some() {
@@ -554,7 +652,6 @@ impl Host {
                 }
                 continue;
             }
-            agent_pids.extend(&tree);
             let (rss_kb, cpu_ms) = procs.sum(&tree);
             let now = Instant::now();
             // CPU over the whole interval since the last scan when there was one.
@@ -635,6 +732,43 @@ impl Host {
                     names: Vec::new(),
                     pids: Vec::new(),
                     ..p.procs.clone()
+                })))
+                .await;
+            }
+        }
+        // Agent programs outside every herdr pane tree: every agent runs in herdr. Managed =
+        // any ancestor is `herdr`; the host's own tree (its `devin auth status` refresh) is out.
+        let own: HashSet<u32> = procs.tree(std::process::id()).into_iter().collect();
+        let mut seen = HashSet::new();
+        for (&pid, p) in &procs.0 {
+            if !crate::kill::AGENTS.contains(&p.name.as_str())
+                || own.contains(&pid)
+                || procs.under(pid, "herdr")
+            {
+                continue;
+            }
+            seen.insert(pid);
+            let key = format!("{}:{pid}", self.cfg.host);
+            let known = state.unmanaged.get(&key);
+            if known.is_none_or(|u| u.program != p.name || u.cwd != p.cwd) {
+                self.publish(self.presence(Known::AgentUnmanaged(AgentUnmanaged {
+                    host: self.cfg.host.clone(),
+                    pid,
+                    program: Some(p.name.clone()),
+                    cwd: p.cwd.clone(),
+                    since: Some(chrono::Utc::now()),
+                })))
+                .await;
+            }
+        }
+        for u in state.unmanaged.values() {
+            if u.host == self.cfg.host && !seen.contains(&u.pid) {
+                self.publish(self.presence(Known::AgentUnmanaged(AgentUnmanaged {
+                    host: self.cfg.host.clone(),
+                    pid: u.pid,
+                    program: None,
+                    cwd: None,
+                    since: None,
                 })))
                 .await;
             }
@@ -906,6 +1040,7 @@ pub async fn run(cfg: Config, client: Client) -> Result<()> {
         r = tokio::spawn(host.clone().presence_loop()) => bail!("presence stopped: {r:?}"),
         r = tokio::spawn(host.clone().scan_loop()) => bail!("scans stopped: {r:?}"),
         r = tokio::spawn(host.clone().lock_loop()) => bail!("lock reads stopped: {r:?}"),
+        r = tokio::spawn(crate::spawn::spawn_loop(host.clone())) => bail!("spawning stopped: {r:?}"),
     }
 }
 
@@ -1007,7 +1142,9 @@ mod tests {
             replica: dir.join("replica.db"),
             data_dir: dir.to_path_buf(),
             repos: Vec::new(),
+            checkouts: Default::default(),
             locks: Vec::new(),
+            stall_min: 15,
         };
         let client = Client::new("http://127.0.0.1:1", "t".into(), dir.join("spool.jsonl"));
         let host = Arc::new(Host::new(
@@ -1169,7 +1306,9 @@ mod tests {
             replica: dir.path().join("replica.db"),
             data_dir: dir.path().to_path_buf(),
             repos: Vec::new(),
+            checkouts: Default::default(),
             locks: Vec::new(),
+            stall_min: 15,
         };
         let replica = Store::open(&cfg.replica).unwrap();
         replica
