@@ -168,7 +168,8 @@ ULID that arrives late is still returned after the cursor, so a follower never m
 `GET /state` returns `hosts`, `agents` (state + since), `roles` (level, lead, domain, by, since)
 keyed by agent id, `spawns` (the request, who asked, the result) keyed by `spawn.requested` id
 — kept for 24 h after its answer (or its request, when unanswered), and never while the agent
-is still up — `quotas` (windows, plan, exhausted, read_at) keyed by `<host>:<kind>`,
+is still up — `quotas` (windows, plan, exhausted, read_at, exhausted_since — when the reports
+first showed the account out) keyed by `<host>:<kind>`,
 `tasks` (state + since, owner, lead,
 blocked_by, handoffs), open `blockers` and `asks` (with their context link) keyed by their raising event id, undelivered
 `msgs` keyed by their `msg.sent` id, the id of the `last` event folded, and the `unknown` count.
@@ -308,9 +309,11 @@ Every 5 seconds the host looks at each of its `idle` or `blocked` agents — and
 `working` one `doctor` calls `hung` — and names ONE cause. The cause is authoritative only
 when it comes from a structured signal: the agent's own `agent.signal` (the latest one
 stored for the agent — `prompt`, `turn_end` and turning `working` clear it, so what remains
-belongs to this episode), or herdr's `blocked` and the fleet's own holds. For Devin, which
+belongs to this episode, and one older than the last working stretch is a replay), or herdr's
+`blocked` and the fleet's own holds. For Devin, which
 emits no hooks, an exhausted `agent.quota` for `<host>:devin` plus the agent sitting idle
-*is* the structured quota signal. The screen is still read, but only as a hint: it may
+*is* the structured quota signal — but only when the agent's current stop began after the
+account ran out and its task is still open: an agent already idle or finished is just idle. The screen is still read, but only as a hint: it may
 ride along in the message to the lead ("screen hints …"), and it never decides a cause or
 drives an action. The result lands in `agent.stuck` (`cause`, `detail`, `until`), written
 when the cause appears or changes, and once with no `cause` when the agent works again.
@@ -339,10 +342,11 @@ run under `host --stuck-act`; without it the host still classifies and records `
 and every would-be action becomes one tell to the lead naming what it would have done. And
 nothing acts or tells before the state has lasted `--stall-min`:
 
-- `quota` with `until` more than 30 min away or unknown: hand the work to the profile's
+- `quota` with `until` KNOWN and more than 30 min away: hand the work to the profile's
   `on_quota` (a fleet.toml key), but only when that profile's kind still has quota on this
-  host; otherwise tell the lead it is out of quota until `until`. `until` within 30 min:
-  tell the lead it waits. A target whose kind is the agent's own is never a quota handoff —
+  host. `until` within 30 min or unknown: tell the lead it is out of quota until `until` —
+  an unknown reset is not a reason to move the work. A target whose kind is the agent's own
+  is never a quota handoff —
   a `haiku` profile's kind is `claude`, it shares the Claude account's limits, so a Claude
   agent out of quota is never handed to it on the same host.
 - `rate_limit`: wait; `continue` once after `until`.
@@ -370,10 +374,11 @@ the host sends ONE `ESCALATED` `msg.sent` to the lead's own lead, and so on up t
 reads a harness's hook JSON on stdin and writes the event — identified from the herdr
 environment exactly as `agent-fleet`'s own `me` does (`HERDR_ENV`, `HERDR_PANE_ID`,
 `HERDR_SESSION`, `HERDR_SOCKET_PATH`, and `agent.get` for the pane's name and program).
-Outside herdr, on unmapped events, on any error, it exits 0 silently; the write goes through
-the normal client, spools when the hub is down, and is capped at one second so the hooked
-program is never slowed. Claude Code is the complete map; Devin CLI and Codex match where
-their hook payloads share the shape.
+Outside herdr, on unmapped events, on any error — argument errors included — it exits 0
+silently. The event lands in the spool first and the client then flushes what the budget
+allows: a hub that never answers still cannot lose the signal, and the whole pass is capped
+at one second so the hooked program is never slowed. Claude Code is the complete map;
+Devin CLI and Codex match where their hook payloads share the shape.
 
 | Hook | Maps to `signal` |
 |---|---|
@@ -394,15 +399,18 @@ their hook payloads share the shape.
 `prompt` and `turn_end` mark a new episode: they clear the stored signal instead of storing
 one. An unknown hook event writes nothing.
 
-Install all of them in the project's `.claude/settings.json` (Devin CLI reads the same file):
+Install all of them in the project's `.claude/settings.json` (Devin CLI reads the same file).
+Every command ends in `|| true`: a Stop or UserPromptSubmit hook exiting 2 blocks Claude
+Code, and an older `agent-fleet` without `hook signal` exits 2 on the unknown subcommand —
+the `|| true` keeps an old binary from blocking the program it hooks.
 
 ```json
 { "hooks": {
-  "Stop":             [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal" } ] } ],
-  "StopFailure":      [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal" } ] } ],
-  "Notification":     [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal" } ] } ],
-  "PreCompact":       [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal" } ] } ],
-  "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal" } ] } ] } }
+  "Stop":             [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ],
+  "StopFailure":      [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ],
+  "Notification":     [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ],
+  "PreCompact":       [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ],
+  "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ] } }
 ```
 
 `agent-fleet hook statusline` stays the status-line wrapper: it stores the `rate_limits`
@@ -431,8 +439,12 @@ against an agent set on evading it.
 
 ```json
 { "hooks": { "PreToolUse": [ { "matcher": "Bash|exec",
-  "hooks": [ { "type": "command", "command": "agent-fleet hook bash" } ] } ] } }
+  "hooks": [ { "type": "command",
+    "command": "command -v agent-fleet >/dev/null 2>&1 || exit 0; agent-fleet hook bash" } ] } ] } }
 ```
+
+The guard passes everything when the binary is absent, and an exit 2 refusal still
+blocks the tool call when it is there.
 
 ## Every agent runs in herdr
 
@@ -502,9 +514,11 @@ took and answers `ok=false`; a request older than 15 min when first seen is answ
 
 `agent-fleet handoff <agent> [--to <profile>] [--note TEXT]` gives the agent's issue, branch and
 existing worktree to a new agent of `--to` (default: its profile's fallback) with a HANDOFF note.
-The host does the same itself only for the quota case — an agent that never reached `working`
-whose kind is out of quota on this host with the reset far out goes to `on_quota` as under
-Stuck causes. Any other never-started agent (`handoff_min` minutes since its successful spawn
+The host does the same itself only for the quota case and only under `--stuck-act` — an agent
+that never reached `working` whose kind went out of quota on this host before it stopped, with
+the reset known and far out, goes to `on_quota` as under
+Stuck causes; without `--stuck-act` the would-be handoff is a tell, deduped like every tell.
+Any other never-started agent (`handoff_min` minutes since its successful spawn
 without reaching `working`) is a tell to the lead, never a handoff. An agent
 that worked, is `working` or `done`, or whose task closed is never handed off; a replacement
 request that failed does not block a retry.
