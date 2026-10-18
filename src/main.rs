@@ -1098,7 +1098,6 @@ async fn main() -> Result<()> {
             let d = spawn::decide(
                 &cfg,
                 &issue,
-                scope.as_deref().unwrap_or(""),
                 &spawn::Overrides {
                     profile: profile.as_deref(),
                     host: host.as_deref(),
@@ -1169,6 +1168,10 @@ async fn main() -> Result<()> {
                 print!("{brief}");
                 return Ok(());
             }
+            println!(
+                "spawn {repo}#{} → {} ({}) on {} as {name} · {}",
+                issue.number, d.profile, prof.kind, d.host, d.why
+            );
             let me = me.map_err(|e| anyhow::anyhow!("{e:#}"))?;
             let req = SpawnRequested {
                 name,
