@@ -19,7 +19,7 @@ use crate::client::{Client, Refused, Sent};
 use crate::event::*;
 use crate::scan;
 use crate::state::State;
-use crate::store::Store;
+use crate::store::{Store, UnknownCursor};
 
 /// herdr socket protocol this build understands.
 pub const HERDR_PROTOCOL: u64 = 22;
@@ -100,10 +100,22 @@ struct Local {
     epoch: u64,
 }
 
+/// One consistent read of the replica: `state` is the fold of `events`, both frozen at the
+/// same instant. The per-tick loops share snapshots through `Host::view` instead of each
+/// re-reading and re-folding the whole log.
+#[derive(Clone, Default)]
+pub(crate) struct View {
+    /// The log through `state.last`, in arrival order.
+    pub(crate) events: Vec<Event>,
+    pub(crate) state: State,
+}
+
 pub(crate) struct Host {
     pub(crate) cfg: Config,
     pub(crate) client: Client,
     pub(crate) replica: Mutex<Store>,
+    /// `view()`'s latest snapshot; swapped only when the log grew.
+    view: Mutex<Arc<View>>,
     /// herdr pane id → the agent in it.
     panes: Mutex<HashMap<String, Local>>,
     next_epoch: AtomicU64,
@@ -168,6 +180,7 @@ impl Host {
             cfg,
             client,
             replica: Mutex::new(replica),
+            view: Mutex::default(),
             panes: Mutex::default(),
             next_epoch: AtomicU64::new(1),
             wake: Notify::new(),
@@ -175,6 +188,35 @@ impl Host {
             started: Instant::now(),
             n: Counters::default(),
         }
+    }
+
+    /// The replica as one (events, state) snapshot. The first call folds the whole log; each
+    /// later call reads only the rows that arrived since — the loops never scan the table again.
+    pub(crate) fn view(&self) -> Result<Arc<View>> {
+        let mut cur = self.view.lock().unwrap();
+        let last = cur.events.last().map(|e| e.id.clone());
+        let new = {
+            let replica = self.replica.lock().unwrap();
+            match replica.after(last.as_deref(), usize::MAX >> 1) {
+                Ok(new) => new,
+                // The replica was replaced under this connection: fold its new log from scratch.
+                Err(err) if err.downcast_ref::<UnknownCursor>().is_some() => {
+                    *cur = Arc::new(View::default());
+                    replica.all()?
+                }
+                Err(err) => return Err(err),
+            }
+        };
+        if new.is_empty() {
+            return Ok(cur.clone());
+        }
+        let mut next = (**cur).clone();
+        for e in new {
+            next.state.apply(&e);
+            next.events.push(e);
+        }
+        *cur = Arc::new(next);
+        Ok(cur.clone())
     }
 
     fn stats(&self) -> HostStats {
@@ -312,7 +354,7 @@ impl Host {
         // The hub's view, not the replica's: at start the replica may not have synced yet.
         let known = match self.client.state().await {
             Ok(s) => s,
-            Err(_) => State::fold(&self.replica.lock().unwrap().all()?),
+            Err(_) => self.view()?.state.clone(),
         };
         let live: Vec<String> = self
             .panes
@@ -677,8 +719,8 @@ impl Host {
             .await;
         }
         prev.retain(|a, _| sampled.contains(a));
-        // ponytail: refolds the replica per scan, like delivery; share one live State if it grows.
-        let state = State::fold(&self.replica.lock().unwrap().all()?);
+        let view = self.view()?;
+        let state = &view.state;
         let known = &state.worktrees;
         let mine = |w: &&crate::state::Worktree| w.state.host == self.cfg.host;
         repos.extend(known.values().filter(mine).map(|w| w.state.repo.clone()));
@@ -918,14 +960,14 @@ impl Host {
                 _ = self.wake.notified() => {}
                 _ = tokio::time::sleep(Duration::from_secs(10)) => {}
             }
-            // ponytail: refolds the whole replica per wake; keep a live State here once the log is large.
-            let pending = match self.replica.lock().unwrap().all() {
-                Ok(events) => State::fold(&events).msgs,
+            let view = match self.view() {
+                Ok(view) => view,
                 Err(err) => {
                     eprintln!("agent-fleet host: replica: {err}");
                     continue;
                 }
             };
+            let pending = &view.state.msgs;
             tried.retain(|id, _| pending.contains_key(id));
             attempts.retain(|id, _| pending.contains_key(id));
             waiting.retain(|id| pending.contains_key(id));
@@ -948,20 +990,13 @@ impl Host {
                     continue;
                 }
                 if tried
-                    .get(&id)
+                    .get(id)
                     .is_some_and(|t| t.elapsed() < Duration::from_secs(60))
                 {
                     continue;
                 }
                 tried.insert(id.clone(), Instant::now());
-                let text = doorbell(
-                    &msg.from,
-                    &msg.to,
-                    &msg.kind,
-                    &msg.reference,
-                    &msg.text,
-                    &id,
-                );
+                let text = doorbell(&msg.from, &msg.to, &msg.kind, &msg.reference, &msg.text, id);
                 let params = json!({ "target": pane, "text": text, "wait": { "until": ["working"], "timeout_ms": 20000 } });
                 let attempt = attempts.entry(id.clone()).or_default();
                 *attempt += 1;
@@ -977,7 +1012,7 @@ impl Host {
                             attempts: Some(attempt),
                         };
                         if self
-                            .publish(self.presence(Known::MsgDelivered(delivered)).re(&id))
+                            .publish(self.presence(Known::MsgDelivered(delivered)).re(id))
                             .await
                         {
                             eprintln!("agent-fleet host: delivered {id} to {}", msg.to);
@@ -1284,6 +1319,58 @@ mod tests {
         );
         host.agent_down("w:2", "pane closed").await;
         assert!(types(&host).contains(&"agent.down".to_string()));
+    }
+
+    /// `view` folds the log once, then only applies what arrived: a quiet log hands back the
+    /// same snapshot rather than re-reading and re-folding every row.
+    #[test]
+    fn the_view_is_kept_live_not_refolded() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            host: "h".into(),
+            session: "s".into(),
+            herdr_socket: dir.path().join("none.sock"),
+            replica: dir.path().join("replica.db"),
+            data_dir: dir.path().to_path_buf(),
+            repos: Vec::new(),
+            checkouts: Default::default(),
+            locks: Vec::new(),
+            stall_min: 15,
+            stuck_act: false,
+        };
+        let host = Host::new(
+            cfg,
+            Client::new(
+                "http://127.0.0.1:1",
+                "t".into(),
+                dir.path().join("spool.jsonl"),
+            ),
+            Store::open(&dir.path().join("replica.db")).unwrap(),
+        );
+        let first = host.view().unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &host.view().unwrap()),
+            "nothing new: the same snapshot, no re-read"
+        );
+        let e = Envelope::new(
+            Actor {
+                kind: ActorKind::Agent,
+                id: "agent:h/s/a".into(),
+            },
+            "p",
+            Known::TaskCreated(TaskCreated {
+                title: "t".into(),
+                url: None,
+            }),
+        )
+        .task("task:p/1")
+        .into_event();
+        host.replica.lock().unwrap().append(&e).unwrap();
+        let grown = host.view().unwrap();
+        assert!(!Arc::ptr_eq(&first, &grown));
+        assert_eq!(grown.events.last().map(|e| &e.id), Some(&e.id));
+        assert_eq!(grown.state, State::fold(&grown.events));
+        assert!(Arc::ptr_eq(&grown, &host.view().unwrap()));
     }
 
     #[tokio::test]

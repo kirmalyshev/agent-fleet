@@ -1694,17 +1694,17 @@ pub async fn spawn_loop(host: Arc<Host>) {
     let mut stuck_seen = crate::stuck::Seen::default();
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let events = match host.replica.lock().unwrap().all() {
-            Ok(e) => e,
+        let view = match host.view() {
+            Ok(v) => v,
             Err(err) => {
                 eprintln!("agent-fleet host: replica: {err}");
                 continue;
             }
         };
-        let state = State::fold(&events);
+        let (state, events) = (&view.state, &view.events);
         seen.retain(|id| state.spawns.get(id).is_some_and(|s| s.result.is_none()));
         let (expired, todo) = select(
-            &state,
+            state,
             &host.cfg.host,
             &host.cfg.session,
             &mut seen,
@@ -1731,11 +1731,11 @@ pub async fn spawn_loop(host: Arc<Host>) {
         }
         for id in todo {
             if let Some(sp) = state.spawns.get(&id) {
-                execute(&host, &id, sp, &state).await;
+                execute(&host, &id, sp, state).await;
             }
         }
-        handoffs(&host, &state, &events, &mut handed, &mut warned).await;
-        stuck(&host, &state, &events, &mut stuck_seen, &handed).await;
+        handoffs(&host, state, events, &mut handed, &mut warned).await;
+        stuck(&host, state, events, &mut stuck_seen, &handed).await;
     }
 }
 

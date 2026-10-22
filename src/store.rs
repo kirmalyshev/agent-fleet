@@ -78,6 +78,11 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// `after`'s tail and `seq_of`'s cursor lookup are the reads the host's per-tick loops
+    /// poll for the log's whole life; a test pins their query plans to index searches.
+    const TAIL_SQL: &str = "SELECT json FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2";
+    const CURSOR_SQL: &str = "SELECT seq FROM events WHERE id = ?1";
+
     /// Every event with the time it reached this store (unix ms; `None` for rows older than
     /// the column).
     pub fn all_with_arrival(&self) -> Result<Vec<(Event, Option<i64>)>> {
@@ -116,9 +121,7 @@ impl Store {
                 None => return Err(UnknownCursor(id.to_string()).into()),
             },
         };
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT json FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2")?;
+        let mut stmt = self.conn.prepare_cached(Self::TAIL_SQL)?;
         let rows = stmt.query_map(params![from, limit as i64], |r| r.get::<_, String>(0))?;
         rows.map(|json| Ok(serde_json::from_str(&json?)?)).collect()
     }
@@ -151,7 +154,7 @@ impl Store {
     fn seq_of(&self, id: &str) -> Result<Option<i64>> {
         Ok(self
             .conn
-            .query_row("SELECT seq FROM events WHERE id = ?1", [id], |r| r.get(0))
+            .query_row(Self::CURSOR_SQL, [id], |r| r.get(0))
             .optional()?)
     }
 }
@@ -233,6 +236,32 @@ mod tests {
         let rows = s.all_with_arrival().unwrap();
         assert!(rows[0].1.is_some());
         assert!(Store::open(&db).is_ok(), "the column is added once");
+    }
+
+    /// The host's per-tick replica reads are `after`'s tail and the `seq_of` lookup behind
+    /// its cursor: both must stay indexed SEARCHes — a SCAN of the events table here is the
+    /// re-read-the-whole-log regression.
+    #[test]
+    fn the_tail_read_never_scans_events() {
+        let s = Store::memory().unwrap();
+        s.append(&ev(1)).unwrap();
+        for (sql, args) in [
+            (Store::TAIL_SQL, params![0, i64::MAX]),
+            (Store::CURSOR_SQL, params![""]),
+        ] {
+            let detail: Vec<String> = s
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(args, |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            assert!(
+                detail.iter().all(|d| !d.starts_with("SCAN events")),
+                "{sql}: {detail:?}"
+            );
+        }
     }
 
     #[test]
