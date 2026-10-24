@@ -130,6 +130,27 @@ details[open] > summary .chev { transform: rotate(90deg); }
 .leaf.none { color: var(--text-3); font-size: var(--fs-meta); grid-template-columns: 16px 1fr; }
 .quiet > summary .row { color: var(--text-3); }
 
+/* kanban */
+.kanban { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; align-items: start; }
+.kcol { background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px; min-width: 0; }
+.kcol > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 6px; padding: 8px 10px; font-weight: 600; font-size: var(--fs-ui); }
+.kcol > summary::-webkit-details-marker { display: none; }
+.kcol > summary .n { color: var(--text-3); font-size: var(--fs-meta); font-weight: 500; font-variant-numeric: tabular-nums; }
+.kcol > summary .chev { margin-left: auto; }
+.col-you > summary { color: var(--warn); } .col-blocked > summary { color: var(--bad); } .col-working > summary { color: var(--ok); }
+.kcards { display: grid; gap: 8px; padding: 0 8px 8px; }
+.kcard { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 8px 10px; display: grid; gap: 3px; min-width: 0; }
+.kc-top { display: flex; gap: 6px; align-items: center; min-width: 0; }
+.kc-top .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.kc-top .meta { margin-left: auto; flex: none; color: var(--text-3); font-size: var(--fs-meta); }
+.kc-title { overflow-wrap: anywhere; }
+.kc-meta { color: var(--text-3); font-size: var(--fs-meta); overflow-wrap: anywhere; }
+.kwhy { font-size: var(--fs-meta); padding: 2px 6px; border-radius: 4px; background: var(--warn-soft); color: var(--warn); overflow: hidden; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.kwhy.blocked { background: var(--bad-soft); color: var(--bad); }
+.kempty { color: var(--line-2); padding: 0 4px 6px; text-align: center; }
+.kfoot { margin-top: 12px; color: var(--text-2); font-size: var(--fs-meta); }
+@media (max-width: 1200px) { .kanban { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+
 /* cards on doorbells / hosts */
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-bottom: 16px; }
 .cards div { background: var(--surface); padding: 12px 14px; }
@@ -167,6 +188,7 @@ h2 .dim { font-weight: 400; }
   .search input { width: 100%; }
   .live { margin-left: 0; }
   .hide-sm { display: none; }
+  .kanban { grid-template-columns: 1fr; }
   .row { grid-template-columns: 16px minmax(0, 1fr) auto; }
   .row .meta { grid-column: 2 / -1; grid-row: 2; }
   .leaf { grid-template-columns: 16px auto minmax(0, 1fr); }
@@ -183,8 +205,8 @@ h2 .dim { font-weight: 400; }
 <script>
 "use strict";
 const KEY = "agent-fleet-token";
-const TABS = ["tree", "agents", "worktrees", "tasks", "resources", "findings", "doorbells", "hosts"];
-const LABEL = { tree: "Tree", agents: "Agents", worktrees: "Worktrees", tasks: "Tasks", resources: "Resources", findings: "Findings", doorbells: "Doorbells", hosts: "Hosts" };
+const TABS = ["kanban", "tree", "agents", "worktrees", "tasks", "resources", "findings", "doorbells", "hosts"];
+const LABEL = { kanban: "Kanban", tree: "Tree", agents: "Agents", worktrees: "Worktrees", tasks: "Tasks", resources: "Resources", findings: "Findings", doorbells: "Doorbells", hosts: "Hosts" };
 const TERMINAL = ["completed", "failed", "canceled"];
 const openState = {};
 let token = null, data = null, stats = null, tab = "tree", filter = "", err = null, loadedAt = 0, statsAt = 0;
@@ -260,6 +282,7 @@ function findingBadges(ix, subj) {
   for (const f of ix.flags[subj] || []) (by[f.kind] = by[f.kind] || []).push(f.detail);
   return Object.entries(by).map(([kind, ds]) => badge("k-" + kind, ds.length > 1 ? `${kind} ×${ds.length}` : kind, ds.join("\n"))).join("");
 }
+const stuckBadge = id => { const x = data.state.stuck?.[id]; return x ? " " + badge("b-warn", x.cause, x.detail) : ""; };
 const usage = u => u?.cpu_pct != null ? `${u.cpu_pct}% · ${mb(u.rss_kb)}` : "";
 
 /* ---------- tree ---------- */
@@ -272,7 +295,6 @@ function treeTab(s) {
     return `<div class="row leaf task">${st(t.state)}<span class="mono">${esc(id.replace(/^task:/, ""))}</span><span class="title">${title}</span>
       <span class="right">${bs.map(b => badge("b-bad", "blocked", b.what + (b.unblocks_when ? " · until " + b.unblocks_when : ""))).join("")}<span class="meta num">${ago(t.since)}</span></span></div>`;
   };
-  const stuckBadge = id => { const st2 = s.stuck?.[id]; return st2 ? " " + badge("b-warn", st2.cause, st2.detail) : ""; };
   const agentLeaf = id => {
     const a = s.agents[id], ts = ix.tasksOf[id] || [];
     return `<div class="row leaf"><span></span>${st(a.state)}${stuckBadge(id)}<span class="who">${esc(short(id))}</span>
@@ -343,6 +365,75 @@ function treeTab(s) {
   const all = repoNodes.join("") + looseNode + taskNode;
   return all ? `<div class="panel tree">${all}</div>`
     : empty(filter ? "Nothing matches the filter" : "No worktrees reported yet", filter ? "Clear the filter to see the whole fleet." : "Each host agent scans its repositories every 5 minutes; the tree fills in after the first scan.");
+}
+
+/* ---------- kanban ---------- */
+const COLS = [["you", "Waiting on you"], ["blocked", "Blocked"], ["review", "In review"], ["working", "Working"], ["queued", "Queued"], ["done", "Done, 24 h"]];
+const FOR_YOU = ["question", "permission", "waiting"];
+// One card per open task, one per agent without a task, and the tasks finished in the last day.
+// The first rule that matches picks the column: [column, why, in it since].
+function kanbanCards(s) {
+  const ix = indexes(s), asks = {}, cards = [], tasked = new Set();
+  for (const a of Object.values(s.asks || {})) asks[a.task || a.by] ??= a;
+  const why = (id, task) => {
+    const a = id && s.agents[id], stuck = id && s.stuck?.[id], sig = id && s.signals?.[id], t = task?.[1];
+    const ask = (task && asks[task[0]]) || (id && asks[id]);
+    if (ask) return ["you", ask.question, ask.since];
+    if (sig?.signal === "question") return ["you", sig.detail || "asks a question", sig.since];
+    if (t?.state === "input-required") return ["you", "input required", t.since];
+    if (stuck && FOR_YOU.includes(stuck.cause)) return ["you", stuck.cause + (stuck.detail ? ": " + stuck.detail : ""), stuck.since];
+    const bs = task ? ix.blockers[task[0]] || [] : [];
+    if (bs.length) return ["blocked", bs[0].what, bs[0].since];
+    const deps = t ? t.blocked_by.filter(d => s.tasks[d] && !TERMINAL.includes(s.tasks[d].state)) : [];
+    if (deps.length) return ["blocked", "waits on " + deps.map(d => d.replace(/^task:/, "")).join(", "), t.since];
+    if (stuck) return ["blocked", stuck.cause + (stuck.detail ? ": " + stuck.detail : ""), stuck.since];
+    if (a?.state === "blocked") return ["blocked", "blocked", a.since];
+    if (/\/pull\/\d+/.test(t?.url || "")) return ["review", "", t.since];
+    if (a?.state === "working") return ["working", "", a.since];
+    return [task ? "queued" : "idle", "", t ? t.since : a.since];
+  };
+  for (const [id, t] of Object.entries(s.tasks)) {
+    if (TERMINAL.includes(t.state)) {
+      if (Date.now() - Date.parse(t.since) < 864e5) cards.push({ col: "done", id, t, who: t.owner, since: t.since });
+      continue;
+    }
+    const owner = s.agents[t.owner] ? t.owner : null;
+    if (owner) tasked.add(owner);
+    const [col, reason, since] = why(owner, [id, t]);
+    cards.push({ col, id, t, who: t.owner, reason, since });
+  }
+  for (const id of Object.keys(s.agents)) if (!tasked.has(id)) {
+    const [col, reason, since] = why(id, null);
+    cards.push({ col, agent: id, who: id, reason, since });
+  }
+  return cards;
+}
+
+function kanbanCard(c) {
+  const s = data.state, a = s.agents[c.who], lead = c.t?.lead || s.roles?.[c.who]?.lead;
+  const name = c.t ? c.id.replace(/^task:/, "") : short(c.agent);
+  const head = c.t?.url ? `<a class="mono" href="${esc(c.t.url)}" target="_blank" rel="noopener">${esc(name)}</a>` : `<span class="mono">${esc(name)}</span>`;
+  const title = !c.t ? `<span class="dim">no task</span>` : c.t.title !== c.id ? esc(c.t.title) : "";
+  const who = c.t ? (c.who ? esc(short(c.who)) + (a ? " · " + esc(a.host) : " · gone") : "no owner") : esc(a.host);
+  const meta = [who, lead ? "lead " + esc(short(lead)) : ""].filter(Boolean).join(" · ");
+  const end = c.col === "done" && c.t.state !== "completed" ? badge("b-bad", c.t.state) : "";
+  return `<article class="kcard"><div class="kc-top">${head}${end}<span class="meta num" title="in this column">${ago(c.since)}</span></div>
+    ${title ? `<div class="kc-title">${title}</div>` : ""}<div class="kc-meta">${meta}</div>
+    ${c.reason ? `<div class="kwhy ${c.col}" title="${esc(c.reason)}">${esc(c.reason)}</div>` : ""}</article>`;
+}
+
+function kanbanTab(s) {
+  const all = kanbanCards(s).filter(c => match(c.id, c.t?.title, c.who, c.reason, s.agents[c.who]?.host));
+  const by = col => all.filter(c => c.col === col).sort((x, y) => Date.parse(x.since) - Date.parse(y.since));
+  const cols = COLS.map(([col, label]) => {
+    const cs = col === "done" ? by(col).reverse() : by(col);
+    return `<details class="kcol col-${col}" ${det("k:" + col, col !== "done")}><summary><span>${esc(label)}</span><span class="n">${cs.length}</span>${ICON.chev}</summary>
+      <div class="kcards">${cs.map(kanbanCard).join("") || `<div class="kempty">–</div>`}</div></details>`;
+  });
+  const idle = by("idle");
+  const foot = idle.length ? `<div class="kfoot">Idle, no task: ${idle.map(c => `<span class="mono" title="${esc(s.agents[c.who].host)} · ${esc(s.agents[c.who].state)} for ${ago(c.since)}">${esc(short(c.who))}</span>`).join(", ")}</div>` : "";
+  if (!all.length) return empty(filter ? "Nothing matches the filter" : "No tasks and no agents", filter ? "Clear the filter to see the whole fleet." : "Tasks appear when agents run agent-fleet task add; agents as soon as a host agent sees them.");
+  return `<div class="kanban">${cols.join("")}</div>${foot}`;
 }
 
 /* ---------- tables ---------- */
@@ -482,7 +573,7 @@ function render() {
   const open = Object.values(s.tasks).filter(t => !TERMINAL.includes(t.state)).length;
   const undelivered = Object.keys(s.msgs).length;
   const n = {
-    tree: new Set(Object.values(s.worktrees).map(w => w.state.host + ":" + w.state.repo)).size, agents: a.length,
+    kanban: kanbanCards(s).filter(c => c.col !== "done").length, tree: new Set(Object.values(s.worktrees).map(w => w.state.host + ":" + w.state.repo)).size, agents: a.length,
     worktrees: Object.keys(s.worktrees).length, tasks: open, resources: Object.values(s.resources).filter(r => r.holder).length, findings: data.findings.length, doorbells: undelivered, hosts: Object.keys(s.hosts).length,
   };
   const statsBar = [
@@ -506,7 +597,7 @@ function render() {
   for (const w of waits) alerts.unshift(
     `<div class="banner warn">${ICON.alert}<div><b>waiting for the principal</b> · <span class="mono">${esc(short(w.who))}</span>, ${ago(w.since)}<div class="sub">${esc(w.text)}</div></div></div>`);
   if (err) alerts.unshift(`<div class="banner warn">${ICON.alert}<div><b>Showing data from ${ago(new Date(loadedAt).toISOString())} ago.</b><div class="sub">${esc(err)} Retrying every 3 seconds.</div></div></div>`);
-  const body = { tree: treeTab, agents: agentsTab, worktrees: worktreesTab, tasks: tasksTab, resources: resourcesTab, findings: findingsTab, doorbells: doorbellsTab, hosts: hostsTab }[tab](s);
+  const body = { kanban: kanbanTab, tree: treeTab, agents: agentsTab, worktrees: worktreesTab, tasks: tasksTab, resources: resourcesTab, findings: findingsTab, doorbells: doorbellsTab, hosts: hostsTab }[tab](s);
   app.innerHTML = shell(n, statsBar, body, alerts);
   bind(focused, caret);
 }
