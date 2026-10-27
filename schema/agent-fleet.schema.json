@@ -340,6 +340,36 @@
           ],
           "type": "object"
         },
+        "AskAnswered": {
+          "additionalProperties": false,
+          "description": "An operator's answer to the `ask.raised` named by `re`, given on the board. The answer reaches\nthe asker as the `msg.sent` named by `msg`, written in the same step.",
+          "properties": {
+            "answer": {
+              "description": "A chosen option or free text.",
+              "type": "string"
+            },
+            "approve": {
+              "description": "An approval, not just an answer. Never implied by choosing an option.",
+              "type": "boolean"
+            },
+            "approves": {
+              "description": "For an approval: the exact question text the approval applies to.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "msg": {
+              "description": "The `msg.sent` that carries the answer to the asker.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "answer",
+            "msg"
+          ],
+          "type": "object"
+        },
         "AskRaised": {
           "additionalProperties": false,
           "properties": {
@@ -1588,6 +1618,22 @@
         {
           "properties": {
             "data": {
+              "$ref": "#/$defs/AskAnswered"
+            },
+            "type": {
+              "const": "ask.answered",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
               "$ref": "#/$defs/MsgSent"
             },
             "type": {
@@ -1823,6 +1869,51 @@
           ],
           "type": "string"
         },
+        "Answered": {
+          "description": "An ask the operator answered on the board, and how far the answer got.",
+          "properties": {
+            "acked": {
+              "description": "When the host saw the asker take the message; `None` while it is only sent.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "answer": {
+              "type": "string"
+            },
+            "approve": {
+              "type": "boolean"
+            },
+            "approves": {
+              "description": "For an approval: the exact question text it applies to.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ask": {
+              "$ref": "#/$defs/Ask"
+            },
+            "at": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "msg": {
+              "description": "The `msg.sent` that carries the answer to the asker.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "ask",
+            "answer",
+            "approve",
+            "msg",
+            "at"
+          ],
+          "type": "object"
+        },
         "Ask": {
           "properties": {
             "by": {
@@ -1839,6 +1930,10 @@
                 "type": "string"
               },
               "type": "array"
+            },
+            "project": {
+              "default": "",
+              "type": "string"
             },
             "question": {
               "type": "string"
@@ -2822,6 +2917,14 @@
           "additionalProperties": {
             "$ref": "#/$defs/Agent"
           },
+          "type": "object"
+        },
+        "answers": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Answered"
+          },
+          "default": {},
+          "description": "Asks answered on the board, by the id of their `ask.raised`; kept for 24 h after the ack.",
           "type": "object"
         },
         "asks": {

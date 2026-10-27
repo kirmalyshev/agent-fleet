@@ -147,6 +147,20 @@ details[open] > summary .chev { transform: rotate(90deg); }
 .kc-meta { color: var(--text-3); font-size: var(--fs-meta); overflow-wrap: anywhere; }
 .kwhy { font-size: var(--fs-meta); padding: 2px 6px; border-radius: 4px; background: var(--warn-soft); color: var(--warn); overflow: hidden; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .kwhy.blocked { background: var(--bad-soft); color: var(--bad); }
+.inbox { display: grid; gap: 10px; max-width: 760px; }
+.icard { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 10px 12px; display: grid; gap: 8px; }
+.icard.sent { opacity: .75; }
+.ic-q { white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--fs-ui); }
+.ic-opts, .ic-reply { display: flex; gap: 6px; flex-wrap: wrap; align-items: flex-start; }
+.ic-opts button, .ic-reply .send { height: 30px; padding: 0 12px; border: 1px solid var(--line-2); border-radius: var(--r); background: var(--surface-2); cursor: pointer; }
+.ic-opts button:hover, .ic-reply .send:hover { background: var(--hover); }
+.ic-opts button.rec { border-color: var(--accent); }
+.ic-reply textarea { flex: 1 1 260px; min-height: 34px; padding: 6px 10px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface-2); color: var(--text); font: inherit; resize: vertical; }
+.ic-reply textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.ic-approve { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; border-top: 1px solid var(--line); padding-top: 8px; }
+.ic-approve .approve { height: 30px; padding: 0 12px; border: 1px solid var(--ok); border-radius: var(--r); background: var(--ok-soft); color: var(--ok); font-weight: 600; cursor: pointer; }
+.ic-approve .approve.go { background: var(--ok); color: #fff; }
+.ic-err { color: var(--bad); font-size: var(--fs-meta); }
 .kempty { color: var(--line-2); padding: 0 4px 6px; text-align: center; }
 .kfoot { margin-top: 12px; color: var(--text-2); font-size: var(--fs-meta); }
 @media (max-width: 1200px) { .kanban { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
@@ -205,8 +219,8 @@ h2 .dim { font-weight: 400; }
 <script>
 "use strict";
 const KEY = "agent-fleet-token";
-const TABS = ["kanban", "tree", "agents", "worktrees", "tasks", "resources", "findings", "doorbells", "hosts"];
-const LABEL = { kanban: "Kanban", tree: "Tree", agents: "Agents", worktrees: "Worktrees", tasks: "Tasks", resources: "Resources", findings: "Findings", doorbells: "Doorbells", hosts: "Hosts" };
+const TABS = ["inbox", "kanban", "tree", "agents", "worktrees", "tasks", "resources", "findings", "doorbells", "hosts"];
+const LABEL = { inbox: "Inbox", kanban: "Kanban", tree: "Tree", agents: "Agents", worktrees: "Worktrees", tasks: "Tasks", resources: "Resources", findings: "Findings", doorbells: "Doorbells", hosts: "Hosts" };
 const TERMINAL = ["completed", "failed", "canceled"];
 const openState = {};
 let token = null, data = null, stats = null, tab = "tree", filter = "", err = null, loadedAt = 0, statsAt = 0;
@@ -422,6 +436,63 @@ function kanbanCard(c) {
     ${c.reason ? `<div class="kwhy ${c.col}" title="${esc(c.reason)}">${esc(c.reason)}</div>` : ""}</article>`;
 }
 
+// Inbox: questions from leads and the root coordinator. The hub filters by level; the page only
+// sends the answer. Drafts live outside the DOM because the page redraws every few seconds.
+const drafts = {}, sending = {}, confirming = {};
+let inboxErr = null;
+const OPEN_ACKED_MS = 10 * 60 * 1000;
+function inboxItems() {
+  const items = (data.inbox || []).filter(i => match(i.ask.by, i.ask.question, i.ask.task));
+  const live = items.filter(i => !i.answer);
+  const sent = items.filter(i => i.answer && (!i.answer.acked || Date.now() - Date.parse(i.answer.acked) < OPEN_ACKED_MS));
+  return { live, sent };
+}
+function inboxCard(i) {
+  const a = i.ask, id = esc(i.id), url = /^https?:\/\//.test(a.context || "");
+  const head = `<div class="kc-top"><span class="mono" title="${esc(a.by)}">${esc(short(a.by))}</span>${badge("b-dim", i.level)}${a.task ? `<span class="mono dim">${esc(a.task.replace(/^task:/, ""))}</span>` : ""}<span class="meta num" title="asked">${ago(a.since)}</span></div>
+    <div class="ic-q">${esc(a.question)}</div>${a.context ? `<div class="kc-meta">${url ? `<a href="${esc(a.context)}" target="_blank" rel="noopener">${esc(a.context)}</a>` : esc(a.context)}</div>` : ""}`;
+  if (i.answer) {
+    const r = i.answer;
+    return `<article class="icard sent">${head}<div class="kc-meta">${r.approve ? "Approved" : "Answered"}: <b>${esc(r.answer)}</b> ${badge(r.acked ? "b-ok" : "b-warn", r.acked ? "acked" : "sent", r.acked ? "the agent took it" : "waiting for the agent to read it")}</div></article>`;
+  }
+  const busy = sending[i.id] ? " disabled" : "";
+  const opts = (a.options || []).map(o => `<button data-opt="${id}" data-ans="${esc(o)}" class="${o === a.recommendation ? "rec" : ""}"${busy}${o === a.recommendation ? ' title="recommended"' : ""}>${esc(o)}</button>`).join("");
+  const approve = confirming[i.id]
+    ? `<span class="kc-meta">Approve exactly: “${esc(a.question)}”</span><button class="approve go" data-approve-go="${id}"${busy}>Confirm approval</button><button class="linkbtn" data-approve-no="${id}">Cancel</button>`
+    : `<button class="approve" data-approve="${id}"${busy}>Approve…</button>`;
+  return `<article class="icard">${head}
+    ${opts ? `<div class="ic-opts">${opts}</div>` : ""}
+    <div class="ic-reply"><textarea data-draft="${id}" rows="1" placeholder="Reply" aria-label="Reply">${esc(drafts[i.id] || "")}</textarea><button class="send" data-send="${id}"${busy}>Send</button></div>
+    <div class="ic-approve">${approve}</div></article>`;
+}
+function inboxTab() {
+  const { live, sent } = inboxItems();
+  live.sort((x, y) => Date.parse(x.ask.since) - Date.parse(y.ask.since));
+  const err1 = inboxErr ? `<div class="ic-err">${esc(inboxErr)}</div>` : "";
+  if (!live.length && !sent.length) return empty("Nothing is waiting for you", "Questions from domain leads, implementation leads and the root coordinator (agent-fleet ask) show up here. Implementers go through their lead.");
+  return `<div class="inbox">${err1}${live.map(inboxCard).join("")}${sent.length ? `<div class="kc-meta">Answered</div>${sent.map(inboxCard).join("")}` : ""}</div>`;
+}
+async function sendAnswer(ask, answer, approve) {
+  if (sending[ask]) return;
+  sending[ask] = true; inboxErr = null; render();
+  try {
+    const r = await fetch("/board/answer", { method: "POST", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" }, body: JSON.stringify({ ask, answer, approve }) });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `The hub answered ${r.status}.`);
+    delete drafts[ask]; delete confirming[ask];
+    await refresh();
+  } catch (e) { inboxErr = e.message; }
+  finally { delete sending[ask]; render(); }
+}
+function bindInbox(app) {
+  const on = (sel, f) => app.querySelectorAll(sel).forEach(el => el.onclick = () => f(el));
+  on("[data-opt]", b => sendAnswer(b.dataset.opt, b.dataset.ans, false));
+  on("[data-send]", b => { const t = (drafts[b.dataset.send] || "").trim(); if (t) sendAnswer(b.dataset.send, t, false); });
+  on("[data-approve]", b => { confirming[b.dataset.approve] = true; render(); });
+  on("[data-approve-no]", b => { delete confirming[b.dataset.approveNo]; render(); });
+  on("[data-approve-go]", b => sendAnswer(b.dataset.approveGo, (drafts[b.dataset.approveGo] || "").trim() || "approved", true));
+  app.querySelectorAll("textarea[data-draft]").forEach(t => t.oninput = () => { drafts[t.dataset.draft] = t.value; });
+}
+
 function kanbanTab(s) {
   const all = kanbanCards(s).filter(c => match(c.id, c.t?.title, c.who, c.reason, s.agents[c.who]?.host));
   const by = col => all.filter(c => c.col === col).sort((x, y) => Date.parse(x.since) - Date.parse(y.since));
@@ -561,6 +632,7 @@ function gate() {
 function render() {
   const app = document.getElementById("app");
   if (!token) { app.innerHTML = gate(); bindGate(); return; }
+  const draftId = document.activeElement?.dataset?.draft, draftAt = draftId ? document.activeElement.selectionStart : 0;
   const focused = document.activeElement?.id === "q";
   const caret = focused ? document.activeElement.selectionStart : null;
   if (!data) {
@@ -573,10 +645,11 @@ function render() {
   const open = Object.values(s.tasks).filter(t => !TERMINAL.includes(t.state)).length;
   const undelivered = Object.keys(s.msgs).length;
   const n = {
-    kanban: kanbanCards(s).filter(c => c.col !== "done").length, tree: new Set(Object.values(s.worktrees).map(w => w.state.host + ":" + w.state.repo)).size, agents: a.length,
+    inbox: inboxItems().live.length, kanban: kanbanCards(s).filter(c => c.col !== "done").length, tree: new Set(Object.values(s.worktrees).map(w => w.state.host + ":" + w.state.repo)).size, agents: a.length,
     worktrees: Object.keys(s.worktrees).length, tasks: open, resources: Object.values(s.resources).filter(r => r.holder).length, findings: data.findings.length, doorbells: undelivered, hosts: Object.keys(s.hosts).length,
   };
   const statsBar = [
+    inboxItems().live.length ? ["inbox", `<b>${inboxItems().live.length}</b> to answer`, "warn"] : null,
     ["agents", `<b>${a.length}</b> agents`, ""],
     ["agents", `<b>${count("working")}</b> working`, count("working") ? "ok" : ""],
     ["agents", `<b>${count("idle") + count("done")}</b> idle`, ""],
@@ -597,9 +670,13 @@ function render() {
   for (const w of waits) alerts.unshift(
     `<div class="banner warn">${ICON.alert}<div><b>waiting for the principal</b> · <span class="mono">${esc(short(w.who))}</span>, ${ago(w.since)}<div class="sub">${esc(w.text)}</div></div></div>`);
   if (err) alerts.unshift(`<div class="banner warn">${ICON.alert}<div><b>Showing data from ${ago(new Date(loadedAt).toISOString())} ago.</b><div class="sub">${esc(err)} Retrying every 3 seconds.</div></div></div>`);
-  const body = { kanban: kanbanTab, tree: treeTab, agents: agentsTab, worktrees: worktreesTab, tasks: tasksTab, resources: resourcesTab, findings: findingsTab, doorbells: doorbellsTab, hosts: hostsTab }[tab](s);
+  const body = { inbox: inboxTab, kanban: kanbanTab, tree: treeTab, agents: agentsTab, worktrees: worktreesTab, tasks: tasksTab, resources: resourcesTab, findings: findingsTab, doorbells: doorbellsTab, hosts: hostsTab }[tab](s);
   app.innerHTML = shell(n, statsBar, body, alerts);
   bind(focused, caret);
+  if (draftId) {
+    const t = [...app.querySelectorAll("textarea[data-draft]")].find(x => x.dataset.draft === draftId);
+    if (t) { t.focus(); t.setSelectionRange(draftAt, draftAt); }
+  }
 }
 
 function shell(n, statsBar, body, alerts) {
@@ -620,6 +697,7 @@ function bind(focused, caret) {
   app.querySelectorAll("[data-tab]").forEach(b => b.onclick = () => { tab = b.dataset.tab; try { localStorage.setItem(KEY + "-tab", tab); } catch (_) {} render(); });
   app.querySelectorAll("details[data-k]").forEach(d => d.ontoggle = () => { openState[d.dataset.k] = d.open; });
   const q = document.getElementById("q");
+  bindInbox(app);
   q.oninput = () => { filter = q.value.trim().toLowerCase(); render(); };
   if (focused) { q.focus(); q.setSelectionRange(caret ?? q.value.length, caret ?? q.value.length); }
   document.getElementById("out").onclick = () => { token = null; data = null; try { localStorage.removeItem(KEY); } catch (_) {} render(); };

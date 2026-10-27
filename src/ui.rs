@@ -681,6 +681,7 @@ mod tests {
         s.asks.insert(
             "ask1".into(),
             Ask {
+                project: "p".into(),
                 task: None,
                 by: "agent:h/s/a".into(),
                 question: "ship it?".into(),
