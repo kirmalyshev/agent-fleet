@@ -12,8 +12,8 @@ Three rules carry the design:
    be lost. So the message is an event first (`msg.sent`), and delivery is a second event
    (`msg.delivered`). A lost doorbell is visible as sent and not delivered, and it is retried.
 3. **Humans are authenticated, agents do not speak for them.** An event whose actor is a human
-   may only enter through a human-only channel. v1 has no such channel, so the hub refuses
-   `actor.kind = human` outright.
+   may only enter through a human-only channel. The one channel is the board's answer route,
+   `POST /board/answer`, behind the hub token; `POST /events` refuses `actor.kind = human` outright.
 
 ## Topology
 
@@ -93,6 +93,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `blocker.resolved` | note? | re = the raise | agent, host |
 | question | `ask.raised` | question, options[], recommendation?, context? | task | agent |
 | comms | `msg.sent` | to, kind, ref, text | | agent, host |
+| | `ask.answered` | answer, approve?, approves?, msg — **human only**, via `POST /board/answer` | re = the ask | human |
 | | `msg.delivered` | to, observed, rung?, attempts? | re = the send | host |
 | | `handoff` | to, next, done?, evidence[], learned? | task | agent |
 | spawn | `spawn.requested` | name, agent, host, session, repo, issue?, branch, profile, brief, level?, lead?, worktree?, replaces?, why | | agent, host |
@@ -100,6 +101,14 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `agent.unmanaged` | host, pid, program?, cwd?, since? — no `program` clears the report | | host |
 | | `agent.stuck` | agent, cause?, detail, until? — no `cause` clears the record | | host |
 | | `agent.signal` | agent, program, signal, detail? — `prompt`/`turn_end` clear the agent's stored signal | | agent |
+
+`ask.answered` closes an `ask.raised` from the board's Inbox. The hub writes it together with the
+`msg.sent` (kind `ANSWER`, or `APPROVED` when `approve` is true; `ref` = the ask) that rings the
+asker's doorbell, so an answer is never recorded without its message. `msg` names that send, and
+the host's `msg.delivered` for it is the ack: the Inbox item reads *sent*, then *acked*. `approve`
+is a separate, explicit act, never implied by picking an option, and `approves` holds the exact
+question text it applies to. Only asks from a `root-coordinator`, `domain-lead` or
+`implementation-lead` are in the Inbox and answerable; an implementer's lead answers for it.
 
 Task states follow the A2A task lifecycle names, so tools that know A2A read them as-is.
 
@@ -125,7 +134,9 @@ data itself, not the scan, so the views can say how stale the numbers are.
   in the envelope or in `data`, with the envelope fields the type needs, at most 64 KiB, and from
   an allowed actor kind, and with every recipient (`msg.sent.to`, `handoff.to`,
   `task.assigned.agent`, `agent.role.agent`, `agent.role.lead`) a full agent id. A malformed or oversized event is `400`; a forbidden actor (any `human`,
-  any `hub`, or a kind not in the table) is `403`. Clients apply the same rules before sending,
+  any `hub`, or a kind not in the table) is `403`. The board's `POST /board/answer`
+  (`{ask, answer, approve?}`) is `400` for an unknown ask or an empty answer, `403` for an ask
+  outside the Inbox, and `409` for one already answered. Clients apply the same rules before sending,
   so an invalid event is refused locally and never spooled.
 - **Exclusive assignment.** `task.assigned` for a task that already has an owner and is not
   finished (`completed`, `failed`, `canceled`) is `409`. The check and the append happen under
@@ -566,6 +577,6 @@ the token and the hub database elsewhere.
 
 ## Not in v1
 
-Decisions and the human channel (`ask.answered`, `decision.*`), data-defined extension types,
+Decisions (`decision.*`) and any human channel beyond the Inbox answer, data-defined extension types,
 the web board, code-host ingest, a NATS transport, `agent-fleet run`/`kill` process ownership, Windows.
 These are v2.

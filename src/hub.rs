@@ -116,7 +116,11 @@ impl Hub {
                 "{task} is already assigned to {owner}"
             )));
         }
-        let e = e.into_event();
+        self.append(e.into_event())
+    }
+
+    fn append(&mut self, e: event::Event) -> Result<Accepted, Reject> {
+        let internal = |err: anyhow::Error| Reject::Internal(err.to_string());
         self.store.append(&e).map_err(internal)?;
         self.state.apply(&e);
         let json = serde_json::to_string(&e).map_err(|err| internal(err.into()))?;
@@ -125,6 +129,66 @@ impl Hub {
             id: e.id,
             duplicate: false,
         })
+    }
+
+    /// The board's human channel: the operator answers an open Inbox question. Appends the
+    /// doorbell to the asker (`msg.sent`) and then `ask.answered` naming it, under one lock, so
+    /// the answer is never recorded without its message. `approve` makes it an approval of the
+    /// exact question text. Only an ask in the Inbox (a lead's or the coordinator's) can be answered.
+    pub fn answer(&mut self, ask: &str, answer: &str, approve: bool) -> Result<Accepted, Reject> {
+        if self.state.answers.contains_key(ask) {
+            return Err(Reject::Conflict(format!("{ask} is already answered")));
+        }
+        let Some(open) = self.state.asks.get(ask).cloned() else {
+            return Err(Reject::BadRequest(format!("no open ask {ask}")));
+        };
+        if !self.state.inbox().iter().any(|i| i.id == ask) {
+            return Err(Reject::Forbidden(format!(
+                "{} is not a lead; its lead answers for it",
+                open.by
+            )));
+        }
+        let answer = answer.trim();
+        if answer.is_empty() {
+            return Err(Reject::BadRequest("the answer is empty".into()));
+        }
+        let operator = event::Actor {
+            kind: event::ActorKind::Human,
+            id: "human:board".into(),
+        };
+        let msg = event::Envelope::new(
+            operator.clone(),
+            open.project.clone(),
+            Known::MsgSent(event::MsgSent {
+                to: open.by.clone(),
+                kind: if approve { "APPROVED" } else { "ANSWER" }.into(),
+                reference: ask.into(),
+                text: if approve {
+                    format!("{answer} (approves: {})", open.question)
+                } else {
+                    answer.into()
+                },
+            }),
+        );
+        let mut answered = event::Envelope::new(
+            operator,
+            open.project.clone(),
+            Known::AskAnswered(event::AskAnswered {
+                answer: answer.into(),
+                approve,
+                approves: approve.then(|| open.question.clone()),
+                msg: msg.id.clone(),
+            }),
+        )
+        .re(ask);
+        answered.task = open.task.clone();
+        // Through the same parser as every write, with the human channel open.
+        for e in [msg.clone(), answered.clone()] {
+            let raw = serde_json::to_value(&e).map_err(|err| Reject::Internal(err.to_string()))?;
+            event::parse_human(&raw)?;
+        }
+        self.append(msg.into_event())?;
+        self.append(answered.into_event())
     }
 }
 
@@ -159,6 +223,7 @@ pub fn router(hub: Hub, token: String) -> Router {
         .route("/state", get(get_state))
         .route("/stats", get(get_stats))
         .route("/board", get(get_board))
+        .route("/board/answer", post(post_answer))
         .route("/schema", get(|| async { Json(event::api_schema()) }))
         .layer(middleware::from_fn_with_state(Arc::new(token), auth));
     // The board page holds no data: it asks for the token and reads `/board` with it.
@@ -193,8 +258,29 @@ async fn get_board(AxState(hub): AxState<Shared>) -> Response {
         "state": s,
         "findings": crate::doctor::findings(s, now),
         "worktree_of": worktree_of,
+        "inbox": s.inbox(),
     }))
     .into_response()
+}
+
+#[derive(Deserialize)]
+struct AnswerBody {
+    ask: String,
+    answer: String,
+    #[serde(default)]
+    approve: bool,
+}
+
+/// The one way a human writes: the token holder answers an Inbox question from the board.
+async fn post_answer(AxState(hub): AxState<Shared>, Json(b): Json<AnswerBody>) -> Response {
+    let result = hub.lock().unwrap().answer(&b.ask, &b.answer, b.approve);
+    match result {
+        Ok(a) => Json(json!({ "id": a.id })).into_response(),
+        Err(Reject::BadRequest(m)) => error(StatusCode::BAD_REQUEST, &m),
+        Err(Reject::Forbidden(m)) => error(StatusCode::FORBIDDEN, &m),
+        Err(Reject::Conflict(m)) => error(StatusCode::CONFLICT, &m),
+        Err(Reject::Internal(m)) => error(StatusCode::INTERNAL_SERVER_ERROR, &m),
+    }
 }
 
 async fn auth(AxState(token): AxState<Arc<String>>, req: Request, next: Next) -> Response {
@@ -446,6 +532,161 @@ mod tests {
             .await
             .unwrap();
         assert!(board["state"]["agents"].is_object() && board["findings"].is_array());
+    }
+
+    fn agent(id: &str) -> Actor {
+        Actor {
+            kind: ActorKind::Agent,
+            id: id.into(),
+        }
+    }
+
+    /// Declares `who` at `level`, then has it raise a 3-option ask; returns the ask's id.
+    fn lead_asks(h: &mut Hub, who: &str, level: Level) -> String {
+        let role = Envelope::new(
+            agent(who),
+            "p",
+            Known::AgentRole(AgentRole {
+                agent: who.into(),
+                level: Some(level),
+                lead: None,
+                domain: None,
+            }),
+        );
+        h.submit(&serde_json::to_value(role).unwrap()).unwrap();
+        let ask = Envelope::new(
+            agent(who),
+            "p",
+            Known::AskRaised(AskRaised {
+                question: "which one?".into(),
+                options: vec!["a".into(), "b".into(), "c".into()],
+                recommendation: None,
+                context: None,
+            }),
+        )
+        .task("task:p/1");
+        let id = ask.id.clone();
+        h.submit(&serde_json::to_value(ask).unwrap()).unwrap();
+        id
+    }
+
+    #[test]
+    fn a_board_answer_reaches_the_lead_and_the_ack_flips_it() {
+        let mut h = hub();
+        let lead = "agent:h/s/lead";
+        let ask = lead_asks(&mut h, lead, Level::DomainLead);
+        assert_eq!(h.state.inbox().len(), 1);
+
+        h.answer(&ask, "b", false).unwrap();
+        assert!(h.state.asks.is_empty());
+        let (mid, m) = h.state.msgs.iter().next().expect("a doorbell is queued");
+        assert_eq!(
+            (m.to.as_str(), m.kind.as_str(), m.text.as_str()),
+            (lead, "ANSWER", "b")
+        );
+        assert_eq!(m.reference, ask);
+        assert_eq!(h.state.answers[&ask].msg, *mid);
+        assert_eq!(h.state.answers[&ask].acked, None, "sent");
+
+        let ack = Envelope::new(
+            Actor {
+                kind: ActorKind::Host,
+                id: "host:h".into(),
+            },
+            "p",
+            Known::MsgDelivered(MsgDelivered {
+                to: lead.into(),
+                observed: AgentState::Working,
+                rung: None,
+                attempts: None,
+            }),
+        )
+        .re(mid.clone());
+        h.submit(&serde_json::to_value(ack).unwrap()).unwrap();
+        assert!(h.state.answers[&ask].acked.is_some(), "acked");
+        // Both board events are in the log, with a human actor on the answer.
+        let log = h.store.after(None, 100).unwrap();
+        assert!(log.iter().any(|e| e.actor.kind == ActorKind::Human
+            && matches!(&e.body, Body::Known(Known::AskAnswered(_)))));
+    }
+
+    #[test]
+    fn approve_is_explicit_and_records_what_it_applies_to() {
+        let mut h = hub();
+        let ask = lead_asks(&mut h, "agent:h/s/lead", Level::RootCoordinator);
+        h.answer(&ask, "yes", true).unwrap();
+        let a = &h.state.answers[&ask];
+        assert!(a.approve);
+        assert_eq!(a.approves.as_deref(), Some("which one?"));
+        let m = h.state.msgs.values().next().unwrap();
+        assert_eq!(m.kind, "APPROVED");
+    }
+
+    #[test]
+    fn the_board_does_not_answer_for_implementers_or_twice() {
+        let mut h = hub();
+        let ask = lead_asks(&mut h, "agent:h/s/impl", Level::Implementer);
+        assert!(matches!(
+            h.answer(&ask, "a", false),
+            Err(Reject::Forbidden(_))
+        ));
+        assert!(h.state.msgs.is_empty() && h.state.answers.is_empty());
+
+        let ask = lead_asks(&mut h, "agent:h/s/lead", Level::ImplementationLead);
+        assert!(matches!(
+            h.answer(&ask, "  ", false),
+            Err(Reject::BadRequest(_))
+        ));
+        assert!(matches!(
+            h.answer("nope", "a", false),
+            Err(Reject::BadRequest(_))
+        ));
+        h.answer(&ask, "a", false).unwrap();
+        assert!(matches!(
+            h.answer(&ask, "b", false),
+            Err(Reject::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn answering_needs_the_token_and_the_board_shows_the_inbox() {
+        let mut h = hub();
+        let ask = lead_asks(&mut h, "agent:h/s/lead", Level::DomainLead);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = router(h, "tok".into());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = reqwest::Client::new();
+        let body = json!({ "ask": ask, "answer": "c" });
+        let anon = http
+            .post(format!("{base}/board/answer"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(anon.status(), 401);
+        let board =
+            |http: &reqwest::Client| http.get(format!("{base}/board")).bearer_auth("tok").send();
+        let b: Value = board(&http).await.unwrap().json().await.unwrap();
+        assert_eq!(b["inbox"][0]["ask"]["options"], json!(["a", "b", "c"]));
+        let ok = http
+            .post(format!("{base}/board/answer"))
+            .bearer_auth("tok")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200);
+        let b: Value = board(&http).await.unwrap().json().await.unwrap();
+        assert_eq!(b["inbox"][0]["answer"]["answer"], "c");
+        let again = http
+            .post(format!("{base}/board/answer"))
+            .bearer_auth("tok")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(again.status(), 409);
     }
 
     #[test]

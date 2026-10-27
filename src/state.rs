@@ -28,6 +28,9 @@ pub struct State {
     pub blockers: BTreeMap<String, Blocker>,
     /// Open asks by the id of their `ask.raised`.
     pub asks: BTreeMap<String, Ask>,
+    /// Asks answered on the board, by the id of their `ask.raised`; kept for 24 h after the ack.
+    #[serde(default)]
+    pub answers: BTreeMap<String, Answered>,
     /// Undelivered doorbells by the id of their `msg.sent`.
     pub msgs: BTreeMap<String, Msg>,
     /// Git worktrees by `<host>:<path>`.
@@ -217,6 +220,8 @@ pub struct Blocker {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Ask {
+    #[serde(default)]
+    pub project: String,
     pub task: Option<String>,
     pub by: String,
     pub question: String,
@@ -224,6 +229,34 @@ pub struct Ask {
     pub recommendation: Option<String>,
     pub context: Option<String>,
     pub since: DateTime<Utc>,
+}
+
+/// An ask the operator answered on the board, and how far the answer got.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Answered {
+    pub ask: Ask,
+    pub answer: String,
+    pub approve: bool,
+    /// For an approval: the exact question text it applies to.
+    pub approves: Option<String>,
+    /// The `msg.sent` that carries the answer to the asker.
+    pub msg: String,
+    pub at: DateTime<Utc>,
+    /// When the host saw the asker take the message; `None` while it is only sent.
+    pub acked: Option<DateTime<Utc>>,
+}
+
+/// How long an acked answer stays in the state, measured against later events' `ts`.
+pub const ANSWER_KEPT: chrono::Duration = chrono::Duration::hours(24);
+
+/// One Inbox row: a question from a lead or the root coordinator, open or answered.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct InboxItem {
+    /// The `ask.raised` id.
+    pub id: String,
+    pub level: Level,
+    pub ask: Ask,
+    pub answer: Option<Answered>,
 }
 
 /// An agent's current stuck record: the latest `agent.stuck` with a cause.
@@ -647,6 +680,7 @@ impl State {
                 self.asks.insert(
                     e.id.clone(),
                     Ask {
+                        project: e.project.clone(),
                         task: e.task.clone(),
                         by: e.actor.id.clone(),
                         question: d.question.clone(),
@@ -656,6 +690,24 @@ impl State {
                         since: ts,
                     },
                 );
+            }
+            Known::AskAnswered(d) => {
+                if let Some(re) = &e.re
+                    && let Some(ask) = self.asks.remove(re)
+                {
+                    self.answers.insert(
+                        re.clone(),
+                        Answered {
+                            ask,
+                            answer: d.answer.clone(),
+                            approve: d.approve,
+                            approves: d.approves.clone(),
+                            msg: d.msg.clone(),
+                            at: ts,
+                            acked: None,
+                        },
+                    );
+                }
             }
             Known::MsgSent(d) => {
                 self.msgs.insert(
@@ -673,6 +725,9 @@ impl State {
             Known::MsgDelivered(_) => {
                 if let Some(re) = &e.re {
                     self.msgs.remove(re);
+                    for a in self.answers.values_mut().filter(|a| &a.msg == re) {
+                        a.acked.get_or_insert(ts);
+                    }
                 }
             }
             Known::Handoff(_) => {
@@ -724,6 +779,8 @@ impl State {
                 }
             }
         }
+        self.answers
+            .retain(|_, a| e.ts - a.acked.unwrap_or(a.at) <= ANSWER_KEPT);
         // The reducer has no clock: a spawn is pruned once a later event's `ts` is more than
         // SPAWN_KEPT past its answer (or its request, when it was never answered) — but never
         // while its agent is still up, so cap counting cannot lose sight of it.
@@ -732,6 +789,35 @@ impl State {
             agents.contains_key(&s.request.agent)
                 || e.ts - s.answered.unwrap_or(s.since) <= SPAWN_KEPT
         });
+    }
+
+    /// The questions the board's Inbox shows: asks from a domain lead, implementation lead or root
+    /// coordinator, open first, then the answered ones. Implementers, and agents with no declared
+    /// role, go through their lead.
+    pub fn inbox(&self) -> Vec<InboxItem> {
+        let level = |by: &str| {
+            self.roles
+                .get(by)
+                .map(|r| r.level)
+                .filter(|l| *l >= Level::ImplementationLead)
+        };
+        let open = self.asks.iter().filter_map(|(id, ask)| {
+            Some(InboxItem {
+                id: id.clone(),
+                level: level(&ask.by)?,
+                ask: ask.clone(),
+                answer: None,
+            })
+        });
+        let answered = self.answers.iter().filter_map(|(id, a)| {
+            Some(InboxItem {
+                id: id.clone(),
+                level: level(&a.ask.by)?,
+                ask: a.ask.clone(),
+                answer: Some(a.clone()),
+            })
+        });
+        open.chain(answered).collect()
     }
 
     fn task_for(&mut self, e: &Event) -> Option<&mut Task> {
@@ -1253,6 +1339,119 @@ mod tests {
             .into_event(),
         );
         assert_eq!((s.blockers.len(), s.msgs.len()), (0, 0));
+    }
+
+    fn role(agent: &str, level: Level) -> Event {
+        ev(
+            ActorKind::Agent,
+            Known::AgentRole(AgentRole {
+                agent: agent.into(),
+                level: Some(level),
+                lead: None,
+                domain: None,
+            }),
+        )
+        .into_event()
+    }
+
+    fn ask_by(agent: &str, q: &str) -> Event {
+        let mut e = ev(
+            ActorKind::Agent,
+            Known::AskRaised(AskRaised {
+                question: q.into(),
+                options: vec!["a".into(), "b".into(), "c".into()],
+                recommendation: None,
+                context: None,
+            }),
+        )
+        .task("task:p/1");
+        e.actor.id = agent.into();
+        e.into_event()
+    }
+
+    #[test]
+    fn the_inbox_holds_only_lead_level_questions() {
+        let mut s = State::default();
+        for (agent, level) in [
+            ("agent:h/s/impl", Level::Implementer),
+            ("agent:h/s/il", Level::ImplementationLead),
+            ("agent:h/s/dl", Level::DomainLead),
+            ("agent:h/s/rc", Level::RootCoordinator),
+        ] {
+            s.apply(&role(agent, level));
+            s.apply(&ask_by(agent, agent));
+        }
+        s.apply(&ask_by("agent:h/s/norole", "no role declared"));
+        let by: Vec<_> = s.inbox().into_iter().map(|i| i.ask.by).collect();
+        assert_eq!(
+            by.len(),
+            3,
+            "implementer and role-less asks stay out: {by:?}"
+        );
+        assert!(
+            !by.iter()
+                .any(|b| b.ends_with("/impl") || b.ends_with("/norole"))
+        );
+        assert_eq!(
+            s.asks.len(),
+            5,
+            "they are still open asks for everyone else"
+        );
+    }
+
+    #[test]
+    fn an_answer_is_sent_then_acked_and_leaves_the_open_asks() {
+        let mut s = State::default();
+        s.apply(&role("agent:h/s/dl", Level::DomainLead));
+        let ask = ask_by("agent:h/s/dl", "ship it?");
+        let aid = ask.id.clone();
+        s.apply(&ask);
+        let mut msg = ev(
+            ActorKind::Human,
+            Known::MsgSent(MsgSent {
+                to: "agent:h/s/dl".into(),
+                kind: "ANSWER".into(),
+                reference: aid.clone(),
+                text: "b".into(),
+            }),
+        );
+        msg.actor.id = "human:board".into();
+        let mid = msg.id.clone();
+        s.apply(&msg.into_event());
+        let mut ans = ev(
+            ActorKind::Human,
+            Known::AskAnswered(AskAnswered {
+                answer: "b".into(),
+                approve: false,
+                approves: None,
+                msg: mid.clone(),
+            }),
+        )
+        .re(&aid);
+        ans.actor.id = "human:board".into();
+        s.apply(&ans.into_event());
+        assert!(s.asks.is_empty(), "an answered ask is no longer open");
+        let item = &s.inbox()[0];
+        assert_eq!(item.answer.as_ref().map(|a| a.answer.as_str()), Some("b"));
+        assert_eq!(item.answer.as_ref().and_then(|a| a.acked), None, "sent");
+
+        s.apply(
+            &ev(
+                ActorKind::Host,
+                Known::MsgDelivered(MsgDelivered {
+                    to: "agent:h/s/dl".into(),
+                    observed: AgentState::Working,
+                    rung: None,
+                    attempts: None,
+                }),
+            )
+            .re(&mid)
+            .into_event(),
+        );
+        assert!(
+            s.inbox()[0].answer.as_ref().unwrap().acked.is_some(),
+            "acked"
+        );
     }
 
     #[test]

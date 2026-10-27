@@ -248,6 +248,8 @@ pub enum Known {
     BlockerResolved(BlockerResolved),
     #[serde(rename = "ask.raised")]
     AskRaised(AskRaised),
+    #[serde(rename = "ask.answered")]
+    AskAnswered(AskAnswered),
     #[serde(rename = "msg.sent")]
     MsgSent(MsgSent),
     #[serde(rename = "msg.delivered")]
@@ -567,6 +569,23 @@ pub struct AskRaised {
     pub context: Option<String>,
 }
 
+/// An operator's answer to the `ask.raised` named by `re`, given on the board. The answer reaches
+/// the asker as the `msg.sent` named by `msg`, written in the same step.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AskAnswered {
+    /// A chosen option or free text.
+    pub answer: String,
+    /// An approval, not just an answer. Never implied by choosing an option.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub approve: bool,
+    /// For an approval: the exact question text the approval applies to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approves: Option<String>,
+    /// The `msg.sent` that carries the answer to the asker.
+    pub msg: String,
+}
+
 /// A doorbell: a short prompt pointing at an event or a task.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -742,6 +761,7 @@ impl Known {
             Self::BlockerRaised(_) => "blocker.raised",
             Self::BlockerResolved(_) => "blocker.resolved",
             Self::AskRaised(_) => "ask.raised",
+            Self::AskAnswered(_) => "ask.answered",
             Self::MsgSent(_) => "msg.sent",
             Self::MsgDelivered(_) => "msg.delivered",
             Self::Handoff(_) => "handoff",
@@ -753,7 +773,9 @@ impl Known {
         }
     }
 
-    /// Actor kinds allowed to write this type. `human` appears nowhere: v1 has no human channel.
+    /// Actor kinds allowed to write this type. `human` appears only where the board's answer
+    /// channel writes it (`ask.answered`, and the `msg.sent` that carries it); `POST /events`
+    /// refuses every human actor.
     pub fn writers(&self) -> &'static [ActorKind] {
         use ActorKind::*;
         match self {
@@ -773,6 +795,8 @@ impl Known {
             | Self::AgentStuck(_) => &[Host],
             Self::MsgDelivered(_) | Self::SpawnResult(_) => &[Host],
             Self::AskRaised(_) | Self::Handoff(_) | Self::AgentSignal(_) => &[Agent],
+            Self::AskAnswered(_) => &[Human],
+            Self::MsgSent(_) => &[Agent, Host, Human],
             _ => &[Agent, Host],
         }
     }
@@ -795,7 +819,10 @@ impl Known {
     fn needs_re(&self) -> bool {
         matches!(
             self,
-            Self::BlockerResolved(_) | Self::MsgDelivered(_) | Self::SpawnResult(_)
+            Self::BlockerResolved(_)
+                | Self::AskAnswered(_)
+                | Self::MsgDelivered(_)
+                | Self::SpawnResult(_)
         )
     }
 }
@@ -857,8 +884,17 @@ pub enum Reject {
 /// Strict validation for writes: a known type at a known version, no unknown fields, an allowed
 /// actor, and the envelope fields the type needs.
 pub fn parse_strict(raw: &Value) -> Result<Envelope<Known>, Reject> {
+    parse(raw, false)
+}
+
+/// `parse_strict` for the board's human channel: a `human` actor is allowed where `writers` lists it.
+pub fn parse_human(raw: &Value) -> Result<Envelope<Known>, Reject> {
+    parse(raw, true)
+}
+
+fn parse(raw: &Value, human_channel: bool) -> Result<Envelope<Known>, Reject> {
     // Checked before the shape, so a human event is refused as such whatever else is wrong with it.
-    if raw.pointer("/actor/kind").and_then(Value::as_str) == Some("human") {
+    if !human_channel && raw.pointer("/actor/kind").and_then(Value::as_str) == Some("human") {
         return Err(Reject::Forbidden(
             "actor.kind=human: v1 has no human channel".into(),
         ));
@@ -1042,6 +1078,45 @@ mod tests {
         let mut v = created();
         v["extra"] = 1.into();
         assert!(matches!(parse_strict(&v), Err(Reject::BadRequest(_))));
+    }
+
+    #[test]
+    fn the_human_channel_is_only_for_answers() {
+        let human = Actor {
+            kind: ActorKind::Human,
+            id: "human:board".into(),
+        };
+        let answered = Envelope::new(
+            human.clone(),
+            "p",
+            Known::AskAnswered(AskAnswered {
+                answer: "a".into(),
+                approve: false,
+                approves: None,
+                msg: ulid::Ulid::new().to_string(),
+            }),
+        )
+        .re(ulid::Ulid::new().to_string());
+        let v = serde_json::to_value(answered).unwrap();
+        assert!(
+            matches!(parse_strict(&v), Err(Reject::Forbidden(_))),
+            "not on POST /events"
+        );
+        assert!(parse_human(&v).is_ok());
+        // An agent cannot speak as the operator, and a human writes nothing else.
+        let mut v2 = v.clone();
+        v2["actor"] = json!({"kind": "agent", "id": "agent:h/s/a"});
+        assert!(matches!(parse_human(&v2), Err(Reject::Forbidden(_))));
+        let down = Envelope::new(
+            human,
+            "p",
+            Known::AgentDown(AgentDown {
+                agent: "agent:h/s/a".into(),
+                reason: None,
+            }),
+        );
+        let v3 = serde_json::to_value(down).unwrap();
+        assert!(matches!(parse_human(&v3), Err(Reject::Forbidden(_))));
     }
 
     #[test]
