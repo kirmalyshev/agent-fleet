@@ -211,7 +211,11 @@ pub async fn serve(listen: &[SocketAddr], db: &Path, hub_file: &Path, token: Str
     for a in listen {
         match tokio::net::TcpListener::bind(a).await {
             Ok(l) => listeners.push(l),
-            Err(e) if has_loopback && !a.ip().is_loopback() => {
+            Err(e)
+                if has_loopback
+                    && !a.ip().is_loopback()
+                    && e.kind() == std::io::ErrorKind::AddrNotAvailable =>
+            {
                 eprintln!("agent-fleet hub: bind {a}: {e}; retrying every {LATE_BIND_RETRY:?}");
                 late.push(*a);
             }
@@ -789,7 +793,7 @@ mod tests {
         let (db, hf) = (dir.path().join("h.db"), hub_file.clone());
         let task = tokio::spawn(async move { serve(&addrs, &db, &hf, "t".into()).await });
         for _ in 0..100 {
-            if hub_file.exists() {
+            if std::fs::read_to_string(&hub_file).is_ok_and(|s| s.ends_with('\n')) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
