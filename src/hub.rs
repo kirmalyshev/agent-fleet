@@ -203,11 +203,24 @@ pub async fn serve(listen: &[SocketAddr], db: &Path, hub_file: &Path, token: Str
         bail!("refusing to listen on {a}: bind a specific address (default 127.0.0.1)");
     }
     let hub = Hub::new(Store::open(db)?)?;
+    // With a loopback address to fall back on, an address that will not bind yet (a Tailscale IP
+    // before Tailscale is up, 3 Nov) is retried in the background instead of taking the hub down.
+    let has_loopback = listen.iter().any(|a| a.ip().is_loopback());
     let mut listeners = Vec::new();
+    let mut late = Vec::new();
     for a in listen {
-        listeners.push(tokio::net::TcpListener::bind(a).await.with_context(|| {
-            format!("bind {a}; if another instance's hub holds it, pass --listen")
-        })?);
+        match tokio::net::TcpListener::bind(a).await {
+            Ok(l) => listeners.push(l),
+            Err(e) if has_loopback && !a.ip().is_loopback() => {
+                eprintln!("agent-fleet hub: bind {a}: {e}; retrying every {LATE_BIND_RETRY:?}");
+                late.push(*a);
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("bind {a}; if another instance's hub holds it, pass --listen")
+                });
+            }
+        }
     }
     let bound = listeners
         .iter()
@@ -227,11 +240,25 @@ pub async fn serve(listen: &[SocketAddr], db: &Path, hub_file: &Path, token: Str
         let app = app.clone();
         set.spawn(async move { axum::serve(l, app).await });
     }
+    for a in late {
+        let app = app.clone();
+        set.spawn(async move {
+            loop {
+                tokio::time::sleep(LATE_BIND_RETRY).await;
+                if let Ok(l) = tokio::net::TcpListener::bind(a).await {
+                    eprintln!("agent-fleet hub: now also listening on http://{a}");
+                    return axum::serve(l, app).await;
+                }
+            }
+        });
+    }
     if let Some(r) = set.join_next().await {
         r??;
     }
     Ok(())
 }
+
+const LATE_BIND_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The address the hub file names: the first loopback one, else the first.
 fn hub_file_addr(listen: &[SocketAddr]) -> Result<SocketAddr> {
@@ -748,6 +775,29 @@ mod tests {
             h.submit(&assign("agent:h/s/b")),
             Err(Reject::Conflict(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn an_unbindable_address_beside_loopback_does_not_stop_the_hub() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub_file = dir.path().join("hub");
+        // 192.0.2.1 is TEST-NET-1: never assigned to this host, so its bind fails.
+        let addrs: Vec<SocketAddr> = ["127.0.0.1:0", "192.0.2.1:7710"]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect();
+        let (db, hf) = (dir.path().join("h.db"), hub_file.clone());
+        let task = tokio::spawn(async move { serve(&addrs, &db, &hf, "t".into()).await });
+        for _ in 0..100 {
+            if hub_file.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let url = std::fs::read_to_string(&hub_file).unwrap();
+        assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+        assert!(!task.is_finished(), "hub exited: {:?}", task.await);
+        task.abort();
     }
 
     #[test]
