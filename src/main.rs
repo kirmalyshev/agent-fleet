@@ -978,12 +978,26 @@ async fn main() -> Result<()> {
                         || std::fs::read_link(format!("/proc/{pid}/cwd"))
                             .is_ok_and(|c| c.to_string_lossy().ends_with(" (deleted)")))
             };
+            // The caller's worktree: the nearest directory with a `.git` above its cwd.
+            let tree = scan::cwd_of(me).and_then(|c| {
+                std::path::Path::new(&c)
+                    .ancestors()
+                    .find(|d| d.join(".git").exists())
+                    .map(|d| d.to_string_lossy().into_owned())
+            });
             let refused: Vec<(u32, String)> = pids
                 .iter()
                 .filter_map(|&pid| {
-                    kill::judge(&t, me, pid, || still_orphaned(pid))
-                        .err()
-                        .map(|why| (pid, why))
+                    kill::judge_in(
+                        &t,
+                        me,
+                        pid,
+                        || still_orphaned(pid),
+                        tree.as_deref(),
+                        &scan::cwd_of,
+                    )
+                    .err()
+                    .map(|why| (pid, why))
                 })
                 .collect();
             if !refused.is_empty() {

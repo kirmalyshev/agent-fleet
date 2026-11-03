@@ -141,11 +141,37 @@ fn protected(t: &Table, me: u32, pid: u32) -> Option<String> {
 }
 
 /// Whether `me` may signal `pid`. `orphan` asks whether doctor proved `pid` an orphan.
-pub fn judge(
+#[cfg(test)]
+fn judge(
     t: &Table,
     me: u32,
     pid: u32,
     orphan: impl FnOnce() -> bool,
+) -> std::result::Result<(), String> {
+    judge_in(t, me, pid, orphan, None, &|_| None)
+}
+
+/// An orphan: its parent is init, or a user's service manager.
+fn is_orphan(t: &Table, pid: u32) -> bool {
+    t.get(&pid).is_some_and(|p| {
+        p.ppid == 1 || (p.ppid > 1 && matches!(name(t, p.ppid), "systemd" | "launchd"))
+    })
+}
+
+fn inside(dir: &str, root: &str) -> bool {
+    dir == root || dir.strip_prefix(root).is_some_and(|r| r.starts_with('/'))
+}
+
+/// `judge`, plus the caller's worktree `tree` and a working-directory lookup: a dev server the
+/// agent backgrounded outlives its Bash shell and is adopted by init, so no ancestry ties it to
+/// the agent any more; an orphan whose cwd is inside `tree` still is the caller's.
+pub fn judge_in(
+    t: &Table,
+    me: u32,
+    pid: u32,
+    orphan: impl FnOnce() -> bool,
+    tree: Option<&str>,
+    cwd: &dyn Fn(u32) -> Option<String>,
 ) -> std::result::Result<(), String> {
     if !t.contains_key(&pid) {
         return Err(format!("pid {pid}: no such process"));
@@ -165,6 +191,11 @@ pub fn judge(
         )),
         None if shell.is_some_and(|sh| ancestors(t, pid).contains(&sh)) => Ok(()),
         None if orphan() => Ok(()),
+        None if is_orphan(t, pid)
+            && tree.zip(cwd(pid)).is_some_and(|(root, d)| inside(&d, root)) =>
+        {
+            Ok(())
+        }
         None => Err(format!(
             "pid {pid} ({}) is not yours: no process of yours started it and doctor has not \
              proved it an orphan",
@@ -603,6 +634,72 @@ mod tests {
                 .unwrap_err()
                 .contains("no such process")
         );
+    }
+
+    #[test]
+    fn a_dev_server_reparented_out_of_the_agents_tree_is_yours_by_its_worktree() {
+        let mut t = fleet();
+        // `bun serve.ts &` from the agent's Bash shell, whose shell then exited: ppid 1, or the
+        // user's systemd on Linux. A stranger's postgres sits in no worktree of yours.
+        t.insert(
+            600,
+            Proc {
+                ppid: 1,
+                name: "bun".into(),
+            },
+        );
+        t.insert(
+            601,
+            Proc {
+                ppid: 650,
+                name: "vite".into(),
+            },
+        );
+        t.insert(
+            650,
+            Proc {
+                ppid: 1,
+                name: "systemd".into(),
+            },
+        );
+        t.insert(
+            602,
+            Proc {
+                ppid: 600,
+                name: "esbuild".into(),
+            },
+        );
+        t.insert(
+            603,
+            Proc {
+                ppid: 1,
+                name: "bun".into(),
+            },
+        );
+        let cwd = |p: u32| match p {
+            600..=602 => Some("/w/mine/web".to_string()),
+            603 => Some("/w/other/web".to_string()),
+            _ => None,
+        };
+        let go = |pid| judge_in(&t, ME, pid, || false, Some("/w/mine"), &cwd);
+        assert_eq!(go(600), Ok(()), "orphan, cwd in my worktree");
+        assert_eq!(go(601), Ok(()), "parent is a user systemd");
+        assert!(go(602).is_err(), "not orphaned: its parent is a live bun");
+        assert!(go(603).unwrap_err().contains("not yours"), "other worktree");
+        assert!(
+            judge_in(&t, ME, 600, || false, None, &cwd).is_err(),
+            "no worktree known"
+        );
+        // `/w/mine-two` is not inside `/w/mine`.
+        t.insert(
+            604,
+            Proc {
+                ppid: 1,
+                name: "bun".into(),
+            },
+        );
+        let cwd2 = |_| Some("/w/mine-two".to_string());
+        assert!(judge_in(&t, ME, 604, || false, Some("/w/mine"), &cwd2).is_err());
     }
 
     #[test]
