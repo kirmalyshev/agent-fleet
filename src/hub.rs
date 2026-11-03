@@ -194,25 +194,49 @@ impl Hub {
 
 type Shared = Arc<Mutex<Hub>>;
 
-/// Serves the hub. Once bound, writes its URL to `hub_file`, where this instance's clients look.
-pub async fn serve(listen: SocketAddr, db: &Path, hub_file: &Path, token: String) -> Result<()> {
-    if listen.ip().is_unspecified() {
-        bail!("refusing to listen on {listen}: bind a specific address (default 127.0.0.1)");
+/// Serves the hub on every address in `listen`. Once bound, writes one URL to `hub_file`, where
+/// this instance's clients look: the loopback one when given, so a client on this host does not
+/// depend on the network the other addresses ride (3 Nov: a Tailscale blip cut the hub off from
+/// its own host).
+pub async fn serve(listen: &[SocketAddr], db: &Path, hub_file: &Path, token: String) -> Result<()> {
+    if let Some(a) = listen.iter().find(|a| a.ip().is_unspecified()) {
+        bail!("refusing to listen on {a}: bind a specific address (default 127.0.0.1)");
     }
     let hub = Hub::new(Store::open(db)?)?;
+    let shown: Vec<String> = listen.iter().map(|a| format!("http://{a}")).collect();
     eprintln!(
-        "agent-fleet hub: {} events in {}, listening on http://{listen}",
+        "agent-fleet hub: {} events in {}, listening on {}",
         hub.store.len()?,
-        db.display()
+        db.display(),
+        shown.join(", ")
     );
-    let listener = tokio::net::TcpListener::bind(listen)
-        .await
-        .with_context(|| {
-            format!("bind {listen}; if another instance's hub holds it, pass --listen")
-        })?;
-    std::fs::write(hub_file, format!("http://{listen}\n"))?;
-    axum::serve(listener, router(hub, token)).await?;
+    let mut listeners = Vec::new();
+    for a in listen {
+        listeners.push(tokio::net::TcpListener::bind(a).await.with_context(|| {
+            format!("bind {a}; if another instance's hub holds it, pass --listen")
+        })?);
+    }
+    std::fs::write(hub_file, format!("http://{}\n", hub_file_addr(listen)?))?;
+    let app = router(hub, token);
+    let mut set = tokio::task::JoinSet::new();
+    for l in listeners {
+        let app = app.clone();
+        set.spawn(async move { axum::serve(l, app).await });
+    }
+    if let Some(r) = set.join_next().await {
+        r??;
+    }
     Ok(())
+}
+
+/// The address the hub file names: the first loopback one, else the first.
+fn hub_file_addr(listen: &[SocketAddr]) -> Result<SocketAddr> {
+    listen
+        .iter()
+        .find(|a| a.ip().is_loopback())
+        .or_else(|| listen.first())
+        .copied()
+        .context("--listen: no address")
 }
 
 pub fn router(hub: Hub, token: String) -> Router {
@@ -722,12 +746,21 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn hub_file_names_the_loopback_address() {
+        let tail: SocketAddr = "100.94.83.110:7710".parse().unwrap();
+        let lo: SocketAddr = "127.0.0.1:7710".parse().unwrap();
+        assert_eq!(hub_file_addr(&[tail, lo]).unwrap(), lo);
+        assert_eq!(hub_file_addr(&[tail]).unwrap(), tail);
+        assert!(hub_file_addr(&[]).is_err());
+    }
+
     #[tokio::test]
     async fn refuses_unspecified_listen_address() {
         let dir = tempfile::tempdir().unwrap();
         for addr in ["0.0.0.0:7710", "[::]:7710"] {
             let err = serve(
-                addr.parse().unwrap(),
+                &[addr.parse().unwrap()],
                 &dir.path().join("h.db"),
                 &dir.path().join("hub"),
                 "t".into(),
