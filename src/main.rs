@@ -978,23 +978,17 @@ async fn main() -> Result<()> {
                         || std::fs::read_link(format!("/proc/{pid}/cwd"))
                             .is_ok_and(|c| c.to_string_lossy().ends_with(" (deleted)")))
             };
-            // The caller's worktree is the one the fleet recorded for its agent (its pane's cwd as
-            // the host scanned it), never the live cwd of this command; no record fails closed.
+            // The caller's worktree is the one the fleet assigned at spawn (`spawn.result`), never
+            // its pane's live cwd, which follows a `cd`; no record fails closed.
             let homes = match (&state, ctx.me().await) {
                 (Some(s), Ok(a)) => {
-                    let agents: Vec<_> = s
-                        .agents
-                        .iter()
-                        .filter(|(_, g)| g.host == host)
-                        .map(|(id, g)| (id.clone(), g.usage.as_ref().and_then(|u| u.cwd.clone())))
-                        .collect();
                     let trees: Vec<_> = s
                         .worktrees
                         .values()
                         .filter(|w| w.state.host == host)
                         .map(|w| w.state.path.clone())
                         .collect();
-                    kill::homes(&a.id, &agents, &trees)
+                    kill::homes(&a.id, &s.assigned_worktrees(&host), &trees)
                 }
                 _ => Default::default(),
             };

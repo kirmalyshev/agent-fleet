@@ -162,7 +162,7 @@ fn inside(dir: &str, root: &str) -> bool {
     dir == root || dir.strip_prefix(root).is_some_and(|r| r.starts_with('/'))
 }
 
-/// Where the fleet says agents work, never where the caller stands now: a caller that `cd`s
+/// Where the fleet assigned agents to work (their spawn worktrees), never where the caller or its pane stands now: a caller that `cd`s
 /// into another agent's worktree gains nothing.
 #[derive(Debug, Default, PartialEq)]
 pub struct Homes {
@@ -180,7 +180,7 @@ fn home_in<'a>(cwd: &str, worktrees: &'a [String]) -> Option<&'a String> {
         .max_by_key(|w| w.len())
 }
 
-/// `agents` are (id, recorded cwd) on this host; `worktrees` the paths the fleet knows here.
+/// `agents` are (id, assigned worktree) on this host; `worktrees` the paths the fleet knows here.
 pub fn homes(me: &str, agents: &[(String, Option<String>)], worktrees: &[String]) -> Homes {
     let home = |cwd: &Option<String>| cwd.as_deref().and_then(|c| home_in(c, worktrees)).cloned();
     Homes {
@@ -703,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn homes_come_from_recorded_agent_cwds_not_from_where_the_caller_stands() {
+    fn homes_come_from_the_assigned_worktrees_not_from_where_the_caller_stands() {
         let ag = |id: &str, c: &str| (id.to_string(), Some(c.to_string()));
         let wts: Vec<String> = ["/w/mine", "/w/other", "/w"].map(String::from).into();
         let agents = [

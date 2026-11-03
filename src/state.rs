@@ -791,6 +791,23 @@ impl State {
         });
     }
 
+    /// The worktree the fleet assigned each agent at spawn on `host`, by agent id: the host's
+    /// `spawn.result`, never where the agent's pane stands now (`usage.cwd` follows a `cd`).
+    /// Agents nobody spawned have none.
+    pub fn assigned_worktrees(&self, host: &str) -> Vec<(String, Option<String>)> {
+        self.spawns
+            .values()
+            .filter(|s| s.request.host == host && self.agents.contains_key(&s.request.agent))
+            .map(|s| {
+                let tree = s.result.as_ref().filter(|r| r.ok);
+                (
+                    s.request.agent.clone(),
+                    tree.and_then(|r| r.worktree.clone()),
+                )
+            })
+            .collect()
+    }
+
     /// The questions the board's Inbox shows: asks from a domain lead, implementation lead or root
     /// coordinator, open first, then the answered ones. Implementers, and agents with no declared
     /// role, go through their lead.
@@ -863,6 +880,68 @@ mod tests {
 
     fn agent_ev(body: Known) -> Envelope<Known> {
         ev(ActorKind::Agent, body).task("task:p/1")
+    }
+
+    #[test]
+    fn an_agents_assigned_worktree_is_its_spawn_result_and_never_where_its_pane_stands() {
+        let req: SpawnRequested = serde_json::from_value(serde_json::json!({
+            "name": "a", "agent": "agent:h/s/a", "host": "h", "session": "s", "repo": "r",
+            "branch": "b", "profile": "p", "brief": "x", "why": "t"
+        }))
+        .unwrap();
+        let res = |ok, wt: Option<&str>| SpawnResult {
+            agent: "agent:h/s/a".into(),
+            ok,
+            pane: None,
+            worktree: wt.map(str::to_string),
+            error: None,
+        };
+        let mut s = State::default();
+        let now = Utc::now();
+        s.agents.insert(
+            "agent:h/s/a".into(),
+            Agent {
+                host: "h".into(),
+                kind: None,
+                pane: None,
+                state: AgentState::Idle,
+                since: now,
+                worked: None,
+                usage: Some(Usage {
+                    rss_kb: None,
+                    cpu_pct: None,
+                    procs: None,
+                    cwd: Some("/w/other".into()),
+                    ts: now,
+                }),
+            },
+        );
+        s.spawns.insert(
+            "e1".into(),
+            Spawn {
+                request: req,
+                by: "x".into(),
+                project: "p".into(),
+                result: Some(res(true, Some("/w/mine"))),
+                since: now,
+                answered: Some(now),
+            },
+        );
+        let want = vec![("agent:h/s/a".to_string(), Some("/w/mine".to_string()))];
+        assert_eq!(
+            s.assigned_worktrees("h"),
+            want,
+            "pane cwd /w/other is ignored"
+        );
+        assert!(s.assigned_worktrees("elsewhere").is_empty());
+        // a failed or unanswered spawn assigns nothing
+        s.spawns.get_mut("e1").unwrap().result = Some(res(false, Some("/w/mine")));
+        assert_eq!(s.assigned_worktrees("h")[0].1, None);
+        s.spawns.get_mut("e1").unwrap().result = None;
+        assert_eq!(s.assigned_worktrees("h")[0].1, None);
+        // an agent nobody spawned is absent: its root fails closed
+        s.spawns.clear();
+        assert!(s.assigned_worktrees("h").is_empty());
     }
 
     #[test]
