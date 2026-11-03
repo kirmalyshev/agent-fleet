@@ -978,26 +978,32 @@ async fn main() -> Result<()> {
                         || std::fs::read_link(format!("/proc/{pid}/cwd"))
                             .is_ok_and(|c| c.to_string_lossy().ends_with(" (deleted)")))
             };
-            // The caller's worktree: the nearest directory with a `.git` above its cwd.
-            let tree = scan::cwd_of(me).and_then(|c| {
-                std::path::Path::new(&c)
-                    .ancestors()
-                    .find(|d| d.join(".git").exists())
-                    .map(|d| d.to_string_lossy().into_owned())
-            });
+            // The caller's worktree is the one the fleet recorded for its agent (its pane's cwd as
+            // the host scanned it), never the live cwd of this command; no record fails closed.
+            let homes = match (&state, ctx.me().await) {
+                (Some(s), Ok(a)) => {
+                    let agents: Vec<_> = s
+                        .agents
+                        .iter()
+                        .filter(|(_, g)| g.host == host)
+                        .map(|(id, g)| (id.clone(), g.usage.as_ref().and_then(|u| u.cwd.clone())))
+                        .collect();
+                    let trees: Vec<_> = s
+                        .worktrees
+                        .values()
+                        .filter(|w| w.state.host == host)
+                        .map(|w| w.state.path.clone())
+                        .collect();
+                    kill::homes(&a.id, &agents, &trees)
+                }
+                _ => Default::default(),
+            };
             let refused: Vec<(u32, String)> = pids
                 .iter()
                 .filter_map(|&pid| {
-                    kill::judge_in(
-                        &t,
-                        me,
-                        pid,
-                        || still_orphaned(pid),
-                        tree.as_deref(),
-                        &scan::cwd_of,
-                    )
-                    .err()
-                    .map(|why| (pid, why))
+                    kill::judge_in(&t, me, pid, || still_orphaned(pid), &homes, &scan::cwd_of)
+                        .err()
+                        .map(|why| (pid, why))
                 })
                 .collect();
             if !refused.is_empty() {
