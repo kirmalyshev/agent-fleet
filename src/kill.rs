@@ -141,11 +141,71 @@ fn protected(t: &Table, me: u32, pid: u32) -> Option<String> {
 }
 
 /// Whether `me` may signal `pid`. `orphan` asks whether doctor proved `pid` an orphan.
-pub fn judge(
+#[cfg(test)]
+fn judge(
     t: &Table,
     me: u32,
     pid: u32,
     orphan: impl FnOnce() -> bool,
+) -> std::result::Result<(), String> {
+    judge_in(t, me, pid, orphan, &Homes::default(), &|_| None)
+}
+
+/// An orphan: its parent is init, or a user's service manager.
+fn is_orphan(t: &Table, pid: u32) -> bool {
+    t.get(&pid).is_some_and(|p| {
+        p.ppid == 1 || (p.ppid > 1 && matches!(name(t, p.ppid), "systemd" | "launchd"))
+    })
+}
+
+fn inside(dir: &str, root: &str) -> bool {
+    dir == root || dir.strip_prefix(root).is_some_and(|r| r.starts_with('/'))
+}
+
+/// Where the fleet assigned agents to work (their spawn worktrees), never where the caller or its pane stands now: a caller that `cd`s
+/// into another agent's worktree gains nothing.
+#[derive(Debug, Default, PartialEq)]
+pub struct Homes {
+    /// The caller's recorded worktree; `None` fails closed.
+    pub mine: Option<String>,
+    /// Worktrees recorded for other agents.
+    pub others: Vec<String>,
+}
+
+/// The worktree a recorded agent cwd lies in: the longest of `worktrees` containing it.
+fn home_in<'a>(cwd: &str, worktrees: &'a [String]) -> Option<&'a String> {
+    worktrees
+        .iter()
+        .filter(|w| inside(cwd, w))
+        .max_by_key(|w| w.len())
+}
+
+/// `agents` are (id, assigned worktree) on this host; `worktrees` the paths the fleet knows here.
+pub fn homes(me: &str, agents: &[(String, Option<String>)], worktrees: &[String]) -> Homes {
+    let home = |cwd: &Option<String>| cwd.as_deref().and_then(|c| home_in(c, worktrees)).cloned();
+    Homes {
+        mine: agents
+            .iter()
+            .find(|(id, _)| id == me)
+            .and_then(|(_, c)| home(c)),
+        others: agents
+            .iter()
+            .filter(|(id, _)| id != me)
+            .filter_map(|(_, c)| home(c))
+            .collect(),
+    }
+}
+
+/// `judge`, plus the caller's recorded worktree (`homes`) and a working-directory lookup: a dev server the
+/// agent backgrounded outlives its Bash shell and is adopted by init, so no ancestry ties it to
+/// the agent any more; an orphan whose cwd is inside `tree` still is the caller's.
+pub fn judge_in(
+    t: &Table,
+    me: u32,
+    pid: u32,
+    orphan: impl FnOnce() -> bool,
+    homes: &Homes,
+    cwd: &dyn Fn(u32) -> Option<String>,
 ) -> std::result::Result<(), String> {
     if !t.contains_key(&pid) {
         return Err(format!("pid {pid}: no such process"));
@@ -165,6 +225,36 @@ pub fn judge(
         )),
         None if shell.is_some_and(|sh| ancestors(t, pid).contains(&sh)) => Ok(()),
         None if orphan() => Ok(()),
+        None if is_orphan(t, pid) => {
+            let at = cwd(pid);
+            let (Some(root), Some(at)) = (homes.mine.as_deref(), at.as_deref()) else {
+                return Err(if homes.mine.is_none() {
+                    format!(
+                        "pid {pid} ({}) is not yours: it is an orphan, but the fleet records no \
+                         worktree for you to attribute it to",
+                        name(t, pid)
+                    )
+                } else {
+                    format!(
+                        "pid {pid} ({}) is not yours: an orphan whose working directory is unknown",
+                        name(t, pid)
+                    )
+                });
+            };
+            if let Some(o) = homes.others.iter().find(|o| *o != root && inside(at, o)) {
+                Err(format!(
+                    "pid {pid} ({}) is an orphan in {o}, a worktree recorded for another agent",
+                    name(t, pid)
+                ))
+            } else if inside(at, root) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "pid {pid} ({}) is not yours: an orphan outside your worktree {root}",
+                    name(t, pid)
+                ))
+            }
+        }
         None => Err(format!(
             "pid {pid} ({}) is not yours: no process of yours started it and doctor has not \
              proved it an orphan",
@@ -603,6 +693,168 @@ mod tests {
                 .unwrap_err()
                 .contains("no such process")
         );
+    }
+
+    fn mine() -> Homes {
+        Homes {
+            mine: Some("/w/mine".into()),
+            others: vec!["/w/other".into()],
+        }
+    }
+
+    #[test]
+    fn homes_come_from_the_assigned_worktrees_not_from_where_the_caller_stands() {
+        let ag = |id: &str, c: &str| (id.to_string(), Some(c.to_string()));
+        let wts: Vec<String> = ["/w/mine", "/w/other", "/w"].map(String::from).into();
+        let agents = [
+            ag("a:me", "/w/mine/web"),
+            ag("a:you", "/w/other"),
+            ("a:blank".into(), None),
+        ];
+        assert_eq!(
+            homes("a:me", &agents, &wts),
+            Homes {
+                mine: Some("/w/mine".into()),
+                others: vec!["/w/other".into()]
+            },
+            "the longest recorded worktree holds the cwd"
+        );
+        assert_eq!(
+            homes("a:blank", &agents, &wts).mine,
+            None,
+            "no cwd recorded"
+        );
+        assert_eq!(
+            homes("a:ghost", &agents, &wts).mine,
+            None,
+            "not an agent here"
+        );
+        assert_eq!(
+            homes("a:me", &agents, &[]).mine,
+            None,
+            "no worktree recorded"
+        );
+    }
+
+    #[test]
+    fn orphans_are_refused_without_a_record_and_in_another_agents_worktree() {
+        let mut t = fleet();
+        t.insert(
+            700,
+            Proc {
+                ppid: 1,
+                name: "bun".into(),
+            },
+        );
+        t.insert(
+            701,
+            Proc {
+                ppid: 1,
+                name: "bun".into(),
+            },
+        );
+        t.insert(
+            702,
+            Proc {
+                ppid: 1,
+                name: "bun".into(),
+            },
+        );
+        let cwd = |p: u32| match p {
+            700 => Some("/w/mine/web".to_string()),
+            701 => Some("/w/other/web".to_string()),
+            _ => Some("/w/elsewhere".to_string()),
+        };
+        let go = |pid, h: &Homes| judge_in(&t, ME, pid, || false, h, &cwd);
+        assert_eq!(go(700, &mine()), Ok(()));
+        let none = go(700, &Homes::default()).unwrap_err();
+        assert!(
+            none.contains("records no worktree for you to attribute"),
+            "{none}"
+        );
+        // The caller may stand in the other agent's directory; its record still says /w/mine.
+        let other = go(701, &mine()).unwrap_err();
+        assert!(
+            other.contains("orphan in /w/other, a worktree recorded for another agent"),
+            "{other}"
+        );
+        let out = go(702, &mine()).unwrap_err();
+        assert!(
+            out.contains("an orphan outside your worktree /w/mine"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_dev_server_reparented_out_of_the_agents_tree_is_yours_by_its_worktree() {
+        let mut t = fleet();
+        // `bun serve.ts &` from the agent's Bash shell, whose shell then exited: ppid 1, or the
+        // user's systemd on Linux. A stranger's postgres sits in no worktree of yours.
+        t.insert(
+            600,
+            Proc {
+                ppid: 1,
+                name: "bun".into(),
+            },
+        );
+        t.insert(
+            601,
+            Proc {
+                ppid: 650,
+                name: "vite".into(),
+            },
+        );
+        t.insert(
+            650,
+            Proc {
+                ppid: 1,
+                name: "systemd".into(),
+            },
+        );
+        t.insert(
+            602,
+            Proc {
+                ppid: 600,
+                name: "esbuild".into(),
+            },
+        );
+        t.insert(
+            603,
+            Proc {
+                ppid: 1,
+                name: "bun".into(),
+            },
+        );
+        let cwd = |p: u32| match p {
+            600..=602 => Some("/w/mine/web".to_string()),
+            603 => Some("/w/other/web".to_string()),
+            _ => None,
+        };
+        let go = |pid| judge_in(&t, ME, pid, || false, &mine(), &cwd);
+        assert_eq!(go(600), Ok(()), "orphan, cwd in my worktree");
+        assert_eq!(go(601), Ok(()), "parent is a user systemd");
+        assert!(
+            go(602).unwrap_err().contains("not yours"),
+            "not orphaned: its parent is a live bun"
+        );
+        assert!(
+            go(603).unwrap_err().contains("recorded for another agent"),
+            "other worktree"
+        );
+        assert!(
+            judge_in(&t, ME, 600, || false, &Homes::default(), &cwd).is_err(),
+            "no worktree known"
+        );
+        // `/w/mine-two` is not inside `/w/mine`.
+        t.insert(
+            604,
+            Proc {
+                ppid: 1,
+                name: "bun".into(),
+            },
+        );
+        let cwd2 = |_| Some("/w/mine-two".to_string());
+        assert!(judge_in(&t, ME, 604, || false, &mine(), &cwd2).is_err());
     }
 
     #[test]

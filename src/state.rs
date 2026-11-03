@@ -791,6 +791,42 @@ impl State {
         });
     }
 
+    /// The worktree the fleet assigned each agent at spawn on `host`, by agent id: the host's
+    /// `spawn.result`, never where the agent's pane stands now (`usage.cwd` follows a `cd`).
+    /// Exact rule: among the spawns of an agent that is up (in `agents`) on `host`, drop any the
+    /// agent requested for itself, and any not answered `ok` with a worktree; the one requested
+    /// LAST (`since`) gives the root. An agent re-spawned into a new worktree so moves with it,
+    /// and an agent with no such spawn, or not up, has `None`.
+    ///
+    /// Threat model: `kill` guards against honest-but-mistaken agents, not deliberate
+    /// impersonation. The hub's one shared bearer token already lets any holder post as any
+    /// actor id, a fleet-wide limit out of scope here.
+    pub fn assigned_worktrees(&self, host: &str) -> Vec<(String, Option<String>)> {
+        let mut out: BTreeMap<&str, (DateTime<Utc>, Option<String>)> = BTreeMap::new();
+        for s in self.spawns.values() {
+            let agent = s.request.agent.as_str();
+            if s.request.host != host || s.by == agent || !self.agents.contains_key(agent) {
+                continue;
+            }
+            let Some(tree) = s
+                .result
+                .as_ref()
+                .filter(|r| r.ok)
+                .and_then(|r| r.worktree.clone())
+            else {
+                out.entry(agent).or_insert((s.since, None));
+                continue;
+            };
+            let slot = out.entry(agent).or_insert((s.since, None));
+            if slot.1.is_none() || s.since >= slot.0 {
+                *slot = (s.since, Some(tree));
+            }
+        }
+        out.into_iter()
+            .map(|(a, (_, t))| (a.to_string(), t))
+            .collect()
+    }
+
     /// The questions the board's Inbox shows: asks from a domain lead, implementation lead or root
     /// coordinator, open first, then the answered ones. Implementers, and agents with no declared
     /// role, go through their lead.
@@ -863,6 +899,100 @@ mod tests {
 
     fn agent_ev(body: Known) -> Envelope<Known> {
         ev(ActorKind::Agent, body).task("task:p/1")
+    }
+
+    #[test]
+    fn an_agents_assigned_worktree_is_its_spawn_result_and_never_where_its_pane_stands() {
+        let req: SpawnRequested = serde_json::from_value(serde_json::json!({
+            "name": "a", "agent": "agent:h/s/a", "host": "h", "session": "s", "repo": "r",
+            "branch": "b", "profile": "p", "brief": "x", "why": "t"
+        }))
+        .unwrap();
+        let res = |ok, wt: Option<&str>| SpawnResult {
+            agent: "agent:h/s/a".into(),
+            ok,
+            pane: None,
+            worktree: wt.map(str::to_string),
+            error: None,
+        };
+        let mut s = State::default();
+        let now = Utc::now();
+        s.agents.insert(
+            "agent:h/s/a".into(),
+            Agent {
+                host: "h".into(),
+                kind: None,
+                pane: None,
+                state: AgentState::Idle,
+                since: now,
+                worked: None,
+                usage: Some(Usage {
+                    rss_kb: None,
+                    cpu_pct: None,
+                    procs: None,
+                    cwd: Some("/w/other".into()),
+                    ts: now,
+                }),
+            },
+        );
+        s.spawns.insert(
+            "e1".into(),
+            Spawn {
+                request: req,
+                by: "x".into(),
+                project: "p".into(),
+                result: Some(res(true, Some("/w/mine"))),
+                since: now,
+                answered: Some(now),
+            },
+        );
+        let want = vec![("agent:h/s/a".to_string(), Some("/w/mine".to_string()))];
+        assert_eq!(
+            s.assigned_worktrees("h"),
+            want,
+            "pane cwd /w/other is ignored"
+        );
+        assert!(s.assigned_worktrees("elsewhere").is_empty());
+        // a failed or unanswered spawn assigns nothing
+        s.spawns.get_mut("e1").unwrap().result = Some(res(false, Some("/w/mine")));
+        assert_eq!(s.assigned_worktrees("h")[0].1, None);
+        s.spawns.get_mut("e1").unwrap().result = None;
+        assert_eq!(s.assigned_worktrees("h")[0].1, None);
+        // a spawn the agent wrote for itself assigns nothing: no record, so fail closed
+        s.spawns.get_mut("e1").unwrap().by = "agent:h/s/a".into();
+        s.spawns.get_mut("e1").unwrap().result = Some(res(true, Some("/w/foreign")));
+        assert!(s.assigned_worktrees("h").is_empty(), "self-spawn ignored");
+        // a coordinator spawn stands; the agent's later self-spawn does not displace it
+        let mut w1 = s.spawns["e1"].clone();
+        w1.by = "agent:h/s/coord".into();
+        w1.since = now - chrono::Duration::minutes(10);
+        w1.result = Some(res(true, Some("/w/mine")));
+        s.spawns.insert("e0".into(), w1.clone());
+        assert_eq!(s.assigned_worktrees("h"), want);
+        // re-spawned into a new worktree: the most recent successful spawn wins
+        let mut w2 = w1.clone();
+        w2.since = now - chrono::Duration::minutes(5);
+        w2.result = Some(res(true, Some("/w/second")));
+        s.spawns.insert("e00".into(), w2.clone());
+        let second = vec![("agent:h/s/a".to_string(), Some("/w/second".to_string()))];
+        assert_eq!(
+            s.assigned_worktrees("h"),
+            second,
+            "W1 then W2 gives W2, whatever the key order"
+        );
+        // a later failed spawn does not displace it
+        let mut w3 = w2;
+        w3.since = now - chrono::Duration::minutes(1);
+        w3.result = Some(res(false, None));
+        s.spawns.insert("e000".into(), w3);
+        assert_eq!(s.assigned_worktrees("h"), second);
+        // an agent that is down has no root
+        let gone = s.agents.remove("agent:h/s/a").unwrap();
+        assert!(s.assigned_worktrees("h").is_empty());
+        s.agents.insert("agent:h/s/a".into(), gone);
+        // an agent nobody spawned is absent: its root fails closed
+        s.spawns.clear();
+        assert!(s.assigned_worktrees("h").is_empty());
     }
 
     #[test]
