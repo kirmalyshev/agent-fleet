@@ -66,8 +66,9 @@ struct Cli {
 enum Cmd {
     /// Run the hub: the log, the fold and the sequencer, over HTTP + SSE.
     Hub {
+        /// Repeat to bind several addresses; clients on this host get the loopback one.
         #[arg(long, default_value = "127.0.0.1:7710")]
-        listen: SocketAddr,
+        listen: Vec<SocketAddr>,
         /// [default: <data dir>/hub.db]
         #[arg(long)]
         db: Option<PathBuf>,
@@ -768,7 +769,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| ctx.paths.token());
             let token = client::read_or_create_token(&token_file)?;
             let db = db.clone().unwrap_or_else(|| ctx.paths.hub_db());
-            hub::serve(*listen, &db, &ctx.paths.hub_file(), token).await?;
+            hub::serve(listen, &db, &ctx.paths.hub_file(), token).await?;
         }
         Cmd::Host {
             herdr_socket,
