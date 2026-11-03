@@ -203,20 +203,24 @@ pub async fn serve(listen: &[SocketAddr], db: &Path, hub_file: &Path, token: Str
         bail!("refusing to listen on {a}: bind a specific address (default 127.0.0.1)");
     }
     let hub = Hub::new(Store::open(db)?)?;
-    let shown: Vec<String> = listen.iter().map(|a| format!("http://{a}")).collect();
-    eprintln!(
-        "agent-fleet hub: {} events in {}, listening on {}",
-        hub.store.len()?,
-        db.display(),
-        shown.join(", ")
-    );
     let mut listeners = Vec::new();
     for a in listen {
         listeners.push(tokio::net::TcpListener::bind(a).await.with_context(|| {
             format!("bind {a}; if another instance's hub holds it, pass --listen")
         })?);
     }
-    std::fs::write(hub_file, format!("http://{}\n", hub_file_addr(listen)?))?;
+    let bound = listeners
+        .iter()
+        .map(|l| l.local_addr())
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let shown: Vec<String> = bound.iter().map(|a| format!("http://{a}")).collect();
+    eprintln!(
+        "agent-fleet hub: {} events in {}, listening on {}",
+        hub.store.len()?,
+        db.display(),
+        shown.join(", ")
+    );
+    std::fs::write(hub_file, format!("http://{}\n", hub_file_addr(&bound)?))?;
     let app = router(hub, token);
     let mut set = tokio::task::JoinSet::new();
     for l in listeners {
@@ -758,9 +762,14 @@ mod tests {
     #[tokio::test]
     async fn refuses_unspecified_listen_address() {
         let dir = tempfile::tempdir().unwrap();
-        for addr in ["0.0.0.0:7710", "[::]:7710"] {
+        for addrs in [
+            vec!["0.0.0.0:7710"],
+            vec!["[::]:7710"],
+            vec!["127.0.0.1:0", "0.0.0.0:7711"],
+        ] {
+            let addrs: Vec<SocketAddr> = addrs.iter().map(|a| a.parse().unwrap()).collect();
             let err = serve(
-                &[addr.parse().unwrap()],
+                &addrs,
                 &dir.path().join("h.db"),
                 &dir.path().join("hub"),
                 "t".into(),
