@@ -793,19 +793,30 @@ impl State {
 
     /// The worktree the fleet assigned each agent at spawn on `host`, by agent id: the host's
     /// `spawn.result`, never where the agent's pane stands now (`usage.cwd` follows a `cd`).
-    /// Agents nobody spawned have none.
+    /// A spawn the agent requested for itself is ignored, so an agent cannot set its own root;
+    /// the first answered spawn (event order) wins. Agents nobody else spawned have none.
+    ///
+    /// Threat model: `kill` guards against honest-but-mistaken agents, not deliberate
+    /// impersonation. The hub's one shared bearer token already lets any holder post as any
+    /// actor id, a fleet-wide limit out of scope here.
     pub fn assigned_worktrees(&self, host: &str) -> Vec<(String, Option<String>)> {
-        self.spawns
-            .values()
-            .filter(|s| s.request.host == host && self.agents.contains_key(&s.request.agent))
-            .map(|s| {
-                let tree = s.result.as_ref().filter(|r| r.ok);
-                (
-                    s.request.agent.clone(),
-                    tree.and_then(|r| r.worktree.clone()),
-                )
-            })
-            .collect()
+        let mut out: BTreeMap<&str, Option<String>> = BTreeMap::new();
+        for s in self.spawns.values() {
+            let agent = s.request.agent.as_str();
+            if s.request.host != host || s.by == agent || !self.agents.contains_key(agent) {
+                continue;
+            }
+            let tree = s
+                .result
+                .as_ref()
+                .filter(|r| r.ok)
+                .and_then(|r| r.worktree.clone());
+            let slot = out.entry(agent).or_default();
+            if slot.is_none() {
+                *slot = tree;
+            }
+        }
+        out.into_iter().map(|(a, t)| (a.to_string(), t)).collect()
     }
 
     /// The questions the board's Inbox shows: asks from a domain lead, implementation lead or root
@@ -939,6 +950,16 @@ mod tests {
         assert_eq!(s.assigned_worktrees("h")[0].1, None);
         s.spawns.get_mut("e1").unwrap().result = None;
         assert_eq!(s.assigned_worktrees("h")[0].1, None);
+        // a spawn the agent wrote for itself assigns nothing: no record, so fail closed
+        s.spawns.get_mut("e1").unwrap().by = "agent:h/s/a".into();
+        s.spawns.get_mut("e1").unwrap().result = Some(res(true, Some("/w/foreign")));
+        assert!(s.assigned_worktrees("h").is_empty(), "self-spawn ignored");
+        // and with an earlier coordinator spawn, that one stands
+        let mut early = s.spawns["e1"].clone();
+        early.by = "agent:h/s/coord".into();
+        early.result = Some(res(true, Some("/w/mine")));
+        s.spawns.insert("e0".into(), early);
+        assert_eq!(s.assigned_worktrees("h"), want);
         // an agent nobody spawned is absent: its root fails closed
         s.spawns.clear();
         assert!(s.assigned_worktrees("h").is_empty());
