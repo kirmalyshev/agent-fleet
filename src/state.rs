@@ -793,30 +793,38 @@ impl State {
 
     /// The worktree the fleet assigned each agent at spawn on `host`, by agent id: the host's
     /// `spawn.result`, never where the agent's pane stands now (`usage.cwd` follows a `cd`).
-    /// A spawn the agent requested for itself is ignored, so an agent cannot set its own root;
-    /// the first answered spawn (event order) wins. Agents nobody else spawned have none.
+    /// Exact rule: among the spawns of an agent that is up (in `agents`) on `host`, drop any the
+    /// agent requested for itself, and any not answered `ok` with a worktree; the one requested
+    /// LAST (`since`) gives the root. An agent re-spawned into a new worktree so moves with it,
+    /// and an agent with no such spawn, or not up, has `None`.
     ///
     /// Threat model: `kill` guards against honest-but-mistaken agents, not deliberate
     /// impersonation. The hub's one shared bearer token already lets any holder post as any
     /// actor id, a fleet-wide limit out of scope here.
     pub fn assigned_worktrees(&self, host: &str) -> Vec<(String, Option<String>)> {
-        let mut out: BTreeMap<&str, Option<String>> = BTreeMap::new();
+        let mut out: BTreeMap<&str, (DateTime<Utc>, Option<String>)> = BTreeMap::new();
         for s in self.spawns.values() {
             let agent = s.request.agent.as_str();
             if s.request.host != host || s.by == agent || !self.agents.contains_key(agent) {
                 continue;
             }
-            let tree = s
+            let Some(tree) = s
                 .result
                 .as_ref()
                 .filter(|r| r.ok)
-                .and_then(|r| r.worktree.clone());
-            let slot = out.entry(agent).or_default();
-            if slot.is_none() {
-                *slot = tree;
+                .and_then(|r| r.worktree.clone())
+            else {
+                out.entry(agent).or_insert((s.since, None));
+                continue;
+            };
+            let slot = out.entry(agent).or_insert((s.since, None));
+            if slot.1.is_none() || s.since >= slot.0 {
+                *slot = (s.since, Some(tree));
             }
         }
-        out.into_iter().map(|(a, t)| (a.to_string(), t)).collect()
+        out.into_iter()
+            .map(|(a, (_, t))| (a.to_string(), t))
+            .collect()
     }
 
     /// The questions the board's Inbox shows: asks from a domain lead, implementation lead or root
@@ -954,12 +962,34 @@ mod tests {
         s.spawns.get_mut("e1").unwrap().by = "agent:h/s/a".into();
         s.spawns.get_mut("e1").unwrap().result = Some(res(true, Some("/w/foreign")));
         assert!(s.assigned_worktrees("h").is_empty(), "self-spawn ignored");
-        // and with an earlier coordinator spawn, that one stands
-        let mut early = s.spawns["e1"].clone();
-        early.by = "agent:h/s/coord".into();
-        early.result = Some(res(true, Some("/w/mine")));
-        s.spawns.insert("e0".into(), early);
+        // a coordinator spawn stands; the agent's later self-spawn does not displace it
+        let mut w1 = s.spawns["e1"].clone();
+        w1.by = "agent:h/s/coord".into();
+        w1.since = now - chrono::Duration::minutes(10);
+        w1.result = Some(res(true, Some("/w/mine")));
+        s.spawns.insert("e0".into(), w1.clone());
         assert_eq!(s.assigned_worktrees("h"), want);
+        // re-spawned into a new worktree: the most recent successful spawn wins
+        let mut w2 = w1.clone();
+        w2.since = now - chrono::Duration::minutes(5);
+        w2.result = Some(res(true, Some("/w/second")));
+        s.spawns.insert("e00".into(), w2.clone());
+        let second = vec![("agent:h/s/a".to_string(), Some("/w/second".to_string()))];
+        assert_eq!(
+            s.assigned_worktrees("h"),
+            second,
+            "W1 then W2 gives W2, whatever the key order"
+        );
+        // a later failed spawn does not displace it
+        let mut w3 = w2;
+        w3.since = now - chrono::Duration::minutes(1);
+        w3.result = Some(res(false, None));
+        s.spawns.insert("e000".into(), w3);
+        assert_eq!(s.assigned_worktrees("h"), second);
+        // an agent that is down has no root
+        let gone = s.agents.remove("agent:h/s/a").unwrap();
+        assert!(s.assigned_worktrees("h").is_empty());
+        s.agents.insert("agent:h/s/a".into(), gone);
         // an agent nobody spawned is absent: its root fails closed
         s.spawns.clear();
         assert!(s.assigned_worktrees("h").is_empty());
