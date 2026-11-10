@@ -20,6 +20,8 @@ pub const HEAVY_CPU_PCT: u32 = 200;
 pub const UNPUSHED: Duration = Duration::hours(1);
 /// A clean worktree nobody works in, untouched this long, is clutter.
 pub const ABANDONED: Duration = Duration::days(3);
+/// A clean worktree nobody works in, still running processes this long after it last changed.
+pub const LEFTOVER: Duration = Duration::minutes(10);
 /// A refused kill stays a finding this long.
 pub const REFUSED: Duration = Duration::hours(1);
 /// Queued this long for a resource: worth a look at who holds it.
@@ -266,6 +268,21 @@ fn told(s: &State, id: &str) -> String {
     escalate(s, id).map_or_else(|| "; nobody to tell".to_string(), |t| format!("; {t} told"))
 }
 
+/// Pids on `host` that doctor proves orphaned, with the directory each runs in.
+pub fn killable(
+    s: &State,
+    now: DateTime<Utc>,
+    host: &str,
+) -> std::collections::BTreeMap<u32, String> {
+    findings(s, now)
+        .iter()
+        .filter(|f| matches!(f.kind, "orphan" | "forgotten"))
+        .filter_map(|f| s.worktree_procs.get(&f.subject))
+        .filter(|p| p.procs.host == host)
+        .flat_map(|p| p.procs.pids.iter().map(|&pid| (pid, p.procs.path.clone())))
+        .collect()
+}
+
 pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
     let mut out = Vec::new();
     // Worktree key → the live agents working in it.
@@ -465,7 +482,11 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
                         st.dirty
                     ),
                 ));
-            } else if !unsaved && st.path != st.repo && now - st.last_commit >= ABANDONED {
+            } else if !unsaved
+                && st.path != st.repo
+                && (now - st.last_commit >= ABANDONED
+                    || (!running.is_empty() && unchanged >= LEFTOVER))
+            {
                 let what = if running.is_empty() {
                     ": remove it"
                 } else {
@@ -754,6 +775,73 @@ mod tests {
             "stop what runs first: {}",
             f[1].detail
         );
+    }
+
+    fn leftover_state(agent_in_it: bool) -> (State, DateTime<Utc>) {
+        use crate::event::WorktreeProcs;
+        use crate::state::Procs;
+        let now = Utc::now();
+        let mut s = State::default();
+        let key = worktree_key("h", "/w/fresh");
+        let mut w = tree("/w/fresh", &[], 0, 0, now - Duration::hours(3));
+        w.since = now - Duration::minutes(20);
+        s.worktrees.insert(key.clone(), w);
+        s.worktree_procs.insert(
+            key,
+            Procs {
+                procs: WorktreeProcs {
+                    host: "h".into(),
+                    path: "/w/fresh".into(),
+                    procs: 1,
+                    rss_kb: 1024,
+                    cpu_pct: 0,
+                    names: vec!["server".into()],
+                    pids: vec![77],
+                    orphaned: false,
+                },
+                ts: now,
+            },
+        );
+        if agent_in_it {
+            s.agents.insert(
+                "agent:h/s/a".into(),
+                agent(AgentState::Working, now, "/w/fresh", 0, 1024),
+            );
+        }
+        (s, now)
+    }
+
+    #[test]
+    fn a_clean_agentless_worktree_still_running_processes_is_found() {
+        let (s, now) = leftover_state(false);
+        let f = findings(&s, now);
+        assert_eq!(kinds(&f), vec![("forgotten", "h:/w/fresh")], "{f:#?}");
+        assert_eq!(
+            killable(&s, now, "h").get(&77).map(String::as_str),
+            Some("/w/fresh")
+        );
+        assert!(
+            f[0].detail.contains("still runs 1 process"),
+            "{}",
+            f[0].detail
+        );
+        let (mut s, now) = leftover_state(false);
+        s.worktrees.values_mut().for_each(|w| w.since = now);
+        assert!(findings(&s, now).is_empty(), "inside the grace");
+    }
+
+    #[test]
+    fn an_occupied_worktree_running_processes_is_not_found() {
+        let (s, now) = leftover_state(true);
+        assert!(findings(&s, now).is_empty());
+        assert!(killable(&s, now, "h").is_empty());
+    }
+
+    #[test]
+    fn a_clean_agentless_worktree_without_processes_is_unchanged() {
+        let (mut s, now) = leftover_state(false);
+        s.worktree_procs.clear();
+        assert!(findings(&s, now).is_empty());
     }
 
     #[test]

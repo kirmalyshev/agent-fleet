@@ -296,7 +296,7 @@ how many worktrees may hold any of a set of resources at once.
 | `hung` | working for 30 min at under 2% CPU, its worktree unchanged as long |
 | `heavy` | an agent's tree, or a worktree's processes, over 4 GB or 200% CPU |
 | `duplicate` | two agents in one worktree, or two agents' worktrees changing the same files (lockfiles aside) |
-| `forgotten` | a worktree no agent works in, with unsaved work for an hour, or clean and 3 days untouched; running processes are named |
+| `forgotten` | a worktree no agent works in, with unsaved work for an hour, or clean and 3 days untouched, or clean with processes still running 10 min after it last changed; running processes are named, and `agent-fleet kill` accepts them |
 | `unpushed` | an agent's worktree holding commits no remote has for an hour |
 | `orphan` | processes running in a deleted worktree, with their pids |
 | `breach` | more worktrees hold a rule's resources than its `max`, while the rule lasts |
@@ -438,8 +438,8 @@ refuses, killing nothing, when any pid is:
 - the caller's own ancestor (its shell, its script's parent, its agent);
 - inside another agent's process tree.
 
-It kills the caller's own processes (its agent's tree) and orphans `doctor` proved (on Linux, still
-in a deleted directory): TERM, then KILL after `--grace` seconds. Each refusal is logged as
+It kills the caller's own processes (its agent's tree) and orphans `doctor` proved: processes in a deleted worktree or a `forgotten` one (on Linux, still
+in that directory): TERM, then KILL after `--grace` seconds. Each refusal is logged as
 `kill.refused`.
 
 `agent-fleet hook bash` is a PreToolUse hook for Claude Code (tool `Bash`) and Devin CLI (tool
