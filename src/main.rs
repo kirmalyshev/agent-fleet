@@ -961,22 +961,18 @@ async fn main() -> Result<()> {
             let me = std::process::id();
             let host = ctx.host_name();
             let state = ctx.state().await.ok();
-            let orphans: std::collections::BTreeSet<u32> =
-                state.as_ref().map_or_else(Default::default, |s| {
-                    doctor::findings(s, now)
-                        .iter()
-                        .filter(|f| f.kind == "orphan")
-                        .filter_map(|f| s.worktree_procs.get(&f.subject))
-                        .filter(|p| p.procs.host == host)
-                        .flat_map(|p| p.procs.pids.iter().copied())
-                        .collect()
-                });
-            // The scan is minutes old: on Linux the pid must still be in a deleted directory.
+            let orphans = state
+                .as_ref()
+                .map_or_else(Default::default, |s| doctor::killable(s, now, &host));
+            // The scan is minutes old: on Linux the pid must still be in the directory doctor named.
             let still_orphaned = |pid: u32| {
-                orphans.contains(&pid)
-                    && (!cfg!(target_os = "linux")
-                        || std::fs::read_link(format!("/proc/{pid}/cwd"))
-                            .is_ok_and(|c| c.to_string_lossy().ends_with(" (deleted)")))
+                orphans.get(&pid).is_some_and(|dir| {
+                    !cfg!(target_os = "linux")
+                        || std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|c| {
+                            let c = c.to_string_lossy();
+                            std::path::Path::new(c.trim_end_matches(" (deleted)")).starts_with(dir)
+                        })
+                })
             };
             let refused: Vec<(u32, String)> = pids
                 .iter()
