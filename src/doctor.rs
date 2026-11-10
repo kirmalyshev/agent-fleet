@@ -268,7 +268,8 @@ fn told(s: &State, id: &str) -> String {
     escalate(s, id).map_or_else(|| "; nobody to tell".to_string(), |t| format!("; {t} told"))
 }
 
-/// Pids on `host` that doctor proves orphaned, with the directory each runs in.
+/// Pids on `host` that doctor proves orphaned, with the directory each runs in. A repo's main
+/// checkout is never included: its processes may be the human's.
 pub fn killable(
     s: &State,
     now: DateTime<Utc>,
@@ -276,7 +277,13 @@ pub fn killable(
 ) -> std::collections::BTreeMap<u32, String> {
     findings(s, now)
         .iter()
-        .filter(|f| matches!(f.kind, "orphan" | "forgotten"))
+        .filter(|f| {
+            f.kind == "orphan"
+                || (f.kind == "forgotten"
+                    && s.worktrees
+                        .get(&f.subject)
+                        .is_some_and(|w| w.state.path != w.state.repo))
+        })
         .filter_map(|f| s.worktree_procs.get(&f.subject))
         .filter(|p| p.procs.host == host)
         .flat_map(|p| p.procs.pids.iter().map(|&pid| (pid, p.procs.path.clone())))
@@ -834,6 +841,18 @@ mod tests {
     fn an_occupied_worktree_running_processes_is_not_found() {
         let (s, now) = leftover_state(true);
         assert!(findings(&s, now).is_empty());
+        assert!(killable(&s, now, "h").is_empty());
+    }
+
+    #[test]
+    fn a_main_checkout_with_dirty_files_is_found_but_not_killable() {
+        let (mut s, now) = leftover_state(false);
+        let w = s.worktrees.values_mut().next().unwrap();
+        w.state.repo = w.state.path.clone();
+        w.state.dirty = 2;
+        w.since = now - Duration::hours(2);
+        let f = findings(&s, now);
+        assert_eq!(kinds(&f), vec![("forgotten", "h:/w/fresh")], "{f:#?}");
         assert!(killable(&s, now, "h").is_empty());
     }
 
