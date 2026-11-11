@@ -974,10 +974,24 @@ async fn main() -> Result<()> {
                         })
                 })
             };
+            // The caller's worktree is the one the fleet assigned at spawn (`spawn.result`), never
+            // its pane's live cwd, which follows a `cd`; no record fails closed.
+            let homes = match (&state, ctx.me().await) {
+                (Some(s), Ok(a)) => {
+                    let trees: Vec<_> = s
+                        .worktrees
+                        .values()
+                        .filter(|w| w.state.host == host)
+                        .map(|w| w.state.path.clone())
+                        .collect();
+                    kill::homes(&a.id, &s.assigned_worktrees(&host), &trees)
+                }
+                _ => Default::default(),
+            };
             let refused: Vec<(u32, String)> = pids
                 .iter()
                 .filter_map(|&pid| {
-                    kill::judge(&t, me, pid, || still_orphaned(pid))
+                    kill::judge_in(&t, me, pid, || still_orphaned(pid), &homes, &scan::cwd_of)
                         .err()
                         .map(|why| (pid, why))
                 })
