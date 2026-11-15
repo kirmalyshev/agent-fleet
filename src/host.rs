@@ -174,6 +174,33 @@ fn on_path(name: &str) -> bool {
         .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
 }
 
+/// The UDIDs still usable by a device/test tool: anything `devicectl` sees connected plus
+/// every booted simulator. `None` when the toolchain cannot answer — a list that may be
+/// incomplete proves no device gone, so the whole stray pass skips rather than guesses.
+async fn live_devices() -> Option<HashSet<String>> {
+    if !cfg!(target_os = "macos") {
+        return Some(HashSet::new());
+    }
+    async fn out_of(args: &[&str]) -> Option<String> {
+        let out = tokio::process::Command::new("xcrun")
+            .args(args)
+            .output()
+            .await
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+    let connected = out_of(&["devicectl", "list", "devices"]).await?;
+    let booted = out_of(&["simctl", "list", "devices", "booted"]).await?;
+    Some(
+        scan::udids(&connected)
+            .union(&scan::udids(&booted))
+            .cloned()
+            .collect(),
+    )
+}
+
 impl Host {
     pub(crate) fn new(cfg: Config, client: Client, replica: Store) -> Self {
         Self {
@@ -823,6 +850,56 @@ impl Host {
                     pid: u.pid,
                     program: None,
                     cwd: None,
+                    since: None,
+                })))
+                .await;
+            }
+        }
+        // Orphans only this host can prove: a reparented device/test tool whose device is
+        // gone, or a lock's recorded holder still alive under init after its owner died.
+        let mut proved: Vec<(u32, Option<String>, String)> = Vec::new();
+        if procs.0.values().any(scan::may_be_stray)
+            && let Some(live) = live_devices().await
+        {
+            for (&pid, p) in &procs.0 {
+                if let Some(why) = scan::stray(p, &live, chrono::Utc::now()) {
+                    proved.push((pid, p.cwd.clone(), why.to_string()));
+                }
+            }
+        }
+        for (name, dir) in &self.cfg.locks {
+            if let Some(pid) = scan::lock_orphan(dir, &procs) {
+                proved.push((
+                    pid,
+                    procs.0[&pid].cwd.clone(),
+                    format!("{name} lock owner dead"),
+                ));
+            }
+        }
+        let now = chrono::Utc::now();
+        let mut seen_strays = HashSet::new();
+        for (pid, cwd, why) in proved {
+            seen_strays.insert(pid);
+            let key = format!("{}:{pid}", self.cfg.host);
+            let known = state.orphans.get(&key);
+            if known.is_none_or(|o| o.why != why || o.cwd != cwd) {
+                self.publish(self.presence(Known::ProcessOrphaned(ProcessOrphaned {
+                    host: self.cfg.host.clone(),
+                    pid,
+                    cwd,
+                    why: Some(why),
+                    since: Some(known.map_or(now, |o| o.since)),
+                })))
+                .await;
+            }
+        }
+        for o in state.orphans.values() {
+            if o.host == self.cfg.host && !seen_strays.contains(&o.pid) {
+                self.publish(self.presence(Known::ProcessOrphaned(ProcessOrphaned {
+                    host: self.cfg.host.clone(),
+                    pid: o.pid,
+                    cwd: None,
+                    why: None,
                     since: None,
                 })))
                 .await;

@@ -18,6 +18,10 @@ pub struct Proc {
     /// `None` when unreadable; a deleted directory keeps its old path and `deleted`.
     pub cwd: Option<String>,
     pub deleted: bool,
+    /// The argv as one line, when the platform reports it.
+    pub args: Option<String>,
+    /// When the process started, when the platform reports it.
+    pub started: Option<DateTime<Utc>>,
 }
 
 /// Every process on this machine at one moment. Empty outside Linux and macOS.
@@ -34,6 +38,9 @@ impl Procs {
                 libc::sysconf(libc::_SC_PAGESIZE).max(1) as u64,
             )
         };
+        let boot = std::fs::read_to_string("/proc/stat")
+            .ok()
+            .and_then(|s| parse_btime(&s));
         let mut all = HashMap::new();
         let Ok(dir) = std::fs::read_dir("/proc") else {
             return Self(all);
@@ -42,9 +49,10 @@ impl Procs {
             let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse().ok()) else {
                 continue;
             };
-            let Some((ppid, ticks, pages)) = std::fs::read_to_string(entry.path().join("stat"))
-                .ok()
-                .and_then(|s| parse_stat(&s))
+            let Some((ppid, ticks, pages, boot_ticks)) =
+                std::fs::read_to_string(entry.path().join("stat"))
+                    .ok()
+                    .and_then(|s| parse_stat(&s))
             else {
                 continue;
             };
@@ -53,6 +61,18 @@ impl Procs {
                 .map(|p| p.to_string_lossy().into_owned());
             let deleted = cwd.as_deref().is_some_and(|c| c.ends_with(" (deleted)"));
             let name = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+            let args = std::fs::read(entry.path().join("cmdline"))
+                .ok()
+                .map(|b| {
+                    b.split(|&c| c == 0)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| String::from_utf8_lossy(s).into_owned())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .filter(|s| !s.is_empty());
+            let started =
+                boot.and_then(|b| DateTime::from_timestamp(b + (boot_ticks / tick) as i64, 0));
             all.insert(
                 pid,
                 Proc {
@@ -62,6 +82,8 @@ impl Procs {
                     name: name.trim().to_string(),
                     cwd: cwd.map(|c| c.trim_end_matches(" (deleted)").to_string()),
                     deleted,
+                    args,
+                    started,
                 },
             );
         }
@@ -72,7 +94,7 @@ impl Procs {
     #[cfg(target_os = "macos")]
     pub fn read() -> Self {
         let out = std::process::Command::new("ps")
-            .args(["-axo", "pid=,ppid=,rss=,time=,comm="])
+            .args(["-axo", "pid=,ppid=,rss=,time=,lstart=,args="])
             .output()
             .ok()
             .filter(|o| o.status.success())
@@ -233,21 +255,29 @@ pub fn by_worktree(
     out
 }
 
-/// `ps -axo pid=,ppid=,rss=,time=,comm=` → pid → Proc (macOS; `ps` reports no cwd).
+/// `ps -axo pid=,ppid=,rss=,time=,lstart=,args=` → pid → Proc (macOS; `ps` reports no
+/// cwd). `lstart` is five words (`Sat Nov 15 21:31:45 2025`), `args` the rest, and the
+/// name is argv[0]'s basename — which also covers a path with a space in it.
 #[cfg(any(target_os = "macos", test))]
 pub fn parse_ps(s: &str) -> HashMap<u32, Proc> {
     s.lines()
         .filter_map(|l| {
-            let mut f = l.split_whitespace();
+            let f: Vec<&str> = l.split_whitespace().collect();
             let (pid, ppid, rss_kb) = (
-                f.next()?.parse().ok()?,
-                f.next()?.parse().ok()?,
-                f.next()?.parse().ok()?,
+                f.first()?.parse().ok()?,
+                f.get(1)?.parse().ok()?,
+                f.get(2)?.parse().ok()?,
             );
-            let cpu_ms = parse_ps_time(f.next()?)?;
-            let comm = f.collect::<Vec<_>>().join(" ");
+            let cpu_ms = parse_ps_time(f.get(3)?)?;
+            let started = parse_lstart(&f.get(4..9)?.join(" "));
+            let argv0 = f.get(9)?;
             // macOS gives a path, and a login shell is `-zsh`.
-            let name = comm.rsplit('/').next()?.trim_start_matches('-').to_string();
+            let name = argv0
+                .rsplit('/')
+                .next()?
+                .trim_start_matches('-')
+                .to_string();
+            let args = f.get(9..).map(|a| a.join(" ")).filter(|a| !a.is_empty());
             Some((
                 pid,
                 Proc {
@@ -257,10 +287,22 @@ pub fn parse_ps(s: &str) -> HashMap<u32, Proc> {
                     name,
                     cwd: None,
                     deleted: false,
+                    args,
+                    started,
                 },
             ))
         })
         .collect()
+}
+
+/// `ps` lstart, `Sat Nov 15 21:31:45 2025` in the local zone, → Utc.
+#[cfg(any(target_os = "macos", test))]
+fn parse_lstart(s: &str) -> Option<DateTime<Utc>> {
+    chrono::NaiveDateTime::parse_from_str(s, "%a %b %d %H:%M:%S %Y")
+        .ok()?
+        .and_local_timezone(chrono::Local)
+        .single()
+        .map(|t| t.to_utc())
 }
 
 /// `ps` TIME, `[[dd-]hh:]mm:ss[.ss]` → milliseconds.
@@ -279,12 +321,25 @@ fn parse_ps_time(s: &str) -> Option<u64> {
     Some(((days * 24 + hour) * 3600 + min * 60 + sec.parse::<u64>().ok()?) * 1000 + ms)
 }
 
-/// `/proc/<pid>/stat` → (ppid, utime + stime + cutime + cstime ticks, rss pages).
-pub fn parse_stat(s: &str) -> Option<(u32, u64, u64)> {
+/// `/proc/<pid>/stat` → (ppid, utime + stime + cutime + cstime ticks, rss pages,
+/// starttime ticks since boot).
+pub fn parse_stat(s: &str) -> Option<(u32, u64, u64, u64)> {
     // The command name may hold spaces and parens; the fields after the last `)` do not.
     let f: Vec<&str> = s[s.rfind(')')? + 1..].split_whitespace().collect();
     let n = |i: usize| f.get(i)?.parse::<u64>().ok();
-    Some((n(1)? as u32, n(11)? + n(12)? + n(13)? + n(14)?, n(21)?))
+    Some((
+        n(1)? as u32,
+        n(11)? + n(12)? + n(13)? + n(14)?,
+        n(21)?,
+        n(19)?,
+    ))
+}
+
+/// `/proc/stat`'s `btime` line: the epoch second the machine booted.
+#[cfg(any(target_os = "linux", test))]
+pub fn parse_btime(s: &str) -> Option<i64> {
+    s.lines()
+        .find_map(|l| l.strip_prefix("btime ")?.trim().parse().ok())
 }
 
 async fn git(dir: &str, args: &[&str]) -> Option<String> {
@@ -508,6 +563,93 @@ pub fn read_lock(dir: &Path) -> Lock {
     Lock { holder, waiting }
 }
 
+/// A reparented device/test tool must outlive its session by this much before its own
+/// idleness is proof it can never work again.
+pub const STRAY_MIN: chrono::Duration = chrono::Duration::hours(2);
+
+/// `true` when the process is a device or test tool a dead session can leave behind:
+/// `xcodebuild`, `maestro`, `simctl`, `idb`, the WDA runner, or `log stream`.
+fn device_tool(p: &Proc) -> bool {
+    matches!(
+        p.name.as_str(),
+        "xcodebuild" | "maestro" | "simctl" | "idb" | "xctest"
+    ) || p.name.starts_with("WebDriverAgentRunner")
+        || (p.name == "log" && p.args.as_deref().is_some_and(|a| a.contains("log stream")))
+}
+
+/// A cheap prefilter: reparented to init and tool-shaped — worth collecting device lists for.
+/// The real proof is `stray`.
+pub fn may_be_stray(p: &Proc) -> bool {
+    p.ppid == 1 && device_tool(p)
+}
+
+/// `abcdef01-2345-6789-abcd-ef0123456789` — the shape a UDID argument takes.
+fn udid_shaped(w: &str) -> bool {
+    w.len() == 36
+        && w.chars().filter(|&c| c == '-').count() == 4
+        && w.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// Every UDID-shaped word in `devicectl`/`simctl` output.
+pub fn udids(s: &str) -> HashSet<String> {
+    s.split_whitespace()
+        .filter(|w| udid_shaped(w))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The UDID the tool's argv targets: `id=` inside `-destination`, `--udid`/`-d`'s word, then
+/// the first UDID-shaped bare argument (a `simctl` verb takes its device positionally).
+fn device_of(args: &str) -> Option<String> {
+    let w: Vec<&str> = args.split_whitespace().collect();
+    for (i, t) in w.iter().enumerate() {
+        if t.starts_with("-destination")
+            && let Some(id) = [*t, w.get(i + 1).copied().unwrap_or("")]
+                .iter()
+                .flat_map(|s| s.split(','))
+                .find_map(|p| p.strip_prefix("id="))
+        {
+            return Some(id.to_string());
+        }
+        if (*t == "--udid" || *t == "-d")
+            && let Some(u) = w.get(i + 1)
+        {
+            return Some(u.to_string());
+        }
+        if let Some(u) = t.strip_prefix("--udid=") {
+            return Some(u.to_string());
+        }
+    }
+    w.iter().find(|t| udid_shaped(t)).map(|s| s.to_string())
+}
+
+/// A process reparented to init that can do no more work: a device/test tool, old enough,
+/// whose target is in `live` — the UDIDs still connected or booted — nowhere. A tool that
+/// names no device, or one we cannot date, is never proved.
+pub fn stray(p: &Proc, live: &HashSet<String>, now: DateTime<Utc>) -> Option<&'static str> {
+    if p.ppid != 1 || !device_tool(p) {
+        return None;
+    }
+    if now - p.started? < STRAY_MIN {
+        return None;
+    }
+    let dev = p.args.as_deref().and_then(device_of)?;
+    (!live.contains(&dev)).then_some("device gone")
+}
+
+/// The pid a lock's `pid` file still names while its `owner` file's process is dead and the
+/// survivor sits under init: nobody's pane could have started it, so it is an orphan. The
+/// tool list does not apply — a reparented `sh` stuck holding a lock is as orphaned.
+pub fn lock_orphan(dir: &Path, procs: &Procs) -> Option<u32> {
+    let pid_in = |name: &str| line(&dir.join(name), 0).and_then(|l| l.parse::<u32>().ok());
+    let owner = pid_in("owner")?;
+    if alive(owner) {
+        return None;
+    }
+    let pid = pid_in("pid")?;
+    procs.0.get(&pid).filter(|p| p.ppid == 1).map(|_| pid)
+}
+
 /// How a lock changed since it was last read: who let go, who took it, who joined the queue.
 /// `before: None` is the first read, which owes a full release ahead of what it found.
 #[derive(Debug, PartialEq)]
@@ -624,6 +766,8 @@ mod tests {
                             name: name.into(),
                             cwd: None,
                             deleted: false,
+                            args: None,
+                            started: None,
                         },
                     )
                 })
@@ -708,19 +852,125 @@ mod tests {
     }
 
     #[test]
+    fn a_reparented_tool_whose_device_is_gone_is_a_stray() {
+        let now = Utc::now();
+        let dev = "ABCDEF01-2345-6789-ABCD-EF0123456789";
+        let proc = |ppid, name: &str, args: &str, h: i64| Proc {
+            ppid,
+            cpu_ms: 0,
+            rss_kb: 0,
+            name: name.into(),
+            cwd: None,
+            deleted: false,
+            args: Some(args.into()),
+            started: Some(now - chrono::Duration::hours(h)),
+        };
+        let live: HashSet<String> = HashSet::new();
+        let x = format!(
+            "xcodebuild -destination id={dev} test-without-building -xctestrun /w/.build/wda/x.xctestrun"
+        );
+        // All four conditions met: ppid 1, a known tool, older than STRAY_MIN, device gone.
+        assert_eq!(
+            stray(&proc(1, "xcodebuild", &x, 3), &live, now),
+            Some("device gone")
+        );
+        // Each one missing is no proof.
+        assert_eq!(
+            stray(&proc(42, "xcodebuild", &x, 3), &live, now),
+            None,
+            "ppid ≠ 1"
+        );
+        assert_eq!(
+            stray(&proc(1, "zsh", "zsh", 3), &live, now),
+            None,
+            "not a tool"
+        );
+        assert_eq!(
+            stray(&proc(1, "xcodebuild", &x, 1), &live, now),
+            None,
+            "too young"
+        );
+        let live: HashSet<String> = [dev.to_string()].into_iter().collect();
+        assert_eq!(
+            stray(&proc(1, "xcodebuild", &x, 3), &live, now),
+            None,
+            "device there"
+        );
+        let live: HashSet<String> = HashSet::new();
+        assert_eq!(
+            stray(
+                &proc(1, "xcodebuild", "xcodebuild build -scheme app", 3),
+                &live,
+                now
+            ),
+            None,
+            "no device named is no proof"
+        );
+        // `simctl` takes its device positionally; `log stream` is a tool only by its args.
+        let boot = format!("simctl bootstatus {dev} -b");
+        assert_eq!(
+            stray(&proc(1, "simctl", &boot, 3), &live, now),
+            Some("device gone")
+        );
+        let stream = format!("log stream --device {dev}");
+        assert_eq!(
+            stray(&proc(1, "log", &stream, 3), &live, now),
+            Some("device gone")
+        );
+        assert_eq!(stray(&proc(1, "log", "log show", 3), &live, now), None);
+        assert_eq!(
+            stray(
+                &proc(
+                    1,
+                    "WebDriverAgentRunner-Runner",
+                    "WebDriverAgentRunner-Runner -XCTest",
+                    3
+                ),
+                &live,
+                now
+            ),
+            None,
+            "the runner names no UDID to check"
+        );
+    }
+
+    #[test]
+    fn a_dead_lock_owner_with_a_reparented_holder_is_an_orphan() {
+        // 15 Nov: the shard (pid 27634, `sh scripts/e2e.sh`) held the sim lock while its
+        // recorded owner (23363) was dead and init had adopted it.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sim.lock");
+        std::fs::create_dir(&dir).unwrap();
+        let me = std::process::id();
+        let t = procs(&[(27634, 1, "sh"), (2, 400, "sh"), (23363, 1, "sh")]);
+        std::fs::write(dir.join("owner"), "999999999\n").unwrap();
+        std::fs::write(dir.join("pid"), "27634\n").unwrap();
+        assert_eq!(lock_orphan(&dir, &t), Some(27634));
+        // A live owner holds the lock — nothing to prove.
+        std::fs::write(dir.join("owner"), format!("{me}\n")).unwrap();
+        assert_eq!(lock_orphan(&dir, &t), None, "owner alive");
+        // A dead holder is no orphan; a holder still under a live parent is not.
+        std::fs::write(dir.join("owner"), "999999999\n").unwrap();
+        std::fs::write(dir.join("pid"), "888888888\n").unwrap();
+        assert_eq!(lock_orphan(&dir, &t), None, "holder gone too");
+        std::fs::write(dir.join("pid"), "2\n").unwrap();
+        assert_eq!(lock_orphan(&dir, &t), None, "holder still parented");
+    }
+
+    #[test]
     fn stat_line_with_a_tricky_name() {
         let s = "42 (a) b (c)) S 7 42 42 0 -1 4194560 100 0 0 0 150 50 10 5 20 0 3 0 1000 9000 512 rest";
-        assert_eq!(parse_stat(s), Some((7, 215, 512)));
+        assert_eq!(parse_stat(s), Some((7, 215, 512, 1000)));
         assert_eq!(parse_stat("garbage"), None);
     }
 
     #[test]
     fn ps_output_parses_every_time_shape() {
-        let s = "    1      0  12345   0:05.50 /sbin/launchd\n\
-                 \x20  42      1  20480  12:34:56 /opt/bin/herdr\n\
-                 \x20  99     42   4096 2-03:04:05 /usr/bin/claude\n\
-                 \x20 100     42    512   7:08.09 -zsh\n\
-                 \x20   7      1   1024   1:00.00 /opt/my tool/agent-fleet\n\
+        let s = "    1      0  12345   0:05.50 Sat Nov 15 20:00:01 2025 /sbin/launchd\n\
+                 \x20  42      1  20480  12:34:56 Sat Nov 15 08:00:01 2025 /opt/bin/herdr\n\
+                 \x20  99     42   4096 2-03:04:05 Sat Nov 15 18:00:01 2025 /usr/bin/claude\n\
+                 \x20 100     42    512   7:08.09 Sat Nov 15 19:00:01 2025 -zsh\n\
+                 \x20   7      1   1024   1:00.00 Sat Nov 15 19:30:01 2025 /opt/tool/agent-fleet -p my proj\n\
                  \x20 bad line\n";
         let t = Procs(parse_ps(s));
         assert_eq!(t.0.len(), 5);
@@ -734,7 +984,12 @@ mod tests {
             (1, 20480, "herdr")
         );
         assert_eq!(p(99).name, "claude", "a path yields its basename");
-        assert_eq!(p(7).name, "agent-fleet", "even one with a space in it");
+        assert_eq!(p(7).name, "agent-fleet");
+        assert_eq!(
+            p(7).args.as_deref(),
+            Some("/opt/tool/agent-fleet -p my proj")
+        );
+        assert!(p(7).started.is_some(), "lstart folds to a start time");
         assert_eq!(p(100).name, "zsh", "a login shell drops its dash");
         assert!(p(1).cwd.is_none() && !p(1).deleted);
         assert!(t.under(99, "herdr"), "the ancestor walk works off it");
@@ -780,6 +1035,8 @@ mod tests {
             name: "p".into(),
             cwd: Some(cwd.into()),
             deleted,
+            args: None,
+            started: None,
         }
     }
 

@@ -945,6 +945,7 @@ mod tests {
             state,
             since: now,
             worked: worked.then_some(now),
+            finished: None,
             usage: None,
         }
     }
