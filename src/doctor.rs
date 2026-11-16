@@ -1121,6 +1121,13 @@ mod tests {
             1,
             "reported 2 h ago: still failing"
         );
+        s.hosts.insert(
+            "mac".into(),
+            host(UPDATE_HOST_RECENT - Duration::minutes(1)),
+        );
+        assert_eq!(findings(&s, now).len(), 1, "just inside the day");
+        s.hosts.insert("mac".into(), host(UPDATE_HOST_RECENT));
+        assert!(findings(&s, now).is_empty(), "a day exactly: gone");
         s.hosts.insert("mac".into(), host(Duration::hours(25)));
         assert!(
             findings(&s, now).is_empty(),

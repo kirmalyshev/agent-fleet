@@ -2269,6 +2269,81 @@ mod tests {
     }
 
     #[test]
+    fn the_newest_failure_is_kept_per_host_and_only_one_on_the_hosts_current_commit() {
+        let trigger = ev(
+            ActorKind::Host,
+            Known::HostHealth(HostHealth {
+                host: "other".into(),
+                disk_free: 1,
+                disk_total: 2,
+                agents: 0,
+                commit: None,
+                stats: None,
+            }),
+        )
+        .into_event();
+        let now = trigger.ts;
+        let host = |commit: &str| Host {
+            disk_free: 0,
+            disk_total: 0,
+            agents: 0,
+            commit: Some(commit.into()),
+            ts: now,
+            started: None,
+        };
+        let res = |h: &str, ok: bool, commit: Option<&str>| {
+            (
+                h.to_string(),
+                UpdateResult {
+                    host: h.into(),
+                    ok,
+                    commit: commit.map(String::from),
+                    error: None,
+                },
+            )
+        };
+        let up = |hours: i64, results: Vec<(String, UpdateResult)>| Update {
+            by: "host:x".into(),
+            since: now - chrono::Duration::hours(hours),
+            host: None,
+            results: results.into_iter().collect(),
+        };
+        let mut s = State::default();
+        s.hosts.insert("a".into(), host("aaa"));
+        s.hosts.insert("b".into(), host("bbb"));
+        // Each host's newest failure on its own commit survives; each older one goes.
+        s.updates
+            .insert("a-old".into(), up(60, vec![res("a", false, Some("aaa"))]));
+        s.updates
+            .insert("a-new".into(), up(40, vec![res("a", false, Some("aaa"))]));
+        s.updates
+            .insert("b-old".into(), up(70, vec![res("b", false, Some("bbb"))]));
+        s.updates
+            .insert("b-new".into(), up(50, vec![res("b", false, Some("bbb"))]));
+        // One update failing on both hosts stays while either needs it.
+        s.updates.insert(
+            "both".into(),
+            up(
+                30,
+                vec![res("a", false, Some("aaa")), res("b", false, Some("bbb"))],
+            ),
+        );
+        // A newer one that failed on another commit, or succeeded, does not displace the
+        // newest failure on the commit the host runs.
+        s.updates.insert(
+            "a-elsewhere".into(),
+            up(26, vec![res("a", false, Some("zzz"))]),
+        );
+        s.updates
+            .insert("a-ok".into(), up(25, vec![res("a", true, Some("aaa"))]));
+        s.updates.insert("fresh".into(), up(1, vec![]));
+        s.apply(&trigger);
+        let mut left: Vec<&str> = s.updates.keys().map(String::as_str).collect();
+        left.sort();
+        assert_eq!(left, ["both", "fresh"], "{left:?}");
+    }
+
+    #[test]
     fn host_health_carries_the_commit() {
         let health = Known::HostHealth(HostHealth {
             host: "h1".into(),
