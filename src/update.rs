@@ -302,6 +302,13 @@ impl Io for HostIo {
     }
 }
 
+/// What a host has already done: requests it ran, and answers it could not write yet.
+#[derive(Default)]
+struct Seen {
+    done: HashSet<String>,
+    unsent: BTreeMap<String, UpdateResult>,
+}
+
 /// What a tick runs against.
 struct Ctx<'a> {
     me: &'a str,
@@ -317,9 +324,17 @@ struct Ctx<'a> {
 /// was replaced it stops new spawns and handoffs, waits (at most `drain_max`) for those in
 /// flight, then exits with `RESTART_STATUS`. A restart whose answer was not written is not
 /// retried by building again: the new process finds the request unanswered and answers it.
-async fn tick<I: Io>(io: &I, c: &Ctx<'_>, seen: &mut HashSet<String>) {
-    for id in io.pending() {
-        if !seen.insert(id.clone()) {
+async fn tick<I: Io>(io: &I, c: &Ctx<'_>, seen: &mut Seen) {
+    let pending = io.pending();
+    // Answers that were not written are sent again as they are: the update is not run twice.
+    seen.unsent.retain(|id, _| pending.contains(id));
+    for (id, r) in seen.unsent.clone() {
+        if io.publish(&id, r).await {
+            seen.unsent.remove(&id);
+        }
+    }
+    for id in pending {
+        if !seen.done.insert(id.clone()) {
             continue;
         }
         let done = match c.exe {
@@ -337,11 +352,11 @@ async fn tick<I: Io>(io: &I, c: &Ctx<'_>, seen: &mut HashSet<String>) {
             commit,
             error,
         };
-        let written = io.publish(&id, result).await;
+        let written = io.publish(&id, result.clone()).await;
         if !restart {
             if !written {
                 eprintln!("agent-fleet host: update.result for {id} not written; retrying");
-                seen.remove(&id);
+                seen.unsent.insert(id, result);
             }
             continue;
         }
@@ -381,7 +396,7 @@ pub async fn update_loop(host: Arc<Host>) {
     }
     let me = host.cfg.host.clone();
     let io = HostIo(host);
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen = Seen::default();
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
         let c = Ctx {
@@ -747,7 +762,7 @@ mod tests {
         let io = Fake::default();
         *io.pending.borrow_mut() = ids(&["r1"]);
         io.busy.set(true);
-        let mut seen = HashSet::new();
+        let mut seen = Seen::default();
         let c = ctx(&clone, &exe, None);
         tokio::join!(tick(&io, &c, &mut seen), async {
             while !io.log.borrow().contains(&"drain".to_string()) {
@@ -776,7 +791,7 @@ mod tests {
             drain_max: Duration::from_millis(100),
             ..ctx(&clone, &exe, None)
         };
-        tick(&io, &c, &mut HashSet::new()).await;
+        tick(&io, &c, &mut Seen::default()).await;
         assert_eq!(io.log.borrow().last().unwrap(), "exit 75");
     }
 
@@ -788,7 +803,7 @@ mod tests {
         let io = Fake::default();
         io.drop_publish.set(true);
         *io.pending.borrow_mut() = ids(&["r1"]);
-        tick(&io, &ctx(&clone, &exe, None), &mut HashSet::new()).await;
+        tick(&io, &ctx(&clone, &exe, None), &mut Seen::default()).await;
         // The new process finds the request unanswered and answers it: no second build here.
         assert_eq!(*io.log.borrow(), ["publish r1 ok=true", "drain", "exit 75"]);
     }
@@ -801,7 +816,7 @@ mod tests {
         let io = Fake::default();
         *io.pending.borrow_mut() = ids(&["r1"]);
         io.drop_publish.set(true);
-        let mut seen = HashSet::new();
+        let mut seen = Seen::default();
         let c = ctx(&clone, &exe, Some(&head));
         tick(&io, &c, &mut seen).await;
         tick(&io, &c, &mut seen).await;
@@ -816,13 +831,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unwritten_answer_is_sent_again_without_running_the_update_again() {
+        let t = tempfile::tempdir().unwrap();
+        let builds = t.path().join("builds");
+        let (_f, origin, clone, exe) = fixture_with(&format!(
+            "echo x >> {}; echo 'error: boom' >&2; exit 1\n",
+            builds.display()
+        ));
+        newer(&origin);
+        let exe = Ok(exe);
+        let io = Fake::default();
+        *io.pending.borrow_mut() = ids(&["r1"]);
+        io.drop_publish.set(true);
+        let (mut seen, c) = (Seen::default(), ctx(&clone, &exe, None));
+        tick(&io, &c, &mut seen).await;
+        tick(&io, &c, &mut seen).await;
+        io.drop_publish.set(false);
+        tick(&io, &c, &mut seen).await;
+        tick(&io, &c, &mut seen).await;
+        assert_eq!(std::fs::read_to_string(&builds).unwrap().lines().count(), 1);
+        assert_eq!(
+            io.results.borrow().len(),
+            3,
+            "sent until written, then no more"
+        );
+        assert!(
+            io.results.borrow()[2]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("boom")
+        );
+    }
+
+    #[tokio::test]
     async fn a_refused_update_never_exits() {
         let (_t, _origin, clone, exe) = fixture();
         std::fs::write(clone.join("f"), "dirty").unwrap();
         let exe = Ok(exe);
         let io = Fake::default();
         *io.pending.borrow_mut() = ids(&["r2"]);
-        tick(&io, &ctx(&clone, &exe, None), &mut HashSet::new()).await;
+        tick(&io, &ctx(&clone, &exe, None), &mut Seen::default()).await;
         assert_eq!(*io.log.borrow(), ["publish r2 ok=false"]);
         assert!(
             io.results.borrow()[0]
@@ -839,7 +888,7 @@ mod tests {
         let exe: Result<PathBuf> = Err(anyhow!("no /proc"));
         let io = Fake::default();
         *io.pending.borrow_mut() = ids(&["r1"]);
-        tick(&io, &ctx(&clone, &exe, None), &mut HashSet::new()).await;
+        tick(&io, &ctx(&clone, &exe, None), &mut Seen::default()).await;
         assert_eq!(*io.log.borrow(), ["publish r1 ok=false"]);
         assert!(
             io.results.borrow()[0]
