@@ -262,7 +262,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
         /// Close each `orphan-pr` a newer merged PR supersedes (comment, branch kept) and tell the
-        /// root coordinator about the others, once each.
+        /// root coordinator about the others (not again while its last tell is pending).
         #[arg(long)]
         apply: bool,
     },

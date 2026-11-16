@@ -490,7 +490,9 @@ fleet.toml, an open PR whose head branch is no live agent's worktree branch and 
 update for `days` (default 3) is named with its age, the issues it closes and their state. A
 newer merged PR that closes one of the same issues supersedes it: `doctor --apply` closes it
 with a comment and keeps the branch. A draft, or a PR touching a `guarded` path, is never
-closed; `--apply` tells the root coordinator once per PR until it answers. The default `guarded` is
+closed; `--apply` tells the root coordinator of each such PR, again on a later run once the earlier
+tell is delivered; a tell still pending is not repeated. A PR whose every closed-by issue is
+closed already is closed too, with no successor named. The default `guarded` is
 `AGENTS.md`, `CLAUDE.md`, `README.md`, `docs/`, `schema/`; setting it replaces that list. A PR whose
 file list hits `gh`'s cap of 100 counts as guarded. Nothing is closed while a live agent's
 branch is unknown; a repo or row `gh` cannot read is an `orphan-pr` error line, and so is a

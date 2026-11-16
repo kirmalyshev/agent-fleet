@@ -70,8 +70,9 @@ pub struct Snapshot {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    /// A newer merged PR closes the same issue: close it with a comment, keep the branch.
-    Close { by: u64 },
+    /// A newer merged PR closes the same issue (`by`), or every issue it closes is closed already
+    /// (`None`): close it with a comment, keep the branch.
+    Close { by: Option<u64> },
     /// Tell the root coordinator; why a person has to look.
     Report(&'static str),
 }
@@ -115,11 +116,16 @@ pub fn classify(
             .iter()
             .find(|(n, closed)| **n > pr.number && closed.iter().any(|i| pr.closes.contains(i)))
             .map(|(n, _)| *n);
+        let all_closed = !pr.closes.is_empty()
+            && pr
+                .closes
+                .iter()
+                .all(|i| snap.issues.get(i).is_some_and(|s| s == "CLOSED"));
         let action = if pr.draft {
             Action::Report("a draft waits for a person")
         } else if pr.files.len() >= FILES_CAP || guarded(&pr.files, &cfg.guarded) {
             Action::Report("touches a guarded surface, waits for a person")
-        } else if let Some(by) = by {
+        } else if by.is_some() || all_closed {
             Action::Close { by }
         } else {
             Action::Report("no newer merged PR closes its issue")
@@ -275,10 +281,13 @@ pub async fn fetch(bin: &str, repo: &str) -> Result<Snapshot> {
 }
 
 /// Close PR `n` with a comment; the branch stays.
-pub async fn close(bin: &str, repo: &str, n: u64, by: u64) -> Result<()> {
+pub async fn close(bin: &str, repo: &str, n: u64, by: Option<u64>) -> Result<()> {
+    let why = match by {
+        Some(by) => format!("#{by} merged since and closes the same issue"),
+        None => "the issue it closes is closed already".to_string(),
+    };
     let comment = format!(
-        "Closed by agent-fleet doctor: no live agent owns this branch, and #{by} merged since \
-         and closes the same issue. The branch is kept."
+        "Closed by agent-fleet doctor: no live agent owns this branch, and {why}. The branch is kept."
     );
     let out = tokio::process::Command::new(bin)
         .args([
@@ -353,7 +362,7 @@ pub fn root_of(s: &crate::state::State) -> Option<String> {
         .map(|(id, _)| id.clone())
 }
 
-/// An unanswered message to `root` about `key` is open: tell once per PR until it is answered.
+/// A message to `root` about `key` is still pending (delivery removes it from the state).
 pub fn already_told(s: &crate::state::State, root: &str, key: &str) -> bool {
     s.msgs.values().any(|m| m.to == root && m.reference == key)
 }
@@ -417,14 +426,23 @@ mod tests {
     #[test]
     fn a_pr_a_newer_merged_pr_supersedes_is_closed() {
         let o = run(&snap(vec![pr(1, "s-1", 4, &[5])]), &[]);
-        assert_eq!(o[0].action, Action::Close { by: 9 });
+        assert_eq!(o[0].action, Action::Close { by: Some(9) });
         assert!(o[0].detail.contains("#5 closed"), "{}", o[0].detail);
     }
 
     #[test]
+    fn a_pr_whose_every_issue_is_closed_is_closed_with_no_successor() {
+        let mut s = snap(vec![pr(20, "s-1", 4, &[5]), pr(21, "s-2", 4, &[5, 6])]);
+        s.merged.clear();
+        let o = run(&s, &[]);
+        assert_eq!(o[0].action, Action::Close { by: None });
+        assert!(matches!(o[1].action, Action::Report(_)), "#6 is open");
+    }
+
+    #[test]
     fn an_older_merged_pr_does_not_supersede() {
-        let mut s = snap(vec![pr(20, "s-1", 4, &[5])]);
-        s.merged = BTreeMap::from([(9, vec![5])]);
+        let mut s = snap(vec![pr(20, "s-1", 4, &[6])]);
+        s.merged = BTreeMap::from([(9, vec![6])]);
         assert!(matches!(run(&s, &[])[0].action, Action::Report(_)));
     }
 
@@ -464,9 +482,9 @@ esac
         let (found, errs) = scan(&bin, &s, &cfg, "2026-11-16T12:00:00Z".parse().unwrap()).await;
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(found.len(), 2);
-        assert_eq!(found[0].action, Action::Close { by: 9 });
+        assert_eq!(found[0].action, Action::Close { by: Some(9) });
         assert!(matches!(found[1].action, Action::Report(_)));
-        close(&bin, "o/r", 1, 9).await.unwrap();
+        close(&bin, "o/r", 1, Some(9)).await.unwrap();
         let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
         assert!(calls.starts_with("pr close 1 -R o/r --comment"), "{calls}");
         assert!(!calls.contains("--delete-branch"), "{calls}");
@@ -648,7 +666,7 @@ esac
         std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o755)).unwrap();
         let e = fetch(bad.to_str().unwrap(), "o/r").await.unwrap_err();
         assert!(format!("{e:#}").contains("unreadable PR"), "{e:#}");
-        assert!(close("/nonexistent/gh", "o/r", 1, 9).await.is_err());
+        assert!(close("/nonexistent/gh", "o/r", 1, Some(9)).await.is_err());
     }
 
     #[test]
