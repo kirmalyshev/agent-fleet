@@ -240,7 +240,7 @@ fn install(cfg: &Cfg, f: &Facts) -> Result<(), String> {
             .output()
             .map_err(|e| format!("new binary does not run: {e}"))?;
         let said = String::from_utf8_lossy(&out.stdout);
-        if !out.status.success() || !said.contains(&format!("({want}")) {
+        if !out.status.success() || !said.contains(&format!("({want})")) {
             return Err(format!("new binary reports {:?}, not {want}", said.trim()));
         }
         std::fs::rename(&tmp, &cfg.dest)
@@ -283,6 +283,7 @@ pub fn record(
         Some(p)
             if status == UpdateStatus::Behind
                 && p.status == UpdateStatus::Failed
+                && p.target == u.target
                 && p.why.as_deref().is_some_and(|w| w.starts_with("restart")) =>
         {
             None
@@ -331,7 +332,10 @@ pub(crate) async fn update_loop(host: std::sync::Arc<crate::host::Host>) {
         }
         if r.outcome == Outcome::Updated && restarted_for != r.target {
             restarted_for = r.target.clone();
-            let errs = restart(&cfg.restart);
+            let cmds = cfg.restart.clone();
+            let errs = tokio::task::spawn_blocking(move || restart(&cmds))
+                .await
+                .unwrap_or_else(|e| vec![format!("restart task died: {e}")]);
             if !errs.is_empty() {
                 let failed = Report {
                     target: r.target.clone(),
@@ -686,6 +690,14 @@ mod tests {
         assert!(
             record("h", "aaa", &pending, Some(&failed)).is_none(),
             "no flip-flop"
+        );
+        let moved = Report {
+            target: Some("ccc".into()),
+            outcome: Outcome::Updated,
+        };
+        assert!(
+            record("h", "aaa", &moved, Some(&failed)).is_some(),
+            "another target is news"
         );
         let build_failed = HostUpdate {
             why: Some("cargo build".into()),

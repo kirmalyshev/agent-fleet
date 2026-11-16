@@ -863,7 +863,7 @@ impl State {
                     .updates
                     .get(&d.host)
                     // A failed fetch has no target: it does not restart the clock.
-                    .filter(|u| d.target.is_none() || u.target == d.target)
+                    .filter(|u| d.target.is_none() || u.target.is_none() || u.target == d.target)
                     .and_then(|u| u.since);
                 self.updates.insert(
                     d.host.clone(),
@@ -1390,6 +1390,12 @@ mod tests {
             s.updates["h"].since,
             Some(moved.ts),
             "a failed fetch keeps the date"
+        );
+        s.apply(&up(UpdateStatus::Blocked, "ccc", "dirty"));
+        assert_eq!(
+            s.updates["h"].since,
+            Some(moved.ts),
+            "a report after the blip keeps the date"
         );
         s.apply(&up(UpdateStatus::Current, "ccc", ""));
         assert!(s.updates.is_empty());

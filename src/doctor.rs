@@ -547,8 +547,8 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
             format!("host:{host}"),
             format!(
                 "running {}, origin/main is {}, behind {} ({:?}){}",
-                &u.installed[..u.installed.len().min(7)],
-                u.target.as_deref().map_or("?", |t| &t[..t.len().min(7)]),
+                u.installed.get(..7).unwrap_or(&u.installed),
+                u.target.as_deref().map_or("?", |t| t.get(..7).unwrap_or(t)),
                 ago(now, since),
                 u.status,
                 u.why
