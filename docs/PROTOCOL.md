@@ -308,7 +308,7 @@ how many worktrees may hold any of a set of resources at once.
 | `role` | an agent's declared lead is down, the lead's level is not above its own, or a second root coordinator is up |
 | `quota` | a program's quota is exhausted, or a window ≥ 90% used resets in the future |
 | `stalled` | an agent idle or blocked for 15 min after it last worked |
-| `outdated` | a host's installed build behind `origin/main` for 15 min: update blocked (dirty, off `main` or diverged checkout), failed (fetch, build or swap; the old binary stays), or installed but not yet restarted. Subject `host:<host>` |
+| `outdated` | a host's installed build behind `origin/main` for 15 min: update blocked (dirty, off `main` or diverged checkout), failed (fetch, build, swap or restart; the old binary stays), or installed but not yet restarted. Subject `host:<host>` |
 
 `hung` and `stalled` are also pushed, not only read: the host writes one `msg.sent` per episode
 — `HUNG` or `STALLED`, ref the agent's name, the finding's own detail for text — to the agent's
@@ -659,13 +659,16 @@ These are v2.
 ## Self-update
 
 `agent-fleet host --self-update <checkout> --restart "<cmd>"…` keeps the installed binary at
-`origin/main`. Every 5 minutes the host fetches `origin/main` and compares it with the commit
-`agent-fleet --version` prints. If they differ and the checkout is clean, on `main` and can
+`origin/main`. Every 5 minutes the host fetches `origin/main` and compares it with the commit the
+running binary was built from (embedded at build time; `agent-fleet --version` shows its short
+form). A build from a modified tree, or with no git, is never current. If they differ and the checkout is clean, on `main` and can
 fast-forward, it pulls, runs `cargo build --release --locked`, copies the binary next to the
 installed one, checks the copy reports the target commit, and renames it over the installed one.
-A rename keeps the old binary whole until the new one is; overwriting in place kills the running
+Run `--self-update` on one host process per machine. A rename keeps the old binary whole until the new one is; overwriting in place kills the running
 process on macOS (`OS_REASON_CODESIGNING`). Then it runs each `--restart` command in order
-(`launchctl kickstart -k gui/<uid>/<label>`, `systemctl --user restart <unit>`; this host's own
-service last, so the hub and other services restart first). A dirty, off-`main` or diverged
+(`launchctl kickstart -k gui/<uid>/<label>`, `systemctl --user restart <unit>`; the operator
+lists this host's own service last, so the hub and other services restart first). If the new
+binary is already installed and the process still runs the old one, the restart commands do not
+run again for that commit; a failing restart is a `failed` record. A dirty, off-`main` or diverged
 checkout, or a failed fetch, build or swap, leaves the old binary and is reported as
 `host.update`, which `doctor` shows as `outdated` after 15 minutes.

@@ -102,9 +102,10 @@ enum Cmd {
         #[arg(long)]
         self_update: Option<PathBuf>,
         /// A command that restarts a long-running process through its service manager
-        /// (`launchctl kickstart -k gui/501/<label>`, `systemctl --user restart <unit>`), run
-        /// after a self-update, in order, this host's own service last. Repeatable.
-        #[arg(long = "restart", value_parser = parse_restart)]
+        /// (`launchctl kickstart -k gui/<uid>/<label>`, `systemctl --user restart <unit>`), run
+        /// after a self-update, in the order given: list this host's own service last. Split on
+        /// whitespace, no quoting. Repeatable.
+        #[arg(long = "restart", value_parser = parse_restart, requires = "self_update")]
         restart: Vec<Vec<String>>,
     },
     /// Protocol metadata.

@@ -10,7 +10,10 @@ fn main() {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
     };
-    let mut commit = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    let mut commit = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| {
+        println!("cargo:warning=no git commit: the build is `unknown` and self-update replaces it");
+        "unknown".into()
+    });
     if git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty()) {
         commit.push_str("-dirty");
     }

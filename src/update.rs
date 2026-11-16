@@ -24,24 +24,37 @@ pub struct Facts {
     pub dirty: bool,
     /// `HEAD` is an ancestor of `origin/main`.
     pub ff: bool,
+    /// What the installed file says to `--version`: it may already be the target while the
+    /// running process is not.
+    pub on_disk: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
     Current,
+    /// The target is already installed on disk; the running process just has to restart.
+    Restart,
     Update,
     Blocked(String),
 }
 
-/// Same commit, whichever way each side abbreviates it.
+/// The first 7 characters of a commit, when it has them.
+fn short(c: &str) -> Option<&str> {
+    c.get(..7)
+}
+
+/// Same commit, whichever way each side abbreviates it. A `-dirty` or `unknown` build is no
+/// commit: it is never the target, so a host running one always gets replaced.
 fn same(a: &str, b: &str) -> bool {
     let n = a.len().min(b.len());
-    n >= 7 && a[..n] == b[..n]
+    n >= 7 && !a.contains('-') && !b.contains('-') && a.get(..n) == b.get(..n)
 }
 
 pub fn decide(f: &Facts) -> Decision {
     if same(&f.installed, &f.target) {
         Decision::Current
+    } else if short(&f.target).is_some_and(|t| f.on_disk.contains(&format!("({t})"))) {
+        Decision::Restart
     } else if f.dirty {
         Decision::Blocked("checkout has uncommitted changes".into())
     } else if f.branch != "main" {
@@ -108,11 +121,21 @@ fn run(dir: &Path, cmd: &[String]) -> Result<String, String> {
         return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
     }
     let err = String::from_utf8_lossy(&out.stderr);
-    let last = err.lines().rev().find(|l| !l.trim().is_empty());
+    let mut tail: Vec<&str> = err
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(3)
+        .collect();
+    tail.reverse();
+    let mut why = tail.join(" | ");
+    if why.len() > 300 {
+        why = why.chars().take(300).collect();
+    }
     Err(format!(
-        "{prog} {}: {}",
+        "{prog} {} ({}): {why}",
         args.first().map_or("", String::as_str),
-        last.unwrap_or("failed")
+        out.status
     ))
 }
 
@@ -124,6 +147,25 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     run(dir, &cmd)
 }
 
+/// `HEAD` is an ancestor of `origin/main`: git exits 0 for yes and 1 for no; anything else is
+/// an error, not a divergence.
+fn is_ancestor(dir: &Path) -> Result<bool, String> {
+    let out = Command::new("git")
+        .args(["merge-base", "--is-ancestor", "HEAD", "origin/main"])
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git merge-base ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
+}
+
 fn facts(cfg: &Cfg, installed: &str) -> Result<Facts, String> {
     let d = &cfg.checkout;
     Ok(Facts {
@@ -131,8 +173,14 @@ fn facts(cfg: &Cfg, installed: &str) -> Result<Facts, String> {
         target: git(d, &["rev-parse", "origin/main"])?,
         head: git(d, &["rev-parse", "HEAD"])?,
         branch: git(d, &["branch", "--show-current"])?,
-        dirty: !git(d, &["status", "--porcelain"])?.is_empty(),
-        ff: git(d, &["merge-base", "--is-ancestor", "HEAD", "origin/main"]).is_ok(),
+        // Untracked files do not stop a fast-forward; `build.rs` counts the same way.
+        dirty: !git(d, &["status", "--porcelain", "--untracked-files=no"])?.is_empty(),
+        ff: is_ancestor(d)?,
+        on_disk: Command::new(&cfg.dest)
+            .arg("--version")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default(),
     })
 }
 
@@ -155,6 +203,10 @@ pub fn check(cfg: &Cfg, installed: &str) -> Report {
             target,
             outcome: Outcome::Current,
         },
+        Decision::Restart => Report {
+            target,
+            outcome: Outcome::Updated,
+        },
         Decision::Blocked(why) => Report {
             target,
             outcome: Outcome::Blocked(why),
@@ -174,23 +226,25 @@ fn install(cfg: &Cfg, f: &Facts) -> Result<(), String> {
         git(&cfg.checkout, &["merge", "--ff-only", "origin/main"])?;
     }
     run(&cfg.checkout, &cfg.build)?;
-    // Next to the installed file: a rename across volumes is not atomic.
-    let tmp = cfg.dest.with_file_name(".agent-fleet.new");
+    // Next to the installed file: a rename across volumes fails (EXDEV).
+    let tmp = cfg
+        .dest
+        .with_file_name(format!(".agent-fleet.new.{}", std::process::id()));
+    let want = short(&f.target).ok_or("origin/main is not a commit id")?;
     let swap = || -> Result<(), String> {
-        std::fs::copy(cfg.checkout.join(&cfg.built), &tmp).map_err(|e| format!("copy: {e}"))?;
-        let said = Command::new(&tmp)
+        let built = cfg.checkout.join(&cfg.built);
+        std::fs::copy(&built, &tmp)
+            .map_err(|e| format!("copy {} to {}: {e}", built.display(), tmp.display()))?;
+        let out = Command::new(&tmp)
             .arg("--version")
             .output()
             .map_err(|e| format!("new binary does not run: {e}"))?;
-        let said = String::from_utf8_lossy(&said.stdout);
-        if !said.contains(&f.target[..7]) {
-            return Err(format!(
-                "new binary reports {:?}, not {}",
-                said.trim(),
-                &f.target[..7]
-            ));
+        let said = String::from_utf8_lossy(&out.stdout);
+        if !out.status.success() || !said.contains(&format!("({want}")) {
+            return Err(format!("new binary reports {:?}, not {want}", said.trim()));
         }
-        std::fs::rename(&tmp, &cfg.dest).map_err(|e| format!("rename: {e}"))
+        std::fs::rename(&tmp, &cfg.dest)
+            .map_err(|e| format!("rename {} to {}: {e}", tmp.display(), cfg.dest.display()))
     };
     let r = swap();
     if r.is_err() {
@@ -225,6 +279,14 @@ pub fn record(
     };
     match prev {
         None if status == UpdateStatus::Current => None,
+        // A restart that keeps failing stays one `failed` record, not a flip-flop.
+        Some(p)
+            if status == UpdateStatus::Behind
+                && p.status == UpdateStatus::Failed
+                && p.why.as_deref().is_some_and(|w| w.starts_with("restart")) =>
+        {
+            None
+        }
         Some(p) if (p.status, &p.target, &p.why) == (u.status, &u.target, &u.why) => None,
         _ => Some(u),
     }
@@ -234,28 +296,50 @@ pub fn record(
 /// restarts itself comes back already current and clears its own record.
 pub(crate) async fn update_loop(host: std::sync::Arc<crate::host::Host>) {
     let Some(cfg) = host.cfg.update.clone() else {
+        eprintln!("agent-fleet host: self-update off (no --self-update)");
         return std::future::pending().await;
     };
     let installed = env!("AGENT_FLEET_COMMIT");
     let me = host.cfg.host.clone();
+    // The restart commands run once per target: a restart that did not take must not bounce
+    // the hub and the other services every tick.
+    let mut restarted_for: Option<String> = None;
     let mut tick = tokio::time::interval(EVERY);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
         let c = cfg.clone();
-        let Ok(r) = tokio::task::spawn_blocking(move || check(&c, installed)).await else {
-            continue;
+        let r = match tokio::task::spawn_blocking(move || check(&c, installed)).await {
+            Ok(r) => r,
+            Err(e) => Report {
+                target: None,
+                outcome: Outcome::Failed(format!("update check died: {e}")),
+            },
         };
-        let prev = host
-            .view()
-            .ok()
-            .and_then(|v| v.state.updates.get(&me).cloned());
-        if let Some(u) = record(&me, installed, &r, prev.as_ref()) {
+        let prev = match host.view() {
+            Ok(v) => v.state.updates.get(&me).cloned(),
+            Err(e) => {
+                eprintln!("agent-fleet host: self-update: replica unreadable: {e:#}");
+                continue;
+            }
+        };
+        let say = |r: &Report, prev: Option<&HostUpdate>| record(&me, installed, r, prev);
+        // Before the restart: it may kill this process.
+        if let Some(u) = say(&r, prev.as_ref()) {
             host.publish(host.presence(Known::HostUpdate(u))).await;
         }
-        if r.outcome == Outcome::Updated {
-            for e in restart(&cfg.restart) {
-                eprintln!("agent-fleet host: self-update restart: {e}");
+        if r.outcome == Outcome::Updated && restarted_for != r.target {
+            restarted_for = r.target.clone();
+            let errs = restart(&cfg.restart);
+            if !errs.is_empty() {
+                let failed = Report {
+                    target: r.target.clone(),
+                    outcome: Outcome::Failed(format!("restart failed: {}", errs.join("; "))),
+                };
+                eprintln!("agent-fleet host: self-update: {errs:?}");
+                if let Some(u) = say(&failed, prev.as_ref()) {
+                    host.publish(host.presence(Known::HostUpdate(u))).await;
+                }
             }
         }
     }
@@ -278,8 +362,8 @@ mod tests {
         run(dir, &["sh".into(), "-c".into(), script.into()]).unwrap()
     }
 
-    /// An origin, a checkout of it on main, an installed script that reports the checkout's
-    /// first commit, and a "build" that writes a script reporting the checkout's HEAD.
+    /// An origin, a checkout of it on main, an installed script that prints `old` (`installed`
+    /// is the checkout's first commit), and a "build" that writes a script reporting HEAD.
     struct Fx {
         _tmp: tempfile::TempDir,
         origin: PathBuf,
@@ -326,6 +410,17 @@ mod tests {
         sh(&fx.origin, "git rev-parse HEAD")
     }
 
+    fn no_temp(f: &Fx) -> bool {
+        std::fs::read_dir(f.cfg.dest.parent().unwrap())
+            .unwrap()
+            .all(|e| {
+                !e.unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".agent-fleet.new")
+            })
+    }
+
     fn installed_says(fx: &Fx) -> String {
         sh(
             fx.cfg.dest.parent().unwrap(),
@@ -341,6 +436,7 @@ mod tests {
             branch: "main".into(),
             dirty: false,
             ff: true,
+            on_disk: "old".into(),
         }
     }
 
@@ -383,7 +479,7 @@ mod tests {
             inode,
             "renamed, not rewritten"
         );
-        assert!(!f.cfg.dest.with_file_name(".agent-fleet.new").exists());
+        assert!(no_temp(&f));
         // The build is installed: the next check is Current.
         assert_eq!(check(&f.cfg, &target).outcome, Outcome::Current);
     }
@@ -400,11 +496,18 @@ mod tests {
     fn a_dirty_checkout_is_blocked_and_the_old_binary_stays() {
         let f = fx();
         push_commit(&f);
-        std::fs::write(f.cfg.checkout.join("scratch"), "x").unwrap();
+        std::fs::write(f.cfg.checkout.join("README"), "x").unwrap();
+        sh(&f.cfg.checkout, "git add README");
+        let head = sh(&f.cfg.checkout, "git rev-parse HEAD");
         let r = check(&f.cfg, &f.installed);
         assert!(
             matches!(&r.outcome, Outcome::Blocked(w) if w.contains("uncommitted")),
             "{r:?}"
+        );
+        assert_eq!(
+            sh(&f.cfg.checkout, "git rev-parse HEAD"),
+            head,
+            "not pulled"
         );
         assert_eq!(installed_says(&f), "old");
     }
@@ -464,10 +567,7 @@ mod tests {
             "{r:?}"
         );
         assert_eq!(installed_says(&f), "old");
-        assert!(
-            !f.cfg.dest.with_file_name(".agent-fleet.new").exists(),
-            "no half-installed file"
-        );
+        assert!(no_temp(&f), "no half-installed file");
     }
 
     #[test]
@@ -510,6 +610,84 @@ mod tests {
             record("h", "aaa", &done, None).unwrap().status,
             UpdateStatus::Behind
         );
+    }
+
+    #[test]
+    fn a_modified_or_unknown_build_is_never_current_and_an_installed_target_only_restarts() {
+        let t = "b".repeat(40);
+        let dirty = Facts {
+            installed: format!("{t}-dirty"),
+            target: t.clone(),
+            ..base()
+        };
+        assert_eq!(decide(&dirty), Decision::Update);
+        let unknown = Facts {
+            installed: "unknown".into(),
+            ..base()
+        };
+        assert_eq!(decide(&unknown), Decision::Update);
+        let on_disk = Facts {
+            on_disk: "agent-fleet 0.1.0 (bbbbbbb)".into(),
+            dirty: true,
+            ..base()
+        };
+        assert_eq!(decide(&on_disk), Decision::Restart);
+    }
+
+    #[test]
+    fn an_unreachable_origin_is_a_failure_that_keeps_the_old_binary() {
+        let f = fx();
+        sh(&f.cfg.checkout, "git remote set-url origin /nonexistent");
+        let r = check(&f.cfg, &f.installed);
+        assert!(
+            matches!(&r.outcome, Outcome::Failed(w) if w.contains("fetch")),
+            "{r:?}"
+        );
+        assert_eq!(r.target, None);
+        assert_eq!(installed_says(&f), "old");
+    }
+
+    #[test]
+    fn a_target_already_on_disk_is_restarted_not_rebuilt() {
+        let mut f = fx();
+        let target = push_commit(&f);
+        assert_eq!(check(&f.cfg, &f.installed).outcome, Outcome::Updated);
+        // The process still runs the old build; a broken build must not matter now.
+        f.cfg.build = vec!["false".into()];
+        let inode = std::fs::metadata(&f.cfg.dest).unwrap().ino();
+        let r = check(&f.cfg, &f.installed);
+        assert_eq!(r.outcome, Outcome::Updated, "{r:?}");
+        assert_eq!(r.target.as_deref(), Some(target.as_str()));
+        assert_eq!(
+            std::fs::metadata(&f.cfg.dest).unwrap().ino(),
+            inode,
+            "no second swap"
+        );
+    }
+
+    #[test]
+    fn a_failing_restart_stays_one_failed_record() {
+        let pending = Report {
+            target: Some("bbb".into()),
+            outcome: Outcome::Updated,
+        };
+        let failed = HostUpdate {
+            host: "h".into(),
+            status: UpdateStatus::Failed,
+            installed: "aaa".into(),
+            target: Some("bbb".into()),
+            why: Some("restart failed: launchctl".into()),
+            since: None,
+        };
+        assert!(
+            record("h", "aaa", &pending, Some(&failed)).is_none(),
+            "no flip-flop"
+        );
+        let build_failed = HostUpdate {
+            why: Some("cargo build".into()),
+            ..failed
+        };
+        assert!(record("h", "aaa", &pending, Some(&build_failed)).is_some());
     }
 
     #[test]

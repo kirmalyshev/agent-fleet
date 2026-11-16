@@ -60,6 +60,7 @@ pub struct State {
     #[serde(default)]
     pub hung: BTreeMap<String, ProcessHung>,
     /// Hosts whose installed build is not `origin/main` (`host.update`), by host.
+    #[serde(default)]
     pub updates: BTreeMap<String, HostUpdate>,
     /// Why a stopped agent is stopped, as its host read it off the screen, keyed by agent id.
     #[serde(default)]
@@ -861,7 +862,8 @@ impl State {
                 let since = self
                     .updates
                     .get(&d.host)
-                    .filter(|u| u.target == d.target)
+                    // A failed fetch has no target: it does not restart the clock.
+                    .filter(|u| d.target.is_none() || u.target == d.target)
                     .and_then(|u| u.since);
                 self.updates.insert(
                     d.host.clone(),
@@ -1378,6 +1380,16 @@ mod tests {
             s.updates["h"].since,
             Some(moved.ts),
             "a new target starts over"
+        );
+        let mut blip = up(UpdateStatus::Failed, "ccc", "fetch failed");
+        if let Body::Known(Known::HostUpdate(d)) = &mut blip.body {
+            d.target = None;
+        }
+        s.apply(&blip);
+        assert_eq!(
+            s.updates["h"].since,
+            Some(moved.ts),
+            "a failed fetch keeps the date"
         );
         s.apply(&up(UpdateStatus::Current, "ccc", ""));
         assert!(s.updates.is_empty());

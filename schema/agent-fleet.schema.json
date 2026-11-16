@@ -3472,6 +3472,7 @@
           "additionalProperties": {
             "$ref": "#/$defs/HostUpdate"
           },
+          "default": {},
           "description": "Hosts whose installed build is not `origin/main` (`host.update`), by host.",
           "type": "object"
         },
@@ -3499,7 +3500,6 @@
         "msgs",
         "worktrees",
         "worktree_procs",
-        "updates",
         "unknown"
       ],
       "title": "State",
