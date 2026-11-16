@@ -3,10 +3,14 @@
 //! the machine; doctor, `kill` and `agent-fleet proc` read the verdicts it left in the log.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 
+use crate::event::{Body, Event, Known, Level, MsgSent, ProcessHung};
+use crate::host::Host;
 use crate::scan::{Proc, Procs};
+use crate::state::State;
 
 /// How often the host runs the watch tick.
 pub const EVERY: std::time::Duration = std::time::Duration::from_secs(120);
@@ -104,6 +108,11 @@ pub struct Watch {
 }
 
 impl Watch {
+    /// The table the last tick read.
+    pub fn last(&self) -> Option<&Procs> {
+        self.prev.as_ref().map(|(p, _)| p)
+    }
+
     /// One tick. The first only remembers the table: CPU needs two.
     pub fn step(&mut self, now: Procs, at: DateTime<Utc>, seen: &Seen) -> Vec<Classified> {
         let Some((before, then)) = self.prev.take() else {
@@ -259,6 +268,403 @@ impl Tick<'_> {
         };
         push(self, verdict);
         false
+    }
+}
+
+// ---------- the host's tick ----------
+
+/// The watch's verdict on `pid` as the log has it: `hung`, `orphan`, `waiting` (in a lock's
+/// queue), else `working`; with its evidence.
+pub fn verdict_of(
+    s: &State,
+    host: &str,
+    pid: u32,
+    now: DateTime<Utc>,
+) -> (&'static str, Option<String>) {
+    if let Some(h) = s
+        .hung
+        .values()
+        .find(|h| h.host == host && (h.pid == pid || h.pids.contains(&pid)))
+    {
+        return ("hung", h.evidence.clone());
+    }
+    if let Some(o) = s.orphans.get(&format!("{host}:{pid}")) {
+        return ("orphan", Some(o.why.clone()));
+    }
+    for r in s.resources.values().filter(|r| r.host == host) {
+        if let Some(w) = r.waiting.iter().find(|w| w.pid == pid) {
+            let d = format!("for {} since {}", r.resource, crate::ui::ago(now, w.since));
+            return ("waiting", Some(d));
+        }
+    }
+    ("working", None)
+}
+
+/// Who hears about a process: the agent that started it, its lead, and the root coordinator.
+pub fn recipients(s: &State, agent: Option<&str>) -> Vec<String> {
+    let root = s.agents.keys().find(|a| {
+        s.roles
+            .get(*a)
+            .is_some_and(|r| r.level == Level::RootCoordinator)
+    });
+    let lead = agent.and_then(|a| crate::doctor::escalate(s, a));
+    let mut out: Vec<String> = Vec::new();
+    for to in [agent, lead, root.map(String::as_str)]
+        .into_iter()
+        .flatten()
+    {
+        if !out.iter().any(|o| o == to) {
+            out.push(to.to_string());
+        }
+    }
+    out
+}
+
+/// Each process matching `is` whose parent does not, with it and the matching ones under it.
+pub fn tops(
+    v: &[Classified],
+    procs: &Procs,
+    is: impl Fn(&Verdict) -> bool,
+) -> Vec<(u32, Vec<u32>)> {
+    let hit: HashSet<u32> = v.iter().filter(|c| is(&c.verdict)).map(|c| c.pid).collect();
+    let mut out: Vec<(u32, Vec<u32>)> = hit
+        .iter()
+        .copied()
+        .filter(|p| procs.0.get(p).is_none_or(|x| !hit.contains(&x.ppid)))
+        .map(|top| {
+            let mut pids: Vec<u32> = procs
+                .tree(top)
+                .into_iter()
+                .filter(|p| hit.contains(p))
+                .collect();
+            pids.sort_unstable();
+            (top, pids)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The live agent on `host` whose worktree holds `cwd` (the deepest one).
+fn agent_in(s: &State, host: &str, cwd: &str) -> Option<String> {
+    s.agents
+        .iter()
+        .filter(|(_, a)| a.host == host)
+        .filter_map(|(id, a)| {
+            let (_, w) = crate::doctor::worktree_of(s, a)?;
+            let p = &w.state.path;
+            (cwd == p || cwd.starts_with(&format!("{p}/"))).then_some((p.len(), id))
+        })
+        .max()
+        .map(|(_, id)| id.clone())
+}
+
+/// `lsof` with `args`, its stdout when it ran (it exits 1 when it lists nothing).
+async fn lsof(args: &[&str]) -> Option<String> {
+    let out = tokio::process::Command::new("lsof")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Listening processes, and when each of `pids`' stdout/stderr files last changed. `None`
+/// when `lsof` cannot answer: then nothing is proved hung.
+async fn machine(pids: &[u32]) -> Option<(HashSet<u32>, HashMap<u32, DateTime<Utc>>)> {
+    let listening = parse_lsof_pids(&lsof(&["-nP", "-iTCP", "-sTCP:LISTEN", "-Fp"]).await?);
+    if pids.is_empty() {
+        return Some((listening, HashMap::new()));
+    }
+    let csv: Vec<String> = pids.iter().map(u32::to_string).collect();
+    let files =
+        parse_lsof_files(&lsof(&["-nP", "-a", "-d", "1,2", "-Fpftn", "-p", &csv.join(",")]).await?);
+    let output_at = files
+        .into_iter()
+        .filter_map(|(pid, fs)| {
+            let t = fs
+                .iter()
+                .filter_map(|f| {
+                    Some(DateTime::<Utc>::from(
+                        std::fs::metadata(f).ok()?.modified().ok()?,
+                    ))
+                })
+                .max()?;
+            Some((pid, t))
+        })
+        .collect();
+    Some((listening, output_at))
+}
+
+/// The booted simulators' UDIDs; empty off macOS or when `simctl` cannot answer.
+async fn booted() -> Vec<String> {
+    let Ok(out) = tokio::process::Command::new("xcrun")
+        .args(["simctl", "list", "devices", "booted"])
+        .output()
+        .await
+    else {
+        return Vec::new();
+    };
+    let mut v: Vec<String> = crate::scan::udids(&String::from_utf8_lossy(&out.stdout))
+        .into_iter()
+        .collect();
+    v.sort();
+    v
+}
+
+/// Every `EVERY`: classify what the agents started, report hung processes, and tell each
+/// agent and its coordinator once about a hung or orphaned process and a wait over 30 min.
+pub(crate) async fn watch_loop(host: Arc<Host>) {
+    let mut w = Watch::default();
+    let mut tick = tokio::time::interval(EVERY);
+    loop {
+        tick.tick().await;
+        if let Err(err) = once(&host, &mut w).await {
+            eprintln!("agent-fleet host: watch: {err:#}");
+        }
+    }
+}
+
+async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {
+    let shells = host.pane_shells().await?;
+    let procs = Procs::read();
+    let view = host.view()?;
+    let s = &view.state;
+    let me = host.cfg.host.clone();
+    let mut seen = Seen::default();
+    for (agent, shell) in &shells {
+        for (&pid, p) in &procs.0 {
+            if p.ppid == *shell {
+                seen.agents.push((agent.clone(), pid));
+            }
+        }
+    }
+    let mut holders: HashMap<u32, String> = HashMap::new();
+    for (name, dir) in &host.cfg.locks {
+        let l = crate::scan::read_lock(dir);
+        if let Some(h) = &l.holder {
+            holders.insert(h.pid, name.clone());
+        }
+        for q in l.waiting {
+            seen.waiting.insert(q.pid, (name.clone(), q.since));
+        }
+    }
+    for o in s.orphans.values().filter(|o| o.host == me) {
+        let cwd = o.cwd.clone().or_else(|| crate::scan::cwd_of(o.pid));
+        let agent = cwd.and_then(|c| agent_in(s, &me, &c));
+        seen.orphans.insert(o.pid, (o.why.clone(), agent));
+    }
+    let pids: Vec<u32> = seen
+        .agents
+        .iter()
+        .flat_map(|(_, a)| procs.tree(*a))
+        .collect();
+    match machine(&pids).await {
+        Some((listening, output_at)) => {
+            seen.listening = listening;
+            seen.output_at = Some(output_at);
+        }
+        None => seen.output_at = None,
+    }
+    let primed = w.last().is_some();
+    let now = Utc::now();
+    let v = w.step(procs, now, &seen);
+    let Some(procs) = w.last().filter(|_| primed) else {
+        return Ok(());
+    };
+    let of = |pid: u32| v.iter().find(|c| c.pid == pid);
+    let up = |pid: u32| {
+        procs
+            .0
+            .get(&pid)
+            .map_or((String::from("?"), String::new()), |p| {
+                let cmd = short_cmd(p.args.as_deref().unwrap_or(&p.name));
+                let age = p
+                    .started
+                    .map(|t| format!(", up {}", crate::ui::ago(now, t)))
+                    .unwrap_or_default();
+                (cmd, age)
+            })
+    };
+    // Hung: one report per topmost hung process, cleared when it works again or is gone.
+    let mut live = HashSet::new();
+    let mins = EVERY.as_secs() as i64 * HUNG_TICKS as i64 / 60;
+    for (top, pids) in tops(&v, procs, |v| matches!(v, Verdict::Hung(_))) {
+        let Some(c) = of(top) else { continue };
+        let Verdict::Hung(e) = &c.verdict else {
+            continue;
+        };
+        let key = format!("{me}:{top}");
+        live.insert(key.clone());
+        let mut evidence = e.text(mins);
+        if let Some((_, r)) = holders
+            .iter()
+            .find(|(h, _)| pids.contains(h) || procs.under_any(top, &[**h].into()))
+        {
+            evidence += &format!("; holds the {r} lock");
+        }
+        let known = s.hung.get(&key);
+        let since = known.and_then(|k| k.since).unwrap_or(now);
+        let p = &procs.0[&top];
+        if known.is_none_or(|k| k.pids != pids) {
+            host.publish(host.presence(Known::ProcessHung(ProcessHung {
+                host: me.clone(),
+                pid: top,
+                pids: pids.clone(),
+                agent: c.agent.clone(),
+                command: Some(p.args.clone().unwrap_or_else(|| p.name.clone())),
+                started: p.started,
+                evidence: Some(evidence.clone()),
+                since: Some(since),
+            })))
+            .await;
+        }
+        let (cmd, age) = up(top);
+        let list: Vec<String> = pids.iter().map(u32::to_string).collect();
+        let text = format!(
+            "{cmd} (pid {top}{age}) is hung: {evidence} — kill: agent-fleet kill {}",
+            list.join(" ")
+        );
+        tell(
+            host,
+            &view.events,
+            s,
+            c.agent.as_deref(),
+            "HUNG",
+            &key,
+            since,
+            text,
+        )
+        .await;
+    }
+    for (key, h) in s.hung.iter().filter(|(_, h)| h.host == me) {
+        // Still idle after a restart: its streak is rebuilding, the report stands.
+        if live.contains(key) || of(h.pid).is_some_and(|c| c.verdict == Verdict::Idle) {
+            continue;
+        }
+        host.publish(host.presence(Known::ProcessHung(ProcessHung {
+            host: me.clone(),
+            pid: h.pid,
+            pids: Vec::new(),
+            agent: None,
+            command: None,
+            started: None,
+            evidence: None,
+            since: None,
+        })))
+        .await;
+    }
+    // Orphans: one tell per topmost orphan.
+    let tops_o = tops(&v, procs, |v| matches!(v, Verdict::Orphan { .. }));
+    let lock_dead = tops_o.iter().any(|(t, _)| {
+        of(*t).is_some_and(
+            |c| matches!(&c.verdict, Verdict::Orphan { why } if why.contains("lock owner dead")),
+        )
+    });
+    let devices = if lock_dead {
+        booted().await
+    } else {
+        Vec::new()
+    };
+    for (top, pids) in tops_o {
+        let Some(c) = of(top) else { continue };
+        let Verdict::Orphan { why } = &c.verdict else {
+            continue;
+        };
+        let key = format!("{me}:{top}");
+        let Some(o) = s.orphans.get(&key) else {
+            continue;
+        };
+        let (cmd, age) = up(top);
+        let list: Vec<String> = pids.iter().map(u32::to_string).collect();
+        let mut text = format!(
+            "{cmd} (pid {top}{age}) is an orphan: {why} — kill: agent-fleet kill {}",
+            list.join(" ")
+        );
+        if why.contains("lock owner dead") && !devices.is_empty() {
+            let d = devices.join(" ");
+            text += &format!(
+                "; booted simulators keep it alive: {d} — release: xcrun simctl shutdown {d}"
+            );
+        }
+        tell(
+            host,
+            &view.events,
+            s,
+            c.agent.as_deref(),
+            "ORPHAN",
+            &key,
+            o.since,
+            text,
+        )
+        .await;
+    }
+    // Waits over 30 min.
+    for c in &v {
+        let Verdict::Waiting { on, since } = &c.verdict else {
+            continue;
+        };
+        if now - *since < WAIT_MAX {
+            continue;
+        }
+        let key = format!("{me}:{}", c.pid);
+        let (cmd, _) = up(c.pid);
+        let behind = holders
+            .iter()
+            .find(|(_, r)| *r == on)
+            .map(|(h, _)| format!(" behind pid {h}"))
+            .unwrap_or_default();
+        let text = format!(
+            "{cmd} (pid {}) has waited {} for the {on} lock{behind}; nothing waits over {}m",
+            c.pid,
+            crate::ui::ago(now, *since),
+            WAIT_MAX.num_minutes()
+        );
+        tell(
+            host,
+            &view.events,
+            s,
+            c.agent.as_deref(),
+            "WAITING",
+            &key,
+            *since,
+            text,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+/// A `msg.sent` of `kind` about `key` to each recipient, once since `since`: the log is the
+/// dedupe across restarts.
+#[allow(clippy::too_many_arguments)]
+async fn tell(
+    host: &Arc<Host>,
+    events: &[Event],
+    s: &State,
+    agent: Option<&str>,
+    kind: &str,
+    key: &str,
+    since: DateTime<Utc>,
+    text: String,
+) {
+    for to in recipients(s, agent) {
+        let sent = events.iter().any(|e| {
+            e.ts >= since
+                && matches!(&e.body, Body::Known(Known::MsgSent(m))
+                    if m.kind == kind && m.reference == key && m.to == to)
+        });
+        if !sent {
+            host.publish(host.presence(Known::MsgSent(MsgSent {
+                to,
+                kind: kind.into(),
+                reference: key.into(),
+                text: text.clone(),
+            })))
+            .await;
+        }
     }
 }
 
@@ -545,6 +951,41 @@ mod tests {
         w.step(wedged(60_000), at(4), &seen());
         let v = w.step(wedged(60_000), at(6), &seen());
         assert_eq!(verdict(&v, 30), Some(&Verdict::Idle));
+    }
+
+    #[test]
+    fn a_hung_chain_is_one_report_at_its_top() {
+        let mut w = Watch::default();
+        for m in [0, 2] {
+            w.step(wedged(0), at(m), &seen());
+        }
+        let v = w.step(wedged(0), at(4), &seen());
+        let t = tops(&v, w.last().unwrap(), |v| matches!(v, Verdict::Hung(_)));
+        assert_eq!(t, vec![(30, vec![30, 31])]);
+    }
+
+    #[test]
+    fn the_logged_verdict_of_a_pid_matches_what_doctor_reads() {
+        let mut s = State::default();
+        s.hung.insert(
+            "h:30".into(),
+            ProcessHung {
+                host: "h".into(),
+                pid: 30,
+                pids: vec![30, 31],
+                agent: None,
+                command: None,
+                started: None,
+                evidence: Some("0% CPU".into()),
+                since: None,
+            },
+        );
+        assert_eq!(
+            verdict_of(&s, "h", 31, t0()),
+            ("hung", Some("0% CPU".into()))
+        );
+        assert_eq!(verdict_of(&s, "other", 31, t0()).0, "working");
+        assert_eq!(verdict_of(&s, "h", 99, t0()), ("working", None));
     }
 
     #[test]

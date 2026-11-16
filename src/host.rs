@@ -295,6 +295,35 @@ impl Host {
         true
     }
 
+    /// Each herdr pane the fleet knows: its agent and the pane's shell pid. A pane herdr cannot
+    /// describe is skipped.
+    pub(crate) async fn pane_shells(&self) -> Result<Vec<(String, u32)>> {
+        let list = herdr_call(&self.cfg.herdr_socket, "agent.list", json!({})).await?;
+        let mut out = Vec::new();
+        for a in list["agents"].as_array().into_iter().flatten() {
+            let pane = a["pane_id"].as_str().unwrap_or_default();
+            let Some(agent) = self
+                .panes
+                .lock()
+                .unwrap()
+                .get(pane)
+                .map(|l| l.agent.clone())
+            else {
+                continue;
+            };
+            let target = json!({ "pane_id": pane });
+            let Ok(info) = herdr_call(&self.cfg.herdr_socket, "pane.process_info", target).await
+            else {
+                bump(&self.n.herdr_errors);
+                continue;
+            };
+            if let Some(shell) = info["process_info"]["shell_pid"].as_u64() {
+                out.push((agent, shell as u32));
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn presence(&self, body: Known) -> Envelope<Known> {
         Envelope::new(self.actor(), self.cfg.session.clone(), body)
     }
@@ -1169,6 +1198,7 @@ pub async fn run(cfg: Config, client: Client) -> Result<()> {
         r = tokio::spawn(host.clone().presence_loop()) => bail!("presence stopped: {r:?}"),
         r = tokio::spawn(host.clone().scan_loop()) => bail!("scans stopped: {r:?}"),
         r = tokio::spawn(host.clone().lock_loop()) => bail!("lock reads stopped: {r:?}"),
+        r = tokio::spawn(crate::watch::watch_loop(host.clone())) => bail!("the watch tick stopped: {r:?}"),
         r = tokio::spawn(crate::spawn::spawn_loop(host.clone())) => bail!("spawning stopped: {r:?}"),
     }
 }

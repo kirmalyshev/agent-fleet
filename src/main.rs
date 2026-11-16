@@ -249,6 +249,9 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// What the watch tick found a process on this host to be: `hung`, `orphan`, `waiting`, or
+    /// `working` when it left no report (working, or not an agent's).
+    Proc { pid: u32 },
     /// What needs a look: stale, hung or heavy agents, duplicate work, forgotten worktrees,
     /// unpushed commits.
     Doctor {
@@ -819,6 +822,14 @@ async fn main() -> Result<()> {
             } else {
                 print!("{}", ui::stats(&v)?);
             }
+        }
+        Cmd::Proc { pid } => {
+            let (verdict, detail) =
+                watch::verdict_of(&ctx.state().await?, &ctx.host_name(), *pid, now);
+            println!(
+                "{verdict}{}",
+                detail.map(|d| format!(": {d}")).unwrap_or_default()
+            );
         }
         Cmd::Doctor { json } => {
             let f = doctor::findings(&ctx.state().await?, now);

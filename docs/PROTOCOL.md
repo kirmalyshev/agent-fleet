@@ -295,7 +295,7 @@ how many worktrees may hold any of a set of resources at once.
 | Finding | When |
 |---|---|
 | `stale` | an agent idle, done or blocked for 2 h |
-| `hung` | working for 30 min at under 2% CPU, its worktree unchanged as long |
+| `hung` | working for 30 min at under 2% CPU, its worktree unchanged as long; or (subject `<host>:<pid>`) a process the watch tick reported in `proc.hung` |
 | `heavy` | an agent's tree, or a worktree's processes, over 4 GB or 200% CPU |
 | `duplicate` | two agents in one worktree, or two agents' worktrees changing the same files (lockfiles aside) |
 | `forgotten` | a worktree no agent works in, with unsaved work for an hour, or clean and 3 days untouched, or clean with processes still running 10 min after it last changed; running processes are named, and `agent-fleet kill` accepts them unless the worktree is a main checkout |
@@ -493,6 +493,34 @@ exits normally releases the lock first, so a member of its group under a still-h
 an orphan by definition, with no age or device check. The device list is only read when a
 reparented tool exists to check. Doctor shows them as `orphan` findings and `agent-fleet
 kill` accepts them.
+
+### The watch tick
+
+Every 2 minutes the host classifies every process an agent started: everything under the
+shells its agent program runs (an agent's own process, its pane shell and its other direct
+children — MCP servers — are never classified), plus the proved orphans, each claimed by the
+agent whose worktree it runs in. A process under 2 minutes old is not classified, nor is one
+with a listening TCP socket (a server it keeps) or anything under it. Each gets one state:
+
+- `working`: over 1% CPU over the interval, its stdout/stderr file changed, a child started
+  since the last tick, a device tool other than `simctl bootstatus` (`xcodebuild`, `maestro`,
+  `simctl`, `idb`, `xctest`, …), or a descendant that is any of these;
+- `waiting`: in a watched lock's queue (`<lock>.waiting/`), with the lock and since when;
+  nothing under it is classified;
+- `hung`: none of the above for 2 ticks in a row. When `lsof` cannot answer, nothing is hung;
+- `orphan`: a `proc.orphaned` proof holds.
+
+The topmost hung process of a chain is reported once as `proc.hung` with every hung pid under
+it, its command, start, and evidence (CPU, the output file's last change, the deepest
+descendant's command, the lock it holds); the report clears when it works again or is gone. A
+`hung` or `orphan` process, and a `waiting` one past 30 minutes, are told once each — a
+`msg.sent` of kind `HUNG`, `ORPHAN` or `WAITING` with `ref` `<host>:<pid>` — to the agent that
+started it, its lead and the root coordinator. An orphan proved by a dead lock owner also names
+the booted simulators that keep its holder alive and the `xcrun simctl shutdown` that releases
+it. Doctor shows `proc.hung` as `hung` findings (subject `<host>:<pid>`), `agent-fleet kill`
+accepts its pids — also inside another agent's tree — and `agent-fleet proc <pid>` prints the
+verdict the log holds for a pid on this host (`working` when there is no report). Nothing is
+killed automatically.
 
 ## Spawning
 

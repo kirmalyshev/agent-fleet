@@ -893,6 +893,45 @@ mod tests {
     }
 
     #[test]
+    fn a_watch_notice_goes_to_the_agent_its_lead_and_the_root_once_each() {
+        let now = Utc::now();
+        let role = |level: Level, lead: Option<&str>| crate::state::Role {
+            level,
+            lead: lead.map(str::to_string),
+            domain: None,
+            by: "agent:h/s/root".into(),
+            since: now,
+        };
+        let mut s = State::default();
+        for id in ["agent:h/s/a", "agent:h/s/root"] {
+            s.agents
+                .insert(id.into(), agent(AgentState::Working, now, "/w/a", 0, 1));
+        }
+        s.roles
+            .insert("agent:h/s/root".into(), role(Level::RootCoordinator, None));
+        s.roles.insert(
+            "agent:h/s/a".into(),
+            role(Level::Implementer, Some("agent:h/s/lead")),
+        );
+        let r = crate::watch::recipients;
+        assert_eq!(
+            r(&s, Some("agent:h/s/a")),
+            vec!["agent:h/s/a", "agent:h/s/lead", "agent:h/s/root"]
+        );
+        s.roles.get_mut("agent:h/s/a").unwrap().lead = None;
+        assert_eq!(
+            r(&s, Some("agent:h/s/a")),
+            vec!["agent:h/s/a", "agent:h/s/root"],
+            "no lead: the root once"
+        );
+        assert_eq!(
+            r(&s, None),
+            vec!["agent:h/s/root"],
+            "an orphan nobody claims"
+        );
+    }
+
+    #[test]
     fn a_hung_process_is_a_finding_and_its_tree_is_killable() {
         let now = Utc::now();
         let mut s = State::default();
