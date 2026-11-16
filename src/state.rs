@@ -52,6 +52,9 @@ pub struct State {
     /// Agent programs outside herdr on each host, keyed `<host>:<pid>`.
     #[serde(default)]
     pub unmanaged: BTreeMap<String, Unmanaged>,
+    /// Processes each host proved orphaned, keyed `<host>:<pid>`.
+    #[serde(default)]
+    pub orphans: BTreeMap<String, Orphan>,
     /// Why a stopped agent is stopped, as its host read it off the screen, keyed by agent id.
     #[serde(default)]
     pub stuck: BTreeMap<String, Stuck>,
@@ -82,6 +85,10 @@ pub struct Agent {
     /// When it was last seen `working`; a stall is an idle stretch after this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worked: Option<DateTime<Utc>>,
+    /// When its state last became `done`; cleared on the next `working`. An agent that
+    /// finished its turn and sits idle is parked awaiting work, not stalled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished: Option<DateTime<Utc>>,
     #[serde(default)]
     pub usage: Option<Usage>,
 }
@@ -282,6 +289,19 @@ pub struct Signal {
     pub since: DateTime<Utc>,
 }
 
+/// A process the host's scan proved an orphan: reparented to init, its device gone or its
+/// lock's recorded owner dead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Orphan {
+    pub host: String,
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    pub why: String,
+    /// First proved.
+    pub since: DateTime<Utc>,
+}
+
 /// An agent program the host's scan saw outside every herdr pane tree.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Unmanaged {
@@ -421,6 +441,13 @@ impl State {
                                 ts
                             })
                             .or_else(|| old.and_then(|a| a.worked)),
+                        finished: if d.state == AgentState::Working {
+                            None
+                        } else {
+                            (d.state == AgentState::Done)
+                                .then_some(ts)
+                                .or_else(|| old.and_then(|a| a.finished))
+                        },
                         usage: old.and_then(|a| a.usage.clone()),
                     },
                 );
@@ -511,7 +538,11 @@ impl State {
                 if let Some(a) = self.agents.get_mut(&d.agent) {
                     if d.state == AgentState::Working {
                         a.worked = Some(ts);
+                        a.finished = None;
                         self.signals.remove(&d.agent);
+                    }
+                    if d.state == AgentState::Done {
+                        a.finished = Some(ts);
                     }
                     if a.state != d.state {
                         a.state = d.state;
@@ -766,6 +797,26 @@ impl State {
                     }
                     None => {
                         self.unmanaged.remove(&key);
+                    }
+                }
+            }
+            Known::ProcessOrphaned(d) => {
+                let key = format!("{}:{}", d.host, d.pid);
+                match &d.why {
+                    Some(why) => {
+                        self.orphans.insert(
+                            key,
+                            Orphan {
+                                host: d.host.clone(),
+                                pid: d.pid,
+                                cwd: d.cwd.clone(),
+                                why: why.clone(),
+                                since: d.since.unwrap_or(ts),
+                            },
+                        );
+                    }
+                    None => {
+                        self.orphans.remove(&key);
                     }
                 }
             }
@@ -1045,6 +1096,39 @@ mod tests {
         .into_event();
         s.apply(&clear);
         assert!(s.unmanaged.is_empty());
+    }
+
+    #[test]
+    fn an_orphan_proof_folds_and_clears() {
+        let mut s = State::default();
+        let seen = ev(
+            ActorKind::Host,
+            Known::ProcessOrphaned(ProcessOrphaned {
+                host: "h".into(),
+                pid: 27634,
+                cwd: Some("/w/shard".into()),
+                why: Some("sim lock owner dead".into()),
+                since: None,
+            }),
+        )
+        .into_event();
+        s.apply(&seen);
+        let o = &s.orphans["h:27634"];
+        assert_eq!(o.why, "sim lock owner dead");
+        assert_eq!(o.since, seen.ts);
+        let clear = ev(
+            ActorKind::Host,
+            Known::ProcessOrphaned(ProcessOrphaned {
+                host: "h".into(),
+                pid: 27634,
+                cwd: None,
+                why: None,
+                since: None,
+            }),
+        )
+        .into_event();
+        s.apply(&clear);
+        assert!(s.orphans.is_empty());
     }
 
     #[test]

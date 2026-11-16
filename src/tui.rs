@@ -1250,6 +1250,7 @@ mod tests {
                 state: AgentState::Idle,
                 since: now - chrono::Duration::hours(3),
                 worked: None,
+                finished: None,
                 usage: None,
             },
         );

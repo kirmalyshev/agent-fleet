@@ -99,6 +99,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | spawn | `spawn.requested` | name, agent, host, session, repo, issue?, branch, profile, brief, level?, lead?, worktree?, replaces?, why | | agent, host |
 | | `spawn.result` | agent, ok, pane?, worktree?, error? | re = the request | host |
 | | `agent.unmanaged` | host, pid, program?, cwd?, since? — no `program` clears the report | | host |
+| | `proc.orphaned` | host, pid, cwd?, why?, since? — no `why` clears the report | | host |
 | | `agent.stuck` | agent, cause?, detail, until? — no `cause` clears the record | | host |
 | | `agent.signal` | agent, program, signal, detail? — `prompt`/`turn_end` clear the agent's stored signal | | agent |
 
@@ -474,6 +475,23 @@ first argument; a `daemon` inside a `-p` prompt is no daemon), as in `codex app-
 daemon` or `claude daemon`, and everything under such a process; the
 process's directory is known on Linux only), re-sent without `program` once the process is gone;
 `agent-fleet doctor` shows them as `unmanaged` findings.
+
+The same scan proves orphans and reports them as `proc.orphaned` (`why` says which proof
+held; no `why` clears it). A process reparented to init that is a device or test tool —
+`xcodebuild`, `maestro` (named `maestro`, or `java` whose args carry `maestro.cli.AppKt` or
+`/.maestro/lib/`), `simctl`, `idb`, `xctest`, a `WebDriverAgentRunner`, or `log stream` —
+whose process-group leader is dead (the group id names no live process) is an orphan once it
+is two minutes old — the floor only spares a script mid-`exec`; its descendants are orphans
+with it. When the leader is alive the older proof remains: two hours and a UDID that is
+neither connected (`devicectl list devices`) nor booted (`simctl list devices booted`); a tool
+that names no device, or a list the toolchain cannot produce, proves nothing that way. And a
+lock's recorded holder still alive under init while its `owner` file names a dead process is
+an orphan whatever program it runs — the tool list does not apply — and so is every member of
+the lock's recorded `pgid` group whose ancestry reaches init or a proved pid: an owner that
+exits normally releases the lock first, so a member of its group under a still-held lock is
+an orphan by definition, with no age or device check. The device list is only read when a
+reparented tool exists to check. Doctor shows them as `orphan` findings and `agent-fleet
+kill` accepts them.
 
 ## Spawning
 

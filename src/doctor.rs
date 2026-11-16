@@ -208,12 +208,16 @@ pub fn resource_wait(s: &State, a: &Agent) -> Option<(String, DateTime<Utc>, Opt
     None
 }
 
-/// `stalled`: idle or blocked at least `min` since it last worked. The host's push uses this
-/// exact predicate, so the board and the notice can never disagree.
+/// `stalled`: idle or blocked at least `min` since it last worked — but never parked: an
+/// agent that reached `done` and has not worked since awaits its next assignment, and an
+/// idle stretch there is the `stale` finding's to name, not a stall's. The host's push uses
+/// this exact predicate, so the board and the notice can never disagree.
 pub fn stalled(a: &Agent, now: DateTime<Utc>, min: Duration) -> Option<String> {
     let idle_for = now - a.since;
+    let parked = a.finished.is_some_and(|f| a.worked.is_none_or(|w| w <= f));
     (matches!(a.state, AgentState::Idle | AgentState::Blocked)
         && idle_for >= min
+        && !parked
         && a.worked.is_some())
     .then(|| format!("idle for {}m since it worked", idle_for.num_minutes()))
 }
@@ -269,13 +273,15 @@ fn told(s: &State, id: &str) -> String {
 }
 
 /// Pids on `host` that doctor proves orphaned, with the directory each runs in. A repo's main
-/// checkout is never included: its processes may be the human's.
+/// checkout is never included: its processes may be the human's. The host's own `proc.orphaned`
+/// proofs — a reparented tool whose device is gone, a lock whose recorded owner died — count
+/// the same: their `cwd`, when the platform reports one, is the directory to check.
 pub fn killable(
     s: &State,
     now: DateTime<Utc>,
     host: &str,
 ) -> std::collections::BTreeMap<u32, String> {
-    findings(s, now)
+    let mut out: std::collections::BTreeMap<u32, String> = findings(s, now)
         .iter()
         .filter(|f| {
             f.kind == "orphan"
@@ -287,7 +293,11 @@ pub fn killable(
         .filter_map(|f| s.worktree_procs.get(&f.subject))
         .filter(|p| p.procs.host == host)
         .flat_map(|p| p.procs.pids.iter().map(|&pid| (pid, p.procs.path.clone())))
-        .collect()
+        .collect();
+    for o in s.orphans.values().filter(|o| o.host == host) {
+        out.insert(o.pid, o.cwd.clone().unwrap_or_else(|| "/".into()));
+    }
+    out
 }
 
 pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
@@ -464,6 +474,16 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
                 ),
             ));
         }
+    }
+    for (key, o) in &s.orphans {
+        out.push(finding(
+            "orphan",
+            key.clone(),
+            format!(
+                "reparented {}, {} — kill: agent-fleet kill {}",
+                o.pid, o.why, o.pid
+            ),
+        ));
     }
     for (key, w) in &s.worktrees {
         let st = &w.state;
@@ -657,6 +677,7 @@ mod tests {
             state,
             since,
             worked: None,
+            finished: None,
             usage: Some(Usage {
                 rss_kb: Some(rss_kb),
                 cpu_pct: Some(cpu),
@@ -958,6 +979,19 @@ mod tests {
         let f = findings(&s, now);
         let r = f.iter().find(|f| f.subject == "agent:h/s/root").unwrap();
         assert_eq!(r.detail, "idle for 20m since it worked; nobody to tell");
+    }
+
+    #[test]
+    fn a_parked_agent_is_stale_never_stalled() {
+        let now = Utc::now();
+        // Reached `done` and idle since: parked awaiting work — `stale` names it, `stalled` does not.
+        let mut a = agent(AgentState::Idle, now - Duration::minutes(20), "/w/a", 0, 1);
+        a.worked = Some(now - Duration::minutes(40));
+        a.finished = Some(now - Duration::minutes(25));
+        assert_eq!(stalled(&a, now, STALLED), None);
+        // Working again after the finish re-arms the stall: a long idle then is one.
+        a.worked = Some(now - Duration::minutes(15));
+        assert!(stalled(&a, now, STALLED).is_some());
     }
 
     #[test]
