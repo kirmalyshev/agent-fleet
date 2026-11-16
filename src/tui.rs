@@ -1295,7 +1295,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_retired_worktree_with_an_open_pr_says_so_and_tells_the_root() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
@@ -1313,8 +1312,10 @@ mod tests {
             assert!(ok);
         }
         let gh = dir.path().join("gh");
-        std::fs::write(&gh, "#!/bin/sh\ncase \"$*\" in *\"--head s-1 \"*) echo '[{\"number\":7}]' ;; *) echo '[]' ;; esac\n").unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::write_script(
+            &gh,
+            "#!/bin/sh\ncase \"$*\" in *\"--head s-1 \"*) echo '[{\"number\":7}]' ;; *) echo '[]' ;; esac\n",
+        );
         let (gh, repo) = (gh.to_str().unwrap(), repo.to_str().unwrap());
         let fleet = Told(Default::default());
         let line = removed_line(&fleet, gh, repo, "/w/s-1", Some("s-1")).await;

@@ -754,9 +754,7 @@ mod tests {
                 .success();
         assert!(ok);
         let bin = dir.path().join("gh");
-        std::fs::write(&bin, "#!/bin/sh\nexec sleep 600\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::write_script(&bin, "#!/bin/sh\nexec sleep 600\n");
         let e = retire_note_within(
             bin.to_str().unwrap(),
             repo.to_str().unwrap(),
@@ -905,13 +903,10 @@ mod tests {
         git(&["init", "-q"]);
         git(&["remote", "add", "origin", "git@host.example:o/r.git"]);
         let bin = dir.path().join("gh");
-        std::fs::write(
+        crate::write_script(
             &bin,
             "#!/bin/sh\ncase \"$*\" in\n  *\"-R o/r --head s-1 \"*) echo '[{\"number\":7}]' ;;\n  *) echo '[]' ;;\nesac\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let (gh, repo) = (bin.to_str().unwrap(), repo.to_str().unwrap());
         let (n, line) = retire_note(gh, repo, "s-1").await.unwrap().unwrap();
         assert_eq!(n, 7);
@@ -932,9 +927,9 @@ mod tests {
     fn fake_gh(dir: &std::path::Path) -> String {
         let log = dir.join("calls");
         let path = dir.join("gh");
-        std::fs::write(
+        crate::write_script(
             &path,
-            format!(
+            &format!(
                 r#"#!/bin/sh
 case "$1 $2 $6" in
   "pr list open") echo '[{{"number":1,"headRefName":"s-1","isDraft":false,"updatedAt":"2026-11-01T00:00:00Z","closingIssuesReferences":[{{"id":"I_x","number":5,"repository":{{"id":"R_x","name":"r","owner":{{"id":"U_x","login":"o"}}}},"url":"https://github.com/o/r/issues/5"}}],"files":[{{"path":"src/a.rs"}}]}},{{"number":2,"headRefName":"s-2","isDraft":false,"updatedAt":"2026-11-01T00:00:00Z","closingIssuesReferences":[{{"id":"I_y","number":6,"repository":{{"id":"R_x","name":"r","owner":{{"id":"U_x","login":"o"}}}},"url":"https://github.com/o/r/issues/6"}}],"files":[{{"path":"src/b.rs"}}]}}]' ;;
@@ -945,10 +940,7 @@ case "$1 $2 $6" in
 esac
 "#
             ),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         path.to_string_lossy().into_owned()
     }
 
@@ -1141,13 +1133,10 @@ esac
     async fn a_malformed_pr_row_or_a_failed_close_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let bad = dir.path().join("gh");
-        std::fs::write(
+        crate::write_script(
             &bad,
             "#!/bin/sh\ncase \"$6\" in open) echo '[{\"number\":1}]' ;; *) echo '[]' ;; esac\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let e = fetch(bad.to_str().unwrap(), "o/r").await.unwrap_err();
         assert!(format!("{e:#}").contains("unreadable PR"), "{e:#}");
         assert!(close("/nonexistent/gh", "o/r", 1, Some(9)).await.is_err());
