@@ -395,7 +395,10 @@ fn plan(args: Vec<String>) -> Result<Plan, String> {
             dry.push("--dry-run".into());
             Plan::DryRun(dry, args)
         }
-        "ps" | "stats" | "proc" | "instances" | "state" | "ui" | "spawn" => Plan::Read(args),
+        "ps" | "stats" | "proc" | "instances" | "state" | "ui" | "spawn" | "help" | "api" => {
+            Plan::Read(args)
+        }
+        _ if has("--help") || has("-h") => Plan::Read(args),
         "doctor" if !has("--apply") => Plan::Read(args),
         "task" if matches!(w(1), "ls" | "show") => Plan::Read(args),
         "repo" if w(1) == "ls" => Plan::Read(args),
@@ -2309,6 +2312,9 @@ mod tests {
             plan(w("spawn o/r#5")),
             Ok(Plan::DryRun(w("spawn o/r#5 --dry-run"), w("spawn o/r#5")))
         );
+        for read in ["help", "api schema", "task add --help", "block -h"] {
+            assert_eq!(plan(w(read)), Ok(Plan::Read(w(read))));
+        }
         assert!(plan(w("hub")).is_err() && plan(vec![]).is_err());
     }
 

@@ -865,7 +865,8 @@ the screen's `--instance`, `--hub`, `--token-file`, `--as`, `--project` and `--h
 background. So each action writes the same events, with the same checks and refusals, as the
 command typed in a shell. Tab completes commands, agents, tasks, blockers, levels and the
 profiles of fleet.toml. A command that only reads (`stats`, `doctor`, `proc`, `ps`, `ui`, `task
-ls|show`, `role <agent>`) runs at once; any other asks first. `spawn` runs its `--dry-run` first
+ls|show`, `role <agent>`, `api schema`, `help`
+and any `--help`) runs at once; any other asks first. `spawn` runs its `--dry-run` first
 and spawns on `y`, following until `spawn.result` as the CLI does. A failure, or an output longer
 than one line, opens over the screen; `o` opens the last one again. The services (`hub`, `host`)
 and the hooks are refused there. Keys fill the command line from the selected row: role and
