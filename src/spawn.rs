@@ -596,9 +596,19 @@ pub fn handoff_note(old: &str, extra: &str) -> String {
     s
 }
 
+/// What the brief's LEAD renders for the lead `id`: `coordinator` for the root coordinator, a
+/// role `tell` resolves to whoever holds it then, else the agent id itself.
+pub fn lead_name(state: &State, id: &str) -> String {
+    match state.roles.get(id) {
+        Some(r) if r.level == Level::RootCoordinator => COORDINATOR.into(),
+        _ => id.into(),
+    }
+}
+
 /// The `spawn.requested` a handoff writes: the agent's repo, issue, branch and EXISTING
 /// worktree to a new agent of `to`, with `replaces` naming the agent to close.
 pub fn handoff_request(
+    state: &State,
     cfg: &FleetConfig,
     cfg_dir: &Path,
     sp: &Spawn,
@@ -640,7 +650,12 @@ pub fn handoff_request(
         ("SCOPE", ""),
         ("HOST", old.host.as_str()),
         ("LEVEL", &level.to_string()),
-        ("LEAD", lead.as_deref().unwrap_or("")),
+        (
+            "LEAD",
+            &lead
+                .as_deref()
+                .map_or(String::new(), |l| lead_name(state, l)),
+        ),
         ("HANDOFF", &handoff_note(&old.name, extra)),
     ] {
         vals.insert(k.into(), v.to_string());
@@ -1439,7 +1454,15 @@ pub async fn hand_off(
         .get(&sp.request.repo)
         .with_context(|| format!("no checkout for {}", sp.request.repo))?;
     let (cfg, cfg_dir) = load(checkout)?;
-    let req = handoff_request(&cfg, &cfg_dir, sp, to, extra, &task_title(state, sp).await)?;
+    let req = handoff_request(
+        state,
+        &cfg,
+        &cfg_dir,
+        sp,
+        to,
+        extra,
+        &task_title(state, sp).await,
+    )?;
     if state.agents.contains_key(&req.agent) {
         bail!("{} is already up", req.agent);
     }
@@ -2842,6 +2865,36 @@ profile = "devin"
     }
 
     #[test]
+    fn lead_renders_coordinator_for_the_root_coordinator_and_the_id_otherwise() {
+        let c = cfg(CFG).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.md"), "lead: @@LEAD@@").unwrap();
+        let sp = spawn_of(req(Some("/w".into())));
+        let mut s = State::default();
+        let brief = |s: &State| {
+            handoff_request(s, &c, dir.path(), &sp, "sonnet", "", "")
+                .unwrap()
+                .brief
+        };
+        assert_eq!(lead_name(&s, "agent:h/s/me"), "agent:h/s/me", "no role");
+        assert_eq!(brief(&s), "lead: agent:h/s/me");
+        let role = |level| crate::state::Role {
+            level,
+            lead: None,
+            domain: None,
+            by: "agent:h/s/me".into(),
+            since: Utc::now(),
+        };
+        s.roles
+            .insert("agent:h/s/me".into(), role(Level::DomainLead));
+        assert_eq!(lead_name(&s, "agent:h/s/me"), "agent:h/s/me");
+        s.roles
+            .insert("agent:h/s/me".into(), role(Level::RootCoordinator));
+        assert_eq!(lead_name(&s, "agent:h/s/me"), COORDINATOR);
+        assert_eq!(brief(&s), "lead: coordinator");
+    }
+
+    #[test]
     fn a_handoff_never_targets_the_same_id() {
         let c = cfg(CFG).unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -2863,7 +2916,7 @@ profile = "devin"
             answered: Some(Utc::now()),
         };
         // --to devin regenerates dv-7, the very agent being replaced.
-        let e = handoff_request(&c, dir.path(), &sp, "devin", "", "")
+        let e = handoff_request(&State::default(), &c, dir.path(), &sp, "devin", "", "")
             .unwrap_err()
             .to_string();
         assert!(e.contains("same agent"), "{e}");

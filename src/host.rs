@@ -1159,11 +1159,15 @@ impl Host {
             attempts.retain(|id, _| pending.contains_key(id));
             waiting.retain(|id| pending.contains_key(id));
             for (id, msg) in pending {
+                // Resolved per pass: a message to `coordinator` follows the role to its holder now.
+                let Some(to) = view.state.recipient(&msg.to) else {
+                    continue;
+                };
                 let target = {
                     let panes = self.panes.lock().unwrap();
                     panes
                         .iter()
-                        .find(|(_, l)| l.agent == msg.to)
+                        .find(|(_, l)| l.agent == to)
                         .map(|(p, l)| (p.clone(), l.state, l.working))
                 };
                 let Some((pane, state, before)) = target else {
@@ -1193,7 +1197,7 @@ impl Host {
                 match herdr_call(&self.cfg.herdr_socket, "agent.prompt", params).await {
                     Ok(_) if self.saw_working(&pane, before).await => {
                         let delivered = MsgDelivered {
-                            to: msg.to.clone(),
+                            to: to.to_string(),
                             observed: AgentState::Working,
                             rung: Some(rung),
                             attempts: Some(attempt),
