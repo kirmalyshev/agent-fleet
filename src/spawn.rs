@@ -3344,6 +3344,8 @@ profile = "devin"
                     files: vec![],
                     last_commit: now,
                     in_main: false,
+                    herdr: false,
+                    dirty_submodules: 0,
                 },
                 since: now - chrono::Duration::minutes(40),
             },

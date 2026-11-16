@@ -1291,6 +1291,12 @@
               "minimum": 0,
               "type": "integer"
             },
+            "dirty_submodules": {
+              "description": "Of `dirty`, submodule pointers that moved.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
             "files": {
               "description": "Files changed against the default branch, plus dirty ones; at most `MAX_FILES`.",
               "items": {
@@ -1300,6 +1306,10 @@
             },
             "head": {
               "type": "string"
+            },
+            "herdr": {
+              "description": "A linked worktree under herdr's worktree directory, where herdr and `agent-fleet spawn`\ncreate them: only these can be `forgotten`.",
+              "type": "boolean"
             },
             "host": {
               "type": "string"
@@ -3118,6 +3128,12 @@
               "minimum": 0,
               "type": "integer"
             },
+            "dirty_submodules": {
+              "description": "Of `dirty`, submodule pointers that moved.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
             "files": {
               "description": "Files changed against the default branch, plus dirty ones; at most `MAX_FILES`.",
               "items": {
@@ -3127,6 +3143,10 @@
             },
             "head": {
               "type": "string"
+            },
+            "herdr": {
+              "description": "A linked worktree under herdr's worktree directory, where herdr and `agent-fleet spawn`\ncreate them: only these can be `forgotten`.",
+              "type": "boolean"
             },
             "host": {
               "type": "string"

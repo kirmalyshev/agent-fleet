@@ -416,6 +416,9 @@ pub struct WorktreeState {
     pub unpushed: u32,
     /// Modified and untracked files.
     pub dirty: u32,
+    /// Of `dirty`, submodule pointers that moved.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dirty_submodules: u32,
     /// Files changed against the default branch, plus dirty ones; at most `MAX_FILES`.
     pub files: Vec<String>,
     pub last_commit: DateTime<Utc>,
@@ -423,6 +426,14 @@ pub struct WorktreeState {
     /// never started): it holds no work of its own.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub in_main: bool,
+    /// A linked worktree under herdr's worktree directory, where herdr and `agent-fleet spawn`
+    /// create them: only these can be `forgotten`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub herdr: bool,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// Most files a `worktree.state` lists.

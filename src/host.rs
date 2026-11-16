@@ -787,8 +787,9 @@ impl Host {
         let mine = |w: &&crate::state::Worktree| w.state.host == self.cfg.host;
         repos.extend(known.values().filter(mine).map(|w| w.state.repo.clone()));
         let mut all = Vec::new();
+        let herdr = scan::herdr_worktrees();
         for repo in repos {
-            let found = scan::worktrees(&self.cfg.host, &repo).await;
+            let found = scan::worktrees(&self.cfg.host, &repo, herdr.as_deref()).await;
             for w in &found {
                 let key = crate::state::worktree_key(&w.host, &w.path);
                 if known.get(&key).map(|k| &k.state) != Some(w) {

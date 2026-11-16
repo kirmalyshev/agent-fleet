@@ -2,7 +2,7 @@
 //! git worktrees its agents work in.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
@@ -414,8 +414,30 @@ pub fn parse_status(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// Every worktree of `repo`, as `host` sees it now.
-pub async fn worktrees(host: &str, repo: &str) -> Vec<WorktreeState> {
+/// herdr's worktree directory: `[worktrees] directory` in its config, else `~/.herdr/worktrees`.
+pub fn herdr_worktrees() -> Option<PathBuf> {
+    let home = directories::BaseDirs::new()?.home_dir().to_path_buf();
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map_or_else(|| home.join(".config"), PathBuf::from)
+        .join("herdr/config.toml");
+    let config = std::fs::read_to_string(config).unwrap_or_default();
+    Some(herdr_dir(&config, &home))
+}
+
+fn herdr_dir(config: &str, home: &Path) -> PathBuf {
+    let dir = config
+        .parse::<toml::Table>()
+        .ok()
+        .and_then(|t| Some(t.get("worktrees")?.get("directory")?.as_str()?.to_string()))
+        .unwrap_or_else(|| "~/.herdr/worktrees".into());
+    match dir.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(dir),
+    }
+}
+
+/// Every worktree of `repo`, as `host` sees it now; `herdr` is herdr's worktree directory.
+pub async fn worktrees(host: &str, repo: &str, herdr: Option<&Path>) -> Vec<WorktreeState> {
     let Some(list) = git(repo, &["worktree", "list", "--porcelain"]).await else {
         return Vec::new();
     };
@@ -473,12 +495,14 @@ pub async fn worktrees(host: &str, repo: &str) -> Vec<WorktreeState> {
             .collect();
         out.push(WorktreeState {
             host: host.to_string(),
+            herdr: path != repo && herdr.is_some_and(|d| Path::new(&path).starts_with(d)),
             path,
             repo: repo.to_string(),
             branch,
             head,
             unpushed,
             dirty: dirty.len() as u32,
+            dirty_submodules: dirty.iter().filter(|&f| submodules.contains(f)).count() as u32,
             files: files.into_iter().take(MAX_FILES).collect(),
             last_commit: last_commit.with_timezone(&Utc),
             in_main,
@@ -1347,7 +1371,7 @@ mod tests {
             && cd ../r && echo v > c.txt && git add c.txt && git commit -q -m 'feature (#1)' && git push -q origin main",
         );
         let r = dir.path().join("r");
-        let wts = worktrees("h", r.to_str().unwrap()).await;
+        let wts = worktrees("h", r.to_str().unwrap(), None).await;
         let by = |b: &str| wts.iter().find(|w| w.branch.as_deref() == Some(b)).unwrap();
         assert!(
             by("sq").in_main && by("sq").files.is_empty(),
@@ -1385,7 +1409,7 @@ mod tests {
         let repo = repo.canonicalize().unwrap();
         let r = repo.to_str().unwrap();
         assert_eq!(repo_of(&format!("{}/../w", r)).await.as_deref(), Some(r));
-        let mut wts = worktrees("h", r).await;
+        let mut wts = worktrees("h", r, repo.parent()).await;
         wts.sort_by(|a, b| a.path.cmp(&b.path));
         assert_eq!(wts.len(), 2, "{wts:#?}");
         let w = wts
@@ -1393,10 +1417,15 @@ mod tests {
             .find(|w| w.branch.as_deref() == Some("feat"))
             .unwrap();
         assert_eq!(
-            (w.unpushed, w.dirty),
-            (2, 3),
-            "no remote has either commit; three files are dirty"
+            (w.unpushed, w.dirty, w.dirty_submodules),
+            (2, 3, 1),
+            "no remote has either commit; three files are dirty, one a submodule"
         );
+        assert!(w.herdr, "a linked worktree under the herdr directory");
+        let main = wts.iter().find(|w| w.path == r).unwrap();
+        assert!(!main.herdr, "a main checkout is never herdr's");
+        let none = worktrees("h", r, None).await;
+        assert!(none.iter().all(|w| !w.herdr), "no herdr directory known");
         assert!(w.files.contains(&"b.txt".to_string()), "{:?}", w.files);
         assert!(
             !w.files.contains(&"lib".to_string()),
@@ -1404,6 +1433,24 @@ mod tests {
             w.files
         );
         assert!(w.files.contains(&".gitmodules".to_string()));
+    }
+
+    #[test]
+    fn herdrs_worktree_directory_comes_from_its_config() {
+        let home = Path::new("/u");
+        assert_eq!(herdr_dir("", home), Path::new("/u/.herdr/worktrees"));
+        assert_eq!(
+            herdr_dir("[ui]\nx = 1", home),
+            Path::new("/u/.herdr/worktrees")
+        );
+        assert_eq!(
+            herdr_dir("[worktrees]\ndirectory = \"~/wt\"", home),
+            Path::new("/u/wt")
+        );
+        assert_eq!(
+            herdr_dir("[worktrees]\ndirectory = \"/srv/wt\"", home),
+            Path::new("/srv/wt")
+        );
     }
 
     #[test]
