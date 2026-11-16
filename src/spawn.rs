@@ -1259,7 +1259,7 @@ pub(crate) fn tail(s: &str) -> String {
 
 /// Executes one `spawn.requested` and answers it with `spawn.result`.
 pub async fn execute(host: &Host, id: &str, sp: &Spawn, state: &State) {
-    let Some(_busy) = host.busy_guard() else {
+    let Some(_busy) = host.busy_guard(format!("spawn of {}", sp.request.agent)) else {
         return; // A restart is waiting: the new process runs the request.
     };
     let r = &sp.request;
@@ -1464,7 +1464,7 @@ async fn handoffs(
     done: &mut HashSet<String>,
     warned: &mut HashSet<String>,
 ) {
-    let Some(_busy) = host.busy_guard() else {
+    let Some(_busy) = host.busy_guard("handoffs") else {
         return;
     };
     let prefix = agent_prefix(&host.cfg.host, &host.cfg.session);
@@ -2214,15 +2214,17 @@ profile = "devin"
         let dir = tempfile::tempdir().unwrap();
         let host = host_at(dir.path(), dir.path().join("sock"), false);
         assert!(!host.is_busy() && !host.is_draining());
-        let (a, b) = (host.busy_guard().unwrap(), host.busy_guard().unwrap());
+        let (a, b) = (host.busy_guard("a").unwrap(), host.busy_guard("b").unwrap());
+        assert_eq!(host.busy_work(), ["a", "b"]);
         drop(a);
-        assert!(host.is_busy(), "one left");
+        assert_eq!(host.busy_work(), ["b"], "one left, and it is named");
+        assert!(host.is_busy());
         drop(b);
         assert!(!host.is_busy());
         host.drain();
         assert!(host.is_draining());
         assert!(
-            host.busy_guard().is_none(),
+            host.busy_guard("c").is_none(),
             "no new work once a restart waits"
         );
         assert!(!host.is_busy(), "the refused guard is not counted");

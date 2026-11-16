@@ -35,6 +35,10 @@ pub const SPAWN_UNANSWERED: Duration = Duration::minutes(5);
 pub const STALLED: Duration = Duration::minutes(crate::spawn::STALL_MIN as i64);
 /// A failed spawn stays a finding this long.
 pub const SPAWN_FAILED: Duration = Duration::hours(1);
+/// A host's latest self-update that failed, or that a live host left unanswered this long, is
+/// a finding for this long after the request.
+pub const UPDATE_FAILED: Duration = Duration::hours(1);
+pub const UPDATE_UNANSWERED: Duration = Duration::minutes(10);
 /// A `proc.hung` report confirmed this recently is kill proof: three watch ticks.
 pub const HUNG_FRESH: Duration = Duration::minutes(6);
 /// A host whose `host.health` is older than this is not compared for `build`.
@@ -52,7 +56,7 @@ const SHARED_BY_ALL: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Finding {
     /// `stale`, `hung`, `heavy`, `duplicate`, `forgotten`, `unpushed`, `orphan`, `breach`,
-    /// `queued`, `refused`, `role`, `quota`, `spawn`, `unmanaged`, `stalled`, `build`, `orphan-pr`
+    /// `queued`, `refused`, `role`, `quota`, `spawn`, `unmanaged`, `stalled`, `build`, `update`, `orphan-pr`
     /// (added by `main`).
     pub kind: &'static str,
     /// The agent id or `<host>:<path>` it is about.
@@ -511,6 +515,36 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
             ),
         ));
     }
+    // Each host's latest update that concerns it: refused or failed, or never answered by a host
+    // that is up. A later success clears it.
+    let mut by_since: Vec<_> = s.updates.values().collect();
+    by_since.sort_by_key(|u| std::cmp::Reverse(u.since));
+    for (host, h) in &s.hosts {
+        let up = now - h.ts < Duration::minutes(3);
+        let latest = by_since.iter().find(|u| {
+            u.results.contains_key(host)
+                || (up && u.host.as_deref().is_none_or(|t| t == host) && u.since <= h.ts)
+        });
+        let Some(u) = latest else { continue };
+        let age = now - u.since;
+        if age >= UPDATE_FAILED {
+            continue;
+        }
+        let why = match u.results.get(host) {
+            Some(r) if !r.ok => format!("failed: {}", r.error.as_deref().unwrap_or("?")),
+            None if age >= UPDATE_UNANSWERED => "not answered".to_string(),
+            _ => continue,
+        };
+        out.push(finding(
+            "update",
+            format!("host:{host}"),
+            format!(
+                "self-update asked {} ago by {}: {why}",
+                ago(now, u.since),
+                u.by
+            ),
+        ));
+    }
     for (key, h) in &s.hung {
         let pids: Vec<String> = std::iter::once(h.pid)
             .chain(h.pids.iter().copied().filter(|&p| p != h.pid))
@@ -793,6 +827,66 @@ mod tests {
 
     fn kinds(f: &[Finding]) -> Vec<(&str, &str)> {
         f.iter().map(|f| (f.kind, f.subject.as_str())).collect()
+    }
+
+    #[test]
+    fn a_failed_or_unanswered_update_is_a_finding_until_a_later_one_succeeds() {
+        use crate::event::UpdateResult;
+        let now = Utc::now();
+        let ans = |ok: bool, error: Option<&str>| UpdateResult {
+            host: "mac".into(),
+            ok,
+            commit: None,
+            error: error.map(String::from),
+        };
+        let up = |mins: i64, host: Option<&str>, results: Vec<UpdateResult>| crate::state::Update {
+            by: "host:ops".into(),
+            since: now - Duration::minutes(mins),
+            host: host.map(String::from),
+            results: results.into_iter().map(|r| (r.host.clone(), r)).collect(),
+        };
+        let mut s = State::default();
+        s.hosts.insert(
+            "mac".into(),
+            crate::state::Host {
+                disk_free: 0,
+                disk_total: 0,
+                agents: 0,
+                commit: None,
+                ts: now,
+            },
+        );
+        s.updates.insert(
+            "a".into(),
+            up(
+                30,
+                None,
+                vec![ans(false, Some("a clone with uncommitted changes"))],
+            ),
+        );
+        let f = findings(&s, now);
+        assert_eq!(kinds(&f), vec![("update", "host:mac")], "{f:#?}");
+        assert!(
+            f[0].detail.contains("failed: a clone with uncommitted"),
+            "{}",
+            f[0].detail
+        );
+        // A later success clears it.
+        s.updates
+            .insert("b".into(), up(5, None, vec![ans(true, None)]));
+        assert!(findings(&s, now).is_empty());
+        // Never answered by a live host: a finding once old enough, not before.
+        s.updates.clear();
+        s.updates.insert("c".into(), up(3, Some("mac"), vec![]));
+        assert!(findings(&s, now).is_empty(), "too soon");
+        s.updates.insert("c".into(), up(20, Some("mac"), vec![]));
+        let f = findings(&s, now);
+        assert!(f[0].detail.contains("not answered"), "{f:#?}");
+        // Asked of another host, or an hour old: nothing.
+        s.updates.insert("c".into(), up(20, Some("other"), vec![]));
+        assert!(findings(&s, now).is_empty());
+        s.updates.insert("c".into(), up(90, Some("mac"), vec![]));
+        assert!(findings(&s, now).is_empty());
     }
 
     #[test]

@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 
 use crate::client::{Client, Refused};
-use crate::event::{Known, UpdateRequested, UpdateResult};
+use crate::event::{Known, MsgSent, UpdateRequested, UpdateResult};
 use crate::host::Host;
 use crate::spawn::tail;
 use crate::state::State;
@@ -49,9 +49,11 @@ const BUILD: Duration = Duration::from_secs(30 * 60);
 /// A `.agent-fleet-update-<pid>` untouched this long (more than `BUILD`) is assumed to be the
 /// leftover of a killed update, not another host's build in progress.
 const LEFTOVER: Duration = Duration::from_secs(45 * 60);
-/// How long a finished update waits for spawns and handoffs in flight (a ready script may run
-/// 15 min) before it exits anyway: a hung one must not keep the old binary running for good.
-const DRAIN_MAX: Duration = Duration::from_secs(20 * 60);
+/// How long a finished update waits for spawns and handoffs in flight before it exits anyway: a
+/// hung one must not keep the old binary running for good. Under the age at which a spawn
+/// request is answered `expired` (`spawn::REQUEST_MAX_AGE`): one that arrives when the drain
+/// starts must still be fresh for the new process.
+const DRAIN_MAX: Duration = Duration::from_secs(10 * 60);
 /// How long an update waits for another update in its clone (a build may take `BUILD`).
 const LOCK_WAIT: Duration = Duration::from_secs(35 * 60);
 /// How often a host looks whether it is behind `origin/main`.
@@ -65,7 +67,6 @@ const DRAIN_POLL: Duration = Duration::from_secs(1);
 async fn limited(mut c: tokio::process::Command, limit: Duration) -> Result<std::process::Output> {
     let child = c
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -84,9 +85,24 @@ async fn limited(mut c: tokio::process::Command, limit: Duration) -> Result<std:
     }
 }
 
+/// Whether git should be told `ssh -o BatchMode=yes`: not when the operator chose an ssh command
+/// (`GIT_SSH_COMMAND`, or `core.sshCommand` in the clone), which BatchMode would override.
+fn wants_batch_ssh(clone: &Path, env_set: bool) -> bool {
+    !env_set
+        && !std::process::Command::new("git")
+            .arg("-C")
+            .arg(clone)
+            .args(["config", "--get", "core.sshCommand"])
+            .output()
+            .is_ok_and(|o| o.status.success())
+}
+
 async fn git_in(clone: &Path, args: &[&str], limit: Duration) -> Result<String> {
     let mut c = tokio::process::Command::new("git");
     c.arg("-C").arg(clone).args(args);
+    if wants_batch_ssh(clone, std::env::var_os("GIT_SSH_COMMAND").is_some()) {
+        c.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
     let out = limited(c, limit)
         .await
         .with_context(|| format!("git {}", args.join(" ")))?;
@@ -239,16 +255,8 @@ async fn update_waiting(
             "{}.prev",
             exe.file_name().unwrap_or_default().to_string_lossy()
         ));
-        match std::fs::remove_file(&prev) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(anyhow!("remove the old {}: {e}", prev.display())),
-        }
-        // No rollback copy, no update: a link, else a copy.
-        if std::fs::hard_link(exe, &prev).is_err() {
-            std::fs::copy(exe, &prev)
-                .with_context(|| format!("keep the old binary as {}", prev.display()))?;
-        }
+        // No rollback copy, no update.
+        keep_prev(exe, &prev, true)?;
         std::fs::rename(root.join("bin/agent-fleet"), exe)
             .with_context(|| format!("move the build to {}", exe.display()))
     });
@@ -264,6 +272,26 @@ fn clean(root: &Path) {
     {
         eprintln!("agent-fleet host: update: remove {}: {e}", root.display());
     }
+}
+
+/// Makes `prev` the old binary: a hard link (else a copy) under a temporary name, renamed over
+/// the old `prev` only once whole, so a failed copy leaves the previous rollback copy intact.
+fn keep_prev(exe: &Path, prev: &Path, link: bool) -> Result<()> {
+    let tmp = prev.with_file_name(format!(
+        "{}.tmp-{}",
+        prev.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&tmp);
+    let made = if link {
+        std::fs::hard_link(exe, &tmp).or_else(|_| std::fs::copy(exe, &tmp).map(|_| ()))
+    } else {
+        std::fs::copy(exe, &tmp).map(|_| ())
+    };
+    let done = made.and_then(|()| std::fs::rename(&tmp, prev));
+    // Renaming a link onto a link of the same file does nothing and leaves `tmp` behind.
+    let _ = std::fs::remove_file(&tmp);
+    done.map_err(|e| anyhow!("keep the old binary as {}: {e}", prev.display()))
 }
 
 /// The running binary's path. Linux names a binary replaced under it `<path> (deleted)`.
@@ -298,6 +326,10 @@ trait Io {
     async fn ask(&self) -> bool;
     /// Spawn or handoff work in flight that an exit would cut short.
     fn busy(&self) -> bool;
+    /// What that work is.
+    fn busy_work(&self) -> Vec<String>;
+    /// Tells the root coordinator.
+    async fn warn(&self, text: String);
     /// One way: no new such work starts, until the process exits.
     fn drain(&self);
     fn exit(&self, code: i32);
@@ -331,6 +363,24 @@ impl Io for HostIo {
 
     fn busy(&self) -> bool {
         self.0.is_busy()
+    }
+
+    fn busy_work(&self) -> Vec<String> {
+        self.0.busy_work()
+    }
+
+    async fn warn(&self, text: String) {
+        let Ok(view) = self.0.view() else { return };
+        for to in crate::watch::recipients(&view.state, None) {
+            self.0
+                .publish(self.0.presence(Known::MsgSent(MsgSent {
+                    to,
+                    kind: "UPDATE".into(),
+                    reference: "update-drain".into(),
+                    text: text.clone(),
+                })))
+                .await;
+        }
     }
 
     fn drain(&self) {
@@ -421,10 +471,14 @@ async fn tick<I: Io>(io: &I, c: &Ctx<'_>, seen: &mut Seen) {
         let deadline = tokio::time::Instant::now() + c.drain_max;
         while io.busy() {
             if tokio::time::Instant::now() >= deadline {
-                eprintln!(
-                    "agent-fleet host: spawn or handoff still running after {} min; restarting anyway",
-                    c.drain_max.as_secs() / 60
+                let text = format!(
+                    "{}: self-update restarts this host after {} min with work still running: {}. It runs again from scratch.",
+                    c.me,
+                    c.drain_max.as_secs() / 60,
+                    io.busy_work().join(", ")
                 );
+                eprintln!("agent-fleet host: {text}");
+                io.warn(text).await;
                 break;
             }
             tokio::time::sleep(c.poll).await;
@@ -803,13 +857,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1300)).await;
         assert!(!mark.exists(), "the child died with the group");
         let mut c = tokio::process::Command::new("sh");
-        c.arg("-c")
-            .arg("echo $GIT_TERMINAL_PROMPT $GIT_SSH_COMMAND");
+        c.arg("-c").arg("echo $GIT_TERMINAL_PROMPT");
         let out = limited(c, Duration::from_secs(5)).await.unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
-            "0 ssh -o BatchMode=yes"
-        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0");
     }
 
     #[test]
@@ -868,6 +918,12 @@ mod tests {
         }
         fn busy(&self) -> bool {
             self.busy.get()
+        }
+        fn busy_work(&self) -> Vec<String> {
+            vec!["spawn of agent:h/s/x".into()]
+        }
+        async fn warn(&self, text: String) {
+            self.log.borrow_mut().push(format!("warn {text}"));
         }
         fn drain(&self) {
             self.log.borrow_mut().push("drain".into());
@@ -934,7 +990,54 @@ mod tests {
             ..ctx(&clone, &exe, None)
         };
         tick(&io, &c, &mut Seen::default()).await;
-        assert_eq!(io.log.borrow().last().unwrap(), "exit 75");
+        let log = io.log.borrow();
+        assert_eq!(log.last().unwrap(), "exit 75");
+        let warn = log.iter().find(|l| l.starts_with("warn ")).expect("told");
+        assert!(
+            warn.contains("spawn of agent:h/s/x") && warn.contains("from scratch"),
+            "{warn}"
+        );
+    }
+
+    #[test]
+    fn the_drain_ends_before_a_spawn_request_that_arrived_with_it_expires() {
+        let max = chrono::Duration::from_std(DRAIN_MAX).unwrap();
+        assert!(max < crate::spawn::REQUEST_MAX_AGE);
+    }
+
+    #[test]
+    fn a_failed_rollback_copy_leaves_the_previous_one_whole_and_no_temp() {
+        let t = tempfile::tempdir().unwrap();
+        let (exe, prev) = (
+            t.path().join("agent-fleet"),
+            t.path().join("agent-fleet.prev"),
+        );
+        std::fs::write(&exe, "v2").unwrap();
+        std::fs::write(&prev, "v1").unwrap();
+        // Link, then copy, both replace it.
+        keep_prev(&exe, &prev, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&prev).unwrap(), "v2");
+        std::fs::write(&exe, "v3").unwrap();
+        std::fs::remove_file(&prev).unwrap();
+        std::fs::write(&prev, "v2").unwrap();
+        keep_prev(&exe, &prev, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&prev).unwrap(), "v3");
+        // The source is gone: the copy fails and `prev` is untouched.
+        std::fs::remove_file(&exe).unwrap();
+        assert!(keep_prev(&exe, &prev, false).is_err());
+        assert!(keep_prev(&exe, &prev, true).is_err());
+        assert_eq!(std::fs::read_to_string(&prev).unwrap(), "v3");
+        let left: Vec<_> = std::fs::read_dir(t.path()).unwrap().collect();
+        assert_eq!(left.len(), 1, "no temp left: {left:?}");
+    }
+
+    #[test]
+    fn batch_ssh_is_set_only_when_the_operator_chose_no_ssh_command() {
+        let (_t, _origin, clone, _exe) = fixture();
+        assert!(wants_batch_ssh(&clone, false));
+        assert!(!wants_batch_ssh(&clone, true), "GIT_SSH_COMMAND is set");
+        sh(&clone, &["config", "core.sshCommand", "ssh -i /k"]);
+        assert!(!wants_batch_ssh(&clone, false), "core.sshCommand is set");
     }
 
     #[tokio::test]

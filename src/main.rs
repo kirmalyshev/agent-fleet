@@ -840,7 +840,9 @@ async fn main() -> Result<()> {
                 bail!("no host has reported in the last 3 minutes");
             }
             let body = Known::UpdateRequested(UpdateRequested::default());
-            // Only a host's actor may ask: the request makes every host rebuild and restart.
+            // `update.requested` lists `host` as its writer; that is a schema rule, not access
+            // control (one shared token, actors name themselves). The request makes every host
+            // rebuild and restart.
             let by = Actor {
                 kind: ActorKind::Host,
                 id: format!("host:{}", ctx.host_name()),
