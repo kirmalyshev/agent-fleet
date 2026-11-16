@@ -16,7 +16,7 @@ cargo build
 
 ## Build, test, lint
 
-Run all three before every commit. CI runs the same on Linux and macOS.
+Run all three before every commit. CI runs all three on Linux, and builds and tests on macOS.
 
 ```sh
 cargo fmt
@@ -86,5 +86,5 @@ Branch from `main` and open the PR against `main`. Keep it to one change. To cat
 ## CI
 
 `.github/workflows/rust.yml` runs on every push to `main` and every PR against it. On Linux it
-checks formatting, runs clippy with warnings as errors, builds and tests; on macOS it runs
-clippy, builds and tests. CI must be green before a PR merges.
+checks formatting, runs clippy with warnings as errors, builds and tests; on macOS it builds
+and tests. CI must be green before a PR merges.
