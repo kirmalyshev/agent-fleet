@@ -1772,6 +1772,7 @@ chmod +x "$root/bin/agent-fleet"
                     agents: 0,
                     commit: commit.map(String::from),
                     behind_since: None,
+                    agents_read_token: None,
                     ts,
                     started: None,
                 },

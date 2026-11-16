@@ -837,6 +837,18 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
             }
         }
     }
+    for (name, h) in &hosts {
+        if h.agents_read_token == Some(true) {
+            out.push(finding(
+                "token",
+                *name,
+                format!(
+                    "its agents can read the token it posts with, so they can post as host:{name} \
+                     (a proc.hung that agent-fleet kill accepts); see PROTOCOL.md, Who can post as a host"
+                ),
+            ));
+        }
+    }
     for (key, r) in &s.resources {
         for w in r.waiting.iter().filter(|w| now - w.since >= QUEUED) {
             let behind = r
@@ -933,6 +945,7 @@ mod tests {
                 agents: 0,
                 commit: None,
                 behind_since: None,
+                agents_read_token: None,
                 ts: now,
                 started: None,
             },
@@ -980,6 +993,7 @@ mod tests {
             agents: 0,
             commit: None,
             behind_since: None,
+            agents_read_token: None,
             ts: now - Duration::minutes(ago_min),
             started: None,
         };
@@ -1041,6 +1055,7 @@ mod tests {
             agents: 0,
             commit: Some(commit.into()),
             behind_since: None,
+            agents_read_token: None,
             ts: now,
             started: None,
         };
@@ -1088,6 +1103,7 @@ mod tests {
                 agents: 0,
                 commit: Some("aaa".into()),
                 behind_since: None,
+                agents_read_token: None,
                 ts: now,
                 started: Some(now - Duration::minutes(5)),
             },
@@ -1149,6 +1165,7 @@ mod tests {
             agents: 0,
             commit: Some("aaa".into()),
             behind_since: None,
+            agents_read_token: None,
             ts: now - reported_ago,
             started: None,
         };
@@ -1200,6 +1217,7 @@ mod tests {
             agents: 0,
             commit: None,
             behind_since: None,
+            agents_read_token: None,
             ts: now,
             started: Some(now - Duration::minutes(started_min_ago)),
         };
@@ -1374,6 +1392,7 @@ mod tests {
                 agents: 0,
                 commit: commit.map(str::to_string),
                 behind_since: None,
+                agents_read_token: None,
                 ts: now - Duration::minutes(age),
                 started: None,
             };
@@ -1400,6 +1419,44 @@ mod tests {
     }
 
     #[test]
+    fn a_host_whose_agents_can_read_its_token_is_a_finding() {
+        use crate::event::{Actor, ActorKind, Envelope, HostHealth, Known};
+        let health = |host: &str, read: Option<bool>| {
+            Envelope::new(
+                Actor {
+                    kind: ActorKind::Host,
+                    id: format!("host:{host}"),
+                },
+                "p",
+                Known::HostHealth(HostHealth {
+                    host: host.into(),
+                    disk_free: 1,
+                    disk_total: 1,
+                    agents: 0,
+                    stats: None,
+                    commit: None,
+                    behind_since: None,
+                    agents_read_token: read,
+                }),
+            )
+            .into_event()
+        };
+        let mut s = State::default();
+        s.apply(&health("open", Some(true)));
+        s.apply(&health("private", Some(false)));
+        s.apply(&health("unknown", None));
+        let now = Utc::now();
+        let f = findings(&s, now);
+        assert_eq!(kinds(&f), vec![("token", "open")], "{f:#?}");
+        assert!(f[0].detail.contains("post as host:open"), "{}", f[0].detail);
+        s.apply(&health("open", Some(false)));
+        assert!(findings(&s, now).is_empty(), "kept private now");
+        s.apply(&health("open", Some(true)));
+        s.hosts.get_mut("open").unwrap().ts = now - Duration::hours(1);
+        assert!(findings(&s, now).is_empty(), "a long-silent host is gone");
+    }
+
+    #[test]
     fn a_fleet_on_one_commit_behind_origin_main_is_a_finding_and_one_on_main_is_not() {
         let now = Utc::now();
         let mut s = State::default();
@@ -1410,6 +1467,7 @@ mod tests {
                 agents: 0,
                 commit: Some("1111111aaaa".into()),
                 behind_since: behind_min.map(|m| now - Duration::minutes(m)),
+                agents_read_token: None,
                 ts: now,
                 started: None,
             };

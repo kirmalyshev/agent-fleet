@@ -75,6 +75,8 @@ pub struct Config {
     pub host: String,
     pub session: String,
     pub herdr_socket: PathBuf,
+    /// The token file this host posts with, for `host.health`'s `agents_read_token`.
+    pub token_file: PathBuf,
     pub replica: PathBuf,
     pub data_dir: PathBuf,
     /// Repositories whose worktrees to watch besides the ones agents work in.
@@ -88,6 +90,25 @@ pub struct Config {
     /// `host --stuck-act`: let the host act on a stuck cause itself — keystrokes and
     /// handoffs. Off (the default) it only classifies, records `agent.stuck`, and tells.
     pub stuck_act: bool,
+}
+
+/// Whether the uid that owns the herdr socket (herdr's, so its agents') can read `token`; `None`
+/// when either file cannot be read.
+fn agents_read_token(token: &Path, herdr_socket: &Path) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let agents = std::fs::metadata(herdr_socket).ok()?.uid();
+    let t = std::fs::metadata(token).ok()?;
+    // SAFETY: geteuid cannot fail and touches no memory.
+    let me = unsafe { libc::geteuid() };
+    Some(token_open(agents, me, t.uid(), t.mode()))
+}
+
+/// The agents' uid can read a file of `owner` and `mode` when the host runs as that uid, the
+/// uid owns the file, or the file is group- or other-readable.
+// ponytail: any group read bit counts, whatever the group and the directories above; an
+// overcautious yes, never a false no.
+fn token_open(agents: u32, me: u32, owner: u32, mode: u32) -> bool {
+    agents == me || owner == agents || mode & 0o044 != 0
 }
 
 #[derive(Clone)]
@@ -668,6 +689,10 @@ impl Host {
                         stats: Some(self.stats()),
                         commit: crate::update::COMMIT.map(str::to_string),
                         behind_since,
+                        agents_read_token: agents_read_token(
+                            &self.cfg.token_file,
+                            &self.cfg.herdr_socket,
+                        ),
                     })))
                     .await;
                 }
@@ -1307,6 +1332,26 @@ mod tests {
     use tokio::net::UnixListener;
 
     #[test]
+    fn a_token_is_open_to_the_agents_unless_another_user_keeps_it_private() {
+        let (agents, host) = (1000, 990);
+        assert!(
+            token_open(agents, agents, agents, 0o600),
+            "the host runs as its agents"
+        );
+        assert!(
+            token_open(agents, host, agents, 0o600),
+            "the agents own the file"
+        );
+        assert!(token_open(agents, host, host, 0o640), "group-readable");
+        assert!(token_open(agents, host, host, 0o604), "other-readable");
+        assert!(
+            !token_open(agents, host, host, 0o600),
+            "another user's private file"
+        );
+        assert!(!token_open(agents, host, host, 0o400));
+    }
+
+    #[test]
     fn doorbell_is_prefixed() {
         let d = doorbell(
             "agent:h/s/lead",
@@ -1396,6 +1441,7 @@ mod tests {
             host: "h".into(),
             session: "s".into(),
             herdr_socket: sock,
+            token_file: dir.join("token"),
             replica: dir.join("replica.db"),
             data_dir: dir.to_path_buf(),
             repos: Vec::new(),
@@ -1539,6 +1585,7 @@ mod tests {
             host: "h".into(),
             session: "s".into(),
             herdr_socket: dir.path().join("none.sock"),
+            token_file: dir.path().join("token"),
             replica: dir.path().join("replica.db"),
             data_dir: dir.path().to_path_buf(),
             repos: Vec::new(),
@@ -1615,6 +1662,7 @@ mod tests {
             host: "h".into(),
             session: "s".into(),
             herdr_socket: dir.path().join("none.sock"),
+            token_file: dir.path().join("token"),
             replica: dir.path().join("replica.db"),
             data_dir: dir.path().to_path_buf(),
             repos: Vec::new(),

@@ -828,6 +828,11 @@ async fn main() -> Result<()> {
                 host: ctx.host_name(),
                 session: session.clone(),
                 herdr_socket: herdr_socket.clone(),
+                token_file: ctx
+                    .cli
+                    .token_file
+                    .clone()
+                    .unwrap_or_else(|| ctx.paths.token()),
                 replica: ctx.paths.replica(),
                 data_dir: ctx.paths.dir.clone(),
                 repos: repos
