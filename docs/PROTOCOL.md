@@ -547,6 +547,10 @@ work and never picks the worker; `label:x` matches only
 a label named x. Config errors name the line that is wrong: an unknown profile, a fallback
 cycle, two defaults, no default.
 
+A checkout with no `.agent-fleet/fleet.toml` uses the machine's own: `fleet.toml` and its brief
+in the user config directory (`~/.config/agent-fleet` on Linux, `AGENT_FLEET_CONFIG_DIR`
+overrides it). The checkout's file wins whenever it exists.
+
 `agent-fleet spawn <owner/repo>#<issue>` reads the issue with `gh issue view` (`AGENT_FLEET_GH`
 names the binary), picks the rule — `--profile`, `--host` and `--level` override it. A profile at
 `cap` (live agents of the profile for this repo plus pending requests) has no seat: the spawn is

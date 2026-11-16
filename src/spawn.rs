@@ -227,11 +227,25 @@ impl FleetConfig {
 }
 
 /// `dir/.agent-fleet/fleet.toml`, and the directory it lives in (the brief template sits there).
+/// A checkout with no fleet.toml of its own uses the machine's: `<user config dir>/agent-fleet`.
 pub fn load(dir: &Path) -> Result<(FleetConfig, PathBuf)> {
-    let dir = dir.join(".agent-fleet");
+    let mut dir = dir.join(".agent-fleet");
+    if !dir.join("fleet.toml").exists()
+        && let Some(user) = user_config_dir().filter(|d| d.join("fleet.toml").exists())
+    {
+        dir = user;
+    }
     let src = std::fs::read_to_string(dir.join("fleet.toml"))
         .with_context(|| format!("read {}", dir.join("fleet.toml").display()))?;
     Ok((FleetConfig::parse(&src)?, dir))
+}
+
+/// `AGENT_FLEET_CONFIG_DIR`, else the platform's user config dir for agent-fleet.
+fn user_config_dir() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("AGENT_FLEET_CONFIG_DIR") {
+        return Some(PathBuf::from(d));
+    }
+    directories::ProjectDirs::from("", "", "agent-fleet").map(|p| p.config_dir().to_path_buf())
 }
 
 /// The fleet.toml of the git checkout holding the current directory.
