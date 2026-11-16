@@ -778,10 +778,15 @@ pub struct SpawnResult {
     pub error: Option<String>,
 }
 
-/// `agent-fleet self-update` asks every host to pull its clone's `main`, rebuild and restart.
+/// `agent-fleet self-update` asks every host to pull its clone's `main`, rebuild and restart;
+/// a host's own timer asks only itself, with `host`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct UpdateRequested {}
+pub struct UpdateRequested {
+    /// Only this host runs it. Absent: every host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
 
 /// One host's answer to the `update.requested` named by `re`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1233,7 +1238,7 @@ mod tests {
             let v = serde_json::to_value(Envelope::new(
                 actor,
                 "p",
-                Known::UpdateRequested(UpdateRequested {}),
+                Known::UpdateRequested(UpdateRequested::default()),
             ))
             .unwrap();
             parse_strict(&v)

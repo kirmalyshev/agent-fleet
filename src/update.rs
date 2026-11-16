@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 
 use crate::client::{Client, Refused};
-use crate::event::{Known, UpdateResult};
+use crate::event::{Known, UpdateRequested, UpdateResult};
 use crate::host::Host;
 use crate::spawn::tail;
 use crate::state::State;
@@ -52,6 +52,8 @@ const LEFTOVER: Duration = Duration::from_secs(45 * 60);
 /// How long a finished update waits for spawns and handoffs in flight (a ready script may run
 /// 15 min) before it exits anyway: a hung one must not keep the old binary running for good.
 const DRAIN_MAX: Duration = Duration::from_secs(20 * 60);
+/// How often a host looks whether it is behind `origin/main`.
+const CHECK_EVERY: Duration = Duration::from_secs(5 * 60);
 /// How often a finished update looks for the work in flight to end.
 const DRAIN_POLL: Duration = Duration::from_secs(1);
 
@@ -248,11 +250,15 @@ fn this_exe() -> Result<PathBuf> {
         .map_or(exe.clone(), PathBuf::from))
 }
 
-/// The requests `me` has not answered, still fresh enough to run.
+/// The requests that ask `me` (or every host), it has not answered, still fresh enough to run.
 fn pending_for(s: &State, me: &str, now: chrono::DateTime<Utc>) -> Vec<String> {
     s.updates
         .iter()
-        .filter(|(_, u)| !u.results.contains_key(me) && now - u.since < REQUEST_MAX_AGE)
+        .filter(|(_, u)| {
+            u.host.as_deref().is_none_or(|h| h == me)
+                && !u.results.contains_key(me)
+                && now - u.since < REQUEST_MAX_AGE
+        })
         .map(|(id, _)| id.clone())
         .collect()
 }
@@ -263,6 +269,8 @@ trait Io {
     fn pending(&self) -> Vec<String>;
     /// Whether the answer was written.
     async fn publish(&self, id: &str, r: UpdateResult) -> bool;
+    /// Writes an `update.requested` that asks this host only; whether it was written.
+    async fn ask(&self) -> bool;
     /// Spawn or handoff work in flight that an exit would cut short.
     fn busy(&self) -> bool;
     /// One way: no new such work starts, until the process exits.
@@ -289,6 +297,13 @@ impl Io for HostIo {
             .await
     }
 
+    async fn ask(&self) -> bool {
+        let body = Known::UpdateRequested(UpdateRequested {
+            host: Some(self.0.cfg.host.clone()),
+        });
+        self.0.publish(self.0.presence(body)).await
+    }
+
     fn busy(&self) -> bool {
         self.0.is_busy()
     }
@@ -309,6 +324,15 @@ struct Seen {
     unsent: BTreeMap<String, UpdateResult>,
 }
 
+/// The timer's memory.
+#[derive(Default)]
+struct Timer {
+    last: Option<tokio::time::Instant>,
+    /// The `origin/main` commit this host last asked itself to update to. A target that failed
+    /// to build is not asked for again until `origin/main` moves.
+    asked_for: Option<String>,
+}
+
 /// What a tick runs against.
 struct Ctx<'a> {
     me: &'a str,
@@ -318,6 +342,8 @@ struct Ctx<'a> {
     running: Option<&'a str>,
     poll: Duration,
     drain_max: Duration,
+    /// How often the timer looks at `origin/main`.
+    check_every: Duration,
 }
 
 /// Executes each request this host has not answered and answers `update.result`. Once the binary
@@ -384,6 +410,60 @@ async fn tick<I: Io>(io: &I, c: &Ctx<'_>, seen: &mut Seen) {
     }
 }
 
+/// `origin/main` when this binary's commit is an ancestor of it and not it: the host is behind.
+/// Takes the clone's lock for the fetch; another update running means nothing to say now.
+async fn behind(clone: &Path, running: Option<&str>) -> Result<Option<String>> {
+    let Some(running) = running else {
+        return Ok(None);
+    };
+    let Ok(_lock) = lock(clone).await else {
+        return Ok(None);
+    };
+    git_in(clone, &["fetch", "--quiet", "origin", "main"], PULL).await?;
+    let target = git_in(clone, &["rev-parse", "origin/main"], GIT).await?;
+    if target == running {
+        return Ok(None);
+    }
+    // 0: ancestor (behind); 1: not (a build from somewhere else: not ours to replace).
+    let mut c = tokio::process::Command::new("git");
+    c.arg("-C")
+        .arg(clone)
+        .args(["merge-base", "--is-ancestor", running, "origin/main"]);
+    let out = limited(c, GIT).await?;
+    match out.status.code() {
+        Some(0) => Ok(Some(target)),
+        Some(1) => Ok(None),
+        _ => bail!(
+            "git merge-base ({}): {}",
+            out.status,
+            tail(String::from_utf8_lossy(&out.stderr).trim())
+        ),
+    }
+}
+
+/// Every `check_every`: when this host's commit is behind `origin/main`, ask this host (and no
+/// other) to update, once per target. The request is run by `tick` like any other.
+async fn timer<I: Io>(io: &I, c: &Ctx<'_>, t: &mut Timer) {
+    let now = tokio::time::Instant::now();
+    if t.last.is_some_and(|l| now - l < c.check_every) {
+        return;
+    }
+    t.last = Some(now);
+    // A request for this host is already waiting: let it run first.
+    if !io.pending().is_empty() {
+        return;
+    }
+    match behind(c.clone, c.running).await {
+        Ok(Some(target)) if t.asked_for.as_deref() != Some(target.as_str()) => {
+            if io.ask().await {
+                t.asked_for = Some(target);
+            }
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("agent-fleet host: update check: {e:#}"),
+    }
+}
+
 pub async fn update_loop(host: Arc<Host>) {
     let exe = this_exe();
     match &exe {
@@ -397,6 +477,7 @@ pub async fn update_loop(host: Arc<Host>) {
     let me = host.cfg.host.clone();
     let io = HostIo(host);
     let mut seen = Seen::default();
+    let mut timer_state = Timer::default();
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
         let c = Ctx {
@@ -406,8 +487,10 @@ pub async fn update_loop(host: Arc<Host>) {
             running: COMMIT,
             poll: DRAIN_POLL,
             drain_max: DRAIN_MAX,
+            check_every: CHECK_EVERY,
         };
         tick(&io, &c, &mut seen).await;
+        timer(&io, &c, &mut timer_state).await;
     }
 }
 
@@ -711,6 +794,7 @@ mod tests {
         log: std::cell::RefCell<Vec<String>>,
         busy: std::cell::Cell<bool>,
         drop_publish: std::cell::Cell<bool>,
+        asked: std::cell::Cell<usize>,
         results: std::cell::RefCell<Vec<UpdateResult>>,
     }
 
@@ -723,7 +807,17 @@ mod tests {
                 .borrow_mut()
                 .push(format!("publish {id} ok={}", r.ok));
             self.results.borrow_mut().push(r);
+            if !self.drop_publish.get() {
+                self.pending.borrow_mut().retain(|p| p != id);
+            }
             !self.drop_publish.get()
+        }
+        async fn ask(&self) -> bool {
+            self.log.borrow_mut().push("ask".into());
+            let n = self.asked.get() + 1;
+            self.asked.set(n);
+            self.pending.borrow_mut().push(format!("own{n}"));
+            true
         }
         fn busy(&self) -> bool {
             self.busy.get()
@@ -746,6 +840,7 @@ mod tests {
             running,
             poll: POLL,
             drain_max: Duration::from_secs(30),
+            check_every: Duration::ZERO,
         }
     }
 
@@ -865,6 +960,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_timer_asks_once_per_target_only_while_behind_origin_main() {
+        let (_t, origin, clone, exe) = fixture();
+        let first = sh(&clone, &["rev-parse", "HEAD"]);
+        let exe = Ok(exe);
+        let io = Fake::default();
+        let (mut t, running) = (Timer::default(), Some(first.as_str()));
+        let c = ctx(&clone, &exe, running);
+        timer(&io, &c, &mut t).await;
+        assert!(io.log.borrow().is_empty(), "up to date: no request");
+        newer(&origin);
+        timer(&io, &c, &mut t).await;
+        assert_eq!(*io.log.borrow(), ["ask"], "behind: one request");
+        // The request is answered; still behind (it built nothing, say): not asked again.
+        io.pending.borrow_mut().clear();
+        timer(&io, &c, &mut t).await;
+        assert_eq!(io.log.borrow().len(), 1, "same target: once");
+        sh(&origin, &["commit", "-q", "--allow-empty", "-m", "three"]);
+        timer(&io, &c, &mut t).await;
+        assert_eq!(io.log.borrow().len(), 2, "origin/main moved: asked again");
+    }
+
+    #[tokio::test]
+    async fn the_timer_waits_for_its_interval_and_for_a_request_already_pending() {
+        let (_t, origin, clone, exe) = fixture();
+        let first = sh(&clone, &["rev-parse", "HEAD"]);
+        newer(&origin);
+        let exe = Ok(exe);
+        let io = Fake::default();
+        let mut t = Timer::default();
+        let slow = Ctx {
+            check_every: Duration::from_secs(3600),
+            ..ctx(&clone, &exe, Some(&first))
+        };
+        *io.pending.borrow_mut() = ids(&["other"]);
+        timer(&io, &slow, &mut t).await;
+        assert!(io.log.borrow().is_empty(), "a request is waiting");
+        io.pending.borrow_mut().clear();
+        timer(&io, &slow, &mut t).await;
+        assert!(io.log.borrow().is_empty(), "the interval has not passed");
+    }
+
+    #[tokio::test]
+    async fn the_timer_leaves_a_build_from_elsewhere_and_an_unknown_commit_alone() {
+        let (_t, origin, clone, exe) = fixture();
+        newer(&origin);
+        let exe = Ok(exe);
+        let io = Fake::default();
+        for running in [Some("0123456789abcdef0123456789abcdef01234567"), None] {
+            let mut t = Timer::default();
+            timer(&io, &ctx(&clone, &exe, running), &mut t).await;
+        }
+        assert!(io.log.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_target_that_failed_to_build_is_not_asked_for_again_until_main_moves() {
+        let t = tempfile::tempdir().unwrap();
+        let builds = t.path().join("builds");
+        let (_f, origin, clone, exe) = fixture_with(&format!(
+            "echo x >> {}; echo 'error: boom' >&2; exit 1\n",
+            builds.display()
+        ));
+        let first = sh(&clone, &["rev-parse", "HEAD"]);
+        newer(&origin);
+        let exe = Ok(exe);
+        let io = Fake::default();
+        let (mut seen, mut tm) = (Seen::default(), Timer::default());
+        let c = ctx(&clone, &exe, Some(&first));
+        for _ in 0..3 {
+            timer(&io, &c, &mut tm).await;
+            tick(&io, &c, &mut seen).await;
+        }
+        let built = |n| std::fs::read_to_string(&builds).unwrap().lines().count() == n;
+        assert!(built(1), "built once");
+        assert_eq!(io.log.borrow().iter().filter(|l| *l == "ask").count(), 1);
+        sh(&origin, &["commit", "-q", "--allow-empty", "-m", "three"]);
+        timer(&io, &c, &mut tm).await;
+        tick(&io, &c, &mut seen).await;
+        assert!(built(2), "origin/main moved: tried again");
+    }
+
+    #[test]
+    fn a_request_for_one_host_is_pending_for_that_host_only() {
+        let now = Utc::now();
+        let mut s = state_with(&[], &[]);
+        s.updates.clear();
+        let ask = |host: Option<&str>| crate::state::Update {
+            by: "host:x".into(),
+            since: now,
+            host: host.map(String::from),
+            results: BTreeMap::new(),
+        };
+        s.updates.insert("all".into(), ask(None));
+        s.updates.insert("mine".into(), ask(Some("h")));
+        s.updates.insert("yours".into(), ask(Some("other")));
+        assert_eq!(pending_for(&s, "h", now), ["all", "mine"]);
+    }
+
+    #[tokio::test]
     async fn a_refused_update_never_exits() {
         let (_t, _origin, clone, exe) = fixture();
         std::fs::write(clone.join("f"), "dirty").unwrap();
@@ -906,6 +1100,7 @@ mod tests {
         let fresh = |results: &[&str]| crate::state::Update {
             by: "host:x".into(),
             since: now,
+            host: None,
             results: results
                 .iter()
                 .map(|h| {
@@ -961,6 +1156,7 @@ mod tests {
         let mut u = crate::state::Update {
             by: "host:x".into(),
             since: ts,
+            host: None,
             results: BTreeMap::new(),
         };
         for (h, ok, commit) in results {

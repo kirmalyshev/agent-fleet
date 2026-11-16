@@ -839,7 +839,7 @@ async fn main() -> Result<()> {
             if hosts.is_empty() {
                 bail!("no host has reported in the last 3 minutes");
             }
-            let body = Known::UpdateRequested(UpdateRequested {});
+            let body = Known::UpdateRequested(UpdateRequested::default());
             // Only a host's actor may ask: the request makes every host rebuild and restart.
             let by = Actor {
                 kind: ActorKind::Host,

@@ -103,7 +103,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `proc.hung` | host, pid, pids[]?, agent?, command?, started?, evidence?, since?, checked? — the topmost hung process an agent started and the hung ones under it (the watch tick, every 2 min); no `evidence` clears the report; folded only from the host actor it names (`host:<host>`) | | host |
 | | `agent.stuck` | agent, cause?, detail, until? — no `cause` clears the record | | host |
 | | `agent.signal` | agent, program, signal, detail? — `prompt`/`turn_end` clear the agent's stored signal | | agent |
-| update | `update.requested` | (empty) — every host pulls, rebuilds and restarts; written by `agent-fleet self-update` as `host:<this machine>` | | host |
+| update | `update.requested` | host? — every host (or only `host`) pulls, rebuilds and restarts; written by `agent-fleet self-update` as `host:<this machine>`, and by a host's own timer for itself | | host |
 | | `update.result` | host, ok, commit?, error? — folded only from the host actor it names, first answer per host | re = the request | host |
 
 `ask.answered` closes an `ask.raised` from the board's Inbox. The hub writes it together with the
@@ -643,6 +643,14 @@ error), then exits with status 75 so its supervisor (systemd `Restart=on-failure
 `host.health` in the last 3 min has refused, or reports in `host.health` the commit it named,
 and prints each one's commit. Only a `host` actor may write `update.requested` (the CLI writes it
 as `host:<this machine>`): it makes every host rebuild and restart.
+
+**Automatic trigger.** Every 5 minutes a host fetches `origin/main` of its clone. When the commit
+its binary was built from is an ancestor of `origin/main` and not equal to it, it writes
+`update.requested` with `host` set to itself, so no other host runs it; it runs like any other
+request. It asks once per `origin/main` commit: a build that failed is not asked for again until
+`origin/main` moves. It asks nothing while a request for this host waits, while an update holds
+the clone's lock, or when its commit is not an ancestor of `origin/main` (a build from
+elsewhere) or unknown.
 
 The update is hardened:
 
