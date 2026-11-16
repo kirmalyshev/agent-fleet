@@ -83,14 +83,46 @@ fn finding(kind: &'static str, subject: impl Into<String>, detail: String) -> Fi
 
 /// The worktree an agent works in: the deepest one on its host containing its cwd.
 pub fn worktree_of<'a>(s: &'a State, a: &Agent) -> Option<(&'a String, &'a Worktree)> {
-    let cwd = a.usage.as_ref()?.cwd.as_deref()?;
+    containing(s, &a.host, a.usage.as_ref()?.cwd.as_deref()?)
+}
+
+/// The deepest known worktree on `host` containing `dir`.
+fn containing<'a>(s: &'a State, host: &str, dir: &str) -> Option<(&'a String, &'a Worktree)> {
     s.worktrees
         .iter()
         .filter(|(_, w)| {
-            w.state.host == a.host
-                && (cwd == w.state.path || cwd.starts_with(&format!("{}/", w.state.path)))
+            w.state.host == host
+                && (dir == w.state.path || dir.starts_with(&format!("{}/", w.state.path)))
         })
         .max_by_key(|(_, w)| w.state.path.len())
+}
+
+/// Worktree key → the live agents that work in it: their cwd is in it, or they were spawned into
+/// it (`State::assigned_worktrees`). Neither `forgotten` nor `worktree clean` touches these.
+pub fn workers(s: &State) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut add = |key: String, id: &str| {
+        let v = out.entry(key).or_default();
+        if !v.iter().any(|a| a == id) {
+            v.push(id.to_string());
+        }
+    };
+    for (id, a) in &s.agents {
+        if let Some((key, _)) = worktree_of(s, a) {
+            add(key.clone(), id);
+        }
+    }
+    let hosts: std::collections::BTreeSet<&String> = s.agents.values().map(|a| &a.host).collect();
+    for host in hosts {
+        for (id, tree) in s.assigned_worktrees(host) {
+            if let Some(t) = tree {
+                let key = containing(s, host, &t)
+                    .map_or_else(|| crate::state::worktree_key(host, &t), |(k, _)| k.clone());
+                add(key, &id);
+            }
+        }
+    }
+    out
 }
 
 /// Who a resource holder is for a capacity rule: its worktree, else its cwd, else its pid.
@@ -616,6 +648,7 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
             ),
         ));
     }
+    let workers = workers(s);
     for (key, w) in &s.worktrees {
         let st = &w.state;
         let running = s.worktree_procs.get(key).map_or(String::new(), |p| {
@@ -635,7 +668,7 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
         };
         // Only a worktree herdr or spawn made is the fleet's to call forgotten: a main checkout
         // or a scratch worktree an agent once stood in is somebody's own.
-        if !occupied.contains_key(key) {
+        if !workers.contains_key(key) {
             if st.herdr && unsaved && unchanged >= UNPUSHED {
                 out.push(finding(
                     "forgotten",

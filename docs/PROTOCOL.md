@@ -865,7 +865,7 @@ the screen's `--instance`, `--hub`, `--token-file`, `--as`, `--project` and `--h
 background. So each action writes the same events, with the same checks and refusals, as the
 command typed in a shell. Tab completes commands, agents, tasks, blockers, levels and the
 profiles of fleet.toml. A command that only reads (`stats`, `doctor`, `proc`, `ps`, `ui`, `task
-ls|show`, `role <agent>`, `api schema`, `help`
+ls|show`, `role <agent>`, `api schema`, `help`, `worktree` without `--execute`
 and any `--help`) runs at once; any other asks first. `spawn` runs its `--dry-run` first
 and spawns on `y`, following until `spawn.result` as the CLI does. A failure, or an output longer
 than one line, opens over the screen; `o` opens the last one again. The services (`hub`, `host`)
@@ -883,6 +883,18 @@ processes left in one (only those still running there, so a reused pid is never 
 simulators a worktree holds, and how its stack stops. If its main checkout has an executable
 `.agent-fleet/hook`, removing a worktree runs `.agent-fleet/hook retire <path>` instead of
 `git worktree remove`; the hook does the repository's own teardown and exits non-zero to refuse.
+
+**Cleaning worktrees.** `agent-fleet worktree ls|clean [--execute] [--repo owner/repo]` reads the
+worktrees and local branches of the machine's `[repos]`, of the main checkouts the host reports
+in `worktree.state`, and of the checkout it runs in. A branch is finished when its tip is the head
+of one of your merged or closed PRs (`pr`), is in the default branch (`in main`), or is in
+`origin/<branch>` (`pushed`); an open PR keeps it. Only `pr` retires a worktree, through the
+repository hook as above, and the outcome line reports an open PR on its branch as `x` does. A
+worktree is kept when it is the main checkout or the caller's, holds uncommitted files, has
+processes in it (`worktree.procs`), or a live agent works in it: its cwd (`agent.usage`) is in it
+or it was spawned into it (`spawn.result`). `doctor` uses the same agents for `forgotten`. Without
+a hub or replica, no agent is known. `:worktree` runs at once from the screen unless it has
+`--execute`.
 
 ## The board
 
