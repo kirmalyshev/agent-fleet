@@ -20,12 +20,15 @@ const DEFAULT_RULE: &str = "profile = \"claude\"";
 
 /// The kinds whose program is an executable on `PATH`.
 pub fn kinds_on_path() -> Vec<&'static str> {
+    kinds_in(&std::env::var_os("PATH").unwrap_or_default())
+}
+
+fn kinds_in(path: &std::ffi::OsStr) -> Vec<&'static str> {
     use std::os::unix::fs::PermissionsExt;
-    let path = std::env::var_os("PATH").unwrap_or_default();
     KINDS
         .into_iter()
         .filter(|k| {
-            std::env::split_paths(&path).any(|d| {
+            std::env::split_paths(path).any(|d| {
                 std::fs::metadata(d.join(k))
                     .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
             })
@@ -271,9 +274,15 @@ const TERMINAL_WORDS: [&str; 3] = ["herdr", "tmux", "cmux"];
 /// Each agent program's user-level skills dir: `$CLAUDE_CONFIG_DIR` or `~/.claude`, and
 /// `$CODEX_HOME` or `~/.codex`, each with `/skills`.
 pub fn user_skill_dirs() -> Vec<(&'static str, PathBuf)> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    skill_dirs_from(|v| std::env::var_os(v))
+}
+
+fn skill_dirs_from(
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(&'static str, PathBuf)> {
+    let home = env("HOME").map(PathBuf::from);
     let dir = |var: &str, dot: &str| {
-        std::env::var_os(var)
+        env(var)
             .map(PathBuf::from)
             .or_else(|| home.as_ref().map(|h| h.join(dot)))
     };
@@ -605,6 +614,51 @@ mod tests {
                 .unwrap();
             assert_eq!(c.repos(), want);
         }
+    }
+
+    #[test]
+    fn programs_are_found_only_as_executables_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let file = |d: &Path, name: &str, mode: u32| {
+            let p = d.join(name);
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        file(a.path(), "codex", 0o755);
+        file(a.path(), "devin", 0o644); // not executable
+        std::fs::create_dir(a.path().join("claude")).unwrap(); // a dir, not a program
+        file(b.path(), "claude", 0o700);
+        let path = std::env::join_paths([a.path(), Path::new("/no/such/dir"), b.path()]).unwrap();
+        assert_eq!(kinds_in(&path), ["claude", "codex"]);
+        assert!(kinds_in(std::ffi::OsStr::new("")).is_empty());
+    }
+
+    #[test]
+    fn skill_dirs_honour_claude_config_dir_and_codex_home() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                vars.iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| std::ffi::OsString::from(v))
+            }
+        };
+        assert_eq!(
+            skill_dirs_from(env(&[("HOME", "/h")])),
+            [
+                ("claude", PathBuf::from("/h/.claude/skills")),
+                ("codex", PathBuf::from("/h/.codex/skills")),
+            ]
+        );
+        assert_eq!(
+            skill_dirs_from(env(&[("CLAUDE_CONFIG_DIR", "/c"), ("CODEX_HOME", "/x")])),
+            [
+                ("claude", PathBuf::from("/c/skills")),
+                ("codex", PathBuf::from("/x/skills")),
+            ]
+        );
+        assert!(skill_dirs_from(env(&[])).is_empty());
     }
 
     #[test]
