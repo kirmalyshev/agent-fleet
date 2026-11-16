@@ -53,7 +53,11 @@ const TABS: [(Tab, &str); 5] = [
 /// An action waiting for `y`.
 enum Pending {
     Kill(Vec<u32>, String),
-    Remove { repo: String, path: String },
+    Remove {
+        repo: String,
+        path: String,
+        branch: Option<String>,
+    },
     Task(String, Box<Known>, &'static str),
 }
 
@@ -415,6 +419,7 @@ async fn action(app: &mut App, c: char, fleet: &impl Fleet) {
                 Pending::Remove {
                     repo: st.repo.clone(),
                     path: st.path.clone(),
+                    branch: st.branch.clone(),
                 },
             );
         }
@@ -472,7 +477,7 @@ async fn act(fleet: &impl Fleet, pending: Pending) -> String {
             }
             out.join(", ")
         }
-        Pending::Remove { repo, path } => {
+        Pending::Remove { repo, path, branch } => {
             let out = match hook(&repo) {
                 Some(h) => {
                     tokio::process::Command::new(h)
@@ -488,7 +493,10 @@ async fn act(fleet: &impl Fleet, pending: Pending) -> String {
                 }
             };
             match out {
-                Ok(o) if o.status.success() => format!("removed {}", home(&path)),
+                Ok(o) if o.status.success() => {
+                    let gh = std::env::var("AGENT_FLEET_GH").unwrap_or_else(|_| "gh".into());
+                    removed_line(fleet, &gh, &repo, &path, branch.as_deref()).await
+                }
                 Ok(o) => format!(
                     "refused: {}",
                     String::from_utf8_lossy(&o.stderr)
@@ -500,6 +508,32 @@ async fn act(fleet: &impl Fleet, pending: Pending) -> String {
             }
         }
     }
+}
+
+/// The outcome line of a removed worktree: when its branch still has an open PR, the line says
+/// so, and the root coordinator is told the PR is a coordinator item now.
+async fn removed_line(
+    fleet: &impl Fleet,
+    gh: &str,
+    repo: &str,
+    path: &str,
+    branch: Option<&str>,
+) -> String {
+    let mut line = format!("removed {}", home(path));
+    if let Some(b) = branch
+        && let Some((_, note)) = crate::orphanpr::retire_note(gh, repo, b).await
+    {
+        line += &format!("; {note}");
+        if let Some(root) = fleet
+            .snapshot()
+            .await
+            .ok()
+            .and_then(|(s, _)| crate::orphanpr::root_of(&s))
+        {
+            let _ = fleet.tell(&root, &format!("{b} retired: {note}")).await;
+        }
+    }
+    line
 }
 
 async fn focus(fleet: &impl Fleet, id: &str, host: &str, pane: Option<&str>) -> String {
@@ -1213,6 +1247,83 @@ mod tests {
     use crate::state::Agent;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    /// A fleet with a root coordinator that records what it is told.
+    struct Told(std::sync::Mutex<Vec<(String, String)>>);
+
+    impl Fleet for Told {
+        async fn snapshot(&self) -> Result<(State, Option<String>)> {
+            let mut s = State::default();
+            s.roles.insert(
+                "agent:h/s/root".into(),
+                crate::state::Role {
+                    level: crate::event::Level::RootCoordinator,
+                    lead: None,
+                    domain: None,
+                    by: "x".into(),
+                    since: Utc::now(),
+                },
+            );
+            Ok((s, None))
+        }
+        async fn task(&self, _: &str, _: Known) -> Result<String> {
+            unreachable!()
+        }
+        async fn tell(&self, a: &str, t: &str) -> Result<String> {
+            self.0.lock().unwrap().push((a.into(), t.into()));
+            Ok(String::new())
+        }
+        fn instance(&self) -> &str {
+            "i"
+        }
+        fn hub(&self) -> String {
+            String::new()
+        }
+        fn host(&self) -> String {
+            "h".into()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retired_worktree_with_an_open_pr_says_so_and_tells_the_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["remote", "add", "origin", "https://host.example/o/r"],
+        ] {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        }
+        let gh = dir.path().join("gh");
+        std::fs::write(&gh, "#!/bin/sh\ncase \"$*\" in *\"--head s-1 \"*) echo '[{\"number\":7}]' ;; *) echo '[]' ;; esac\n").unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (gh, repo) = (gh.to_str().unwrap(), repo.to_str().unwrap());
+        let fleet = Told(Default::default());
+        let line = removed_line(&fleet, gh, repo, "/w/s-1", Some("s-1")).await;
+        assert!(line.starts_with("removed "), "{line}");
+        assert!(line.contains("o/r#7 is still open"), "{line}");
+        let told = fleet.0.lock().unwrap().clone();
+        assert_eq!(told.len(), 1);
+        assert_eq!(told[0].0, "agent:h/s/root");
+        // No open PR (or no branch): the plain line, nobody told.
+        let fleet = Told(Default::default());
+        let line = removed_line(&fleet, gh, repo, "/w/s-2", Some("s-2")).await;
+        assert!(!line.contains("still open") && fleet.0.lock().unwrap().is_empty());
+        assert!(
+            !removed_line(&fleet, gh, repo, "/w/x", None)
+                .await
+                .contains(';')
+        );
+    }
 
     struct Stub;
 

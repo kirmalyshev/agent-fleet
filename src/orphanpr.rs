@@ -25,6 +25,10 @@ pub struct Config {
     /// name (at any depth) or exact path.
     #[serde(default = "default_guarded")]
     pub guarded: Vec<String>,
+    /// The host's watch loop runs the `doctor --apply` step itself (close superseded PRs, tell
+    /// the root coordinator of the rest). Off unless set.
+    #[serde(default)]
+    pub apply: bool,
 }
 
 fn default_days() -> u32 {
@@ -43,6 +47,7 @@ impl Default for Config {
             repos: Vec::new(),
             days: default_days(),
             guarded: default_guarded(),
+            apply: false,
         }
     }
 }
@@ -396,6 +401,104 @@ fn missing(e: &anyhow::Error) -> bool {
         .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 
+/// The `--apply` outcome of one orphan, as a finding-detail suffix: a `Close` runs `gh pr close`,
+/// a report adds nothing.
+pub async fn close_note(bin: &str, o: &Orphan) -> String {
+    match &o.action {
+        Action::Close { by } => match close(bin, &o.repo, o.number, *by).await {
+            Ok(()) => "; closed, branch kept".into(),
+            Err(e) => format!("; close failed: {e:#}"),
+        },
+        Action::Report(_) => String::new(),
+    }
+}
+
+/// What the watch loop does with the orphans of one scan.
+#[derive(Debug, PartialEq)]
+pub enum Act {
+    Close(Orphan),
+    /// A `msg.sent` to the root coordinator.
+    Tell {
+        to: String,
+        key: String,
+        text: String,
+    },
+}
+
+/// A report is told again only after this long without a change.
+pub const RETELL: Duration = Duration::days(7);
+
+/// Close each `Close`; tell the root coordinator of each `Report` it was not told of within
+/// `RETELL` (the log is the dedupe across restarts).
+pub fn acts(
+    orphans: Vec<Orphan>,
+    s: &crate::state::State,
+    events: &[crate::event::Event],
+    now: DateTime<Utc>,
+) -> Vec<Act> {
+    let root = root_of(s);
+    let mut out = Vec::new();
+    for o in orphans {
+        if matches!(o.action, Action::Close { .. }) {
+            out.push(Act::Close(o));
+            continue;
+        }
+        let key = format!("{}#{}", o.repo, o.number);
+        if let Some(to) = root.clone()
+            && !already_told(s, &to, &key)
+            && !crate::watch::unsent(events, vec![to.clone()], "orphan-pr", &key, now - RETELL)
+                .is_empty()
+        {
+            out.push(Act::Tell {
+                text: format!("{key} has no live agent: {}", o.detail),
+                to,
+                key,
+            });
+        }
+    }
+    out
+}
+
+/// `owner/repo` of a git remote URL (`git@host:o/r.git`, `https://host/o/r`, `ssh://git@host/o/r`).
+pub fn slug_of(url: &str) -> Option<String> {
+    let path = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    let path = path.rsplit_once(':').map_or(path, |(h, p)| {
+        if p.contains('/') && !h.ends_with("http") && !h.ends_with("https") && !h.ends_with("ssh") {
+            p
+        } else {
+            path
+        }
+    });
+    let mut parts = path.rsplit('/');
+    let (r, o) = (parts.next()?, parts.next()?);
+    (!r.is_empty() && !o.is_empty() && !o.contains(':')).then(|| format!("{o}/{r}"))
+}
+
+/// The note a retire adds to its outcome line when the branch it retired still has an open PR:
+/// `(PR number, line)`. `None` when there is none, or it cannot be told.
+pub async fn retire_note(bin: &str, repo: &str, branch: &str) -> Option<(u64, String)> {
+    let url = tokio::process::Command::new("git")
+        .args(["-C", repo, "remote", "get-url", "origin"])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())?;
+    let slug = slug_of(&String::from_utf8_lossy(&url.stdout))?;
+    let v = gh(
+        bin,
+        &[
+            "pr", "list", "-R", &slug, "--head", branch, "--state", "open", "--json", "number",
+        ],
+    )
+    .await
+    .ok()?;
+    let n = v.as_array()?.first()?["number"].as_u64()?;
+    Some((
+        n,
+        format!("PR {slug}#{n} is still open: a coordinator item now"),
+    ))
+}
+
 /// The root coordinator's agent id.
 pub fn root_of(s: &crate::state::State) -> Option<String> {
     s.roles
@@ -534,6 +637,122 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config(dir.path()).unwrap().unwrap().repos, ["o/r"]);
+    }
+
+    #[test]
+    fn apply_is_off_unless_set_and_slugs_come_from_any_remote_form() {
+        assert!(!Config::default().apply);
+        let c: Config = toml::from_str("repos = [\"o/r\"]\napply = true").unwrap();
+        assert!(c.apply);
+        for u in [
+            "git@host.example:o/r.git\n",
+            "https://host.example/o/r",
+            "https://host.example/o/r.git/",
+            "ssh://git@host.example/o/r.git",
+        ] {
+            assert_eq!(slug_of(u).as_deref(), Some("o/r"), "{u}");
+        }
+        assert_eq!(slug_of("r"), None);
+    }
+
+    fn orphan(n: u64, action: Action) -> Orphan {
+        Orphan {
+            repo: "o/r".into(),
+            number: n,
+            age: Duration::days(5),
+            detail: "s: 5d quiet".into(),
+            action,
+        }
+    }
+
+    fn with_root() -> crate::state::State {
+        let mut s = crate::state::State::default();
+        s.roles.insert(
+            "agent:h/s/root".into(),
+            crate::state::Role {
+                level: crate::event::Level::RootCoordinator,
+                lead: None,
+                domain: None,
+                by: "x".into(),
+                since: now(),
+            },
+        );
+        s
+    }
+
+    fn told(key: &str, at: DateTime<Utc>) -> crate::event::Event {
+        use crate::event::*;
+        let mut e = Envelope::new(
+            Actor {
+                kind: ActorKind::Host,
+                id: "host:h".into(),
+            },
+            "p",
+            Known::MsgSent(MsgSent {
+                to: "agent:h/s/root".into(),
+                kind: "orphan-pr".into(),
+                reference: key.into(),
+                text: "t".into(),
+            }),
+        );
+        e.ts = at;
+        e.into_event()
+    }
+
+    #[test]
+    fn the_watch_closes_what_is_superseded_and_tells_the_root_once_a_week() {
+        let s = with_root();
+        let mk = || {
+            vec![
+                orphan(1, Action::Close { by: Some(9) }),
+                orphan(2, Action::Report("a draft waits for a person")),
+            ]
+        };
+        let a = acts(mk(), &s, &[], now());
+        assert!(matches!(&a[0], Act::Close(o) if o.number == 1));
+        assert!(matches!(&a[1], Act::Tell { key, .. } if key == "o/r#2"));
+        // Told two days ago: quiet. Told eight days ago: again.
+        let two = [told("o/r#2", now() - Duration::days(2))];
+        assert_eq!(acts(mk(), &s, &two, now()).len(), 1);
+        let eight = [told("o/r#2", now() - Duration::days(8))];
+        assert_eq!(acts(mk(), &s, &eight, now()).len(), 2);
+        // No root coordinator: nobody to tell, the close still runs.
+        let none = acts(mk(), &crate::state::State::default(), &[], now());
+        assert_eq!(none.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_retired_branch_with_an_open_pr_gets_a_note_and_one_without_gets_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            )
+        };
+        git(&["init", "-q"]);
+        git(&["remote", "add", "origin", "git@host.example:o/r.git"]);
+        let bin = dir.path().join("gh");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\ncase \"$*\" in\n  *\"-R o/r --head s-1 \"*) echo '[{\"number\":7}]' ;;\n  *) echo '[]' ;;\nesac\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (gh, repo) = (bin.to_str().unwrap(), repo.to_str().unwrap());
+        let (n, line) = retire_note(gh, repo, "s-1").await.unwrap();
+        assert_eq!(n, 7);
+        assert!(line.contains("o/r#7 is still open"), "{line}");
+        assert!(retire_note(gh, repo, "s-2").await.is_none());
+        assert!(retire_note("/nonexistent/gh", repo, "s-1").await.is_none());
     }
 
     #[test]

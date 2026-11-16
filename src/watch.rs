@@ -552,12 +552,57 @@ pub(crate) async fn watch_loop(host: Arc<Host>) {
     let mut tick = tokio::time::interval(EVERY);
     // A stalled tick must not fire the next ones back to back: streaks count real intervals.
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_prs: Option<std::time::Instant> = None;
     loop {
         tick.tick().await;
         if let Err(err) = once(&host, &mut w).await {
             eprintln!("agent-fleet host: watch: {err:#}");
         }
+        if last_prs.is_none_or(|t| t.elapsed() >= ORPHAN_PR_EVERY) {
+            last_prs = Some(std::time::Instant::now());
+            if let Err(err) = orphan_prs(&host).await {
+                eprintln!("agent-fleet host: orphan PRs: {err:#}");
+            }
+        }
     }
+}
+
+/// How often the watch loop looks at GitHub for PRs no live agent owns.
+const ORPHAN_PR_EVERY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// `doctor --apply` for `orphan-pr`, when fleet.toml turns it on (`[orphan_pr] apply = true`, off by
+/// default): close what a merged PR supersedes, tell the root coordinator of the rest.
+async fn orphan_prs(host: &Arc<Host>) -> anyhow::Result<()> {
+    let Some(cfg) = crate::orphanpr::config(std::path::Path::new("."))?
+        .filter(|c| c.apply && !c.repos.is_empty())
+    else {
+        return Ok(());
+    };
+    let view = host.view()?;
+    let gh = std::env::var("AGENT_FLEET_GH").unwrap_or_else(|_| "gh".into());
+    let now = Utc::now();
+    let (orphans, errs) = crate::orphanpr::scan(&gh, &view.state, &cfg, now).await;
+    for (repo, e) in errs {
+        eprintln!("agent-fleet host: orphan PRs: {repo}: {e}");
+    }
+    for act in crate::orphanpr::acts(orphans, &view.state, &view.events, now) {
+        match act {
+            crate::orphanpr::Act::Close(o) => {
+                let note = crate::orphanpr::close_note(&gh, &o).await;
+                eprintln!("agent-fleet host: orphan PR {}#{}{note}", o.repo, o.number);
+            }
+            crate::orphanpr::Act::Tell { to, key, text } => {
+                host.publish(host.presence(Known::MsgSent(MsgSent {
+                    to,
+                    kind: "orphan-pr".into(),
+                    reference: key,
+                    text,
+                })))
+                .await;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {

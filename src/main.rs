@@ -883,12 +883,7 @@ async fn main() -> Result<()> {
                 let mut detail = o.detail.clone();
                 if *apply {
                     detail += &match &o.action {
-                        orphanpr::Action::Close { by } => {
-                            match orphanpr::close(&gh, &o.repo, o.number, *by).await {
-                                Ok(()) => "; closed, branch kept".to_string(),
-                                Err(e) => format!("; close failed: {e:#}"),
-                            }
-                        }
+                        orphanpr::Action::Close { .. } => orphanpr::close_note(&gh, o).await,
                         orphanpr::Action::Report(why) => {
                             format!("; {why}{}", tell_root(&ctx, &state, &key, &o.detail).await)
                         }
