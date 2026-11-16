@@ -7,7 +7,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::event::{
-    AgentState, Body, Event, Known, Level, QuotaWindow, ResourceHold, ResourceLimit,
+    AgentState, Body, Event, Known, Level, ProcessHung, QuotaWindow, ResourceHold, ResourceLimit,
     SpawnRequested, SpawnResult, StuckCause, TYPE_VERSION, TaskState, WorktreeProcs, WorktreeState,
 };
 
@@ -55,6 +55,9 @@ pub struct State {
     /// Processes each host proved orphaned, keyed `<host>:<pid>`.
     #[serde(default)]
     pub orphans: BTreeMap<String, Orphan>,
+    /// Hung processes by `<host>:<pid>` of the topmost one, `since` always set.
+    #[serde(default)]
+    pub hung: BTreeMap<String, ProcessHung>,
     /// Why a stopped agent is stopped, as its host read it off the screen, keyed by agent id.
     #[serde(default)]
     pub stuck: BTreeMap<String, Stuck>,
@@ -820,6 +823,30 @@ impl State {
                     }
                 }
             }
+            // Kill proof: only the host it names may report or clear it.
+            Known::ProcessHung(d)
+                if e.actor.kind != crate::event::ActorKind::Host
+                    || e.actor.id != format!("host:{}", d.host) => {}
+            Known::ProcessHung(d) => {
+                let key = format!("{}:{}", d.host, d.pid);
+                if d.evidence.is_some() {
+                    // A reused pid's report starts its own episode.
+                    let since = self
+                        .hung
+                        .get(&key)
+                        .filter(|h| h.started == d.started)
+                        .and_then(|h| h.since);
+                    self.hung.insert(
+                        key,
+                        ProcessHung {
+                            since: since.or(d.since).or(Some(ts)),
+                            ..d.clone()
+                        },
+                    );
+                } else {
+                    self.hung.remove(&key);
+                }
+            }
             Known::SpawnResult(d) => {
                 if let Some(re) = &e.re
                     && let Some(s) = self.spawns.get_mut(re)
@@ -1129,6 +1156,68 @@ mod tests {
         .into_event();
         s.apply(&clear);
         assert!(s.orphans.is_empty());
+    }
+
+    #[test]
+    fn a_hung_report_folds_keeps_its_first_since_and_clears() {
+        let mut s = State::default();
+        let hung = |evidence: Option<&str>| {
+            ev(
+                ActorKind::Host,
+                Known::ProcessHung(ProcessHung {
+                    host: "h".into(),
+                    pid: 30,
+                    pids: vec![30, 31],
+                    agent: Some("agent:h/s/o-1".into()),
+                    command: Some("bash scripts/e2e.sh".into()),
+                    started: None,
+                    evidence: evidence.map(str::to_string),
+                    since: None,
+                    checked: None,
+                }),
+            )
+            .into_event()
+        };
+        let first = hung(Some("0% CPU"));
+        s.apply(&first);
+        s.apply(&hung(Some("0% CPU, 6m")));
+        let h = &s.hung["h:30"];
+        assert_eq!(h.since, Some(first.ts), "the first report dates it");
+        assert_eq!(h.evidence.as_deref(), Some("0% CPU, 6m"));
+        assert_eq!(h.pids, vec![30, 31]);
+        s.apply(&hung(None));
+        assert!(s.hung.is_empty());
+    }
+
+    #[test]
+    fn a_hung_report_counts_only_from_the_host_it_names() {
+        let body = |host: &str| {
+            Known::ProcessHung(ProcessHung {
+                host: host.into(),
+                pid: 30,
+                pids: vec![30],
+                agent: None,
+                command: None,
+                started: None,
+                evidence: Some("0% CPU".into()),
+                since: None,
+                checked: None,
+            })
+        };
+        let mut s = State::default();
+        s.apply(&ev(ActorKind::Agent, body("h")).into_event());
+        assert!(s.hung.is_empty(), "an agent cannot report a process hung");
+        s.apply(&ev(ActorKind::Host, body("other")).into_event());
+        assert!(s.hung.is_empty(), "host:h cannot report for another host");
+        assert!(crate::doctor::hung_pids(&s, "h", Utc::now()).is_empty());
+        s.apply(&ev(ActorKind::Host, body("h")).into_event());
+        assert_eq!(s.hung.len(), 1);
+        let mut clear = ev(ActorKind::Agent, body("h"));
+        if let Known::ProcessHung(d) = &mut clear.body {
+            d.evidence = None;
+        }
+        s.apply(&clear.into_event());
+        assert_eq!(s.hung.len(), 1, "nor clear one");
     }
 
     #[test]

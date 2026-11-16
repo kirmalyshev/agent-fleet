@@ -100,6 +100,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `spawn.result` | agent, ok, pane?, worktree?, error? | re = the request | host |
 | | `agent.unmanaged` | host, pid, program?, cwd?, since? — no `program` clears the report | | host |
 | | `proc.orphaned` | host, pid, cwd?, why?, since? — no `why` clears the report | | host |
+| | `proc.hung` | host, pid, pids[]?, agent?, command?, started?, evidence?, since?, checked? — the topmost hung process an agent started and the hung ones under it (the watch tick, every 2 min); no `evidence` clears the report; folded only from the host actor it names (`host:<host>`) | | host |
 | | `agent.stuck` | agent, cause?, detail, until? — no `cause` clears the record | | host |
 | | `agent.signal` | agent, program, signal, detail? — `prompt`/`turn_end` clear the agent's stored signal | | agent |
 
@@ -294,7 +295,7 @@ how many worktrees may hold any of a set of resources at once.
 | Finding | When |
 |---|---|
 | `stale` | an agent idle, done or blocked for 2 h |
-| `hung` | working for 30 min at under 2% CPU, its worktree unchanged as long |
+| `hung` | working for 30 min at under 2% CPU, its worktree unchanged as long; or (subject `<host>:<pid>`) a process the watch tick reported in `proc.hung` |
 | `heavy` | an agent's tree, or a worktree's processes, over 4 GB or 200% CPU |
 | `duplicate` | two agents in one worktree, or two agents' worktrees changing the same files (lockfiles aside) |
 | `forgotten` | a worktree no agent works in, with unsaved work for an hour, or clean and 3 days untouched, or clean with processes still running 10 min after it last changed; running processes are named, and `agent-fleet kill` accepts them unless the worktree is a main checkout |
@@ -437,11 +438,15 @@ refuses, killing nothing, when any pid is:
 - a terminal multiplexer (`herdr`), a pane's shell, an agent (`claude`, `devin`, `codex`, or what
   a pane's shell runs), an `agent-fleet` daemon, or an ancestor of any of them;
 - the caller's own ancestor (its shell, its script's parent, its agent);
-- inside another agent's process tree.
+- inside another agent's process tree, unless a `proc.hung` report names it (below).
 
-It kills the caller's own processes (its agent's tree) and orphans `doctor` proved: processes in a deleted worktree or a `forgotten` linked worktree (never a repository's main checkout) (on Linux, still
-in that directory): TERM, then KILL after `--grace` seconds. Each refusal is logged as
-`kill.refused`.
+It kills the caller's own processes (its agent's tree) and orphans `doctor` proved: processes in
+a deleted worktree or a `forgotten` linked worktree (never a repository's main checkout) (on
+Linux, still in that directory). It also kills the pids of a `proc.hung` report on the caller's
+host, also inside another agent's tree, when the live process started before the report's
+`since` (a later one with that pid is not the one that hung) and the report was `checked` in
+the last 6 minutes (one nobody re-checks proves nothing). TERM, then KILL after `--grace`
+seconds. Each refusal is logged as `kill.refused`.
 
 `agent-fleet hook bash` is a PreToolUse hook for Claude Code (tool `Bash`) and Devin CLI (tool
 `exec`, which also reads hooks from `.claude/settings.json`) that refuses (exit 2) a shell command
@@ -492,6 +497,41 @@ exits normally releases the lock first, so a member of its group under a still-h
 an orphan by definition, with no age or device check. The device list is only read when a
 reparented tool exists to check. Doctor shows them as `orphan` findings and `agent-fleet
 kill` accepts them.
+
+### The watch tick
+
+Every 2 minutes the host classifies every process an agent started: everything under the
+shells its agent program runs (an agent's own process, its pane shell and its other direct
+children — MCP servers — are never classified), plus the proved orphans, each claimed by the
+agent whose worktree it runs in. A process under 2 minutes old or with no start time is not
+classified, nor is one with a listening TCP socket (a server it keeps) or `mcp` in a non-flag word of its argv (an
+MCP server started through a shell), or anything under them. Each gets one state:
+
+- `working`: over 1% CPU over the interval, its stdout/stderr file changed, a child started
+  since the last tick, a device tool other than `simctl bootstatus` (`xcodebuild`, `maestro`,
+  `simctl`, `idb`, `xctest`, …), or a descendant that is any of these, waits, or listens;
+- `waiting`: in a watched lock's queue (`<lock>.waiting/`), with the lock and since when;
+  nothing under it is classified;
+- `hung`: none of the above for 2 ticks in a row. Output on a pipe or terminal is not seen, so
+  it does not count as work. When `lsof` gives no answer (an error, a timeout), nothing is hung and the tick does not count;
+  a tick after a gap of more than two intervals (the machine slept) only re-reads the table;
+- `orphan`: a `proc.orphaned` proof holds.
+
+The topmost hung process of a chain is reported as `proc.hung` with every hung pid under it,
+its command, start, and evidence (CPU, the output file's last change, the deepest descendant's
+command, the lock it holds), re-sent every tick that confirms it with `checked`. The report
+clears when its pid is gone or is now another process, when a parent's report covers it, or
+when its agent's tree was walked and found it working or waiting, or when no tick confirmed it
+for 6 minutes and it is not idle now; until then a tree the tick could not read, or a process that left the tree,
+leaves it standing. A `hung` or `orphan` process, and a
+`waiting` one past 30 minutes, are told once per episode — a `msg.sent` of kind `HUNG`,
+`ORPHAN` or `WAITING` with `ref` `<host>:<pid>` — to the agent that started it, its lead and
+the root coordinator; a hung tell waits until its report is in the log. An orphan proved by a
+dead lock owner also lists the simulators booted on the host, which may keep its holder alive,
+with the `xcrun simctl shutdown` that releases them. Doctor shows `proc.hung` as `hung` findings
+(subject `<host>:<pid>`), `agent-fleet kill` accepts its pids as above, and `agent-fleet proc
+<pid>` prints what the log says of a pid on this host: `hung`, `orphan`, `waiting`, `no report`
+or `gone`. Nothing is killed automatically.
 
 ## Spawning
 

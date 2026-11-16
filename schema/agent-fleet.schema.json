@@ -691,6 +691,76 @@
           ],
           "type": "object"
         },
+        "ProcessHung": {
+          "additionalProperties": false,
+          "description": "A process an agent started that the watch tick found hung: at most 1% CPU, no change to a\nstdout/stderr file, and no new or working child for two ticks in a row. `pid` is the\ntopmost hung process, `pids` it and every hung process under it. `evidence` absent clears\nit (see `watch::to_clear`).",
+          "properties": {
+            "agent": {
+              "description": "The agent that started it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "checked": {
+              "description": "When the host last confirmed it hung; it re-reports every tick it does.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "command": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "evidence": {
+              "description": "CPU, the last output, the deepest descendant's command.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pids": {
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "since": {
+              "description": "When it was first found hung.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "started": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "host",
+            "pid"
+          ],
+          "type": "object"
+        },
         "ProcessOrphaned": {
           "additionalProperties": false,
           "description": "A process on the writer's host doctor proved an orphan: reparented to init with its\ndevice gone, or a lock's recorded owner dead. `why`/`cwd`/`since` absent clears it —\nthe process is gone or somebody's parent chain claimed it.",
@@ -1787,6 +1857,22 @@
         {
           "properties": {
             "data": {
+              "$ref": "#/$defs/ProcessHung"
+            },
+            "type": {
+              "const": "proc.hung",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
               "$ref": "#/$defs/AgentStuck"
             },
             "type": {
@@ -2199,6 +2285,76 @@
             "pid",
             "why",
             "since"
+          ],
+          "type": "object"
+        },
+        "ProcessHung": {
+          "additionalProperties": false,
+          "description": "A process an agent started that the watch tick found hung: at most 1% CPU, no change to a\nstdout/stderr file, and no new or working child for two ticks in a row. `pid` is the\ntopmost hung process, `pids` it and every hung process under it. `evidence` absent clears\nit (see `watch::to_clear`).",
+          "properties": {
+            "agent": {
+              "description": "The agent that started it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "checked": {
+              "description": "When the host last confirmed it hung; it re-reports every tick it does.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "command": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "evidence": {
+              "description": "CPU, the last output, the deepest descendant's command.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pids": {
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "since": {
+              "description": "When it was first found hung.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "started": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "host",
+            "pid"
           ],
           "type": "object"
         },
@@ -3044,6 +3200,14 @@
           "additionalProperties": {
             "$ref": "#/$defs/Host"
           },
+          "type": "object"
+        },
+        "hung": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ProcessHung"
+          },
+          "default": {},
+          "description": "Hung processes by `<host>:<pid>` of the topmost one, `since` always set.",
           "type": "object"
         },
         "last": {

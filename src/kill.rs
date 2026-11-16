@@ -1,5 +1,5 @@
 //! `agent-fleet kill` and the Bash hook that sends agents to it. A process is killed only when it
-//! is the caller's own or an orphan doctor proved; never an agent, a multiplexer pane, the fleet's
+//! is the caller's own, an orphan doctor proved, or a process the watch reported hung; never an agent, a multiplexer pane, the fleet's
 //! own daemons, or anything above one of them.
 
 use std::collections::HashMap;
@@ -140,12 +140,14 @@ fn protected(t: &Table, me: u32, pid: u32) -> Option<String> {
         })
 }
 
-/// Whether `me` may signal `pid`. `orphan` asks whether doctor proved `pid` an orphan.
+/// Whether `me` may signal `pid`. `proved(foreign)` asks whether the log proves `pid` may go:
+/// outside every agent's tree (`foreign` false) an orphan doctor proved or a hung report
+/// counts; inside another agent's tree (`foreign` true) only a hung report does.
 pub fn judge(
     t: &Table,
     me: u32,
     pid: u32,
-    orphan: impl FnOnce() -> bool,
+    proved: impl Fn(bool) -> bool,
 ) -> std::result::Result<(), String> {
     if !t.contains_key(&pid) {
         return Err(format!("pid {pid}: no such process"));
@@ -158,16 +160,17 @@ pub fn judge(
     let shell = parent(t, me).filter(|_| mine.is_none());
     match agent_of(t, pid) {
         Some(a) if Some(a) == mine => Ok(()),
+        Some(_) if proved(true) => Ok(()),
         Some(a) => Err(format!(
             "pid {pid} ({}) belongs to another agent's process tree: {} {a}",
             name(t, pid),
             name(t, a)
         )),
         None if shell.is_some_and(|sh| ancestors(t, pid).contains(&sh)) => Ok(()),
-        None if orphan() => Ok(()),
+        None if proved(false) => Ok(()),
         None => Err(format!(
-            "pid {pid} ({}) is not yours: no process of yours started it and doctor has not \
-             proved it an orphan",
+            "pid {pid} ({}) is not yours: no process of yours started it, doctor has not \
+             proved it an orphan and the watch has not reported it hung",
             name(t, pid)
         )),
     }
@@ -473,7 +476,7 @@ pub fn agent_start(line: &str, in_herdr: bool) -> Option<String> {
 pub const HOOK_REFUSAL: &str = "agent-fleet: raw kill, pkill and killall are blocked for fleet agents. \
 Use `agent-fleet kill <pid>...` (find pids with pgrep): it refuses agents, their panes and \
 everything above them, your own ancestors and other agents' processes, and kills your own \
-processes and orphans `agent-fleet doctor` proved, TERM then KILL. `kill -0` passes.";
+processes, the orphans `agent-fleet doctor` proved and the processes the watch reported hung, TERM then KILL. `kill -0` passes.";
 
 pub const UNMANAGED_REFUSAL: &str = "agent-fleet: every agent runs in herdr. Spawn one with \
 `agent-fleet spawn <owner/repo>#<issue>`, or start it in a pane with \
@@ -531,11 +534,11 @@ mod tests {
     fn the_incident_killing_the_parent_of_your_script_is_refused() {
         let t = fleet();
         for pid in [104, 103, 102] {
-            let why = judge(&t, ME, pid, || true).unwrap_err();
+            let why = judge(&t, ME, pid, |_| true).unwrap_err();
             assert!(why.contains("your own ancestor"), "{pid}: {why}");
         }
         assert!(
-            judge(&t, ME, 102, || true)
+            judge(&t, ME, 102, |_| true)
                 .unwrap_err()
                 .contains("bash → zsh → claude")
         );
@@ -555,7 +558,7 @@ mod tests {
             (1, "system"),
             (ME, "this command"),
         ] {
-            let why = judge(&t, ME, pid, || true).unwrap_err();
+            let why = judge(&t, ME, pid, |_| true).unwrap_err();
             assert!(why.contains(what), "{pid}: {why}");
         }
     }
@@ -578,28 +581,33 @@ mod tests {
                 name: "claude".into(),
             },
         );
-        let why = judge(&t, ME, 400, || true).unwrap_err();
+        let why = judge(&t, ME, 400, |_| true).unwrap_err();
         assert!(why.contains("ancestor of an agent 401"), "{why}");
     }
 
     #[test]
     fn your_own_processes_pass_and_other_agents_and_strangers_do_not() {
         let t = fleet();
-        assert_eq!(judge(&t, ME, 106, || false), Ok(()));
-        assert_eq!(judge(&t, ME, 107, || false), Ok(()));
-        let other = judge(&t, ME, 203, || true).unwrap_err();
+        assert_eq!(judge(&t, ME, 106, |_| false), Ok(()));
+        assert_eq!(judge(&t, ME, 107, |_| false), Ok(()));
+        let other = judge(&t, ME, 203, |foreign| !foreign).unwrap_err();
+        assert_eq!(
+            judge(&t, ME, 203, |foreign| foreign),
+            Ok(()),
+            "a hung report is proof inside another agent's tree"
+        );
         assert!(
             other.contains("another agent's process tree: devin-cli 202"),
             "{other}"
         );
         assert!(
-            judge(&t, ME, 300, || false)
+            judge(&t, ME, 300, |_| false)
                 .unwrap_err()
                 .contains("not yours")
         );
-        assert_eq!(judge(&t, ME, 300, || true), Ok(()), "a proved orphan");
+        assert_eq!(judge(&t, ME, 300, |_| true), Ok(()), "a proved orphan");
         assert!(
-            judge(&t, ME, 999, || true)
+            judge(&t, ME, 999, |_| true)
                 .unwrap_err()
                 .contains("no such process")
         );
@@ -615,14 +623,14 @@ mod tests {
              13 11 sleep
              20 1 sleep",
         );
-        assert_eq!(judge(&t, 12, 13, || false), Ok(()));
+        assert_eq!(judge(&t, 12, 13, |_| false), Ok(()));
         assert!(
-            judge(&t, 12, 20, || false)
+            judge(&t, 12, 20, |_| false)
                 .unwrap_err()
                 .contains("not yours")
         );
         assert!(
-            judge(&t, 12, 11, || false)
+            judge(&t, 12, 11, |_| false)
                 .unwrap_err()
                 .contains("your own ancestor")
         );
