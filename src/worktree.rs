@@ -176,6 +176,49 @@ fn lineage(procs: &Procs, pid: u32) -> HashSet<u32> {
     out
 }
 
+/// `lsof -Fpn` output → pid → path of each `n` line (one per pid with `-d cwd`).
+fn parse_lsof_cwds(s: &str) -> BTreeMap<u32, String> {
+    let (mut out, mut pid) = (BTreeMap::new(), None);
+    for l in s.lines() {
+        if let Some(p) = l.strip_prefix('p') {
+            pid = p.parse().ok();
+        } else if let (Some(n), Some(p)) = (l.strip_prefix('n'), pid) {
+            out.insert(p, n.to_string());
+        }
+    }
+    out
+}
+
+/// `procs` with every cwd it can have: /proc gives them on Linux; elsewhere (macOS `ps` has
+/// none) `lsof`'s answer fills them in. `None` when no cwd can be read: then no worktree is
+/// known to be empty.
+fn with_cwds(mut procs: Procs, lsof: impl FnOnce() -> Option<String>) -> Option<Procs> {
+    if procs.0.values().any(|p| p.cwd.is_some()) {
+        return Some(procs);
+    }
+    let cwds = parse_lsof_cwds(&lsof()?);
+    if cwds.is_empty() {
+        return None;
+    }
+    for (pid, cwd) in cwds {
+        if let Some(p) = procs.0.get_mut(&pid) {
+            p.cwd = Some(cwd);
+        }
+    }
+    Some(procs)
+}
+
+/// Every process on this machine with its cwd, or `None` when cwds cannot be read.
+fn table() -> Option<Procs> {
+    with_cwds(Procs::read(), || {
+        let out = std::process::Command::new(crate::scan::lsof_path())
+            .args(["-w", "-a", "-d", "cwd", "-Fpn"])
+            .output()
+            .ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    })
+}
+
 /// Seconds between TERM and KILL, as `agent-fleet kill`'s default.
 const GRACE: Duration = Duration::from_secs(5);
 
@@ -189,7 +232,8 @@ async fn stop(them: &[Leftover], dir: &str, grace: Duration) -> Result<String, S
         })
     };
     let signal = |pid: u32, sig| unsafe { libc::kill(pid as i32, sig) };
-    let now = Procs::read();
+    let read = || table().ok_or_else(|| "processes unknown: no cwd readable".to_string());
+    let now = read()?;
     let them: Vec<&Leftover> = them.iter().filter(|l| still(&now, l)).collect();
     for l in &them {
         // SAFETY: kill only sends a signal.
@@ -199,14 +243,14 @@ async fn stop(them: &[Leftover], dir: &str, grace: Duration) -> Result<String, S
     let mut left = them.clone();
     while !left.is_empty() && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let now = Procs::read();
+        let now = read()?;
         left.retain(|l| still(&now, l));
     }
     for l in &left {
         signal(l.pid, libc::SIGKILL);
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let now = Procs::read();
+    let now = read()?;
     if let Some(l) = left.iter().find(|l| still(&now, l)) {
         return Err(format!("pid {} survived KILL", l.pid));
     }
@@ -312,7 +356,15 @@ struct Scan {
     notes: Vec<String>,
 }
 
-fn scan(slug: &str, dir: &Path, s: &State, host: &str, here: &Path, procs: &Procs) -> Result<Scan> {
+/// `procs`: `None` when no cwd could be read; every worktree is then kept.
+fn scan(
+    slug: &str,
+    dir: &Path,
+    s: &State,
+    host: &str,
+    here: &Path,
+    procs: Option<&Procs>,
+) -> Result<Scan> {
     let mut notes = Vec::new();
     if git(dir, &["fetch", "origin", "--prune", "--quiet"]).is_none() {
         notes.push("fetch failed, origin may be stale".into());
@@ -328,7 +380,7 @@ fn scan(slug: &str, dir: &Path, s: &State, host: &str, here: &Path, procs: &Proc
         bail!("{} is not a git checkout", dir.display());
     };
     let workers = crate::doctor::workers(s);
-    let mine = lineage(procs, std::process::id());
+    let mine = procs.map_or_else(HashSet::new, |p| lineage(p, std::process::id()));
     let locks = locks(&list);
     let why = |b: &str, tip: &str| {
         let remote = format!("refs/remotes/origin/{b}");
@@ -339,7 +391,10 @@ fn scan(slug: &str, dir: &Path, s: &State, host: &str, here: &Path, procs: &Proc
     let mut rows = Vec::new();
     for (i, (path, tip, branch)) in crate::scan::parse_worktrees(&list).into_iter().enumerate() {
         let key = worktree_key(host, &path);
-        let (stops, guarded) = leftovers(procs, &path, &mine);
+        let (stops, guarded) = match procs {
+            Some(procs) => leftovers(procs, &path, &mine),
+            None => (vec![], vec![]),
+        };
         let lock = locks
             .get(&path)
             .map(|r| lock_note(r, dir, &path, crate::scan::alive));
@@ -354,6 +409,7 @@ fn scan(slug: &str, dir: &Path, s: &State, host: &str, here: &Path, procs: &Proc
             dirty,
             &guarded,
         );
+        let block = block.or_else(|| procs.is_none().then(|| "processes unknown".to_string()));
         let reason = branch.as_deref().and_then(|b| why(b, &tip));
         let (verdict, retire) = match (reason, block) {
             (Some("pr"), None) => ("retire (pr)".into(), true),
@@ -422,8 +478,11 @@ pub async fn run(
     let here = std::env::current_dir().unwrap_or_default();
     let host = fleet.host();
     let gh = std::env::var("AGENT_FLEET_GH").unwrap_or_else(|_| "gh".into());
-    let procs = Procs::read();
+    let procs = table();
     let mut out = String::new();
+    if procs.is_none() {
+        out += "processes unknown (no cwd from /proc or lsof): every worktree is kept\n";
+    }
     // One line per process clean stops, under its worktree's line.
     let stops = |r: &Row| -> String {
         r.stops
@@ -436,7 +495,7 @@ pub async fn run(
     };
     for (slug, dir) in repos {
         out += &format!("{slug} {}\n", dir.display());
-        let sc = match scan(slug, dir, s, &host, &here, &procs) {
+        let sc = match scan(slug, dir, s, &host, &here, procs.as_ref()) {
             Ok(sc) => sc,
             Err(e) => {
                 out += &format!("  skipped: {e:#}\n");
@@ -670,7 +729,24 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[test]
+    fn cwds_come_from_lsof_where_the_table_has_none_and_unknown_is_none() {
+        let mut bare = proc(1, "bun", "/x");
+        bare.cwd = None;
+        let table = || Procs(std::collections::HashMap::from([(7, bare.clone())]));
+        let lsof = "p7\nfcwd\nn/w/done\np8\nfcwd\nn/w/other\n";
+        assert_eq!(parse_lsof_cwds(lsof).len(), 2);
+        let got = with_cwds(table(), || Some(lsof.into())).unwrap();
+        assert_eq!(got.0[&7].cwd.as_deref(), Some("/w/done"));
+        assert!(with_cwds(table(), || None).is_none(), "no lsof");
+        assert!(
+            with_cwds(table(), || Some(String::new())).is_none(),
+            "lsof saw nothing"
+        );
+        let linux = Procs(std::collections::HashMap::from([(7, proc(1, "bun", "/w"))]));
+        assert!(with_cwds(linux, || panic!("not asked")).is_some());
+    }
+
     #[tokio::test]
     async fn a_leftover_is_stopped_and_a_reused_pid_is_not_hit() {
         let dir = tempfile::tempdir().unwrap();
@@ -682,7 +758,7 @@ mod tests {
             .output()
             .unwrap();
         let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
-        let procs = Procs::read();
+        let procs = table().expect("cwds readable");
         let (them, _) = leftovers(&procs, &path, &HashSet::new());
         assert!(them.iter().any(|l| l.pid == pid), "{them:?}");
         let mut reused = them.clone();

@@ -895,8 +895,8 @@ holds uncommitted files, or a live agent works in it: its cwd (`agent.usage`) is
 spawned into it (`spawn.result`). `doctor` uses the same agents for `forgotten`. A lock whose
 reason names a pid that is gone (Claude Code's `claude agent <id> (pid N start S)`) is called
 stale, with its `git worktree unlock` command; clean never unlocks or forces. Processes whose cwd
-is in a worktree clean retires, read live from the process table (Linux; macOS reports no cwd),
-are stopped before it goes: TERM, then KILL after 5 s, each re-read just before its signal so a
+is in a worktree clean retires, read live (cwds from `/proc` on Linux, from one `lsof -a -d cwd
+-Fpn` elsewhere; when neither answers, every worktree is kept as "processes unknown"), are stopped before it goes: TERM, then KILL after 5 s, each re-read just before its signal so a
 pid reused by another process (another start time or cwd) is never hit. `ls` and the dry run list
 them, pid and command. A herdr pane, anything under an agent program (`claude`, `codex`, `devin`)
 and the caller and its ancestors are never stopped; one of them in the worktree keeps it. Without

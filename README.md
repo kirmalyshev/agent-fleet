@@ -109,7 +109,8 @@ are in, a locked one, one an agent works in (by the fleet's log, the same rule a
 `forgotten`), or one with uncommitted files. Processes left in a worktree it retires are stopped
 first (TERM, then KILL after 5 s); `ls` and the dry run list them, pid and command. A process an
 agent program runs, a herdr pane and your own shell are never stopped: one of those in a worktree
-keeps it. It never unlocks a worktree: a lock whose pid is gone is called stale, with its
+keeps it; when the working directories of processes cannot be read (no `/proc`, no `lsof`), every
+worktree is kept. It never unlocks a worktree: a lock whose pid is gone is called stale, with its
 `git worktree unlock` command. A worktree is retired as the TUI's `x` does it:
 `.agent-fleet/hook retire <path>`, else `git worktree remove`. `gh` (`AGENT_FLEET_GH`) reads the
 PRs, one `gh pr list` per repository.

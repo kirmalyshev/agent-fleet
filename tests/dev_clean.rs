@@ -181,21 +181,15 @@ fn clean_retires_finished_work_in_every_connected_repo_and_keeps_the_rest() {
     let only_b = fleet(&["dev", "clean", "--repo", "owner/b"]);
     assert!(!only_b.contains("owner/a"), "{only_b}");
 
-    // Only Linux reads a process's cwd; elsewhere no leftover is seen.
-    let linux = cfg!(target_os = "linux");
-    if linux {
-        assert!(dry.contains(&format!("stop {sleeper} sleep 60")), "{dry}");
-    }
+    assert!(dry.contains(&format!("stop {sleeper} sleep 60")), "{dry}");
     let out = fleet(&["dev", "clean", "--execute"]);
-    if linux {
-        assert!(out.contains(&format!("stopped {sleeper} TERM")), "{out}");
-        let alive = Command::new("kill")
-            .args(["-0", &sleeper])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap();
-        assert!(!alive.success(), "{sleeper} still runs");
-    }
+    assert!(out.contains(&format!("stopped {sleeper} TERM")), "{out}");
+    let alive = Command::new("kill")
+        .args(["-0", &sleeper])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!alive.success(), "{sleeper} still runs");
     assert!(!t.join("busy").exists(), "{out}");
     assert!(out.contains("[merged: pr]"), "{out}");
     assert!(out.contains("[closed: pr]"), "{out}");
