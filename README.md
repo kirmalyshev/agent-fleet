@@ -254,6 +254,35 @@ agent-fleet role me root-coordinator
 processes.
 Other levels are `domain-lead`, `implementation-lead` and `implementer`, each with a `--lead`.
 
+## Watch and steer the fleet: `agent-fleet tui`
+
+`agent-fleet tui` shows the whole fleet on one screen and refreshes every 2 s. The top lines
+count agents, tasks, worktrees, findings and undelivered messages; below them, in red, up to
+three hung or orphaned processes, duplicate work or capacity breaches. Pick a tab with `1`–`5` or `←`/`→`, move with `↑`/`↓` or `j`/`k`, and read the selected
+row's details in the bottom panel. The footer lists the keys of the current tab; `?` shows them
+all, `q` quits.
+
+![The Agents tab: state, role, CPU, memory, task and branch of each agent](docs/images/tui-agents.png)
+
+| Tab | Shows | Keys |
+|---|---|---|
+| 1 Agents | State, time in it, role, CPU, memory, task, branch | `t` send a message (`tell`), `f` focus its herdr pane |
+| 2 Worktrees | Branch, agent, unpushed commits, uncommitted files, what runs in it | `x` remove a worktree no agent works in, `K` kill the processes left in it |
+| 3 Tasks | State, time in it, owner, open blockers, title | `d` done, `u` release, `x` cancel |
+| 4 Findings | What `doctor` found: hung, orphaned, stuck or blocked work | `Enter` go to the agent, worktree or resource |
+| 5 Resources | Locks the hosts report, who holds and who waits, capacity rules, quotas | |
+
+Every action asks before it runs, and writes the same events as the CLI.
+
+![The Worktrees tab: unpushed and uncommitted work per worktree](docs/images/tui-worktrees.png)
+
+![The Findings tab: a held blocker and a hung process](docs/images/tui-findings.png)
+
+![The help screen](docs/images/tui-help.png)
+
+`agent-fleet ui` opens the same fleet in the browser: a tree of repositories, worktrees, agents
+and tasks, and the Inbox where you answer agents' questions.
+
 ## Configuration
 
 Flags or environment:
