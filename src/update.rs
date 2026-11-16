@@ -319,8 +319,9 @@ pub(crate) async fn update_loop(host: std::sync::Arc<crate::host::Host>) {
         let prev = match host.view() {
             Ok(v) => v.state.updates.get(&me).cloned(),
             Err(e) => {
+                // `record` tolerates no previous record: still say what the check found.
                 eprintln!("agent-fleet host: self-update: replica unreadable: {e:#}");
-                continue;
+                None
             }
         };
         let say = |r: &Report, prev: Option<&HostUpdate>| record(&me, installed, r, prev);
@@ -337,8 +338,11 @@ pub(crate) async fn update_loop(host: std::sync::Arc<crate::host::Host>) {
                     outcome: Outcome::Failed(format!("restart failed: {}", errs.join("; "))),
                 };
                 eprintln!("agent-fleet host: self-update: {errs:?}");
-                if let Some(u) = say(&failed, prev.as_ref()) {
-                    host.publish(host.presence(Known::HostUpdate(u))).await;
+                if let Some(u) = say(&failed, prev.as_ref())
+                    && !host.publish(host.presence(Known::HostUpdate(u))).await
+                {
+                    // Not recorded: try the restart and the report again next tick.
+                    restarted_for = None;
                 }
             }
         }

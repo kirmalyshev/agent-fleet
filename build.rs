@@ -14,7 +14,10 @@ fn main() {
         println!("cargo:warning=no git commit: the build is `unknown` and self-update replaces it");
         "unknown".into()
     });
-    if git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty()) {
+    // A status that cannot be read counts as dirty: never claim a clean commit unverified.
+    let dirty =
+        git(&["status", "--porcelain", "--untracked-files=no"]).is_none_or(|s| !s.is_empty());
+    if dirty {
         commit.push_str("-dirty");
     }
     let short: String = commit.chars().take(7).collect();
@@ -23,6 +26,9 @@ fn main() {
     } else {
         short
     };
+    for p in ["src", "Cargo.toml", "Cargo.lock"] {
+        println!("cargo:rerun-if-changed={p}");
+    }
     println!("cargo:rustc-env=AGENT_FLEET_COMMIT={commit}");
     println!("cargo:rustc-env=AGENT_FLEET_SHORT={short}");
     if let Some(head) = git(&["rev-parse", "--git-path", "HEAD"]) {
