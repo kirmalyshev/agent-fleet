@@ -890,9 +890,13 @@ in `worktree.state`, and of the checkout it runs in. A branch is finished when i
 of one of your merged or closed PRs (`pr`), is in the default branch (`in main`), or is in
 `origin/<branch>` (`pushed`); an open PR keeps it. Only `pr` retires a worktree, through the
 repository hook as above, and the outcome line reports an open PR on its branch as `x` does. A
-worktree is kept when it is the main checkout or the caller's, holds uncommitted files, has
-processes in it (`worktree.procs`), or a live agent works in it: its cwd (`agent.usage`) is in it
-or it was spawned into it (`spawn.result`). `doctor` uses the same agents for `forgotten`. Without
+worktree is kept when it is the main checkout, is locked (the reason first), is the caller's,
+holds uncommitted files, has processes in it (`worktree.procs`), or a live agent works in it: its
+cwd (`agent.usage`) is in it or it was spawned into it (`spawn.result`). It never unlocks or stops
+anything: a lock whose reason names a pid that is gone (Claude Code's `claude agent <id> (pid N
+start S)`) is called stale with its `git worktree unlock` command, and when every process in a
+worktree is one `kill` accepts as a proved orphan (`doctor::killable`), the line gives the
+`agent-fleet kill` command. `doctor` uses the same agents for `forgotten`. Without
 a hub or replica, no agent is known. `:worktree` runs at once from the screen unless it has
 `--execute`.
 

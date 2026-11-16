@@ -52,15 +52,19 @@ pub fn stale(
 }
 
 /// Why the worktree at `path` must stay even when its branch is finished; `None` when it may go.
+/// `lock` and `procs` are already said (`lock_note`, `procs_note`).
 fn blocked(
     main: bool,
     here: bool,
-    dirty: usize,
+    lock: Option<String>,
     agents: &[String],
-    procs: &[String],
+    dirty: usize,
+    procs: Option<String>,
 ) -> Option<String> {
     if main {
         Some("main checkout".into())
+    } else if lock.is_some() {
+        lock
     } else if here {
         Some("you are in it".into())
     } else if !agents.is_empty() {
@@ -68,10 +72,65 @@ fn blocked(
         Some(format!("{} works in it", names.join(", ")))
     } else if dirty > 0 {
         Some(format!("{dirty} uncommitted files"))
-    } else if !procs.is_empty() {
-        Some(format!("{} runs in it", procs.join(", ")))
     } else {
-        None
+        procs
+    }
+}
+
+/// `path` → lock reason (maybe empty) of each locked worktree in `git worktree list --porcelain`.
+fn locks(list: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for block in list.split("\n\n") {
+        let path = block.lines().find_map(|l| l.strip_prefix("worktree "));
+        let lock = block
+            .lines()
+            .find_map(|l| (l == "locked").then_some("").or(l.strip_prefix("locked ")));
+        if let (Some(p), Some(r)) = (path, lock) {
+            out.insert(p.to_string(), r.to_string());
+        }
+    }
+    out
+}
+
+/// What keeps a locked worktree. A lock whose reason names a pid that is gone (Claude Code locks
+/// a subagent's as `claude agent <id> (pid N start S)`) is stale: the note gives the unlock
+/// command, and clean never unlocks or forces by itself.
+fn lock_note(reason: &str, repo: &Path, path: &str, alive: impl Fn(u32) -> bool) -> String {
+    let pid = reason.split("pid ").nth(1).and_then(|r| {
+        let digits: String = r.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse::<u32>().ok()
+    });
+    match pid {
+        Some(pid) if !alive(pid) => format!(
+            "locked, stale (pid {pid} gone): git -C {} worktree unlock {path}",
+            repo.display()
+        ),
+        _ if reason.is_empty() => "locked".into(),
+        _ => format!("locked: {reason}"),
+    }
+}
+
+/// What keeps a worktree processes run in: `names`, and when every one of `pids` (all of them,
+/// `total`) is an orphan doctor proved (`killable`), the `agent-fleet kill` that stops them.
+/// Clean never stops a process itself.
+fn procs_note(
+    names: &[String],
+    pids: &[u32],
+    total: u32,
+    killable: &BTreeMap<u32, String>,
+) -> String {
+    let what = format!("{} runs in it", names.join(", "));
+    if !pids.is_empty()
+        && pids.len() == total as usize
+        && pids.iter().all(|p| killable.contains_key(p))
+    {
+        let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
+        format!(
+            "{what}, proved orphans: agent-fleet kill {}",
+            pids.join(" ")
+        )
+    } else {
+        what
     }
 }
 
@@ -177,6 +236,8 @@ fn scan(slug: &str, dir: &Path, s: &State, host: &str, here: &Path) -> Result<Sc
         bail!("{} is not a git checkout", dir.display());
     };
     let workers = crate::doctor::workers(s);
+    let killable = crate::doctor::killable(s, chrono::Utc::now(), host);
+    let locks = locks(&list);
     let why = |b: &str, tip: &str| {
         let remote = format!("refs/remotes/origin/{b}");
         let pushed = git(dir, &["rev-parse", "-q", "--verify", &remote]).is_some()
@@ -190,17 +251,20 @@ fn scan(slug: &str, dir: &Path, s: &State, host: &str, here: &Path) -> Result<Sc
             .worktree_procs
             .get(&key)
             .filter(|p| p.procs.procs > 0)
-            .map_or(vec![], |p| p.procs.names.clone());
+            .map(|p| procs_note(&p.procs.names, &p.procs.pids, p.procs.procs, &killable));
+        let lock = locks
+            .get(&path)
+            .map(|r| lock_note(r, dir, &path, crate::scan::alive));
         let agents = workers.get(&key).cloned().unwrap_or_default();
         let dirty =
             git(Path::new(&path), &["status", "--porcelain"]).map_or(0, |o| o.lines().count());
-        let block = blocked(i == 0, here.starts_with(&path), dirty, &agents, &procs);
+        let block = blocked(i == 0, here.starts_with(&path), lock, &agents, dirty, procs);
         let reason = branch.as_deref().and_then(|b| why(b, &tip));
         let (verdict, retire) = match (reason, block) {
             (Some("pr"), None) => ("retire (pr)".into(), true),
-            (Some(_), Some(why)) => (format!("keep: {why}"), false),
+            (_, Some(why)) => (format!("keep: {why}"), false),
             (Some(r), None) => (format!("keep ({r})"), false),
-            (None, _) => ("-".into(), false),
+            (None, None) => ("-".into(), false),
         };
         let pr = branch
             .as_deref()
@@ -398,23 +462,70 @@ mod tests {
     #[test]
     fn what_keeps_a_worktree() {
         let none: [String; 0] = [];
-        assert_eq!(blocked(false, false, 0, &none, &none), None);
+        assert_eq!(blocked(false, false, None, &none, 0, None), None);
         assert_eq!(
-            blocked(true, false, 0, &none, &none).unwrap(),
+            blocked(true, false, None, &none, 0, None).unwrap(),
             "main checkout"
         );
         assert_eq!(
-            blocked(false, true, 0, &none, &none).unwrap(),
+            blocked(false, true, None, &none, 0, None).unwrap(),
             "you are in it"
         );
         assert_eq!(
-            blocked(false, false, 2, &none, &none).unwrap(),
+            blocked(false, false, None, &none, 2, None).unwrap(),
             "2 uncommitted files"
         );
-        let procs = ["bun".to_string()];
+        let lock = Some("locked".to_string());
         assert_eq!(
-            blocked(false, false, 0, &none, &procs).unwrap(),
+            blocked(false, true, lock, &none, 2, None).unwrap(),
+            "locked",
+            "lock first"
+        );
+        let procs = Some("bun runs in it".to_string());
+        assert_eq!(
+            blocked(false, false, None, &none, 0, procs).unwrap(),
             "bun runs in it"
+        );
+    }
+
+    #[test]
+    fn a_lock_is_said_and_a_stale_one_gets_its_unlock_command() {
+        let list = "worktree /r\nHEAD a\nbranch refs/heads/main\n\n\
+                    worktree /w/sub\nHEAD b\nbranch refs/heads/x\n\
+                    locked claude agent a1 (pid 42 start 9)\n\n\
+                    worktree /w/bare\nHEAD c\ndetached\nlocked\n";
+        let l = locks(list);
+        assert_eq!(l.len(), 2, "{l:?}");
+        assert_eq!(l["/w/bare"], "");
+        let reason = &l["/w/sub"];
+        let repo = Path::new("/r");
+        assert_eq!(
+            lock_note(reason, repo, "/w/sub", |_| false),
+            "locked, stale (pid 42 gone): git -C /r worktree unlock /w/sub"
+        );
+        assert_eq!(
+            lock_note(reason, repo, "/w/sub", |p| p == 42),
+            "locked: claude agent a1 (pid 42 start 9)"
+        );
+        assert_eq!(lock_note("", repo, "/w/bare", |_| false), "locked");
+    }
+
+    #[test]
+    fn only_proved_orphans_get_a_kill_command() {
+        let names = ["bun".to_string()];
+        let killable = BTreeMap::from([(41, "/w".to_string()), (42, "/w".to_string())]);
+        assert_eq!(
+            procs_note(&names, &[41, 42], 2, &killable),
+            "bun runs in it, proved orphans: agent-fleet kill 41 42"
+        );
+        assert_eq!(
+            procs_note(&names, &[41, 43], 2, &killable),
+            "bun runs in it"
+        );
+        assert_eq!(
+            procs_note(&names, &[41], 2, &killable),
+            "bun runs in it",
+            "pids cut off"
         );
     }
 
@@ -468,7 +579,7 @@ mod tests {
             .remove(&worktree_key("h", "/w/c-1"))
             .unwrap();
         assert_eq!(
-            blocked(false, false, 0, &agents, &[]).unwrap(),
+            blocked(false, false, None, &agents, 0, None).unwrap(),
             "c-1 works in it"
         );
         let s = state_with("/w/c-1", "/elsewhere");

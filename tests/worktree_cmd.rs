@@ -93,6 +93,22 @@ fn clean_retires_finished_work_in_every_connected_repo_and_keeps_the_rest() {
     let open = branch(&a, "open", true, true); // open PR: kept
     let dirty = branch(&a, "dirty", true, true); // merged PR, uncommitted file: kept
     std::fs::write(t.join("dirty/scratch"), "x").unwrap();
+    let locked = branch(&a, "locked", true, true); // merged PR, its subagent's lock: kept
+    let mut gone = Command::new("true").spawn().unwrap();
+    let pid = gone.id();
+    gone.wait().unwrap();
+    let reason = format!("claude agent a1 (pid {pid} start 1)");
+    let wt = t.join("locked");
+    git(
+        &a,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            &reason,
+            wt.to_str().unwrap(),
+        ],
+    );
     branch(&a, "local", false, false); // local-only commit: kept
     branch(&a, "pushed", false, true); // on origin: deleted
     let b = repo(t, "b");
@@ -102,6 +118,7 @@ fn clean_retires_finished_work_in_every_connected_repo_and_keeps_the_rest() {
         pr("merged", "MERGED", &merged, 1),
         pr("open", "OPEN", &open, 2),
         pr("dirty", "MERGED", &dirty, 3),
+        pr("locked", "MERGED", &locked, 4),
     ];
     let gh = format!(
         "#!/bin/sh\ncase \"$*\" in\n*owner/a*) echo '[{}]' ;;\n*owner/b*) echo '[{}]' ;;\n\
@@ -160,6 +177,10 @@ fn clean_retires_finished_work_in_every_connected_repo_and_keeps_the_rest() {
     assert!(out.contains("[closed: pr]"), "{out}");
     assert!(out.contains("delete pushed (pushed)"), "{out}");
     assert!(out.contains("uncommitted files"), "{out}");
+    assert!(
+        out.contains(&format!("locked, stale (pid {pid} gone): git -C ")),
+        "{out}"
+    );
     let has = |repo: &Path, b: &str| {
         git(repo, &["branch", "--format=%(refname:short)"])
             .lines()
@@ -169,9 +190,9 @@ fn clean_retires_finished_work_in_every_connected_repo_and_keeps_the_rest() {
         !has(&a, "merged") && !has(&a, "pushed") && !has(&b, "closed"),
         "{out}"
     );
-    for kept in ["open", "dirty", "local", "main"] {
+    for kept in ["open", "dirty", "locked", "local", "main"] {
         assert!(has(&a, kept), "{kept}: {out}");
     }
     assert!(!t.join("merged").exists() && !t.join("closed").exists());
-    assert!(t.join("open").exists() && t.join("dirty").exists());
+    assert!(t.join("open").exists() && t.join("dirty").exists() && t.join("locked").exists());
 }
