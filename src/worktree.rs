@@ -353,6 +353,8 @@ struct Row {
     retire: bool,
     /// The processes clean stops before it retires this worktree.
     stops: Vec<Leftover>,
+    /// Its `dev` slot, ports and running services (`dev::line`).
+    dev: Option<String>,
 }
 
 /// One repository, read: its worktrees and the stale branches no worktree has out.
@@ -372,6 +374,7 @@ fn scan(
     host: &str,
     here: &Path,
     procs: Option<&Procs>,
+    groups: &Procs,
 ) -> Result<Scan> {
     let mut notes = Vec::new();
     if git(dir, &["fetch", "origin", "--prune", "--quiet"]).is_none() {
@@ -435,6 +438,7 @@ fn scan(
             .as_deref()
             .and_then(|b| git(dir, &["rev-list", "--count", &format!("{base}..{b}")]))
             .unwrap_or_else(|| "-".into());
+        let dev = crate::dev::line(Path::new(&path), i == 0, groups);
         rows.push(Row {
             path,
             branch,
@@ -445,6 +449,7 @@ fn scan(
             reason,
             retire,
             stops: if retire { stops } else { vec![] },
+            dev,
         });
     }
     let out: BTreeSet<&str> = rows.iter().filter_map(|r| r.branch.as_deref()).collect();
@@ -487,6 +492,8 @@ pub async fn run(
     let host = fleet.host();
     let gh = std::env::var("AGENT_FLEET_GH").unwrap_or_else(|_| "gh".into());
     let procs = table();
+    // Process groups and start times, which every platform reports: what `dev` records.
+    let groups = Procs::read();
     let mut out = String::new();
     if procs.is_none() {
         out += "processes unknown (no cwd from /proc or lsof): every worktree is kept\n";
@@ -503,7 +510,7 @@ pub async fn run(
     };
     for (slug, dir) in repos {
         out += &format!("{slug} {}\n", dir.display());
-        let sc = match scan(slug, dir, s, &host, &here, procs.as_ref()) {
+        let sc = match scan(slug, dir, s, &host, &here, procs.as_ref(), &groups) {
             Ok(sc) => sc,
             Err(e) => {
                 out += &format!("  skipped: {e:#}\n");
@@ -528,6 +535,9 @@ pub async fn run(
                     r.verdict,
                     r.path
                 );
+                if let Some(d) = &r.dev {
+                    out += &format!("      {d}\n");
+                }
                 out += &stops(r);
             }
             continue;
@@ -537,6 +547,9 @@ pub async fn run(
             if r.retire {
                 let b = r.branch.as_deref().unwrap_or("-");
                 out += &format!("  retire {} [{b}: pr]\n", r.path);
+                if let Some(d) = &r.dev {
+                    out += &format!("      dev down --release: {d}\n");
+                }
                 out += &stops(r);
             } else if r.reason == Some("pr") {
                 out += &format!("  keep worktree {}: {}\n", r.path, &r.verdict[6..]);
@@ -558,6 +571,15 @@ pub async fn run(
         git(dir, &["worktree", "prune"]);
         let mut branches: Vec<&str> = sc.delete.iter().map(|(b, _)| b.as_str()).collect();
         for r in retire {
+            // Its dev services first, through their own process groups; then what is left.
+            match crate::dev::release(Path::new(&r.path)) {
+                Ok(Some(line)) => out += &format!("  {line}\n"),
+                Ok(None) => {}
+                Err(e) => {
+                    out += &format!("  could not release {}'s slot: {e:#}; kept\n", r.path);
+                    continue;
+                }
+            }
             if !r.stops.is_empty() {
                 match stop(&r.stops, &r.path, GRACE).await {
                     Ok(line) => out += &format!("  {line}\n"),
@@ -588,7 +610,7 @@ pub async fn run(
         }
     }
     if clean && !execute {
-        out += "dry run; agent-fleet dev clean --execute to do it\n";
+        out += "dry run; the same command with --execute does it\n";
     }
     out
 }
