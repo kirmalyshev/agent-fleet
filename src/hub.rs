@@ -46,17 +46,31 @@ pub struct Accepted {
     pub duplicate: bool,
 }
 
+/// Folds the whole log. The hub only ever appends events it validated: one it cannot fold now
+/// means the binary and the log drifted apart, and a skipped `task.assigned` would let a task be
+/// granted twice.
+fn fold_log(store: &Store) -> Result<State> {
+    let state = State::fold(&store.all()?);
+    if state.unknown > 0 {
+        bail!(
+            "the log holds {} events this hub cannot read; run the build that wrote them",
+            state.unknown
+        );
+    }
+    Ok(state)
+}
+
+/// `agent-fleet hub --check`: whether this binary can run the log at `db`, read-only. Returns
+/// how many events it holds.
+pub fn check(db: &Path) -> Result<u64> {
+    let store = Store::open_readonly(db)?;
+    fold_log(&store)?;
+    store.len()
+}
+
 impl Hub {
     pub fn new(store: Store) -> Result<Self> {
-        let state = State::fold(&store.all()?);
-        // The hub only ever appends events it validated. One it cannot fold now means the binary
-        // and the log drifted apart, and a skipped `task.assigned` would let a task be granted twice.
-        if state.unknown > 0 {
-            bail!(
-                "the log holds {} events this hub cannot read; run the build that wrote them",
-                state.unknown
-            );
-        }
+        let state = fold_log(&store)?;
         Ok(Self {
             store,
             state,
@@ -308,23 +322,28 @@ async fn follow_binary<V, Fut>(
     }
 }
 
-/// The real check: the new binary runs, and is not an older commit than this one.
+/// How long the new binary may take to read the whole log.
+const CHECK_LIMIT: Duration = Duration::from_secs(120);
+
+/// The real check before the exec: the new binary runs and names itself, it is the same commit
+/// as this one or built on it (not a rollback; unknown refuses), and it can run this hub's log
+/// (`hub --check`, read-only, with this hub's own arguments): replacing the only hub with a
+/// binary that cannot start would leave no hub.
 async fn followable(exe: &Path) -> Result<(), String> {
     let says = crate::update::binary_says(exe)
         .await
         .map_err(|e| format!("{e:#}"))?;
-    if crate::update::is_rollback(
+    crate::update::can_follow(
         Path::new(crate::update::CLONE),
         crate::update::COMMIT,
         &says,
     )
-    .await
-    {
-        return Err(format!(
-            "it is an older build ({says}); restart the hub by hand to run it"
-        ));
-    }
-    Ok(())
+    .await?;
+    let mut check = tokio::process::Command::from(restart_command(exe));
+    check.arg("--check");
+    crate::update::probe(check, CHECK_LIMIT)
+        .await
+        .map_err(|e| format!("it cannot run this hub's log: {e}"))
 }
 
 /// Serves the hub on every address in `listen`. Once bound, writes one URL to `hub_file`, where

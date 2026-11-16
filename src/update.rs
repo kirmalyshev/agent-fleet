@@ -106,26 +106,56 @@ pub(crate) async fn binary_says(exe: &Path) -> Result<String> {
     Ok(says)
 }
 
-/// Whether the build that `says` (a `--version` line) was made from an older commit than the one
-/// running (`running`, full): a rollback, which a hub does not follow. Judged by git in `clone`;
-/// when that cannot tell (no clone, an unknown commit), it is not a rollback.
-pub(crate) async fn is_rollback(clone: &Path, running: Option<&str>, says: &str) -> bool {
-    let (Some(running), Some(open)) = (running, says.rfind('(')) else {
-        return false;
-    };
-    let new: String = says[open + 1..]
-        .chars()
-        .take_while(char::is_ascii_hexdigit)
-        .collect();
-    if new.len() < 7 || running.starts_with(new.as_str()) {
-        return false;
+/// Whether a hub running `running` (full commit) may follow the build that `says` (its
+/// `--version` line): only to the same commit or one built on top of it. An older or unrelated
+/// build (a rollback), a commit git does not know, no clone to ask, a line with no commit: all
+/// refuse, with the reason. Judged by git in `clone`.
+pub(crate) async fn can_follow(
+    clone: &Path,
+    running: Option<&str>,
+    says: &str,
+) -> Result<(), String> {
+    let running = running.ok_or("this hub does not know which commit it runs")?;
+    let new: String = says
+        .rfind('(')
+        .map(|open| {
+            says[open + 1..]
+                .chars()
+                .take_while(char::is_ascii_hexdigit)
+                .collect()
+        })
+        .unwrap_or_default();
+    if new.len() < 7 {
+        return Err(format!("it does not say which commit it is ({says:?})"));
+    }
+    if running.starts_with(new.as_str()) {
+        return Ok(());
     }
     let mut c = tokio::process::Command::new("git");
     c.arg("-C")
         .arg(clone)
-        .args(["merge-base", "--is-ancestor", &new, running]);
-    // 0: the new commit is an ancestor of the running one (older); 1: not; anything else: unknown.
-    matches!(limited(c, GIT).await.map(|o| o.status.code()), Ok(Some(0)))
+        .args(["merge-base", "--is-ancestor", running, &new]);
+    // 0: the running commit is an ancestor of the new one (newer); 1: not (older, or unrelated);
+    // anything else: git cannot tell.
+    match limited(c, GIT).await.map(|o| o.status.code()) {
+        Ok(Some(0)) => Ok(()),
+        Ok(Some(1)) => Err(format!("it is an older or unrelated build ({says})")),
+        _ => Err(format!(
+            "git cannot tell whether {new} is newer than {} in {}",
+            short(Some(running)),
+            clone.display()
+        )),
+    }
+}
+
+/// Runs `c`; Ok when it exits 0, else the tail of what it said.
+pub(crate) async fn probe(c: tokio::process::Command, limit: Duration) -> Result<(), String> {
+    let out = limited(c, limit).await.map_err(|e| format!("{e:#}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let said = String::from_utf8_lossy(&out.stderr);
+    Err(format!("exited {}: {}", out.status, tail(said.trim())))
 }
 
 /// Whether git should be told `ssh -o BatchMode=yes`: not when the operator chose an ssh command
@@ -1752,37 +1782,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_build_of_an_older_commit_is_a_rollback_and_nothing_else_is() {
+    async fn a_hub_follows_only_the_same_commit_or_one_built_on_it() {
         let (_t, _origin, clone, _exe) = fixture();
         let old = sh(&clone, &["rev-parse", "HEAD"]);
         sh(&clone, &["commit", "-q", "--allow-empty", "-m", "two"]);
         let new = sh(&clone, &["rev-parse", "HEAD"]);
+        sh(&clone, &["checkout", "-q", "-b", "side", &old]);
+        sh(&clone, &["commit", "-q", "--allow-empty", "-m", "side"]);
+        let side = sh(&clone, &["rev-parse", "HEAD"]);
         let says = |c: &str| format!("agent-fleet 0.1.0 ({})", &c[..7]);
-        let rb = |running: Option<&str>, says: &str| {
+        let can = |running: Option<&str>, says: &str| {
             let (clone, running, says) =
                 (clone.clone(), running.map(String::from), says.to_string());
-            async move { is_rollback(&clone, running.as_deref(), &says).await }
+            async move { can_follow(&clone, running.as_deref(), &says).await }
         };
         assert!(
-            rb(Some(&new), &says(&old)).await,
-            "older than the running one"
+            can(Some(&old), &says(&new)).await.is_ok(),
+            "newer: an update"
         );
-        assert!(!rb(Some(&old), &says(&new)).await, "newer: an update");
-        assert!(!rb(Some(&new), &says(&new)).await, "the same commit");
         assert!(
-            !rb(Some(&new), "agent-fleet 0.1.0 (0123456)").await,
-            "unknown to git: not a rollback"
+            can(Some(&new), &says(&new)).await.is_ok(),
+            "the same commit rebuilt"
         );
-        assert!(!rb(None, &says(&old)).await, "running commit unknown");
+        let e = can(Some(&new), &says(&old)).await.unwrap_err();
+        assert!(e.contains("older or unrelated"), "{e}");
+        assert!(can(Some(&new), &says(&side)).await.is_err(), "unrelated");
+        // Unknown means no: a commit git has not heard of, no commit, no clone.
         assert!(
-            !rb(Some(&new), "agent-fleet 0.1.0").await,
+            can(Some(&new), "agent-fleet 0.1.0 (0123456)")
+                .await
+                .is_err()
+        );
+        assert!(can(None, &says(&old)).await.is_err(), "own commit unknown");
+        assert!(
+            can(Some(&new), "agent-fleet 0.1.0").await.is_err(),
             "no commit in the line"
         );
-        assert!(!rb(Some(&new), "agent-fleet 0.1.0 (unknown)").await);
         assert!(
-            !is_rollback(Path::new("/nonexistent"), Some(&new), &says(&old)).await,
-            "no clone"
+            can(Some(&new), "agent-fleet 0.1.0 (unknown)")
+                .await
+                .is_err()
         );
+        assert!(
+            can_follow(Path::new("/nonexistent"), Some(&new), &says(&old))
+                .await
+                .is_err()
+        );
+        assert!(
+            can_follow(Path::new("/nonexistent"), Some(&old), &says(&new))
+                .await
+                .is_err(),
+            "no clone: cannot tell"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_probe_passes_on_exit_zero_and_reports_what_a_failure_said() {
+        let t = tempfile::tempdir().unwrap();
+        let sh_c = |script: &str| {
+            let mut c = tokio::process::Command::new("sh");
+            c.arg("-c").arg(script);
+            c
+        };
+        assert!(probe(sh_c("exit 0"), Duration::from_secs(5)).await.is_ok());
+        let e = probe(
+            sh_c("echo 'the log holds 3 events' >&2; exit 1"),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("the log holds 3 events"), "{e}");
+        let e = probe(sh_c("sleep 30"), Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(e.contains("timed out"), "{e}");
+        drop(t);
     }
 
     #[test]

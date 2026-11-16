@@ -34,7 +34,7 @@ use store::Store;
 
 /// One event log for a fleet of coding agents: presence, tasks, blockers, asks and doorbells.
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("AGENT_FLEET_SHORT"), ")"), about)]
 struct Cli {
     /// Which fleet: one instance per project or product, each with its own hub, log, token,
     /// spool and replica.
@@ -75,6 +75,10 @@ enum Cmd {
         /// [default: <data dir>/hub.db]
         #[arg(long)]
         db: Option<PathBuf>,
+        /// Read the log and fold it, read-only, and exit 0 when this binary can run it. A hub
+        /// follows a replaced binary only after this passes.
+        #[arg(long)]
+        check: bool,
     },
     /// Run the host agent for one herdr session: presence, disk, replica, doorbell delivery,
     /// and spawn requests for this host.
@@ -780,7 +784,12 @@ async fn main() -> Result<()> {
     let now = Utc::now();
     match &ctx.cli.cmd {
         Cmd::Api { .. } => unreachable!(),
-        Cmd::Hub { listen, db } => {
+        Cmd::Hub { listen, db, check } => {
+            if *check {
+                let db = db.clone().unwrap_or_else(|| ctx.paths.hub_db());
+                println!("ok: {} events", hub::check(&db)?);
+                return Ok(());
+            }
             let token_file = ctx
                 .cli
                 .token_file

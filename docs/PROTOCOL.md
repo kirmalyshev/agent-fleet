@@ -691,19 +691,28 @@ The update is hardened:
 
 **The hub follows the binary.** Every 5 seconds the hub looks whether the file it runs from was
 replaced (a new device or inode at its path). The same new file must be seen on two polls in a row
-(a copy still being written changes it more than once), and `<binary> --version` must exit 0 and
-name itself (`agent-fleet ...`). A replacement that fails either is not followed: the hub keeps
-running, logs why once, and looks again only when the file is replaced again. A replacement that
-is an *older* commit than the hub's own (a rollback, judged by `git merge-base --is-ancestor` in
-the clone the hub was built from; when git cannot tell, it counts as newer) is not followed
-either: restart the hub by hand to run it. Otherwise it waits for the request it is serving to
-finish and replaces its process with the new binary, with the same arguments and environment
-(`exec`: the same pid, so a supervisor sees no exit, and a hub started by hand needs none). If
-the exec fails it exits with status 75, for a supervisor to start. So a host's self-update brings
-the hub on the same machine along (the host replaces the binary and exits; the hub notices within
-seconds), and so does any other replacement of the binary, `cargo install` or `cargo build`
-included. A change to the protocol that adds a field still needs the hub on the new binary before
-the hosts that write it: until it is, it refuses what they write.
+(a copy still being written changes it more than once). Then three checks, all of which must pass:
+
+- `<binary> --version` exits 0 and prints `agent-fleet <version> (<commit>)` (the first 7
+  characters of the commit it was built from, or `unknown` outside a git checkout);
+- the commit is the hub's own or one built on it (`git merge-base --is-ancestor` in the clone the
+  hub was built from). An older or unrelated build (a rollback), a commit git does not know, no
+  clone to ask, or a hub that does not know its own commit: **not followed**, unknown means no;
+- `<binary> hub --check` (the hub's own arguments, plus `--check`) exits 0: it opens the log
+  read-only, folds it, and fails on an event this binary cannot read, the failure that would
+  stop a new hub from starting and leave none. Nothing is written, and a missing log is not
+  created.
+
+A replacement that fails any of them is not followed: the hub keeps running, logs why once, and
+looks again only when the file is replaced again (restart the hub by hand to run it anyway).
+Otherwise it waits for the request it is serving to finish and replaces its process with the new
+binary, with the same arguments and environment (`exec`: the same pid, so a supervisor sees no
+exit, and a hub started by hand needs none). If the exec fails it exits with status 75, for a
+supervisor to start. So a host's self-update brings the hub on the same machine along (the host
+replaces the binary and exits; the hub notices within seconds), and so does any other
+replacement of the binary, `cargo install` or `cargo build` included. A change to the protocol
+that adds a field still needs the hub on the new binary before the hosts that write it: until it
+is, it refuses what they write.
 
 **Logs.** The host logs one line when its timer asks itself to update (both commits), and one
 when an update ends: built and installed (the new and old commit), already current, or failed
