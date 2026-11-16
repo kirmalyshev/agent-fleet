@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -125,6 +125,19 @@ pub(crate) struct Host {
     seen: Notify,
     started: Instant,
     n: Counters,
+    /// Spawn executions and handoffs in flight; a self-update restart waits for zero.
+    busy: AtomicUsize,
+    /// A self-update restart is waiting: start no new spawn or handoff.
+    draining: AtomicBool,
+}
+
+/// Held while the host does work a restart would cut short.
+pub(crate) struct Busy<'a>(&'a AtomicUsize);
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Since start; reported in `host.health`.
@@ -214,7 +227,26 @@ impl Host {
             seen: Notify::new(),
             started: Instant::now(),
             n: Counters::default(),
+            busy: AtomicUsize::new(0),
+            draining: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn busy_guard(&self) -> Busy<'_> {
+        self.busy.fetch_add(1, Ordering::SeqCst);
+        Busy(&self.busy)
+    }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::SeqCst) > 0
+    }
+
+    pub(crate) fn drain(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
     }
 
     /// The replica as one (events, state) snapshot. The first call folds the whole log; each

@@ -876,7 +876,10 @@ impl Known {
             | Self::ProcessOrphaned(_)
             | Self::ProcessHung(_)
             | Self::AgentStuck(_) => &[Host],
-            Self::MsgDelivered(_) | Self::SpawnResult(_) | Self::UpdateResult(_) => &[Host],
+            Self::MsgDelivered(_)
+            | Self::SpawnResult(_)
+            | Self::UpdateRequested(_)
+            | Self::UpdateResult(_) => &[Host],
             Self::AskRaised(_) | Self::Handoff(_) | Self::AgentSignal(_) => &[Agent],
             Self::AskAnswered(_) => &[Human],
             Self::MsgSent(_) => &[Agent, Host, Human],
@@ -1222,6 +1225,25 @@ mod tests {
             matches!(parse_strict(&v), Err(Reject::Forbidden(_))),
             "presence is host-only"
         );
+    }
+
+    #[test]
+    fn only_a_host_may_ask_every_host_to_update() {
+        let ask = |actor: Actor| {
+            let v = serde_json::to_value(Envelope::new(
+                actor,
+                "p",
+                Known::UpdateRequested(UpdateRequested {}),
+            ))
+            .unwrap();
+            parse_strict(&v)
+        };
+        assert!(matches!(ask(agent()), Err(Reject::Forbidden(_))));
+        let host = Actor {
+            kind: ActorKind::Host,
+            id: "host:h".into(),
+        };
+        assert!(ask(host).is_ok());
     }
 
     #[test]

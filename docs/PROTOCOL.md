@@ -103,7 +103,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `proc.hung` | host, pid, pids[]?, agent?, command?, started?, evidence?, since?, checked? — the topmost hung process an agent started and the hung ones under it (the watch tick, every 2 min); no `evidence` clears the report; folded only from the host actor it names (`host:<host>`) | | host |
 | | `agent.stuck` | agent, cause?, detail, until? — no `cause` clears the record | | host |
 | | `agent.signal` | agent, program, signal, detail? — `prompt`/`turn_end` clear the agent's stored signal | | agent |
-| update | `update.requested` | (empty) — every host pulls, rebuilds and restarts | | agent, host |
+| update | `update.requested` | (empty) — every host pulls, rebuilds and restarts; written by `agent-fleet self-update` as `host:<this machine>` | | host |
 | | `update.result` | host, ok, commit?, error? — folded only from the host actor it names, first answer per host | re = the request | host |
 
 `ask.answered` closes an `ask.raised` from the board's Inbox. The hub writes it together with the
@@ -630,7 +630,25 @@ a running binary on macOS. It answers `update.result` (ok, the commit it will ru
 error), then exits with status 75 so its supervisor (systemd `Restart=on-failure` or launchd
 `KeepAlive`) starts the new binary. The CLI waits (20 min) until each host that sent
 `host.health` in the last 3 min has refused, or reports in `host.health` the commit it named,
-and prints each one's commit. The hub is not restarted: a change to the protocol needs the hub
+and prints each one's commit. Only a `host` actor may write `update.requested` (the CLI writes it
+as `host:<this machine>`): it makes every host rebuild and restart.
+
+The update is hardened:
+
+- **Work in flight.** A spawn execution or handoff running when the build finishes would be cut
+  off by the exit and run again from scratch. The host answers `update.result`, starts no new
+  spawn or handoff, waits until the running ones end, then exits.
+- **Time limits.** `git pull` 2 min, other git 1 min, `cargo install` 30 min; the process group
+  is killed on a timeout and the update answers with the error. git never prompts
+  (`GIT_TERMINAL_PROMPT=0`, ssh `BatchMode`).
+- **One at a time.** A non-blocking `flock` in the clone's git dir around the pull and build:
+  a second update in the same clone (two hosts on one machine) is refused, not raced.
+- **Rollback.** The old binary stays hard-linked as `<binary>.prev`. To roll back, rename it over
+  the binary and restart the host.
+- **Leftovers.** At start a host removes `.agent-fleet-update-<pid>` directories older than 10
+  minutes from its binary's directory (a killed update leaves one).
+
+The hub is not restarted: a change to the protocol needs the hub
 restarted by hand first, or it refuses what the new hosts write.
 
 ## The operator's screen
