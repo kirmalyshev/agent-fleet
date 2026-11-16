@@ -845,8 +845,8 @@ async fn main() -> Result<()> {
         Cmd::Doctor { json, apply } => {
             let state = ctx.state().await?;
             let mut f = doctor::findings(&state, now);
-            let (cfg, cfg_err) = match spawn::find() {
-                Ok((c, _)) => (c.orphan_pr, None),
+            let (cfg, cfg_err) = match orphanpr::config(std::path::Path::new(".")) {
+                Ok(c) => (c.unwrap_or_default(), None),
                 Err(e) => (Default::default(), Some(format!("{e:#}"))),
             };
             let gh = std::env::var("AGENT_FLEET_GH").unwrap_or_else(|_| "gh".into());

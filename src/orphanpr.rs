@@ -55,6 +55,8 @@ pub struct Pr {
     pub updated: DateTime<Utc>,
     /// Issues the PR closes.
     pub closes: Vec<u64>,
+    /// It closes an issue in another repo (or one `gh` did not place): never covered.
+    pub foreign: bool,
     pub files: Vec<String>,
 }
 
@@ -111,24 +113,26 @@ pub fn classify(
         if live.contains(&pr.head) || age < Duration::days(cfg.days.into()) {
             continue;
         }
-        let by = snap
-            .merged
-            .iter()
-            .find(|(n, closed)| **n > pr.number && closed.iter().any(|i| pr.closes.contains(i)))
-            .map(|(n, _)| *n);
-        let all_closed = !pr.closes.is_empty()
-            && pr
-                .closes
+        let newer = |i: &u64| {
+            snap.merged
                 .iter()
-                .all(|i| snap.issues.get(i).is_some_and(|s| s == "CLOSED"));
+                .find(|(n, closed)| **n > pr.number && closed.contains(i))
+                .map(|(n, _)| *n)
+        };
+        let closed = |i: &u64| snap.issues.get(i).is_some_and(|s| s == "CLOSED");
+        // Every issue it closes must be covered, and none may live in another repo.
+        let covered = !pr.closes.is_empty()
+            && !pr.foreign
+            && pr.closes.iter().all(|i| closed(i) || newer(i).is_some());
+        let by = pr.closes.iter().find_map(newer);
         let action = if pr.draft {
             Action::Report("a draft waits for a person")
         } else if pr.files.len() >= FILES_CAP || guarded(&pr.files, &cfg.guarded) {
             Action::Report("touches a guarded surface, waits for a person")
-        } else if by.is_some() || all_closed {
+        } else if covered {
             Action::Close { by }
         } else {
-            Action::Report("no newer merged PR closes its issue")
+            Action::Report("a newer merged PR or a closed issue does not cover all its issues")
         };
         let issues = if pr.closes.is_empty() {
             "closes no issue".to_string()
@@ -175,13 +179,23 @@ async fn gh(bin: &str, args: &[&str]) -> Result<Value> {
     serde_json::from_slice(&out.stdout).with_context(|| format!("gh {}: bad JSON", args.join(" ")))
 }
 
-fn closes(v: &Value) -> Vec<u64> {
-    v["closingIssuesReferences"]
+/// The issues in `repo` that `v` closes, and whether it closes any other.
+fn closes(v: &Value, repo: &str) -> (Vec<u64>, bool) {
+    let (mut here, mut foreign) = (Vec::new(), false);
+    for i in v["closingIssuesReferences"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|i| i["number"].as_u64())
-        .collect()
+    {
+        match (
+            i["number"].as_u64(),
+            i["repository"]["nameWithOwner"].as_str(),
+        ) {
+            (Some(n), Some(r)) if r.eq_ignore_ascii_case(repo) => here.push(n),
+            _ => foreign = true,
+        }
+    }
+    (here, foreign)
 }
 
 /// What `repo` has open (at most `OPEN_LIMIT`, else an error), the last 100 merged and 300 issues,
@@ -254,7 +268,8 @@ pub async fn fetch(bin: &str, repo: &str) -> Result<Snapshot> {
             head: p["headRefName"].as_str()?.to_string(),
             draft: p["isDraft"].as_bool()?,
             updated: p["updatedAt"].as_str()?.parse().ok()?,
-            closes: closes(p),
+            closes: closes(p, repo).0,
+            foreign: closes(p, repo).1,
             files: p["files"]
                 .as_array()?
                 .iter()
@@ -271,7 +286,7 @@ pub async fn fetch(bin: &str, repo: &str) -> Result<Snapshot> {
         open: prs,
         merged: list("pr list --state merged", &merged)?
             .iter()
-            .filter_map(|p| Some((p["number"].as_u64()?, closes(p))))
+            .filter_map(|p| Some((p["number"].as_u64()?, closes(p, repo).0)))
             .collect(),
         issues: list("issue list", &issues)?
             .iter()
@@ -354,6 +369,30 @@ pub async fn scan(
     (found, errs)
 }
 
+/// `[orphan_pr]` of the fleet.toml in `dir`'s checkout (or the machine's own). No fleet.toml
+/// anywhere means the check is off: `Ok(None)`. One that cannot be read or parsed is an error.
+pub fn config(dir: &std::path::Path) -> Result<Option<Config>> {
+    let top = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
+    match crate::spawn::load(top.as_deref().unwrap_or(dir)) {
+        Ok((c, _)) => Ok(Some(c.orphan_pr)),
+        Err(e) if missing(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn missing(e: &anyhow::Error) -> bool {
+    e.root_cause()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// The root coordinator's agent id.
 pub fn root_of(s: &crate::state::State) -> Option<String> {
     s.roles
@@ -382,6 +421,7 @@ mod tests {
             draft: false,
             updated: now() - Duration::days(days_old),
             closes: closes.to_vec(),
+            foreign: false,
             files: vec!["src/a.rs".into()],
         }
     }
@@ -416,7 +456,7 @@ mod tests {
         assert_eq!(o.len(), 1);
         assert_eq!(
             o[0].action,
-            Action::Report("no newer merged PR closes its issue")
+            Action::Report("a newer merged PR or a closed issue does not cover all its issues")
         );
         assert_eq!(o[0].age, Duration::days(4));
         assert!(o[0].detail.contains("4d"), "{}", o[0].detail);
@@ -440,6 +480,56 @@ mod tests {
     }
 
     #[test]
+    fn one_covered_issue_of_two_is_not_enough() {
+        // PR closes 5 and 6; a newer merged PR closes only 5, and 6 is open.
+        let o = run(&snap(vec![pr(1, "s-1", 4, &[5, 6])]), &[]);
+        assert!(matches!(o[0].action, Action::Report(_)), "{o:?}");
+    }
+
+    #[test]
+    fn an_issue_in_another_repo_is_never_covered() {
+        let mut p = pr(1, "s-1", 4, &[5]);
+        p.foreign = true;
+        assert!(matches!(
+            run(&snap(vec![p]), &[])[0].action,
+            Action::Report(_)
+        ));
+    }
+
+    #[test]
+    fn closing_refs_are_matched_on_repo_and_number() {
+        let v: Value = serde_json::json!({"closingIssuesReferences": [
+            {"number": 5, "repository": {"nameWithOwner": "o/r"}},
+            {"number": 5, "repository": {"nameWithOwner": "x/y"}},
+            {"number": 7}]});
+        assert_eq!(closes(&v, "o/r"), (vec![5], true));
+        assert_eq!(closes(&serde_json::json!({}), "o/r"), (vec![], false));
+    }
+
+    #[test]
+    fn no_fleet_toml_is_off_and_a_broken_one_is_an_error() {
+        let gone = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("read fleet.toml");
+        assert!(missing(&gone));
+        assert!(!missing(&anyhow::anyhow!("fleet.toml: bad")));
+        let dir = tempfile::tempdir().unwrap();
+        let c = dir.path().join(".agent-fleet");
+        std::fs::create_dir(&c).unwrap();
+        std::fs::write(
+            c.join("fleet.toml"),
+            "brief = \"b.md\"\n[orphan_pr]\ndayz = 1\n",
+        )
+        .unwrap();
+        assert!(config(dir.path()).is_err());
+        std::fs::write(
+            c.join("fleet.toml"),
+            "brief = \"b.md\"\n[profiles.p]\nkind = \"claude\"\n[[rules]]\nprofile = \"p\"\n[orphan_pr]\nrepos = [\"o/r\"]\n",
+        )
+        .unwrap();
+        assert_eq!(config(dir.path()).unwrap().unwrap().repos, ["o/r"]);
+    }
+
+    #[test]
     fn an_older_merged_pr_does_not_supersede() {
         let mut s = snap(vec![pr(20, "s-1", 4, &[6])]);
         s.merged = BTreeMap::from([(9, vec![6])]);
@@ -455,8 +545,8 @@ mod tests {
             format!(
                 r#"#!/bin/sh
 case "$1 $2 $6" in
-  "pr list open") echo '[{{"number":1,"headRefName":"s-1","isDraft":false,"updatedAt":"2026-11-01T00:00:00Z","closingIssuesReferences":[{{"number":5}}],"files":[{{"path":"src/a.rs"}}]}},{{"number":2,"headRefName":"s-2","isDraft":false,"updatedAt":"2026-11-01T00:00:00Z","closingIssuesReferences":[{{"number":6}}],"files":[{{"path":"src/b.rs"}}]}}]' ;;
-  "pr list merged") echo '[{{"number":9,"closingIssuesReferences":[{{"number":5}}]}}]' ;;
+  "pr list open") echo '[{{"number":1,"headRefName":"s-1","isDraft":false,"updatedAt":"2026-11-01T00:00:00Z","closingIssuesReferences":[{{"number":5,"repository":{{"nameWithOwner":"o/r"}}}}],"files":[{{"path":"src/a.rs"}}]}},{{"number":2,"headRefName":"s-2","isDraft":false,"updatedAt":"2026-11-01T00:00:00Z","closingIssuesReferences":[{{"number":6,"repository":{{"nameWithOwner":"o/r"}}}}],"files":[{{"path":"src/b.rs"}}]}}]' ;;
+  "pr list merged") echo '[{{"number":9,"closingIssuesReferences":[{{"number":5,"repository":{{"nameWithOwner":"o/r"}}}}]}}]' ;;
   "issue list all") echo '[{{"number":5,"state":"CLOSED"}},{{"number":6,"state":"OPEN"}}]' ;;
   "pr close"*) echo "$@" >> {log:?} ;;
   *) echo "unexpected: $@" >&2; exit 1 ;;
