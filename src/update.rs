@@ -18,7 +18,7 @@ use crate::state::State;
 /// The commit this binary was built from (`build.rs`); `None` outside a git checkout.
 pub const COMMIT: Option<&str> = option_env!("AGENT_FLEET_COMMIT");
 /// The checkout this binary was built from: `cargo install --path <clone>` compiles it in place.
-const CLONE: &str = env!("CARGO_MANIFEST_DIR");
+pub(crate) const CLONE: &str = env!("CARGO_MANIFEST_DIR");
 /// Exit status after a replace: non-zero, so `Restart=on-failure` and launchd's `KeepAlive`
 /// (even with `SuccessfulExit=false`) both start the new binary.
 pub const RESTART_STATUS: i32 = 75;
@@ -45,6 +45,8 @@ pub enum Outcome {
 /// credential prompt or compiler silences the host for good.
 const PULL: Duration = Duration::from_secs(120);
 const GIT: Duration = Duration::from_secs(60);
+/// `<exe> --version`: a whole binary answers at once.
+const VERSION: Duration = Duration::from_secs(10);
 pub(crate) const BUILD: Duration = Duration::from_secs(30 * 60);
 /// A `.agent-fleet-update-<pid>` untouched this long (more than `BUILD`) is assumed to be the
 /// leftover of a killed update, not another host's build in progress.
@@ -83,6 +85,49 @@ async fn limited(mut c: tokio::process::Command, limit: Duration) -> Result<std:
             bail!("timed out after {}s", limit.as_secs())
         }
     }
+}
+
+/// What `exe --version` says, when it runs, exits 0 and names itself: proof that a replaced
+/// binary is whole.
+pub(crate) async fn binary_says(exe: &Path) -> Result<String> {
+    let mut c = tokio::process::Command::new(exe);
+    c.arg("--version");
+    let out = limited(c, VERSION)
+        .await
+        .with_context(|| format!("run {} --version", exe.display()))?;
+    if !out.status.success() {
+        bail!("{} --version exited {}", exe.display(), out.status);
+    }
+    let says = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // An empty or truncated file can "run" as an empty script and exit 0: it must say who it is.
+    if !says.starts_with("agent-fleet ") {
+        bail!("{} --version says {says:?}", exe.display());
+    }
+    Ok(says)
+}
+
+/// Whether the build that `says` (a `--version` line) was made from an older commit than the one
+/// running (`running`, full): a rollback, which a hub does not follow. Judged by git in `clone`;
+/// when that cannot tell (no clone, an unknown commit), it is not a rollback.
+pub(crate) async fn is_rollback(clone: &Path, running: Option<&str>, says: &str) -> bool {
+    // `--version` prints `agent-fleet <version> <commit>`; the commit is the last word.
+    let (Some(running), Some(last)) = (running, says.split_whitespace().last()) else {
+        return false;
+    };
+    let new: String = last
+        .trim_start_matches('(')
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect();
+    if new.len() < 7 || running.starts_with(new.as_str()) {
+        return false;
+    }
+    let mut c = tokio::process::Command::new("git");
+    c.arg("-C")
+        .arg(clone)
+        .args(["merge-base", "--is-ancestor", &new, running]);
+    // 0: the new commit is an ancestor of the running one (older); 1: not; anything else: unknown.
+    matches!(limited(c, GIT).await.map(|o| o.status.code()), Ok(Some(0)))
 }
 
 /// Whether git should be told `ssh -o BatchMode=yes`: not when the operator chose an ssh command
@@ -340,7 +385,7 @@ fn keep_prev(exe: &Path, prev: &Path, link: bool) -> Result<()> {
 }
 
 /// The running binary's path. Linux names a binary replaced under it `<path> (deleted)`.
-fn this_exe() -> Result<PathBuf> {
+pub(crate) fn this_exe() -> Result<PathBuf> {
     let exe = std::env::current_exe()?;
     Ok(exe
         .to_str()
@@ -388,6 +433,8 @@ trait Io {
     fn busy_work(&self) -> Vec<String>;
     /// Tells the root coordinator.
     async fn warn(&self, text: String);
+    /// One line for the host's log.
+    fn note(&self, line: String);
     /// One way: no new such work starts, until the process exits.
     fn drain(&self);
     fn exit(&self, code: i32);
@@ -425,6 +472,10 @@ impl Io for HostIo {
 
     fn busy_work(&self) -> Vec<String> {
         self.0.busy_work()
+    }
+
+    fn note(&self, line: String) {
+        eprintln!("agent-fleet host: {line}");
     }
 
     async fn warn(&self, text: String) {
@@ -507,14 +558,24 @@ async fn tick<I: Io>(io: &I, c: &Ctx<'_>, seen: &mut Seen) {
             Err(err) => Err(anyhow!("cannot tell this binary's path: {err:#}")),
         };
         let (commit, error, restart) = match done {
-            Ok(Outcome::Current(c)) => (Some(c), None, false),
-            Ok(Outcome::Replaced(c)) => (Some(c), None, true),
+            Ok(Outcome::Current(head)) => {
+                io.note(format!("update: already at {}", short(Some(&head))));
+                (Some(head), None, false)
+            }
+            Ok(Outcome::Replaced(head)) => {
+                io.note(format!(
+                    "update: built and installed {} (was {}); restarting once spawns and handoffs in flight end",
+                    short(Some(&head)),
+                    short(c.running)
+                ));
+                (Some(head), None, true)
+            }
             // The commit it still runs: a failure leaves it as it was.
-            Err(err) => (
-                c.running.map(String::from),
-                Some(tail(&format!("{err:#}"))),
-                false,
-            ),
+            Err(err) => {
+                let why = tail(&format!("{err:#}"));
+                io.note(format!("update: failed: {why}"));
+                (c.running.map(String::from), Some(why), false)
+            }
         };
         let result = UpdateResult {
             host: c.me.to_string(),
@@ -606,6 +667,11 @@ async fn timer<I: Io>(io: &I, c: &Ctx<'_>, t: &mut Timer) {
         Ok(Some(target)) => {
             t.behind_since.get_or_insert_with(Utc::now);
             if t.asked_for.as_deref() != Some(target.as_str()) && io.ask().await {
+                io.note(format!(
+                    "update: running {}, origin/main is {}; asked this host to update",
+                    short(c.running),
+                    short(Some(&target))
+                ));
                 t.asked_for = Some(target);
             }
         }
@@ -991,6 +1057,7 @@ chmod +x "$root/bin/agent-fleet"
         drop_publish: std::cell::Cell<bool>,
         asked: std::cell::Cell<usize>,
         ask_fails: std::cell::Cell<bool>,
+        notes: std::cell::RefCell<Vec<String>>,
         results: std::cell::RefCell<Vec<UpdateResult>>,
     }
 
@@ -1023,6 +1090,9 @@ chmod +x "$root/bin/agent-fleet"
         }
         fn busy_work(&self) -> Vec<String> {
             vec!["spawn of agent:h/s/x".into()]
+        }
+        fn note(&self, line: String) {
+            self.notes.borrow_mut().push(line);
         }
         async fn warn(&self, text: String) {
             self.log.borrow_mut().push(format!("warn {text}"));
@@ -1485,6 +1555,61 @@ chmod +x "$root/bin/agent-fleet"
     }
 
     #[tokio::test]
+    async fn the_host_logs_when_the_timer_asks_and_when_an_update_ends() {
+        let (_t, origin, clone, exe) = fixture();
+        let first = sh(&clone, &["rev-parse", "HEAD"]);
+        let exe = Ok(exe);
+        let io = Fake::default();
+        let c = ctx(&clone, &exe, Some(&first));
+        let mut t = Timer::default();
+        // Up to date: the check says nothing, the update says it is current.
+        timer(&io, &c, &mut t).await;
+        *io.pending.borrow_mut() = ids(&["r0"]);
+        tick(&io, &c, &mut Seen::default()).await;
+        assert_eq!(io.notes.borrow().len(), 1);
+        assert!(
+            io.notes.borrow()[0].starts_with("update: already at "),
+            "{:?}",
+            io.notes
+        );
+        // Behind: the timer logs that it asked, with both commits.
+        io.notes.borrow_mut().clear();
+        newer(&origin);
+        timer(&io, &c, &mut t).await;
+        let notes = io.notes.borrow().clone();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains(&first[..7]) && notes[0].contains("asked this host to update"),
+            "{notes:?}"
+        );
+        // Its request runs: built and installed, then restarting.
+        io.notes.borrow_mut().clear();
+        tick(&io, &c, &mut Seen::default()).await;
+        let notes = io.notes.borrow().clone();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("built and installed") && notes[0].contains(&first[..7]),
+            "{notes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_update_is_logged_with_its_cause() {
+        let (_t, _origin, clone, exe) = fixture();
+        std::fs::write(clone.join("f"), "dirty").unwrap();
+        let exe = Ok(exe);
+        let io = Fake::default();
+        *io.pending.borrow_mut() = ids(&["r1"]);
+        tick(&io, &ctx(&clone, &exe, None), &mut Seen::default()).await;
+        let notes = io.notes.borrow();
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].starts_with("update: failed: ") && notes[0].contains("uncommitted"),
+            "{notes:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_refused_update_never_exits() {
         let (_t, _origin, clone, exe) = fixture();
         std::fs::write(clone.join("f"), "dirty").unwrap();
@@ -1677,6 +1802,65 @@ chmod +x "$root/bin/agent-fleet"
             waited(silent, &["a"], Duration::from_millis(100))
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replaced_binary_must_run_and_exit_zero_to_be_followed() {
+        let (_t, _origin, _clone, exe) = fixture();
+        let bin = exe.with_file_name("probe");
+        let put = |body: &str| {
+            std::fs::write(&bin, body).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        put("#!/bin/sh\necho 'agent-fleet 0.1.0 (abc1234)'\n");
+        assert_eq!(
+            binary_says(&bin).await.unwrap(),
+            "agent-fleet 0.1.0 (abc1234)"
+        );
+        put("#!/bin/sh\necho boom; exit 3\n");
+        assert!(binary_says(&bin).await.is_err(), "exits non-zero");
+        put("");
+        assert!(
+            binary_says(&bin).await.is_err(),
+            "empty: exits 0 but says nothing"
+        );
+        put("#!/bin/sh\necho hello\n");
+        assert!(binary_says(&bin).await.is_err(), "not this program");
+        assert!(binary_says(&exe.with_file_name("missing")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_build_of_an_older_commit_is_a_rollback_and_nothing_else_is() {
+        let (_t, _origin, clone, _exe) = fixture();
+        let old = sh(&clone, &["rev-parse", "HEAD"]);
+        sh(&clone, &["commit", "-q", "--allow-empty", "-m", "two"]);
+        let new = sh(&clone, &["rev-parse", "HEAD"]);
+        let says = |c: &str| format!("agent-fleet 0.1.0 {c}");
+        let rb = |running: Option<&str>, says: &str| {
+            let (clone, running, says) =
+                (clone.clone(), running.map(String::from), says.to_string());
+            async move { is_rollback(&clone, running.as_deref(), &says).await }
+        };
+        assert!(
+            rb(Some(&new), &says(&old)).await,
+            "older than the running one"
+        );
+        assert!(!rb(Some(&old), &says(&new)).await, "newer: an update");
+        assert!(!rb(Some(&new), &says(&new)).await, "the same commit");
+        assert!(
+            !rb(Some(&new), "agent-fleet 0.1.0 (0123456)").await,
+            "unknown to git: not a rollback"
+        );
+        assert!(!rb(None, &says(&old)).await, "running commit unknown");
+        assert!(
+            !rb(Some(&new), "agent-fleet 0.1.0").await,
+            "no commit in the line"
+        );
+        assert!(!rb(Some(&new), "agent-fleet 0.1.0 (unknown)").await);
+        assert!(
+            !is_rollback(Path::new("/nonexistent"), Some(&new), &says(&old)).await,
+            "no clone"
         );
     }
 

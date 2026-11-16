@@ -706,13 +706,37 @@ The update is hardened:
   under a temporary name and renamed into place, so a failed copy leaves the previous rollback
   copy whole); one generation, replaced by each update. If it cannot be kept the update fails
   before the rename.
-  To roll back, rename it over the binary and restart the host.
+  To roll back, rename it over the binary and restart the host. The hub on that machine does
+  not follow a rollback to an older commit (an old binary refuses a log that holds event types it
+  does not know): it keeps running the newer code; restart it by hand to roll it back too, only
+  while the log holds no newer event types.
 - **Leftovers.** At start a host removes `.agent-fleet-update-<pid>` directories from its
   binary's directory that are older than 45 minutes and whose process is gone (a killed update
   leaves one; a live pid is another host's build in progress).
 
-The hub is not restarted: a change to the protocol needs the hub
-restarted by hand first, or it refuses what the new hosts write.
+**The hub follows the binary.** Every 5 seconds the hub looks whether the file it runs from was
+replaced (a new device or inode at its path). The same new file must be seen on two polls in a row
+(a copy still being written changes it more than once), and `<binary> --version` must exit 0 and
+name itself (`agent-fleet ...`). A replacement that fails either is not followed: the hub keeps
+running, logs why once, and looks again only when the file is replaced again. A replacement that
+is an *older* commit than the hub's own (a rollback, judged by `git merge-base --is-ancestor` in
+the clone the hub was built from; when git cannot tell, it counts as newer) is not followed
+either: restart the hub by hand to run it. Otherwise it waits for the request it is serving to
+finish and replaces its process with the new binary, with the same arguments and environment
+(`exec`: the same pid, so a supervisor sees no exit, and a hub started by hand needs none). If
+the exec fails it exits with status 75, for a supervisor to start. So a host's self-update brings
+the hub on the same machine along (the host replaces the binary and exits; the hub notices within
+seconds), and so does any other replacement of the binary, `cargo install` or `cargo build`
+included. A change to the protocol that adds a field still needs the hub on the new binary before
+the hosts that write it: until it is, it refuses what they write.
+
+**Logs.** The host logs one line when its timer asks itself to update (both commits), and one
+when an update ends: built and installed (the new and old commit), already current, or failed
+with the cause.
+
+**Tools.** The watch tick finds `lsof` at `/usr/sbin/lsof` (where macOS keeps it) or
+`/usr/bin/lsof` before falling back to `PATH`: a supervisor's `PATH` (launchd's default) lacks
+`/usr/sbin`.
 
 ## The operator's screen
 

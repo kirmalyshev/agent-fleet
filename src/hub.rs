@@ -6,9 +6,9 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use axum::extract::{Extension, Query, Request, State as AxState};
@@ -318,6 +318,139 @@ pub fn mint(table: &Path, scope: &str, out: &Path) -> Result<()> {
 
 type Shared = Arc<Mutex<Hub>>;
 
+/// How often the hub looks whether its binary was replaced.
+const BINARY_POLL: Duration = Duration::from_secs(5);
+
+/// A file's identity (device, inode): a rename over the path gives it a new one.
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.dev(), m.ino()))
+}
+
+/// The command that starts this same hub again: the same arguments and environment.
+fn restart_command(exe: &Path) -> std::process::Command {
+    let mut c = std::process::Command::new(exe);
+    c.args(std::env::args_os().skip(1));
+    c
+}
+
+/// Replaces this process with the new binary: same pid, so a supervisor sees no exit, and with
+/// none nothing is lost. Its sockets are close-on-exec, so the new hub binds them again. If the
+/// exec fails, exit 75 and let a supervisor start it.
+fn restart_in_place(exe: &Path) -> ! {
+    use std::os::unix::process::CommandExt;
+    let err = restart_command(exe).exec();
+    eprintln!(
+        "agent-fleet hub: cannot start {}: {err}; exiting",
+        exe.display()
+    );
+    std::process::exit(crate::update::RESTART_STATUS)
+}
+
+/// Watches a file's identity. A replacement counts once the same new identity is seen on two
+/// polls in a row: a copy still being written (`cargo install` over a running binary, a hand
+/// `cp`) changes it more than once.
+struct Settle {
+    start: Option<(u64, u64)>,
+    pending: Option<(u64, u64)>,
+}
+
+#[derive(Debug, PartialEq)]
+enum Seen {
+    Quiet,
+    Settling,
+    /// A new file that has stayed the same for two polls.
+    Replaced((u64, u64)),
+}
+
+impl Settle {
+    fn new(start: Option<(u64, u64)>) -> Self {
+        Settle {
+            start,
+            pending: None,
+        }
+    }
+
+    /// `now`: the file's identity this poll; none when it is briefly missing.
+    fn step(&mut self, now: Option<(u64, u64)>) -> Seen {
+        match now {
+            Some(id) if Some(id) != self.start => {
+                if self.pending == Some(id) {
+                    Seen::Replaced(id)
+                } else {
+                    self.pending = Some(id);
+                    Seen::Settling
+                }
+            }
+            _ => {
+                self.pending = None;
+                Seen::Quiet
+            }
+        }
+    }
+}
+
+/// Calls `changed` once when the file at `path` has been replaced by one that `verify` accepts
+/// (a host's self-update renames a new binary over the installed one, and a hub still running the
+/// old one would stay on the old code and protocol). Settled but refused (a binary that does not
+/// run, a rollback): the hub keeps running, says why once, and looks again only when the file is
+/// replaced again. A file that is briefly missing is not a change.
+async fn follow_binary<V, Fut>(
+    path: PathBuf,
+    start: Option<(u64, u64)>,
+    poll: Duration,
+    verify: V,
+    changed: impl FnOnce(),
+) where
+    V: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let mut settle = Settle::new(start);
+    let mut refused: Option<(u64, u64)> = None;
+    loop {
+        tokio::time::sleep(poll).await;
+        let Seen::Replaced(id) = settle.step(file_id(&path)) else {
+            continue;
+        };
+        if refused == Some(id) {
+            continue;
+        }
+        match verify().await {
+            Ok(()) => {
+                changed();
+                return;
+            }
+            Err(why) => {
+                eprintln!(
+                    "agent-fleet hub: {} was replaced but is not followed: {why}",
+                    path.display()
+                );
+                refused = Some(id);
+            }
+        }
+    }
+}
+
+/// The real check: the new binary runs, and is not an older commit than this one.
+async fn followable(exe: &Path) -> Result<(), String> {
+    let says = crate::update::binary_says(exe)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    if crate::update::is_rollback(
+        Path::new(crate::update::CLONE),
+        crate::update::COMMIT,
+        &says,
+    )
+    .await
+    {
+        return Err(format!(
+            "it is an older build ({says}); restart the hub by hand to run it"
+        ));
+    }
+    Ok(())
+}
+
 /// Serves the hub on every address in `listen`. Once bound, writes one URL to `hub_file`, where
 /// this instance's clients look: the loopback one when given, so a client on this host does not
 /// depend on the network the other addresses ride (3 Nov: a Tailscale blip cut the hub off from
@@ -331,6 +464,9 @@ pub async fn serve(
     if let Some(a) = listen.iter().find(|a| a.ip().is_unspecified()) {
         bail!("refusing to listen on {a}: bind a specific address (default 127.0.0.1)");
     }
+    // Taken before the log loads, which can take a while: a replacement meanwhile is noticed.
+    let exe = crate::update::this_exe();
+    let started_as = exe.as_ref().ok().and_then(|e| file_id(e));
     let hub = Hub::new(Store::open(db)?)?;
     // With a loopback address to fall back on, an address that will not bind yet (a Tailscale IP
     // before Tailscale is up, 3 Nov) is retried in the background instead of taking the hub down.
@@ -367,7 +503,30 @@ pub async fn serve(
         shown.join(", ")
     );
     std::fs::write(hub_file, format!("http://{}\n", hub_file_addr(&bound)?))?;
-    let app = scoped_router(hub, tokens);
+    let shared: Shared = Arc::new(Mutex::new(hub));
+    let app = router_shared(shared.clone(), tokens);
+    match exe {
+        Ok(exe) => {
+            let at = exe.clone();
+            let check = exe.clone();
+            tokio::spawn(follow_binary(
+                exe,
+                started_as,
+                BINARY_POLL,
+                move || {
+                    let exe = check.clone();
+                    async move { followable(&exe).await }
+                },
+                move || {
+                    // Between requests: one that writes twice (an answer) is not cut in half.
+                    let _held = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    eprintln!("agent-fleet hub: binary replaced; starting the new one");
+                    restart_in_place(&at)
+                },
+            ));
+        }
+        Err(e) => eprintln!("agent-fleet hub: cannot follow its binary: {e:#}"),
+    }
     let mut set = tokio::task::JoinSet::new();
     for l in listeners {
         let app = app.clone();
@@ -409,7 +568,10 @@ pub fn router(hub: Hub, token: String) -> Router {
 }
 
 pub fn scoped_router(hub: Hub, tokens: Tokens) -> Router {
-    let hub: Shared = Arc::new(Mutex::new(hub));
+    router_shared(Arc::new(Mutex::new(hub)), tokens)
+}
+
+fn router_shared(hub: Shared, tokens: Tokens) -> Router {
     let api = Router::new()
         .route("/events", post(post_event).get(get_events))
         .route("/events/stream", get(stream))
@@ -611,6 +773,121 @@ async fn stream(AxState(hub): AxState<Shared>, Query(q): Query<Cursor>) -> Respo
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_replacement_counts_only_once_the_same_new_file_stays_for_two_polls() {
+        let (old, a, b) = (Some((1, 1)), Some((1, 2)), Some((1, 3)));
+        let mut w = Settle::new(old);
+        assert_eq!(w.step(old), Seen::Quiet);
+        assert_eq!(w.step(a), Seen::Settling, "first sight of a new file");
+        assert_eq!(
+            w.step(b),
+            Seen::Settling,
+            "it changed again: still being written"
+        );
+        assert_eq!(w.step(b), Seen::Replaced((1, 3)));
+        // Missing or back to the old one in between: start over.
+        let mut w = Settle::new(old);
+        assert_eq!(w.step(a), Seen::Settling);
+        assert_eq!(w.step(None), Seen::Quiet);
+        assert_eq!(w.step(a), Seen::Settling);
+        assert_eq!(w.step(old), Seen::Quiet);
+        assert_eq!(w.step(a), Seen::Settling);
+    }
+
+    #[tokio::test]
+    async fn a_replacement_that_is_refused_is_kept_out_once_and_a_later_good_one_is_followed() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("agent-fleet");
+        std::fs::write(&exe, "old").unwrap();
+        std::fs::hard_link(&exe, dir.path().join("held")).unwrap();
+        let (changed, asked) = (
+            std::sync::Arc::new(AtomicBool::new(false)),
+            std::sync::Arc::new(AtomicUsize::new(0)),
+        );
+        let (flag, count) = (changed.clone(), asked.clone());
+        let task = tokio::spawn(follow_binary(
+            exe.clone(),
+            file_id(&exe),
+            Duration::from_millis(10),
+            move || {
+                let n = count.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        Err("half written".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            move || flag.store(true, Ordering::SeqCst),
+        ));
+        let put = |name: &str, body: &str| {
+            let new = dir.path().join(name);
+            std::fs::write(&new, body).unwrap();
+            std::fs::rename(&new, &exe).unwrap();
+        };
+        put(".a", "a");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!changed.load(Ordering::SeqCst), "refused: keeps running");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "asked once, not every poll"
+        );
+        std::fs::hard_link(&exe, dir.path().join("held-a")).unwrap();
+        put(".b", "b");
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("followed the next one")
+            .unwrap();
+        assert!(changed.load(Ordering::SeqCst));
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn the_hub_restarts_as_the_same_command() {
+        let c = restart_command(Path::new("/opt/agent-fleet"));
+        assert_eq!(c.get_program(), "/opt/agent-fleet");
+        let args: Vec<_> = c.get_args().collect();
+        let mine: Vec<_> = std::env::args_os().skip(1).collect();
+        assert_eq!(args, mine.iter().map(|a| a.as_os_str()).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn the_hub_follows_its_binary_and_ignores_a_file_that_is_briefly_missing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("agent-fleet");
+        std::fs::write(&exe, "old").unwrap();
+        // Keep the old file's inode taken, as the running hub does: a filesystem reuses a freed
+        // one for the next file.
+        std::fs::hard_link(&exe, dir.path().join("held")).unwrap();
+        let changed = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = changed.clone();
+        let task = tokio::spawn(follow_binary(
+            exe.clone(),
+            file_id(&exe),
+            Duration::from_millis(10),
+            || async { Ok(()) },
+            move || flag.store(true, Ordering::SeqCst),
+        ));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(!changed.load(Ordering::SeqCst), "untouched: no change");
+        std::fs::remove_file(&exe).unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(!changed.load(Ordering::SeqCst), "missing is not replaced");
+        // A self-update writes the new binary beside it and renames it over.
+        let new = dir.path().join(".new");
+        std::fs::write(&new, "new").unwrap();
+        std::fs::rename(&new, &exe).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("noticed")
+            .unwrap();
+        assert!(changed.load(Ordering::SeqCst));
+    }
+
     use super::*;
     use crate::event::*;
 
