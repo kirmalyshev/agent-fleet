@@ -8,6 +8,7 @@ mod kill;
 mod orphanpr;
 mod quota;
 mod scan;
+mod setup;
 mod signal;
 mod spawn;
 mod state;
@@ -98,7 +99,8 @@ enum Cmd {
         session: String,
         /// A repository whose worktrees to watch even when no agent works in it, as
         /// `<owner/repo>=<checkout>` also the checkout a `spawn.requested` runs against.
-        /// Repeatable.
+        /// Repeatable. Adds to the repos connected with `agent-fleet repo add` (re-read at each
+        /// spawn and scan); a flag wins over the config for the same repo.
         #[arg(long = "repo", value_parser = parse_repo)]
         repos: Vec<(Option<String>, PathBuf)>,
         /// A lock directory to report as a resource, `<name>=<dir>`. Repeatable.
@@ -124,6 +126,18 @@ enum Cmd {
     SelfUpdate,
     /// The agent-fleet instances on this machine and the hub each one uses.
     Instances,
+    /// Write this machine's fleet.toml and brief.md into the user config dir
+    /// (`AGENT_FLEET_CONFIG_DIR` overrides it): commented templates with a profile for each agent
+    /// program on PATH and one default rule. Never overwrites an existing file. Lists the
+    /// user-level Claude and Codex skills that drive terminals (herdr, tmux, cmux).
+    Init,
+    /// Connect a repository to the fleet on this machine: `add` records its checkout in the
+    /// machine's fleet.toml, `ls` lists, `rm` disconnects. The host picks changes up without a
+    /// restart.
+    Repo {
+        #[command(subcommand)]
+        cmd: RepoCmd,
+    },
     /// The fleet on one screen, live: agents, worktrees, tasks, findings, and the actions on them.
     Tui,
     /// Tasks: `add` claims (exclusive), `done` finishes, `rm` cancels or releases.
@@ -207,7 +221,7 @@ enum Cmd {
         #[arg(long, conflicts_with = "level")]
         clear: bool,
     },
-    /// Spawn an agent on an issue, or with `--title` on work that has none: the project's `.agent-fleet/fleet.toml` picks the profile
+    /// Spawn an agent on an issue, or with `--title` on work that has none: the machine's fleet.toml (`agent-fleet init`), or the project's own `.agent-fleet/fleet.toml`, picks the profile
     /// and host, the host agent runs it (worktree, env scrub, agent start, the brief) and
     /// answers `spawn.result`. Follows the hub until the result arrives (10 min).
     Spawn {
@@ -404,6 +418,23 @@ fn parse_window(s: &str) -> Result<i64, String> {
 enum ApiCmd {
     /// Print the JSON Schema of events and state.
     Schema,
+}
+
+#[derive(Subcommand)]
+enum RepoCmd {
+    /// Record `<dir>`'s checkout (default: the one holding the current directory) as
+    /// `<owner/repo>`'s. Refuses a directory outside a git checkout and a checkout whose
+    /// `origin` remote is another repository. Lists the checkout's Claude and Codex skills that
+    /// drive terminals (herdr, tmux, cmux).
+    Add {
+        /// `owner/repo`.
+        repo: String,
+        dir: Option<PathBuf>,
+    },
+    /// The connected repositories and their checkouts.
+    Ls,
+    /// Disconnect a repository; its checkout is left alone.
+    Rm { repo: String },
 }
 
 #[derive(Subcommand)]
@@ -720,6 +751,67 @@ impl Ctx {
     }
 }
 
+/// `init` and `repo`: the machine's config dir only; no hub, no instance.
+fn machine_config(cmd: &Cmd) -> Result<()> {
+    let dir = spawn::machine_dir().context("no user config dir; set AGENT_FLEET_CONFIG_DIR")?;
+    match cmd {
+        Cmd::Init => {
+            let found = setup::kinds_on_path();
+            for (p, wrote) in setup::init(&dir, &found)? {
+                let what = if wrote { "wrote" } else { "kept the existing" };
+                println!("{what} {}", p.display());
+            }
+            if found.is_empty() {
+                println!(
+                    "no agent program ({}) on PATH: every profile is in; keep the ones you use",
+                    setup::KINDS.join(", ")
+                );
+            } else {
+                println!("profiles: {}", found.join(", "));
+            }
+            println!(
+                "\nNext:\n  1. Read the comments in fleet.toml and brief.md and adjust them.\n  \
+                 2. Start the hub: agent-fleet hub\n  \
+                 3. Start the host: agent-fleet host --herdr-socket <socket> --session <name>\n  \
+                 4. Connect a repository: agent-fleet repo add <owner/repo> [<checkout>]"
+            );
+            let found = setup::terminal_skills(&setup::user_skill_dirs());
+            print!("{}", setup::skills_report(&found));
+        }
+        Cmd::Repo {
+            cmd: RepoCmd::Add { repo, dir: co },
+        } => {
+            let co = match co {
+                Some(d) => d.clone(),
+                None => std::env::current_dir()?,
+            };
+            let (top, changed) = setup::add(&dir, repo, &co)?;
+            let what = if changed {
+                "connected"
+            } else {
+                "already connected:"
+            };
+            println!("{what} {repo} {}", top.display());
+            let found = setup::terminal_skills(&setup::project_skill_dirs(&top));
+            print!("{}", setup::skills_report(&found));
+        }
+        Cmd::Repo { cmd: RepoCmd::Ls } => {
+            for (repo, co) in setup::registered(&dir)? {
+                let gone = if co.is_dir() { "" } else { "  (missing)" };
+                println!("{repo:<30} {}{gone}", co.display());
+            }
+        }
+        Cmd::Repo {
+            cmd: RepoCmd::Rm { repo },
+        } => {
+            setup::rm(&dir, repo)?;
+            println!("disconnected {repo}");
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -777,13 +869,16 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if let Cmd::Init | Cmd::Repo { .. } = &cli.cmd {
+        return machine_config(&cli.cmd);
+    }
     let ctx = Ctx {
         paths: Paths::from_env(&cli.instance)?,
         cli,
     };
     let now = Utc::now();
     match &ctx.cli.cmd {
-        Cmd::Api { .. } => unreachable!(),
+        Cmd::Api { .. } | Cmd::Init | Cmd::Repo { .. } => unreachable!(),
         Cmd::Hub { listen, db, check } => {
             if *check {
                 let db = db.clone().unwrap_or_else(|| ctx.paths.hub_db());
@@ -833,6 +928,7 @@ async fn main() -> Result<()> {
                             .map(|s| (s, d.clone()))
                     })
                     .collect(),
+                config_dir: spawn::machine_dir(),
                 locks: locks.clone(),
                 stall_min: *stall_min,
                 stuck_act: *stuck_act,

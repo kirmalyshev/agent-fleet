@@ -15,9 +15,10 @@ const OPEN_LIMIT: usize = 100;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// `owner/repo` list to look at; empty = the check is off.
+    /// `owner/repo` list to look at; absent = the repos connected on this machine
+    /// (`agent-fleet repo add`), filled in by `config_in`; empty = the check is off.
     #[serde(default)]
-    pub repos: Vec<String>,
+    pub repos: Option<Vec<String>>,
     /// Quiet this many days before a PR is an orphan.
     #[serde(default = "default_days")]
     pub days: u32,
@@ -41,10 +42,17 @@ fn default_guarded() -> Vec<String> {
         .into()
 }
 
+impl Config {
+    /// The repos to look at; none when unset and not yet filled in.
+    pub fn repos(&self) -> &[String] {
+        self.repos.as_deref().unwrap_or_default()
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
-            repos: Vec::new(),
+            repos: None,
             days: default_days(),
             guarded: default_guarded(),
             apply: false,
@@ -362,7 +370,7 @@ pub async fn scan(
 ) -> (Vec<Orphan>, Vec<(String, String)>) {
     let (live, unknown) = live_branches(s);
     let (mut found, mut errs) = (Vec::new(), Vec::new());
-    for repo in &cfg.repos {
+    for repo in cfg.repos() {
         match fetch(bin, repo).await {
             Ok(snap) => found.extend(classify(&snap, &live, cfg, now)),
             Err(e) => errs.push((repo.clone(), format!("{e:#}"))),
@@ -381,6 +389,15 @@ pub async fn scan(
 /// `[orphan_pr]` of the fleet.toml in `dir`'s checkout (or the machine's own). No fleet.toml
 /// anywhere means the check is off: `Ok(None)`. One that cannot be read or parsed is an error.
 pub fn config(dir: &std::path::Path) -> Result<Option<Config>> {
+    config_in(dir, crate::spawn::machine_dir().as_deref())
+}
+
+/// `config` with the machine's config dir given. `repos` unset means the machine's connected
+/// repos, in either file.
+pub fn config_in(
+    dir: &std::path::Path,
+    machine: Option<&std::path::Path>,
+) -> Result<Option<Config>> {
     let top = std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -389,8 +406,17 @@ pub fn config(dir: &std::path::Path) -> Result<Option<Config>> {
         .ok()
         .filter(|o| o.status.success())
         .map(|o| std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
-    match crate::spawn::load(top.as_deref().unwrap_or(dir)) {
-        Ok((c, _)) => Ok(Some(c.orphan_pr)),
+    match crate::spawn::load_in(top.as_deref().unwrap_or(dir), machine) {
+        Ok((mut c, _)) => {
+            if c.orphan_pr.repos.is_none() {
+                let connected = match machine {
+                    Some(m) => crate::setup::registered(m)?,
+                    None => BTreeMap::new(),
+                };
+                c.orphan_pr.repos = Some(connected.into_keys().collect());
+            }
+            Ok(Some(c.orphan_pr))
+        }
         Err(e) if missing(&e) => Ok(None),
         Err(e) => Err(e),
     }
@@ -532,10 +558,13 @@ async fn retire_note_inner(bin: &str, repo: &str, branch: &str) -> Result<Option
 /// The configs the watch loop acts on: one per spawn checkout (`owner/repo` → path) whose
 /// fleet.toml sets `apply`. Read from the checkouts, never from the process's directory: a
 /// service manager starts the host in `/`. A checkout whose fleet.toml cannot be read is an error.
-pub fn watch_configs(checkouts: &BTreeMap<String, std::path::PathBuf>) -> Result<Vec<Config>> {
+pub fn watch_configs(
+    checkouts: &BTreeMap<String, std::path::PathBuf>,
+    machine: Option<&std::path::Path>,
+) -> Result<Vec<Config>> {
     let mut out = Vec::new();
     for (repo, dir) in checkouts {
-        let c = config(dir).with_context(|| format!("{repo}: fleet.toml"))?;
+        let c = config_in(dir, machine).with_context(|| format!("{repo}: fleet.toml"))?;
         out.extend(watch_enabled(c));
     }
     Ok(out)
@@ -543,7 +572,7 @@ pub fn watch_configs(checkouts: &BTreeMap<String, std::path::PathBuf>) -> Result
 
 /// The config the watch loop acts on: only a fleet.toml that sets `apply` and names repos.
 pub fn watch_enabled(cfg: Option<Config>) -> Option<Config> {
-    cfg.filter(|c| c.apply && !c.repos.is_empty())
+    cfg.filter(|c| c.apply && !c.repos().is_empty())
 }
 
 /// The root coordinator's agent id.
@@ -677,13 +706,16 @@ mod tests {
             "brief = \"b.md\"\n[orphan_pr]\ndayz = 1\n",
         )
         .unwrap();
-        assert!(config(dir.path()).is_err());
+        assert!(config_in(dir.path(), None).is_err());
         std::fs::write(
             c.join("fleet.toml"),
             "brief = \"b.md\"\n[profiles.p]\nkind = \"claude\"\n[[rules]]\nprofile = \"p\"\n[orphan_pr]\nrepos = [\"o/r\"]\n",
         )
         .unwrap();
-        assert_eq!(config(dir.path()).unwrap().unwrap().repos, ["o/r"]);
+        assert_eq!(
+            config_in(dir.path(), None).unwrap().unwrap().repos(),
+            ["o/r"]
+        );
     }
 
     #[test]
@@ -722,15 +754,15 @@ mod tests {
             ("o/off".to_string(), mk("off", false)),
             ("o/none".to_string(), dir.path().join("none")),
         ]);
-        let got = watch_configs(&checkouts).unwrap();
+        let got = watch_configs(&checkouts, None).unwrap();
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].repos, ["o/on"]);
+        assert_eq!(got[0].repos(), ["o/on"]);
         let broken = BTreeMap::from([("o/b".to_string(), {
             let d = mk("b", true);
             std::fs::write(d.join(".agent-fleet/fleet.toml"), "nope = 1").unwrap();
             d
         })]);
-        assert!(watch_configs(&broken).is_err());
+        assert!(watch_configs(&broken, None).is_err());
     }
 
     #[tokio::test]
@@ -769,7 +801,7 @@ mod tests {
     #[test]
     fn the_watch_acts_only_on_apply_with_repos() {
         let on = || Config {
-            repos: vec!["o/r".into()],
+            repos: Some(vec!["o/r".into()]),
             apply: true,
             ..Config::default()
         };
@@ -784,7 +816,7 @@ mod tests {
         );
         assert!(
             watch_enabled(Some(Config {
-                repos: vec![],
+                repos: Some(vec![]),
                 ..on()
             }))
             .is_none()
@@ -949,7 +981,7 @@ esac
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_gh(dir.path());
         let cfg = Config {
-            repos: vec!["o/r".into()],
+            repos: Some(vec!["o/r".into()]),
             ..Config::default()
         };
         let s = crate::state::State::default();
@@ -967,7 +999,7 @@ esac
     #[tokio::test]
     async fn an_unreadable_repo_is_an_error_not_a_pass() {
         let cfg = Config {
-            repos: vec!["o/r".into()],
+            repos: Some(vec!["o/r".into()]),
             ..Config::default()
         };
         let (found, errs) = scan(
@@ -1054,7 +1086,7 @@ esac
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_gh(dir.path());
         let cfg = Config {
-            repos: vec!["o/r".into()],
+            repos: Some(vec!["o/r".into()]),
             ..Config::default()
         };
         let live = state_with(&[("a", Some("/w/a"), Some("s-1"))]);

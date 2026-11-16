@@ -79,8 +79,11 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Repositories whose worktrees to watch besides the ones agents work in.
     pub repos: Vec<String>,
-    /// `owner/repo` → the local checkout a `spawn.requested` is executed against.
+    /// `owner/repo` → the local checkout a `spawn.requested` is executed against, from the
+    /// `--repo` flags; `checkouts_now` adds the repos connected with `agent-fleet repo add`.
     pub checkouts: BTreeMap<String, PathBuf>,
+    /// The machine's config dir (`spawn::machine_dir`): its fleet.toml, brief and `[repos]`.
+    pub config_dir: Option<PathBuf>,
     /// Lock directories to report as resources: (name, directory).
     pub locks: Vec<(String, PathBuf)>,
     /// Minutes an agent may idle/block after working before its lead is told it's stalled.
@@ -88,6 +91,20 @@ pub struct Config {
     /// `host --stuck-act`: let the host act on a stuck cause itself — keystrokes and
     /// handoffs. Off (the default) it only classifies, records `agent.stuck`, and tells.
     pub stuck_act: bool,
+}
+
+impl Config {
+    /// The checkouts this host serves now: the machine's `[repos]`, re-read at each call so a
+    /// repo connected after the host started is served without a restart, under the `--repo`
+    /// flags, which win on a conflict.
+    pub fn checkouts_now(&self) -> Result<BTreeMap<String, PathBuf>> {
+        let mut all = match &self.config_dir {
+            Some(d) => crate::setup::registered(d)?,
+            None => BTreeMap::new(),
+        };
+        all.extend(self.checkouts.clone());
+        Ok(all)
+    }
 }
 
 #[derive(Clone)]
@@ -769,6 +786,10 @@ impl Host {
         let procs = scan::Procs::read();
         let gap = t0.elapsed().as_millis() as u64;
         let mut repos: BTreeSet<String> = self.cfg.repos.iter().cloned().collect();
+        match self.cfg.checkouts_now() {
+            Ok(c) => repos.extend(c.values().map(|d| d.to_string_lossy().into_owned())),
+            Err(e) => eprintln!("agent-fleet host: connected repos: {e:#}"),
+        }
         let mut agent_pids: HashSet<u32> = HashSet::new();
         let mut sampled = HashSet::new();
         for a in list["agents"].as_array().into_iter().flatten() {
@@ -1404,6 +1425,7 @@ mod tests {
             data_dir: dir.to_path_buf(),
             repos: Vec::new(),
             checkouts: Default::default(),
+            config_dir: None,
             locks: Vec::new(),
             stall_min: 15,
             stuck_act: false,
@@ -1547,6 +1569,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             repos: Vec::new(),
             checkouts: Default::default(),
+            config_dir: None,
             locks: Vec::new(),
             stall_min: 15,
             stuck_act: false,
@@ -1623,6 +1646,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             repos: Vec::new(),
             checkouts: Default::default(),
+            config_dir: None,
             locks: Vec::new(),
             stall_min: 15,
             stuck_act: false,

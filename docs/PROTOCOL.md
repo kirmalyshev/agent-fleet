@@ -588,8 +588,8 @@ daemon` or `claude daemon`, and everything under such a process; the
 process's directory is known on Linux only), re-sent without `program` once the process is gone;
 `agent-fleet doctor` shows them as `unmanaged` findings.
 
-`doctor` also reads GitHub, not the log, for `orphan-pr` findings: with `[orphan_pr] repos` set in
-fleet.toml, an open PR whose head branch is no live agent's worktree branch and that has had no
+`doctor` also reads GitHub, not the log, for `orphan-pr` findings: for each repository in
+`[orphan_pr] repos` of fleet.toml (absent: the machine's connected `[repos]`; `[]`: off), an open PR whose head branch is no live agent's worktree branch and that has had no
 update for `days` (default 3) is named with its age, the issues it closes and their state. `doctor --apply` closes it, with a comment and the branch kept, only when every issue it closes is closed or closed by a newer
 merged PR in the same repo; anything else is reported. A draft, or a PR touching a `guarded` path, is never
 closed; `--apply` tells the root coordinator of each orphan it does not close, again on a later run once the earlier
@@ -598,7 +598,7 @@ tell is delivered; a tell still pending is not repeated. The default `guarded` i
 file list hits `gh`'s cap of 100 counts as guarded. Nothing is closed while a live agent's
 branch is unknown; a repo or row `gh` cannot read is an `orphan-pr` error line, and so is a
 fleet.toml `doctor` cannot read (no fleet.toml, or no checkout, means the check is off). With `[orphan_pr] apply = true` (default off) the host's watch loop runs the same step every 30 minutes
-from the fleet.toml of each spawn checkout the host knows (never its working directory: a service starts it in `/`), on its own task with a 5-minute limit: it closes the superseded PRs and tells the root
+from the fleet.toml of each spawn checkout the host knows (`[repos]` and `--repo`) (never its working directory: a service starts it in `/`), on its own task with a 5-minute limit: it closes the superseded PRs and tells the root
 coordinator of each other orphan, again 7 days after the last tell and never while one is still pending (the log is the dedupe); with no root coordinator it tells nobody, and the closes still run.
 When the TUI removes a worktree whose branch still has an open PR, its outcome line says so and
 the root coordinator is told: the PR is a coordinator item from then on.
@@ -661,8 +661,8 @@ or `gone`. Nothing is killed automatically.
 
 ## Spawning
 
-The fleet starts agents itself. `<checkout>/.agent-fleet/fleet.toml` in the project says how
-(`docs/fleet.example.toml` ships one): a `session` (absent: the herdr session the CLI runs
+The fleet starts agents itself. A `fleet.toml` says how (`docs/fleet.example.toml` is the
+commented reference, and the template `agent-fleet init` writes): a `session` (absent: the herdr session the CLI runs
 in, from `HERDR_SESSION`), a `base` ref (default `origin/main`), a
 `brief` template next to the file with `@@KEY@@` placeholders, an optional `ready` script run
 inside a new worktree before the agent starts, `[vars]` for extra tokens, `[profiles]` —
@@ -674,9 +674,27 @@ work and never picks the worker; `label:x` matches only
 a label named x. Config errors name the line that is wrong: an unknown profile, a fallback
 cycle, two defaults, no default.
 
-A checkout with no `.agent-fleet/fleet.toml` uses the machine's own: `fleet.toml` and its brief
-in the user config directory (`~/.config/agent-fleet` on Linux, `AGENT_FLEET_CONFIG_DIR`
-overrides it). The checkout's file wins whenever it exists.
+The machine's rules are `fleet.toml` and its brief in the user config directory
+(`~/.config/agent-fleet` on Linux, `AGENT_FLEET_CONFIG_DIR` overrides it). `agent-fleet init`
+writes both from `docs/fleet.example.toml` and `docs/brief.example.md`, with a profile for each
+agent program on `PATH` (`claude`, `codex`, `devin`; all three when none is found) and a default
+rule on the first; it never overwrites a file. It also lists the user-level skills
+(`$CLAUDE_CONFIG_DIR` or `~/.claude`, `$CODEX_HOME` or `~/.codex`, each `/skills/*/SKILL.md`)
+that name herdr, tmux or cmux, and warns that in a fleet agents message each other with `tell`
+and start agents with `spawn`; it changes nothing about them. A checkout with its own
+`.agent-fleet/fleet.toml` uses that file instead, wholesale; otherwise the machine's applies.
+Config errors name the file that was read.
+
+**Connected repositories.** The machine's `fleet.toml` has a `[repos]` table, `"owner/repo" =
+"<checkout>"`, read only from that file. `agent-fleet repo add <owner/repo> [<dir>]` records the
+git toplevel of `<dir>` (default: the current directory); it refuses a directory outside a git
+checkout and a checkout whose `origin` is not a GitHub remote of `<owner/repo>` (compared
+case-insensitively), because the host would create that other repository's worktrees and
+branches. It edits that one line and keeps every comment; adding the same checkout again changes
+nothing. `repo rm <owner/repo>` removes the line, `repo ls` lists the table. `repo add` lists the
+checkout's project-level skills that name a terminal multiplexer the same way, from
+`.claude/skills` and `.codex/skills`. `repo add` needs
+`init` first.
 
 `agent-fleet spawn <owner/repo>#<issue>` reads the issue with `gh issue view` (`AGENT_FLEET_GH`
 names the binary), picks the rule — `--profile`, `--host` and `--level` override it. A profile at
@@ -698,11 +716,15 @@ ISSUE renders empty, and the task is `task:<repo name>/<name>`. The CLI creates 
 once `spawn.result` is ok, assigns it to the new agent; under `--no-wait` it stays unassigned.
 Every brief also has REF (`owner/repo#N`, or `owner/repo` with no issue) and TASK (the task id).
 
-The host agent serves requests naming its host and session, against a checkout given as
-`--repo <owner/repo>=<dir>` (a bare `--repo <dir>` watches a checkout and derives the slug from
-its `origin` remote). A request names the `profile`; the host reads `kind`, `args`, `unset_env`,
-`base` and the checkout's `ready` from its OWN `.agent-fleet/fleet.toml` — a request never
-carries executable configuration, and a handoff's worktree is not a config source — and refuses
+The host agent serves requests naming its host and session, against the checkout of the
+request's repository: the machine's `[repos]`, re-read at each spawn and each scan so a repository
+connected after the host started is served without a restart, merged with `--repo
+<owner/repo>=<dir>` flags (a bare `--repo <dir>` watches a checkout and derives the slug from its
+`origin` remote). A flag wins over `[repos]` for the same repository. With neither, the request
+fails with `no checkout for <owner/repo> on this host: run agent-fleet repo add`. A request names
+the `profile`; the host reads `kind`, `args`, `unset_env`, `base` and `ready` from that
+checkout's `.agent-fleet/fleet.toml`, else the machine's — a request never carries executable
+configuration, and a handoff's worktree is not a config source — and refuses
 (`ok=false`) a `name` or `branch` that starts with `-`, or a `branch` `git check-ref-format
 --branch` rejects. For a new worktree it fetches
 `origin`, calls `worktree.create` (label `<name> #<issue>`, no focus, trust the repository); a

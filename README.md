@@ -62,7 +62,36 @@ git clone https://github.com/kirmalyshev/agent-fleet
 cd agent-fleet
 cargo install --locked --path .        # puts agent-fleet in ~/.cargo/bin
 agent-fleet --version                  # the crate version and the commit it was built from
+agent-fleet init
 ```
+
+`agent-fleet init` writes this machine's `fleet.toml` and `brief.md` into the user config dir
+(`~/.config/agent-fleet` on Linux; `AGENT_FLEET_CONFIG_DIR` overrides it). They are the rules
+`spawn` uses for every repository: a profile for each agent program found on `PATH` (claude,
+codex, devin), one default rule, and a comment on every key. It never overwrites a file. It also
+lists your Claude and Codex skills that drive terminals (herdr, tmux, cmux): in a fleet, agents
+talk through `agent-fleet tell` and `spawn`, so check that those skills do not tell them to type
+into each other's panes. Edit
+them, then start the hub and the host as in the quick start below.
+
+## Connect a repository
+
+```sh
+cd <checkout of owner/repo>
+agent-fleet repo add owner/repo        # or: agent-fleet repo add owner/repo <checkout>
+agent-fleet repo ls
+agent-fleet repo rm owner/repo
+```
+
+`repo add` records the checkout in the machine's `fleet.toml` (`[repos]`). It refuses a directory
+that is not a git checkout and a checkout whose `origin` is another repository. The host re-reads
+the list at each spawn and scan, so no restart is needed. It lists the repository's own terminal-driving
+skills (`.claude/skills`, `.codex/skills`) the same way. A repository with its own
+`.agent-fleet/fleet.toml` uses that file instead of the machine's rules.
+
+`agent-fleet host --repo owner/repo=<checkout>` flags still work and merge with this list.
+Try a route without starting anything: `agent-fleet spawn owner/repo#123 --dry-run`. The
+keys are explained in [docs/fleet.example.toml](docs/fleet.example.toml).
 
 ## Quick start
 
@@ -105,25 +134,6 @@ agent-fleet hub --listen 127.0.0.1:7799 &       # later commands find this hub t
 
 An agent's CLI reads its pane shell's environment, not yours: export the same two variables in
 that shell before you start the agent, or its commands go to your other fleet.
-
-## Connect a repository
-
-The host watches a repository's worktrees and runs spawns in it when you name its checkout:
-
-```sh
-agent-fleet host --herdr-socket <socket> --session <name> --repo owner/repo=/path/to/checkout
-```
-
-`--repo` is repeatable. A bare `--repo <dir>` derives the slug from the checkout's `origin` remote.
-To add a repository, restart the host with one more `--repo`.
-
-`agent-fleet spawn owner/repo#123` reads its rules from `<checkout>/.agent-fleet/fleet.toml`, or,
-when the checkout has none, from `fleet.toml` and `brief.md` in your user config directory
-(`~/.config/agent-fleet` on Linux, `AGENT_FLEET_CONFIG_DIR` overrides it). Start from
-[docs/fleet.example.toml](docs/fleet.example.toml): profiles say which agent program to run and
-how, rules route an issue to a profile and a host. `doctor`'s check for open PRs no agent owns
-reads its repositories from the separate `[orphan_pr] repos` list. Try a route with
-`agent-fleet spawn owner/repo#123 --dry-run`.
 
 ## Run the hub and host as services
 
@@ -324,6 +334,8 @@ From `agent-fleet --help`; every command has its own `--help`.
 | `ps` | What every agent is doing |
 | `self-update` | Every host that is up pulls `main` in the clone its binary was built from, rebuilds and restarts; prints the commit each one then runs. A dirty clone or one not on `main` refuses |
 | `instances` | The agent-fleet instances on this machine and the hub each one uses |
+| `init` | Write this machine's fleet.toml and brief.md into the user config dir (`AGENT_FLEET_CONFIG_DIR` overrides it): commented templates with a profile for each agent program on PATH and one default rule. Never overwrites an existing file. Lists the user-level Claude and Codex skills that drive terminals (herdr, tmux, cmux) |
+| `repo` | Connect a repository to the fleet on this machine: `add` records its checkout in the machine's fleet.toml, `ls` lists, `rm` disconnects. The host picks changes up without a restart |
 | `tui` | The fleet on one screen, live: agents, worktrees, tasks, findings, and the actions on them |
 | `task` | Tasks: `add` claims (exclusive), `done` finishes, `rm` cancels or releases |
 | `dep` | Dependencies between tasks: <task> is blocked by <on> |
@@ -334,7 +346,7 @@ From `agent-fleet --help`; every command has its own `--help`.
 | `unblock` | Resolve a blocker by its id |
 | `ask` | Raise a question for an operator |
 | `role` | Declare an agent's level of responsibility (root-coordinator, domain-lead, implementation-lead, implementer), or with no level show its role, its chain of leads and its direct reports |
-| `spawn` | Spawn an agent on an issue, or with `--title` on work that has none: the project's `.agent-fleet/fleet.toml` picks the profile and host, the host agent runs it (worktree, env scrub, agent start, the brief) and answers `spawn.result`. Follows the hub until the result arrives (10 min) |
+| `spawn` | Spawn an agent on an issue, or with `--title` on work that has none: the machine's fleet.toml (`agent-fleet init`), or the project's own `.agent-fleet/fleet.toml`, picks the profile and host, the host agent runs it (worktree, env scrub, agent start, the brief) and answers `spawn.result`. Follows the hub until the result arrives (10 min) |
 | `handoff` | Hand an agent's issue, branch and existing worktree to a new agent of `--to` (default: its profile's fallback), then close the replaced agent's pane and workspace |
 | `tell` | Ring an agent's doorbell: `[agent-fleet <from>→<to>] TYPE ref: text (event <id>)` |
 | `stats` | Numbers about the fleet: doorbell latency and loss, event lag, host and hub vitals |

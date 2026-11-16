@@ -746,7 +746,8 @@ const ORPHAN_PR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 /// `doctor --apply` for `orphan-pr`, when fleet.toml turns it on (`[orphan_pr] apply = true`, off by
 /// default): close what a merged PR supersedes, tell the root coordinator of the rest.
 async fn orphan_prs(host: &Arc<Host>) -> anyhow::Result<()> {
-    let cfgs = crate::orphanpr::watch_configs(&host.cfg.checkouts)?;
+    let cfgs =
+        crate::orphanpr::watch_configs(&host.cfg.checkouts_now()?, host.cfg.config_dir.as_deref())?;
     if cfgs.is_empty() {
         return Ok(());
     }
@@ -756,7 +757,9 @@ async fn orphan_prs(host: &Arc<Host>) -> anyhow::Result<()> {
     let mut seen = std::collections::BTreeSet::new();
     for mut cfg in cfgs {
         // Two checkouts may name one repo: it is looked at once.
-        cfg.repos.retain(|r| seen.insert(r.clone()));
+        if let Some(r) = &mut cfg.repos {
+            r.retain(|r| seen.insert(r.clone()));
+        }
         let (orphans, errs) = crate::orphanpr::scan(&gh, &view.state, &cfg, now).await;
         for (repo, e) in errs {
             eprintln!("agent-fleet host: orphan PRs: {repo}: {e}");

@@ -55,6 +55,7 @@ One crate, one binary. `docs/PROTOCOL.md` is the spec, `schema/` the generated J
 | `src/signal.rs` | `hook signal`: harness hook events become `agent.signal`. |
 | `src/quota.rs` | Each agent program's usage quota and `hook statusline`. |
 | `src/spawn.rs` | `fleet.toml` routing, briefs, the host's spawn executor. |
+| `src/setup.rs` | `init` and `repo add`, `ls`, `rm`: the machine's `fleet.toml`, brief and connected repos. |
 | `src/kill.rs` | `agent-fleet kill` and `hook bash`. |
 | `src/doctor.rs` | Findings read off the state. |
 | `src/orphanpr.rs` | Open PRs no live agent owns, read off `gh`. |
