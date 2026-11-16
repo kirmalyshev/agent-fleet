@@ -75,7 +75,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `host.health` | host, disk_free, disk_total, agents, stats?, commit? (the commit its binary was built from; every minute) | | host |
 | | `agent.usage` | agent, rss_kb?, cpu_pct?, procs?, cwd? (each scan) | | host |
 | | `agent.role` | agent, level? (`root-coordinator` `domain-lead` `implementation-lead` `implementer`; absent `level` removes the role), lead?, domain? | | agent, host |
-| machine | `worktree.state` | host, path, repo, branch?, head, unpushed, dirty, files[] (only what still differs from the default branch), last_commit, in_main? (on change) | | host |
+| machine | `worktree.state` | host, path, repo, branch?, head, unpushed, dirty, dirty_submodules? (of dirty, moved submodule pointers), files[] (only what still differs from the default branch), last_commit, in_main?, herdr? (a linked worktree under herdr's worktree directory: `[worktrees] directory` in its config, default `~/.herdr/worktrees`) (on change) | | host |
 | | `worktree.gone` | host, path | | host |
 | | `worktree.procs` | host, path, procs, rss_kb, cpu_pct, names[], pids[], orphaned (each scan; `procs: 0` once when they end; Linux only — `ps` reports no working directory on macOS) | | host |
 | | `agent.quota` | host, kind, windows[] ({name, used_pct, resets_at?}), plan?, exhausted, read_at (each minute, when anything but `read_at` changes) | | host |
@@ -89,8 +89,8 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `task.unassigned` | reason? | task | agent, host |
 | | `task.state` | state (`submitted` `working` `input-required` `completed` `failed` `canceled`) | task | agent, host |
 | | `task.dep.added` / `task.dep.removed` | on (task is blocked by `on`) | task | agent, host |
-| blocker | `blocker.raised` | what, owner?, unblocks_when? | task | agent, host |
-| | `blocker.resolved` | note? | re = the raise | agent, host |
+| blocker | `blocker.raised` | what, owner?, unblocks_when?, pid?, started? (`pid`: a process on the raiser's host it waits on, `started` when that process started) | task | agent, host |
+| | `blocker.resolved` | note? (the raiser's host writes one once the blocker's `pid` is gone or started at another time) | re = the raise | agent, host |
 | question | `ask.raised` | question, options[], recommendation?, context? | task | agent |
 | comms | `msg.sent` | to, kind, ref, text | | agent, host |
 | | `ask.answered` | answer, approve?, approves?, msg — **human only**, via `POST /board/answer` | re = the ask | human |
@@ -301,12 +301,12 @@ how many worktrees may hold any of a set of resources at once.
 | `hung` | working for 30 min at under 2% CPU, its worktree unchanged as long; or (subject `<host>:<pid>`) a process the watch tick reported in `proc.hung` |
 | `heavy` | an agent's tree, or a worktree's processes, over 4 GB or 200% CPU |
 | `duplicate` | two agents in one worktree, or two agents' worktrees changing the same files (lockfiles aside) |
-| `forgotten` | a worktree no agent works in, with unsaved work for an hour, or clean and 3 days untouched, or clean with processes still running 10 min after it last changed; running processes are named, and `agent-fleet kill` accepts them unless the worktree is a main checkout |
+| `forgotten` | a worktree herdr made (`herdr`; spawn makes its worktrees through herdr) that no agent works in, with unsaved work for an hour, or clean and 3 days untouched, or clean with processes still running 10 min after it last changed; running processes are named, dirty files that are only moved submodule pointers say so, and `agent-fleet kill` accepts them unless the worktree is a main checkout |
 | `unpushed` | an agent's worktree holding commits no remote has for an hour |
 | `orphan` | processes running in a deleted worktree, with their pids |
 | `breach` | more worktrees hold a rule's resources than its `max`, while the rule lasts |
 | `queued` | a process waiting 10 min for a resource, with who holds it |
-| `refused` | `agent-fleet kill` refused a pid in the last hour, with the reason |
+| `refused` | `agent-fleet kill` refused a pid in the last hour, with the reason; a pid already gone (`no such process`) is no finding |
 | `role` | an agent's declared lead is down, the lead's level is not above its own, or a second root coordinator is up |
 | `quota` | a program's quota is exhausted, or a window ≥ 90% used resets in the future |
 | `stalled` | an agent idle or blocked for 15 min after it last worked |
