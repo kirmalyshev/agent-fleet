@@ -61,6 +61,24 @@ pub enum Cmd {
     Url,
     /// Slot, id, ports, env and services as JSON.
     Info,
+    /// Run the repository's `[db]` command with this worktree's env. `reset` and `drop` refuse a
+    /// database name another worktree, or another user, also uses; `drop` then stops this
+    /// worktree's services and frees its slot, as `down --release`.
+    Db {
+        #[arg(value_enum)]
+        action: DbAction,
+    },
+    /// Run `[test.<name>]` with this worktree's env; the args go after its `run`.
+    Test {
+        name: String,
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+    /// The fleet's agents in this repository: worktree, slot, branch and the PR's health
+    /// (checks, mergeable).
+    Agents,
+    /// Your open PRs across the connected repositories, with their health and the agent on each.
+    Prs,
     /// Each worktree: branch, PR, commits not in the default branch, uncommitted files, and what
     /// `clean` would do with it.
     Ls {
@@ -85,6 +103,13 @@ pub enum Cmd {
     },
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum DbAction {
+    Setup,
+    Reset,
+    Drop,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -95,6 +120,28 @@ pub struct Config {
     infra: Option<Infra>,
     #[serde(default)]
     services: BTreeMap<String, Service>,
+    db: Option<Db>,
+    #[serde(default)]
+    test: BTreeMap<String, Test>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Db {
+    /// The database this worktree uses: what `reset` and `drop` check against other worktrees.
+    name: String,
+    setup: Option<String>,
+    reset: Option<String>,
+    drop: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Test {
+    dir: Option<String>,
+    run: String,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,16 +207,17 @@ impl Service {
     }
 }
 
-/// What a template may name: `{slot}`, `{id}`, `{root}`, `{port.<name>}`.
+/// What a template may name: `{slot}`, `{id}`, `{root}`, `{state}`, `{port.<name>}`.
 struct Vars {
     slot: u32,
     id: String,
     root: String,
+    state: String,
     ports: BTreeMap<String, u16>,
 }
 
 impl Vars {
-    fn new(cfg: &Config, slot: u32, id: &str, root: &Path) -> Result<Self> {
+    fn new(cfg: &Config, slot: u32, id: &str, root: &Path, state: &Path) -> Result<Self> {
         let ports = cfg
             .slots
             .ports
@@ -185,6 +233,7 @@ impl Vars {
             slot,
             id: id.to_string(),
             root: root.display().to_string(),
+            state: state.display().to_string(),
             ports,
         })
     }
@@ -202,6 +251,7 @@ fn render(s: &str, v: &Vars) -> Result<String> {
             "slot" => Some(v.slot.to_string()),
             "id" => Some(v.id.clone()),
             "root" => Some(v.root.clone()),
+            "state" => Some(v.state.clone()),
             key => match key.strip_prefix("port.") {
                 Some(name) => Some(
                     v.ports
@@ -246,8 +296,14 @@ pub fn parse(text: &str) -> Result<Config> {
         }
     }
     // Every template must render at every slot: catches a misspelt port and an overflow now.
-    let vars = Vars::new(&cfg, cfg.slots.max, "id", Path::new("/root"))
-        .map_err(|e| anyhow!("{CONFIG}: [slots] {e}"))?;
+    let vars = Vars::new(
+        &cfg,
+        cfg.slots.max,
+        "id",
+        Path::new("/root"),
+        Path::new("/state"),
+    )
+    .map_err(|e| anyhow!("{CONFIG}: [slots] {e}"))?;
     for (k, t) in &cfg.env {
         render(t, &vars).map_err(|e| anyhow!("{CONFIG}: env.{k}: {e}"))?;
     }
@@ -261,6 +317,26 @@ pub fn parse(text: &str) -> Result<Config> {
     for (name, s) in &cfg.services {
         for (k, t) in s.templates() {
             render(t, &vars).map_err(|e| anyhow!("{CONFIG}: services.{name}.{k}: {e}"))?;
+        }
+    }
+    if let Some(d) = &cfg.db {
+        let all = [
+            ("name", Some(&d.name)),
+            ("setup", d.setup.as_ref()),
+            ("reset", d.reset.as_ref()),
+            ("drop", d.drop.as_ref()),
+        ];
+        for (k, t) in all.into_iter().filter_map(|(k, t)| Some((k, t?))) {
+            render(t, &vars).map_err(|e| anyhow!("{CONFIG}: db.{k}: {e}"))?;
+        }
+    }
+    for (name, t) in &cfg.test {
+        let all = [("run", Some(&t.run)), ("dir", t.dir.as_ref())]
+            .into_iter()
+            .filter_map(|(k, t)| Some((k, t?)))
+            .chain(t.env.values().map(|t| ("env", t)));
+        for (k, t) in all {
+            render(t, &vars).map_err(|e| anyhow!("{CONFIG}: test.{name}.{k}: {e}"))?;
         }
     }
     Ok(cfg)
@@ -365,10 +441,32 @@ fn others(shared: &Path) -> BTreeSet<u32> {
         .filter(|e| {
             let n = e.file_name();
             let n = n.to_string_lossy();
-            n.ends_with(".json") && n != mine
+            n.ends_with(".json") && !n.ends_with(DBS) && n != mine
         })
         .filter_map(|e| serde_json::from_slice::<Vec<u32>>(&fs::read(e.path()).ok()?).ok())
         .flatten()
+        .collect()
+}
+
+/// The suffix of the files each user publishes their database names to, next to their slots.
+const DBS: &str = ".dbs.json";
+
+/// The users other than you who published `name` as a database they use, as `uid <n>`.
+fn others_using(shared: &Path, name: &str) -> Vec<String> {
+    let mine = format!("{}{DBS}", uid());
+    fs::read_dir(shared)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            let user = n.strip_suffix(DBS).filter(|_| n != mine)?.to_string();
+            let names: Vec<String> = serde_json::from_slice(&fs::read(e.path()).ok()?).ok()?;
+            names
+                .iter()
+                .any(|x| x == name)
+                .then(|| format!("uid {user}"))
+        })
         .collect()
 }
 
@@ -398,15 +496,61 @@ impl Registry<'_> {
         Ok(slot)
     }
 
+    /// Frees `root`'s slot and forgets its database.
     fn release(&self, root: &str) -> Result<()> {
         let _l = lock(&self.dir.join("slots.lock"))?;
         let mut reg: BTreeMap<String, u32> = read_json(&self.dir.join("slots.json"))?;
-        if reg.remove(root).is_some() {
+        let mut dbs: BTreeMap<String, String> = read_json(&self.dir.join("dbs.json"))?;
+        let slot = reg.remove(root).is_some();
+        let db = dbs.remove(root).is_some();
+        if slot || db {
             shared_dir(self.shared)?;
             let _m = lock(&self.shared.join(".lock"))?;
-            self.save(&reg)?;
+            if slot {
+                self.save(&reg)?;
+            }
+            if db {
+                self.save_dbs(&dbs)?;
+            }
         }
         Ok(())
+    }
+
+    /// Records that `root` uses the database `name`, and publishes it for the other users.
+    fn use_db(&self, root: &str, name: &str) -> Result<()> {
+        let _l = lock(&self.dir.join("slots.lock"))?;
+        let mut dbs: BTreeMap<String, String> = read_json(&self.dir.join("dbs.json"))?;
+        if dbs.get(root).is_some_and(|n| n == name) {
+            return Ok(());
+        }
+        dbs.insert(root.to_string(), name.to_string());
+        shared_dir(self.shared)?;
+        let _m = lock(&self.shared.join(".lock"))?;
+        self.save_dbs(&dbs)
+    }
+
+    /// Who else uses the database `name`: your other worktrees that still exist, and other
+    /// users.
+    fn db_users(&self, root: &str, name: &str) -> Result<Vec<String>> {
+        let dbs: BTreeMap<String, String> = read_json(&self.dir.join("dbs.json"))?;
+        let mut out: Vec<String> = dbs
+            .into_iter()
+            .filter(|(r, n)| r != root && n == name && Path::new(r).exists())
+            .map(|(r, _)| r)
+            .collect();
+        out.extend(others_using(self.shared, name));
+        Ok(out)
+    }
+
+    /// The caller holds both locks. Worktrees that are gone are not published.
+    fn save_dbs(&self, dbs: &BTreeMap<String, String>) -> Result<()> {
+        write_json(&self.dir.join("dbs.json"), dbs)?;
+        let mine: BTreeSet<&String> = dbs
+            .iter()
+            .filter(|(r, _)| Path::new(r).exists())
+            .map(|(_, n)| n)
+            .collect();
+        write_json(&self.shared.join(format!("{}{DBS}", uid())), &mine)
     }
 
     fn save(&self, reg: &BTreeMap<String, u32>) -> Result<()> {
@@ -567,9 +711,12 @@ impl Worktree {
         } else {
             reg.claim(&root.display().to_string(), cfg.slots.max)?
         };
-        let vars = Vars::new(&cfg, slot, &id, &root)?;
         let state = reg.dir.join(format!("{slot}-{id}"));
         fs::create_dir_all(&state)?;
+        let vars = Vars::new(&cfg, slot, &id, &root, &state)?;
+        if let Some(db) = &cfg.db {
+            reg.use_db(&root.display().to_string(), &render(&db.name, &vars)?)?;
+        }
         Ok(Self {
             root,
             main,
@@ -599,13 +746,25 @@ impl Worktree {
 
     /// [env], then the service's own env on top.
     fn env(&self, service: Option<&str>) -> Result<BTreeMap<String, String>> {
-        let own = service.map(|s| &self.cfg.services[s].env);
+        self.env_with(service.map(|s| &self.cfg.services[s].env))
+    }
+
+    /// [env], then `own` on top.
+    fn env_with(&self, own: Option<&BTreeMap<String, String>>) -> Result<BTreeMap<String, String>> {
         self.cfg
             .env
             .iter()
             .chain(own.into_iter().flatten())
             .map(|(k, t)| Ok((k.clone(), render(t, &self.vars)?)))
             .collect()
+    }
+
+    /// `dir` rendered against the root; the root itself when it is not set.
+    fn dir(&self, dir: Option<&String>) -> Result<PathBuf> {
+        Ok(match dir {
+            Some(d) => self.root.join(render(d, &self.vars)?),
+            None => self.root.clone(),
+        })
     }
 
     fn url(&self, name: &str) -> Option<String> {
@@ -624,10 +783,7 @@ impl Worktree {
     }
 
     fn dir_of(&self, name: &str) -> Result<PathBuf> {
-        Ok(match &self.cfg.services[name].dir {
-            Some(d) => self.root.join(render(d, &self.vars)?),
-            None => self.root.clone(),
-        })
+        self.dir(self.cfg.services[name].dir.as_ref())
     }
 
     async fn infra(&self) -> Result<()> {
@@ -775,6 +931,72 @@ impl Worktree {
         Ok(())
     }
 
+    /// `down --release`: stop every service, delete the state and logs, free the slot.
+    fn release(&self, reg: &Registry) -> Result<()> {
+        let _l = lock(&self.state.join("lock"))?;
+        let mut rec = self.recorded()?;
+        self.stop_all(&mut rec, None);
+        fs::remove_dir_all(&self.state)?;
+        reg.release(&self.root.display().to_string())?;
+        println!("released slot {}", self.slot);
+        Ok(())
+    }
+
+    /// Runs a `[db]` command; `reset` and `drop` first check nobody else uses the database.
+    fn db(&self, reg: &Registry, action: DbAction) -> Result<()> {
+        let db = self
+            .cfg
+            .db
+            .as_ref()
+            .ok_or_else(|| anyhow!("{CONFIG} has no [db]"))?;
+        let (key, cmd) = match action {
+            DbAction::Setup => ("setup", &db.setup),
+            DbAction::Reset => ("reset", &db.reset),
+            DbAction::Drop => ("drop", &db.drop),
+        };
+        let cmd = cmd
+            .as_ref()
+            .ok_or_else(|| anyhow!("{CONFIG} has no [db] {key}"))?;
+        let name = render(&db.name, &self.vars)?;
+        if !matches!(action, DbAction::Setup) {
+            let users = reg.db_users(&self.root.display().to_string(), &name)?;
+            if !users.is_empty() {
+                bail!(
+                    "refusing to {key} database {name}: also used by {}",
+                    users.join(", ")
+                );
+            }
+        }
+        let cmd = render(cmd, &self.vars)?;
+        println!("db {key}: {cmd}");
+        let st = sh(&cmd, &self.root, &self.env(None)?).status()?;
+        if !st.success() {
+            bail!("db {key}: `{cmd}` failed ({st})");
+        }
+        if matches!(action, DbAction::Drop) {
+            self.release(reg)?;
+        }
+        Ok(())
+    }
+
+    /// Replaces this process with `[test.<name>]`'s `run`, `args` appended.
+    fn test(&self, name: &str, args: &[String]) -> Result<()> {
+        let Some(t) = self.cfg.test.get(name) else {
+            let known: Vec<&str> = self.cfg.test.keys().map(String::as_str).collect();
+            bail!("no [test.{name}] in {CONFIG}; it has: {}", known.join(", "));
+        };
+        let run = render(&t.run, &self.vars)?;
+        let err = sh(
+            &format!("{run} \"$@\""),
+            &self.dir(t.dir.as_ref())?,
+            &self.env_with(Some(&t.env))?,
+        )
+        .arg("sh")
+        .args(args)
+        .exec();
+        bail!("run sh: {err}")
+    }
+
     fn print_urls(&self) {
         println!("slot {} ({})", self.slot, self.id);
         for name in self.cfg.services.keys() {
@@ -785,11 +1007,22 @@ impl Worktree {
     }
 }
 
-pub async fn run(cmd: &Cmd) -> Result<()> {
+/// `<data dir>/dev`: the slots and each worktree's state.
+fn data_dir() -> Result<PathBuf> {
     let dir = client::Paths::from_env(client::DEFAULT_INSTANCE)?
         .dir
         .join("dev");
     fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Worktree path → slot, for every linked worktree that holds one.
+pub fn slots() -> Result<BTreeMap<String, u32>> {
+    read_json(&data_dir()?.join("slots.json"))
+}
+
+pub async fn run(cmd: &Cmd) -> Result<()> {
+    let dir = data_dir()?;
     let shared = std::env::var_os("AGENT_FLEET_DEV_SHARED").map_or(SHARED.into(), PathBuf::from);
     let reg = Registry {
         dir: &dir,
@@ -797,7 +1030,11 @@ pub async fn run(cmd: &Cmd) -> Result<()> {
     };
     let w = Worktree::open(&reg)?;
     match cmd {
-        Cmd::Ls { .. } | Cmd::Clean { .. } => unreachable!("main runs ls and clean"),
+        Cmd::Ls { .. } | Cmd::Clean { .. } | Cmd::Agents | Cmd::Prs => {
+            unreachable!("main runs ls, clean, agents and prs")
+        }
+        Cmd::Db { action } => w.db(&reg, *action)?,
+        Cmd::Test { name, args } => w.test(name, args)?,
         Cmd::Up { services } => {
             let names = pick(services, &w.cfg)?;
             w.infra().await?;
@@ -806,18 +1043,12 @@ pub async fn run(cmd: &Cmd) -> Result<()> {
             w.start_each(&names, &mut rec).await?;
             w.print_urls();
         }
-        Cmd::Down { release } => {
+        Cmd::Down { release: true } => w.release(&reg)?,
+        Cmd::Down { release: false } => {
             let _l = lock(&w.state.join("lock"))?;
             let mut rec = w.recorded()?;
             w.stop_all(&mut rec, None);
             w.save(&rec)?;
-            if *release {
-                fs::remove_dir_all(&w.state)?;
-                if !w.main {
-                    reg.release(&w.root.display().to_string())?;
-                }
-                println!("released slot {}", w.slot);
-            }
         }
         Cmd::Restart { services } => {
             let asked = pick(services, &w.cfg)?;
@@ -952,7 +1183,7 @@ env = { PORT = "{port.web}", API = "{port.api}" }
              env = { PORT = \"{port.api}\" }\n",
         )
         .unwrap();
-        let v = Vars::new(&m, 2, "x", Path::new("/r")).unwrap();
+        let v = Vars::new(&m, 2, "x", Path::new("/r"), Path::new("/s")).unwrap();
         assert_eq!(
             render(&m.services["api"].run, &v).unwrap(),
             "serve --port ${PORT}"
@@ -981,10 +1212,14 @@ env = { PORT = "{port.web}", API = "{port.api}" }
     #[test]
     fn templates_fill_known_names_and_leave_shell_braces() {
         let c = parse(SAMPLE).unwrap();
-        let v = Vars::new(&c, 3, "c_99", Path::new("/w/c-99")).unwrap();
+        let v = Vars::new(&c, 3, "c_99", Path::new("/w/c-99"), Path::new("/d/3-c_99")).unwrap();
         assert_eq!(
-            render("{root} {id} {slot} {port.api} {port.web} ${HOME} {x", &v).unwrap(),
-            "/w/c-99 c_99 3 9020 9021 ${HOME} {x"
+            render(
+                "{root} {id} {slot} {state} {port.api} {port.web} ${HOME} {x",
+                &v
+            )
+            .unwrap(),
+            "/w/c-99 c_99 3 /d/3-c_99 9020 9021 ${HOME} {x"
         );
         assert!(render("{port.apx}", &v).is_err());
         assert_eq!(
@@ -1099,6 +1334,12 @@ env = { PORT = "{port.web}", API = "{port.api}" }
         ));
         // Nobody is in the group.
         assert!(!ours(&run, &procs(vec![(500, p(7, 10))])));
+    }
+
+    #[test]
+    fn this_repositorys_own_file_parses() {
+        let c = parse(include_str!("../.agent-fleet/dev.toml")).unwrap();
+        assert_eq!(c.services.keys().collect::<Vec<_>>(), ["host", "hub"]);
     }
 
     #[test]

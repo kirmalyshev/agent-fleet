@@ -1,0 +1,26 @@
+# A throwaway fleet per worktree: `./dev up hub` starts a hub on this worktree's own port with its
+# data in the slot's state, never the fleet you run; `./dev down --release` deletes it.
+# `set -a; eval "$(./dev env)"; set +a` points the agent-fleet CLI in your
+# shell at it. Name services bare: `--hub` and `--host` are global flags. docs/DEV.md has the format.
+
+[slots]
+ports = { hub = 17710 }
+
+[env]
+AGENT_FLEET_HUB = "http://127.0.0.1:{port.hub}"
+AGENT_FLEET_TOKEN_FILE = "{state}/fleet/token"
+# Spool and replica away from your real fleet's, so a write never replays into it.
+AGENT_FLEET_INSTANCE = "dev-{id}"
+
+[services.hub]
+before = "cargo build -q"
+run = "exec {root}/target/debug/agent-fleet hub --listen 127.0.0.1:{port.hub}"
+env = { AGENT_FLEET_HOME = "{state}/fleet" }
+health = "http://127.0.0.1:{port.hub}/"
+url = "http://127.0.0.1:{port.hub}"
+
+# Optional; run it from a herdr pane (HERDR_SOCKET_PATH, HERDR_SESSION): `./dev up hub host`.
+[services.host]
+before = "cargo build -q"
+run = "exec {root}/target/debug/agent-fleet host --repo kirmalyshev/agent-fleet={root}"
+env = { AGENT_FLEET_HOME = "{state}/fleet" }

@@ -125,6 +125,10 @@ agent-fleet dev up --api --web   # infra, then the services; waits for health, p
 agent-fleet dev status           # running, healthy, env changed since start
 agent-fleet dev logs api
 agent-fleet dev down             # this worktree's services only; --release frees the slot
+agent-fleet dev db reset         # the repo's [db] command; refuses a database another worktree uses
+agent-fleet dev test unit -x     # the repo's [test.unit] with this worktree's env
+agent-fleet dev agents           # the fleet's agents here: worktree, slot, PR and its health
+agent-fleet dev prs              # your open PRs everywhere, their health and the agent on each
 ```
 
 The file format, the commands and how slots are shared are in [docs/DEV.md](docs/DEV.md).
@@ -380,7 +384,7 @@ From `agent-fleet --help`; every command has its own `--help`.
 | `instances` | The agent-fleet instances on this machine and the hub each one uses |
 | `init` | Write this machine's fleet.toml and brief.md into the user config dir (`AGENT_FLEET_CONFIG_DIR` overrides it): commented templates with a profile for each agent program on PATH and one default rule. Never overwrites an existing file. Lists the user-level Claude and Codex skills that drive terminals (herdr, tmux, cmux) |
 | `repo` | Connect a repository to the fleet on this machine: `add` records its checkout in the machine's fleet.toml, `ls` lists, `rm` disconnects. The host picks changes up without a restart |
-| `dev` | Per-worktree dev environments from the repository's `.agent-fleet/dev.toml` (`up`, `down`, `status` …: each worktree gets a slot with its own ports and values, runs its own services, and shares the infra), and the worktrees of the connected repositories (`ls`, `clean`) |
+| `dev` | Per-worktree dev environments from the repository's `.agent-fleet/dev.toml` (`up`, `down`, `status` …: each worktree gets a slot with its own ports and values, runs its own services, and shares the infra; `db`, `test`), the worktrees of the connected repositories (`ls`, `clean`), and the agents and PRs on them (`agents`, `prs`) |
 | `tui` | The fleet on one screen, live: agents, worktrees, tasks, findings, resources, asks; `:` runs any command from it |
 | `task` | Tasks: `add` claims (exclusive), `done` finishes, `rm` cancels or releases |
 | `dep` | Dependencies between tasks: <task> is blocked by <on> |
