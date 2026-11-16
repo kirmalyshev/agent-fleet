@@ -16,6 +16,7 @@ mod store;
 mod stuck;
 mod tui;
 mod ui;
+mod update;
 mod watch;
 
 use std::net::SocketAddr;
@@ -105,6 +106,9 @@ enum Cmd {
     },
     /// What every agent is doing.
     Ps,
+    /// Every host that is up pulls `main` in the clone its binary was built from, rebuilds and
+    /// restarts; prints the commit each one then runs. A dirty clone or one not on `main` refuses.
+    SelfUpdate,
     /// The agent-fleet instances on this machine and the hub each one uses.
     Instances,
     /// The fleet on one screen, live: agents, worktrees, tasks, findings, and the actions on them.
@@ -823,6 +827,23 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Ps => print!("{}", ui::ps(&ctx.state().await?, now)),
+        Cmd::SelfUpdate => {
+            let me = ctx.me().await?;
+            let s = ctx.client()?.state().await?;
+            // Up = a `host.health` in the last 3 minutes; they report every minute.
+            let hosts: Vec<String> = s
+                .hosts
+                .iter()
+                .filter(|(_, h)| now - h.ts < chrono::Duration::minutes(3))
+                .map(|(name, _)| name.clone())
+                .collect();
+            if hosts.is_empty() {
+                bail!("no host has reported in the last 3 minutes");
+            }
+            let body = Known::UpdateRequested(UpdateRequested {});
+            let id = ctx.write(Envelope::new(me, &ctx.cli.project, body)).await?;
+            update::wait(&ctx.client()?, &id, &hosts).await?;
+        }
         Cmd::Stats { since, json } => {
             let v = ctx.client()?.stats(*since).await?;
             if *json {
@@ -1066,8 +1087,9 @@ async fn main() -> Result<()> {
                         .is_some_and(|t| t <= *since)
                 })
             };
-            // The caller's worktree is the one the fleet assigned at spawn (`spawn.result`), never
-            // its pane's live cwd, which follows a `cd`; no record fails closed.
+            // The caller's worktree is the one the fleet assigned at spawn (`spawn.result`), or, for
+            // a hand-started agent, where its host first saw it; never its pane's live cwd, which
+            // follows a `cd`. No record fails closed.
             let homes = match (&state, ctx.me().await) {
                 (Some(s), Ok(a)) => {
                     let trees: Vec<_> = s

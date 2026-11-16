@@ -28,6 +28,7 @@ fn health(n: usize) -> Envelope<Known> {
             disk_total: 1,
             agents: 0,
             stats: None,
+            commit: None,
         }),
     )
 }
