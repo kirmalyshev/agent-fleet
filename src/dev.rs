@@ -13,12 +13,14 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, Utc};
 use rustix::fs::{FlockOperation, flock};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::client::{self, Held};
+use crate::scan::Procs;
 
 pub const CONFIG: &str = ".agent-fleet/dev.toml";
 /// Where each Unix user publishes the slots they hold, so users on one machine share ports.
@@ -405,13 +407,28 @@ struct Recorded {
 struct Run {
     /// The process group, led by the service's shell.
     pid: i32,
+    /// When the leader started: tells this group from a later one that reuses its id.
+    #[serde(default)]
+    started: Option<DateTime<Utc>>,
     env: BTreeMap<String, String>,
 }
 
-// ponytail: a pid reused as a group leader after a reboot would look alive; record a start time
-// if that ever bites.
 fn alive(pgid: i32) -> bool {
     pgid > 1 && unsafe { libc::kill(-pgid, 0) } == 0
+}
+
+/// The group is still the one the service started: its leader runs with the recorded start
+/// time, or, the leader gone, every member started after it. Anything else is a reused id.
+fn ours(r: &Run, procs: &Procs) -> bool {
+    let Some(started) = r.started else {
+        return alive(r.pid);
+    };
+    let pgid = r.pid as u32;
+    if let Some(leader) = procs.0.get(&pgid) {
+        return leader.pgid == Some(pgid) && leader.started == Some(started);
+    }
+    let mut members = procs.0.values().filter(|p| p.pgid == Some(pgid)).peekable();
+    members.peek().is_some() && members.all(|p| p.started.is_some_and(|s| s >= started))
 }
 
 /// TERM to the whole group, then KILL after the grace.
@@ -542,8 +559,12 @@ impl Worktree {
         })
     }
 
+    /// The state, with every service whose group is gone or no longer ours dropped.
     fn recorded(&self) -> Result<Recorded> {
-        read_json(&self.state.join("state.json"))
+        let mut rec: Recorded = read_json(&self.state.join("state.json"))?;
+        let procs = Procs::read();
+        rec.running.retain(|_, r| ours(r, &procs));
+        Ok(rec)
     }
 
     fn save(&self, rec: &Recorded) -> Result<()> {
@@ -637,7 +658,7 @@ impl Worktree {
         let held: BTreeSet<u16> = rec
             .running
             .iter()
-            .filter(|(n, r)| *n != name && alive(r.pid) && self.cfg.services.contains_key(*n))
+            .filter(|(n, _)| *n != name && self.cfg.services.contains_key(*n))
             .flat_map(|(n, _)| self.ports_of(n))
             .collect();
         for port in self.ports_of(name).difference(&held) {
@@ -672,6 +693,7 @@ impl Worktree {
             name.to_string(),
             Run {
                 pid,
+                started: Procs::read().0.get(&(pid as u32)).and_then(|p| p.started),
                 env: env.clone(),
             },
         );
@@ -712,17 +734,15 @@ impl Worktree {
             .collect();
         for n in names {
             let r = rec.running.remove(&n).expect("listed");
-            if alive(r.pid) {
-                stop(r.pid);
-                println!("{n}: stopped");
-            }
+            stop(r.pid);
+            println!("{n}: stopped");
         }
     }
 
     async fn start_each(&self, names: &[String], rec: &mut Recorded) -> Result<()> {
         for name in names {
             rec.set.insert(name.clone());
-            if rec.running.get(name).is_some_and(|r| alive(r.pid)) {
+            if rec.running.contains_key(name) {
                 println!("{name}: already running");
                 continue;
             }
@@ -791,7 +811,7 @@ pub async fn run(cmd: &Cmd) -> Result<()> {
             let rec = w.recorded()?;
             println!("slot {} ({}) {}", w.slot, w.id, w.root.display());
             for (name, s) in &w.cfg.services {
-                let run = rec.running.get(name).filter(|r| alive(r.pid));
+                let run = rec.running.get(name);
                 let mut line = match run {
                     Some(r) => format!("{name:<12} running (pid {})", r.pid),
                     None => format!("{name:<12} stopped"),
@@ -844,7 +864,7 @@ pub async fn run(cmd: &Cmd) -> Result<()> {
                 .services
                 .keys()
                 .map(|n| {
-                    let pid = rec.running.get(n).map(|r| r.pid).filter(|p| alive(*p));
+                    let pid = rec.running.get(n).map(|r| r.pid);
                     (
                         n,
                         json!({ "running": pid.is_some(), "pid": pid, "url": w.url(n),
@@ -866,6 +886,7 @@ pub async fn run(cmd: &Cmd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scan::Proc;
 
     const SAMPLE: &str = r#"
 [slots]
@@ -1005,6 +1026,44 @@ env = { PORT = "{port.web}", API = "{port.api}" }
         assert!(shared_dir(&p).is_err());
         fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
         shared_dir(&p).unwrap();
+    }
+
+    #[test]
+    fn only_the_group_the_service_started_is_ours() {
+        let t = |s: i64| DateTime::from_timestamp(1_000_000 + s, 0);
+        let p = |pgid: u32, started: i64| Proc {
+            ppid: 1,
+            cpu_ms: 0,
+            rss_kb: 0,
+            name: "sh".into(),
+            cwd: None,
+            deleted: false,
+            args: None,
+            started: t(started),
+            pgid: Some(pgid),
+        };
+        let run = Run {
+            pid: 500,
+            started: t(10),
+            env: BTreeMap::new(),
+        };
+        let procs = |v: Vec<(u32, Proc)>| Procs(v.into_iter().collect());
+        // The leader runs with the recorded start time.
+        assert!(ours(&run, &procs(vec![(500, p(500, 10))])));
+        // A new leader reuses the id.
+        assert!(!ours(&run, &procs(vec![(500, p(500, 99))])));
+        // The leader is gone; its children still run.
+        assert!(ours(
+            &run,
+            &procs(vec![(501, p(500, 11)), (502, p(500, 10))])
+        ));
+        // The leader is gone, and a member of the group is older than it: another group.
+        assert!(!ours(
+            &run,
+            &procs(vec![(501, p(500, 11)), (400, p(500, 5))])
+        ));
+        // Nobody is in the group.
+        assert!(!ours(&run, &procs(vec![(500, p(7, 10))])));
     }
 
     #[test]

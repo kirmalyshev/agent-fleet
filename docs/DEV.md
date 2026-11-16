@@ -13,7 +13,7 @@ Run them anywhere inside the worktree.
 | Command | What |
 |---|---|
 | `dev up [--<service>…] [--all]` | Start the infra, then the named services (`api` works as well as `--api`). Bare `up` starts the infra only. Refuses a port that something else listens on. Waits for each service's health; on failure prints the last 20 log lines, stops the service and exits non-zero. Prints the URLs. |
-| `dev down [--release]` | Stop this worktree's services: TERM to the process group, KILL after 10 s. Never stops the infra. `--release` also frees the slot and deletes the worktree's state and logs. |
+| `dev down [--release]` | Stop this worktree's services: TERM to the process group, KILL after 10 s. A group counts as the service's only while its leader runs with the recorded start time, or, the leader gone, every member started after it; a reused group id is never signalled. Never stops the infra. `--release` also frees the slot and deletes the worktree's state and logs. |
 | `dev restart [--<service>…]` | Bare: stop and start the recorded set, every service `up` started in this worktree (it survives a crash and `down`). With names: only those. |
 | `dev status` | Each service: running or stopped, healthy or not, and `env changed since start` when its rendered env differs from the one it started with. |
 | `dev logs [service]` | `tail -F` one service's log, or all of them. |
@@ -84,7 +84,7 @@ running service of the same worktree also names.
   missing. For several users, create it once as root: `sudo install -d -m 1777
   /var/tmp/agent-fleet-dev`. `AGENT_FLEET_DEV_SHARED` names another directory.
 - A worktree's state is in `<data dir>/dev/<slot>-<id>/`: `state.json` (the recorded set, and
-  each running service's process group and env) and `<service>.log`. Nothing is written inside
+  each running service's process group, its leader's start time and env) and `<service>.log`. Nothing is written inside
   the worktree.
 
 `<data dir>` is `AGENT_FLEET_HOME`, else the default instance's data directory.
