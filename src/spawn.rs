@@ -1256,6 +1256,7 @@ fn tail(s: &str) -> String {
 
 /// Executes one `spawn.requested` and answers it with `spawn.result`.
 pub async fn execute(host: &Host, id: &str, sp: &Spawn, state: &State) {
+    let _busy = host.busy_guard();
     let r = &sp.request;
     let mut made = Made::default();
     match run_spawn(host, r, &mut made, state).await {
@@ -1458,6 +1459,7 @@ async fn handoffs(
     done: &mut HashSet<String>,
     warned: &mut HashSet<String>,
 ) {
+    let _busy = host.busy_guard();
     let prefix = agent_prefix(&host.cfg.host, &host.cfg.session);
     // A failed replacement frees the agent: dedupe counts only pending or successful ones.
     done.retain(|id| replacement_open(state, id));

@@ -661,14 +661,30 @@ These are v2.
 `agent-fleet host --self-update <checkout> --restart "<cmd>"…` keeps the installed binary at
 `origin/main`. Every 5 minutes the host fetches `origin/main` and compares it with the commit the
 running binary was built from (embedded at build time; `agent-fleet --version` shows its short
-form). A build from a modified tree, or with no git, is never current. If they differ and the checkout is clean, on `main` and can
-fast-forward, it pulls, runs `cargo build --release --locked`, copies the binary next to the
-installed one, checks the copy reports the target commit, and renames it over the installed one.
-Run `--self-update` on one host process per machine. A rename keeps the old binary whole until the new one is; overwriting in place kills the running
-process on macOS (`OS_REASON_CODESIGNING`). Then it runs each `--restart` command in order
-(`launchctl kickstart -k gui/<uid>/<label>`, `systemctl --user restart <unit>`; the operator
-lists this host's own service last, so the hub and other services restart first). If the new
-binary is already installed and the process still runs the old one, the restart commands do not
-run again for that commit; a failing restart is a `failed` record. A dirty, off-`main` or diverged
-checkout, or a failed fetch, build or swap, leaves the old binary and is reported as
-`host.update`, which `doctor` shows as `outdated` after 15 minutes.
+form). A build from a modified tree, or with no git, is never current. If they differ and the
+checkout is clean, on `main` and can fast-forward, it pulls, runs `cargo build --release --locked`,
+copies the binary next to the installed one, checks the copy reports the target commit, hard-links
+the old binary to `<name>.prev`, and renames the copy over the installed one. A rename keeps the
+old binary whole until the new one is; overwriting in place kills the running process on macOS
+(`OS_REASON_CODESIGNING`). To roll back, rename `<name>.prev` over the installed binary and
+restart.
+
+- **One at a time.** A non-blocking `flock` in the checkout's git dir covers check and restart;
+  a host that finds it held skips the tick. Two hosts of one machine never race on `git merge`
+  or both restart.
+- **Time limits.** Fetch 2 min, other git 1 min, build 30 min, `--version` 10 s, each restart
+  command 1 min; the process group is killed and the tick reports `failed`. git never prompts
+  (`GIT_TERMINAL_PROMPT=0`, ssh `BatchMode`).
+- **A failed build is not repeated.** While `host.update` says `failed` for the current
+  `origin/main`, the host does not build it again; it tries again when `origin/main` moves.
+- **Restart.** Each `--restart` command runs in the order given (`launchctl kickstart -k
+  gui/<uid>/<label>`, `systemctl --user restart <unit>`): list this host's own service last,
+  after the hub and other services. They run once per target, and not while a spawn or handoff is
+  in flight (the next tick tries again): a restart there would cut it short. If the new binary is
+  already installed and the process still runs the old one, the restart commands do not run again
+  for that commit; a failing restart is a `failed` record.
+- **Leftovers.** At start the host removes `.agent-fleet.new.<pid>` files older than 10 minutes
+  next to the binary.
+
+A dirty, off-`main` or diverged checkout, or a failed fetch, build, swap or restart, leaves the
+old binary and is reported as `host.update`, which `doctor` shows as `outdated` after 15 minutes.
