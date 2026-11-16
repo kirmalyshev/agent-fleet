@@ -644,7 +644,7 @@ pub struct ProcessOrphaned {
     /// Where it runs, when the platform reports one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// The proof: `"device gone"` or `"<resource> lock owner dead"`.
+    /// The proof: `"group leader dead"`, `"device gone"`, or `"<resource> lock owner dead"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
     /// When the proof first held.

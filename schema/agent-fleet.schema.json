@@ -719,7 +719,7 @@
               ]
             },
             "why": {
-              "description": "The proof: `\"device gone\"` or `\"<resource> lock owner dead\"`.",
+              "description": "The proof: `\"group leader dead\"`, `\"device gone\"`, or `\"<resource> lock owner dead\"`.",
               "type": [
                 "string",
                 "null"

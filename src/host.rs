@@ -855,30 +855,34 @@ impl Host {
                 .await;
             }
         }
-        // Orphans only this host can prove: a reparented device/test tool whose device is
-        // gone, or a lock's recorded holder still alive under init after its owner died.
-        let mut proved: Vec<(u32, Option<String>, String)> = Vec::new();
-        if procs.0.values().any(scan::may_be_stray)
-            && let Some(live) = live_devices().await
-        {
-            for (&pid, p) in &procs.0 {
-                if let Some(why) = scan::stray(p, &live, chrono::Utc::now()) {
-                    proved.push((pid, p.cwd.clone(), why.to_string()));
-                }
+        // Orphans only this host can prove: a reparented device/test tool whose group
+        // leader is dead (or, the older proof, whose device is gone), a lock's recorded
+        // holder alive under init after its owner died, and every member of the dead
+        // owner's group. A dead leader needs no device list, so a toolchain that cannot
+        // answer narrows the proofs, never blocks them.
+        let mut proved: HashMap<u32, String> = HashMap::new();
+        let live = if procs.0.values().any(scan::may_be_stray) {
+            live_devices().await
+        } else {
+            None
+        };
+        for &pid in procs.0.keys() {
+            if let Some(why) = scan::stray(&procs, pid, live.as_ref(), chrono::Utc::now()) {
+                proved.insert(pid, why.to_string());
             }
         }
         for (name, dir) in &self.cfg.locks {
-            if let Some(pid) = scan::lock_orphan(dir, &procs) {
-                proved.push((
-                    pid,
-                    procs.0[&pid].cwd.clone(),
-                    format!("{name} lock owner dead"),
-                ));
+            for pid in scan::lock_orphan(dir, &procs) {
+                proved
+                    .entry(pid)
+                    .or_insert_with(|| format!("{name} lock owner dead"));
             }
         }
+        scan::descendants(&procs, &mut proved);
         let now = chrono::Utc::now();
         let mut seen_strays = HashSet::new();
-        for (pid, cwd, why) in proved {
+        for (pid, why) in proved {
+            let cwd = procs.0.get(&pid).and_then(|p| p.cwd.clone());
             seen_strays.insert(pid);
             let key = format!("{}:{pid}", self.cfg.host);
             let known = state.orphans.get(&key);

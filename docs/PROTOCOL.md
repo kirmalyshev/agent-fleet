@@ -476,15 +476,21 @@ daemon` or `claude daemon`, and everything under such a process; the
 process's directory is known on Linux only), re-sent without `program` once the process is gone;
 `agent-fleet doctor` shows them as `unmanaged` findings.
 
-The same scan proves two kinds of orphan and reports them as `proc.orphaned` (`why` says which
-proof held; no `why` clears it). A process reparented to init that is a device or test tool —
+The same scan proves orphans and reports them as `proc.orphaned` (`why` says which proof
+held; no `why` clears it). A process reparented to init that is a device or test tool —
 `xcodebuild`, `maestro`, `simctl`, `idb`, `xctest`, a `WebDriverAgentRunner`, or `log stream` —
-older than two hours and aiming at a UDID that is neither connected (`devicectl list devices`)
-nor booted (`simctl list devices booted`) can do no more work; a tool that names no device is
-never proved. And a lock's recorded holder still alive under init while its `owner` file names a
-dead process is an orphan whatever program it runs — the tool list does not apply. The device
-list is only read when a reparented tool exists to check, and when the toolchain cannot answer
-nothing is proved. Doctor shows them as `orphan` findings and `agent-fleet kill` accepts them.
+whose process-group leader is dead (the group id names no live process) is an orphan once it
+is two minutes old — the floor only spares a script mid-`exec`; its descendants are orphans
+with it. When the leader is alive the older proof remains: two hours and a UDID that is
+neither connected (`devicectl list devices`) nor booted (`simctl list devices booted`); a tool
+that names no device, or a list the toolchain cannot produce, proves nothing that way. And a
+lock's recorded holder still alive under init while its `owner` file names a dead process is
+an orphan whatever program it runs — the tool list does not apply — and so is every member of
+the lock's recorded `pgid` group whose ancestry reaches init or a proved pid: an owner that
+exits normally releases the lock first, so a member of its group under a still-held lock is
+an orphan by definition, with no age or device check. The device list is only read when a
+reparented tool exists to check. Doctor shows them as `orphan` findings and `agent-fleet
+kill` accepts them.
 
 ## Spawning
 
