@@ -227,6 +227,13 @@ impl Tick<'_> {
             || self.kids(pid).iter().any(|&c| self.fresh(c))
     }
 
+    /// Mark `pid`'s subtree walked without classifying it.
+    fn skip(&mut self, pid: u32) {
+        for p in self.now.tree(pid) {
+            self.visited.insert((p, self.now.0[&p].started));
+        }
+    }
+
     fn deepest(&self, pid: u32) -> Option<(usize, u32)> {
         self.kids(pid)
             .iter()
@@ -249,6 +256,7 @@ impl Tick<'_> {
             })
         };
         if let Some((on, since)) = self.seen.waiting.get(&pid) {
+            self.skip(pid);
             if old {
                 let verdict = Verdict::Waiting {
                     on: on.clone(),
@@ -258,19 +266,17 @@ impl Tick<'_> {
             }
             return true;
         }
-        // ponytail: "mcp" in the program or its first words marks an MCP server started through
-        // a shell (`npx -y some-mcp`); a task named so is skipped too. Skipped, not busy: its
-        // parent can still be hung. A listener is a server it keeps, and keeps its parent busy.
+        // ponytail: "mcp" in a non-flag argv word marks an MCP server started through a shell
+        // (`npx -y some-mcp`, `docker run … github-mcp-server`); a task naming mcp is skipped
+        // too. Skipped, not busy: its parent can still be hung. A listener is a server it
+        // keeps, and keeps its parent busy. A skipped subtree's streaks end.
         let mcp = p.args.as_deref().is_some_and(|a| {
             a.split_whitespace()
-                .take(4)
-                .any(|w| w.to_lowercase().contains("mcp"))
+                .any(|w| !w.starts_with('-') && w.to_lowercase().contains("mcp"))
         });
-        if mcp {
-            return false;
-        }
-        if self.seen.listening.contains(&pid) {
-            return true;
+        if mcp || self.seen.listening.contains(&pid) {
+            self.skip(pid);
+            return !mcp;
         }
         let mut busy = false;
         for c in self.kids(pid).to_vec() {
@@ -468,9 +474,9 @@ async fn booted() -> Vec<String> {
 }
 
 /// The `proc.hung` reports on `host` to clear. A report that is still a top (`tops`) stands;
-/// so does one whose agent's tree this tick could not walk. Otherwise it clears when its pid
-/// is gone or is now another process, when another report now covers it, or when its walked
-/// tree found it neither idle nor hung.
+/// so does one whose agent's tree this tick could not walk, for a while. It clears when its
+/// pid is gone or is now another process, when another report now covers it, when its walked
+/// tree found it working or waiting, or when no tick confirmed it for `HUNG_FRESH`.
 pub fn to_clear(
     s: &State,
     host: &str,
@@ -478,6 +484,7 @@ pub fn to_clear(
     procs: &Procs,
     tops: &[(u32, Vec<u32>)],
     walked: &HashSet<String>,
+    now: DateTime<Utc>,
 ) -> Vec<String> {
     s.hung
         .iter()
@@ -487,15 +494,15 @@ pub fn to_clear(
                 return true;
             };
             let covered = tops.iter().any(|(_, pids)| pids.contains(&h.pid));
-            let still = v
-                .iter()
-                .any(|c| c.pid == h.pid && matches!(c.verdict, Verdict::Idle | Verdict::Hung(_)));
             // Walked and found working or waiting; absent from the walk (reparented) proves nothing.
             let seen = h.agent.as_ref().is_some_and(|a| walked.contains(a));
             let works = v.iter().any(|c| {
                 c.pid == h.pid && matches!(c.verdict, Verdict::Working | Verdict::Waiting { .. })
             });
-            (h.started.is_some() && p.started != h.started) || covered || (seen && works && !still)
+            let stale = h
+                .checked
+                .is_none_or(|c| now - c > crate::doctor::HUNG_FRESH);
+            (h.started.is_some() && p.started != h.started) || covered || (seen && works) || stale
         })
         .map(|(k, _)| k.clone())
         .collect()
@@ -670,7 +677,7 @@ async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {
         )
         .await;
     }
-    for key in to_clear(s, &me, &v, procs, &hung, &walked) {
+    for key in to_clear(s, &me, &v, procs, &hung, &walked, now) {
         let pid = s.hung[&key].pid;
         host.publish(host.presence(Known::ProcessHung(ProcessHung {
             host: me.clone(),
@@ -1177,7 +1184,7 @@ mod tests {
             started,
             evidence: Some("0% CPU".into()),
             since: Some(at(-2)),
-            checked: None,
+            checked: Some(at(-1)),
         }
     }
 
@@ -1200,7 +1207,7 @@ mod tests {
              v: &[Classified],
              procs: &Procs,
              tops: &[(u32, Vec<u32>)],
-             w: &HashSet<String>| { to_clear(s, "h", v, procs, tops, w) };
+             w: &HashSet<String>| { to_clear(s, "h", v, procs, tops, w, at(0)) };
         let idle = c(Verdict::Idle);
         assert!(
             clear(&s, &idle, &procs, &[], &walked).is_empty(),
@@ -1239,6 +1246,12 @@ mod tests {
             clear(&s, &idle, &procs, &[(20, vec![20, 30])], &walked),
             vec!["h:30"],
             "covered by its parent's report"
+        );
+        s.hung.get_mut("h:30").unwrap().checked = Some(at(-7));
+        assert_eq!(
+            clear(&s, &[], &procs, &[], &HashSet::new()),
+            vec!["h:30"],
+            "no tick confirmed it for HUNG_FRESH"
         );
     }
 

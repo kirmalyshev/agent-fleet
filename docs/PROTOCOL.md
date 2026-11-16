@@ -504,7 +504,7 @@ Every 2 minutes the host classifies every process an agent started: everything u
 shells its agent program runs (an agent's own process, its pane shell and its other direct
 children — MCP servers — are never classified), plus the proved orphans, each claimed by the
 agent whose worktree it runs in. A process under 2 minutes old or with no start time is not
-classified, nor is one with a listening TCP socket (a server it keeps) or `mcp` in the first words of its argv (an
+classified, nor is one with a listening TCP socket (a server it keeps) or `mcp` in a non-flag word of its argv (an
 MCP server started through a shell), or anything under them. Each gets one state:
 
 - `working`: over 1% CPU over the interval, its stdout/stderr file changed, a child started
@@ -521,8 +521,9 @@ The topmost hung process of a chain is reported as `proc.hung` with every hung p
 its command, start, and evidence (CPU, the output file's last change, the deepest descendant's
 command, the lock it holds), re-sent every tick that confirms it with `checked`. The report
 clears when its pid is gone or is now another process, when a parent's report covers it, or
-when its agent's tree was walked and found it working or waiting; a tree the tick could not
-read, or a process that left the tree, leaves it standing. A `hung` or `orphan` process, and a
+when its agent's tree was walked and found it working or waiting, or when no tick confirmed it
+for 6 minutes; until then a tree the tick could not read, or a process that left the tree,
+leaves it standing. A `hung` or `orphan` process, and a
 `waiting` one past 30 minutes, are told once per episode — a `msg.sent` of kind `HUNG`,
 `ORPHAN` or `WAITING` with `ref` `<host>:<pid>` — to the agent that started it, its lead and
 the root coordinator; a hung tell waits until its report is in the log. An orphan proved by a
