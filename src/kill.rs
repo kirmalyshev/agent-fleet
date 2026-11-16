@@ -1,6 +1,7 @@
 //! `agent-fleet kill` and the Bash hook that sends agents to it. A process is killed only when it
-//! is the caller's own, an orphan doctor proved, or a process the watch reported hung; never an agent, a multiplexer pane, the fleet's
-//! own daemons, or anything above one of them.
+//! is the caller's own, an orphan doctor proved, or a process the watch reported hung and `kill`'s
+//! own sample finds idle; never an agent, a multiplexer pane, the fleet's own daemons, or anything
+//! above one of them.
 
 use std::collections::HashMap;
 
@@ -86,6 +87,14 @@ fn is_agent(t: &Table, pid: u32) -> bool {
 /// The agent whose process tree holds `pid`: its nearest agent ancestor.
 fn agent_of(t: &Table, pid: u32) -> Option<u32> {
     ancestors(t, pid).into_iter().find(|&a| is_agent(t, a))
+}
+
+/// The command `pid` is part of: the shell an agent runs it in (`pid` or its nearest ancestor
+/// right under an agent); `None` when no agent is above it.
+pub fn command_of(t: &Table, pid: u32) -> Option<u32> {
+    std::iter::once(pid)
+        .chain(ancestors(t, pid))
+        .find(|&p| parent(t, p).is_some_and(|a| is_agent(t, a)))
 }
 
 /// Why `pid` must never be signalled by `me`, if it must not.
@@ -714,6 +723,23 @@ mod tests {
                 .unwrap_err()
                 .contains("no such process")
         );
+    }
+
+    #[test]
+    fn a_command_is_the_tool_shell_an_agent_runs_it_in() {
+        let t = fleet();
+        assert_eq!(
+            command_of(&t, 105),
+            Some(103),
+            "under bash under the tool shell"
+        );
+        assert_eq!(
+            command_of(&t, 107),
+            Some(106),
+            "under the agent's node child"
+        );
+        assert_eq!(command_of(&t, 203), Some(203), "a direct child of an agent");
+        assert_eq!(command_of(&t, 300), None, "no agent above");
     }
 
     fn mine() -> Homes {

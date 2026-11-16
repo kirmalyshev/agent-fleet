@@ -152,7 +152,8 @@ enum Cmd {
     },
     /// Signal processes safely: TERM, then KILL after --grace. Refuses agents, panes, the fleet's
     /// daemons and anything above them, your own ancestors and other agents' processes; kills
-    /// only your own processes and orphans `doctor` proved. A refusal kills nothing and is logged.
+    /// only your own processes, orphans `doctor` proved, and processes the watch reported hung
+    /// that a 5 s sample finds idle. A refusal kills nothing and is logged.
     Kill {
         #[arg(required = true)]
         pids: Vec<u32>,
@@ -1102,21 +1103,41 @@ async fn main() -> Result<()> {
                         })
                 })
             };
-            // A hung report holds for the process that hung, not a later one with its pid.
+            // A hung report is only a claim: any process that can read the host's token file can
+            // post one. It counts when kill's own sample of the live process agrees with it, the
+            // process that hung (not a later one with its pid) and idle by the watch's rules.
+            // pid → why the sample disagrees, `None` when it agrees.
             let hung = state
                 .as_ref()
                 .map_or_else(Default::default, |s| doctor::hung_pids(s, &host, now));
-            let live = (!hung.is_empty())
-                .then(scan::Procs::read)
-                .unwrap_or_default();
-            let hung_ok = |pid: u32| {
-                hung.get(&pid).is_some_and(|since| {
-                    live.0
-                        .get(&pid)
-                        .and_then(|p| p.started)
-                        .is_some_and(|t| t <= *since)
-                })
+            let claimed: Vec<u32> = pids
+                .iter()
+                .copied()
+                .filter(|p| hung.contains_key(p))
+                .collect();
+            let checked: std::collections::HashMap<u32, Option<String>> = if claimed.is_empty() {
+                Default::default()
+            } else {
+                let waiting = state
+                    .iter()
+                    .flat_map(|s| s.resources.values())
+                    .filter(|r| r.host == host)
+                    .flat_map(|r| {
+                        r.waiting
+                            .iter()
+                            .map(|w| (w.pid, (r.resource.clone(), w.since)))
+                    })
+                    .collect();
+                let sample = watch::Sample::take(&claimed, waiting).await;
+                claimed
+                    .iter()
+                    .map(|&p| {
+                        let why = sample.contradicts(p, hung[&p], kill::command_of(&t, p));
+                        (p, why)
+                    })
+                    .collect()
             };
+            let hung_ok = |pid: u32| matches!(checked.get(&pid), Some(None));
             // The caller's worktree is the one the fleet assigned at spawn (`spawn.result`), or, for
             // a hand-started agent, where its host first saw it; never its pane's live cwd, which
             // follows a `cd`; and never a main checkout. No record fails closed.
@@ -1149,7 +1170,13 @@ async fn main() -> Result<()> {
                         &scan::cwd_of,
                     )
                     .err()
-                    .map(|why| (pid, why))
+                    .map(|why| match checked.get(&pid) {
+                        Some(Some(no)) => (
+                            pid,
+                            format!("{why}; the hung report is not confirmed: {no}"),
+                        ),
+                        _ => (pid, why),
+                    })
                 })
                 .collect();
             if !refused.is_empty() {
