@@ -522,7 +522,7 @@ its command, start, and evidence (CPU, the output file's last change, the deepes
 command, the lock it holds), re-sent every tick that confirms it with `checked`. The report
 clears when its pid is gone or is now another process, when a parent's report covers it, or
 when its agent's tree was walked and found it working or waiting, or when no tick confirmed it
-for 6 minutes; until then a tree the tick could not read, or a process that left the tree,
+for 6 minutes and it is not idle now; until then a tree the tick could not read, or a process that left the tree,
 leaves it standing. A `hung` or `orphan` process, and a
 `waiting` one past 30 minutes, are told once per episode — a `msg.sent` of kind `HUNG`,
 `ORPHAN` or `WAITING` with `ref` `<host>:<pid>` — to the agent that started it, its lead and

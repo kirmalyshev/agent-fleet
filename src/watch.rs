@@ -499,9 +499,14 @@ pub fn to_clear(
             let works = v.iter().any(|c| {
                 c.pid == h.pid && matches!(c.verdict, Verdict::Working | Verdict::Waiting { .. })
             });
-            let stale = h
-                .checked
-                .is_none_or(|c| now - c > crate::doctor::HUNG_FRESH);
+            // Unconfirmed for HUNG_FRESH and not idle now (left the walk): nobody can re-check
+            // it. One still idle (after a sleep, a blind tick) stands until the streak rebuilds.
+            let idle = v
+                .iter()
+                .any(|c| c.pid == h.pid && c.verdict == Verdict::Idle);
+            let stale = !idle
+                && h.checked
+                    .is_none_or(|c| now - c > crate::doctor::HUNG_FRESH);
             (h.started.is_some() && p.started != h.started) || covered || (seen && works) || stale
         })
         .map(|(k, _)| k.clone())
@@ -1248,6 +1253,10 @@ mod tests {
             "covered by its parent's report"
         );
         s.hung.get_mut("h:30").unwrap().checked = Some(at(-7));
+        assert!(
+            clear(&s, &idle, &procs, &[], &walked).is_empty(),
+            "unconfirmed but still idle (after a sleep): it stands, the tell is not repeated"
+        );
         assert_eq!(
             clear(&s, &[], &procs, &[], &HashSet::new()),
             vec!["h:30"],
