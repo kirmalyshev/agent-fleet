@@ -678,7 +678,10 @@ The machine's rules are `fleet.toml` and its brief in the user config directory
 (`~/.config/agent-fleet` on Linux, `AGENT_FLEET_CONFIG_DIR` overrides it). `agent-fleet init`
 writes both from `docs/fleet.example.toml` and `docs/brief.example.md`, with a profile for each
 agent program on `PATH` (`claude`, `codex`, `devin`; all three when none is found) and a default
-rule on the first; it never overwrites a file. A checkout with its own
+rule on the first; it never overwrites a file. It also lists the user-level skills
+(`$CLAUDE_CONFIG_DIR` or `~/.claude`, `$CODEX_HOME` or `~/.codex`, each `/skills/*/SKILL.md`)
+that name herdr, tmux or cmux, and warns that in a fleet agents message each other with `tell`
+and start agents with `spawn`; it changes nothing about them. A checkout with its own
 `.agent-fleet/fleet.toml` uses that file instead, wholesale; otherwise the machine's applies.
 Config errors name the file that was read.
 
@@ -688,7 +691,9 @@ git toplevel of `<dir>` (default: the current directory); it refuses a directory
 checkout and a checkout whose `origin` is not a GitHub remote of `<owner/repo>` (compared
 case-insensitively), because the host would create that other repository's worktrees and
 branches. It edits that one line and keeps every comment; adding the same checkout again changes
-nothing. `repo rm <owner/repo>` removes the line, `repo ls` lists the table. `repo add` needs
+nothing. `repo rm <owner/repo>` removes the line, `repo ls` lists the table. `repo add` lists the
+checkout's project-level skills that name a terminal multiplexer the same way, from
+`.claude/skills` and `.codex/skills`. `repo add` needs
 `init` first.
 
 `agent-fleet spawn <owner/repo>#<issue>` reads the issue with `gh issue view` (`AGENT_FLEET_GH`

@@ -85,7 +85,10 @@ agent-fleet init
 `agent-fleet init` writes this machine's `fleet.toml` and `brief.md` into the user config dir
 (`~/.config/agent-fleet` on Linux; `AGENT_FLEET_CONFIG_DIR` overrides it). They are the rules
 `spawn` uses for every repository: a profile for each agent program found on `PATH` (claude,
-codex, devin), one default rule, and a comment on every key. It never overwrites a file. Edit
+codex, devin), one default rule, and a comment on every key. It never overwrites a file. It also
+lists your Claude and Codex skills that drive terminals (herdr, tmux, cmux): in a fleet, agents
+talk through `agent-fleet tell` and `spawn`, so check that those skills do not tell them to type
+into each other's panes. Edit
 them, then start the hub and the host as in the quick start below.
 
 ## Connect a repository
@@ -99,7 +102,8 @@ agent-fleet repo rm owner/repo
 
 `repo add` records the checkout in the machine's `fleet.toml` (`[repos]`). It refuses a directory
 that is not a git checkout and a checkout whose `origin` is another repository. The host re-reads
-the list at each spawn and scan, so no restart is needed. A repository with its own
+the list at each spawn and scan, so no restart is needed. It lists the repository's own terminal-driving
+skills (`.claude/skills`, `.codex/skills`) the same way. A repository with its own
 `.agent-fleet/fleet.toml` uses that file instead of the machine's rules.
 
 ## Quick start
