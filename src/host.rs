@@ -131,6 +131,8 @@ pub(crate) struct Host {
     busy_ids: AtomicU64,
     /// A self-update restart is waiting: no new spawn or handoff gets a guard.
     draining: AtomicBool,
+    /// Since when the self-update timer has seen `origin/main` ahead of this binary.
+    pub(crate) behind_since: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
 }
 
 /// Held while the host does work a restart would cut short.
@@ -235,6 +237,7 @@ impl Host {
             busy: Mutex::default(),
             busy_ids: AtomicU64::new(0),
             draining: AtomicBool::new(false),
+            behind_since: Mutex::default(),
         }
     }
 
@@ -656,6 +659,7 @@ impl Host {
             match rustix::fs::statvfs(&self.cfg.data_dir) {
                 Ok(s) => {
                     let agents = self.panes.lock().unwrap().len() as u32;
+                    let behind_since = *self.behind_since.lock().unwrap();
                     self.publish(self.presence(Known::HostHealth(HostHealth {
                         host: self.cfg.host.clone(),
                         disk_free: s.f_bavail * s.f_frsize,
@@ -663,6 +667,7 @@ impl Host {
                         agents,
                         stats: Some(self.stats()),
                         commit: crate::update::COMMIT.map(str::to_string),
+                        behind_since,
                     })))
                     .await;
                 }

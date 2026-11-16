@@ -47,6 +47,9 @@ pub const UPDATE_UNANSWERED: Duration = Duration::minutes(75);
 pub const HUNG_FRESH: Duration = Duration::minutes(6);
 /// A host whose `host.health` is older than this is not compared for `build`.
 pub const HOST_LIVE: Duration = Duration::minutes(10);
+/// Hosts that agree on a commit `origin/main` left behind this long are a `build` finding: the
+/// self-update (asked within 5 min, done in minutes) did not take.
+pub const BEHIND: Duration = Duration::minutes(15);
 /// Files every branch touches; sharing them is not duplicate work.
 const SHARED_BY_ALL: &[&str] = &[
     "bun.lock",
@@ -762,11 +765,14 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
         }
     }
     // Hosts that reported lately but run different builds: one of them missed an update.
-    let live: Vec<(&String, Option<&str>)> = s
+    let hosts: Vec<_> = s
         .hosts
         .iter()
         .filter(|(_, h)| now - h.ts < HOST_LIVE)
-        .map(|(n, h)| (n, h.commit.as_deref()))
+        .collect();
+    let live: Vec<(&String, Option<&str>)> = hosts
+        .iter()
+        .map(|(n, h)| (*n, h.commit.as_deref()))
         .collect();
     if live.iter().any(|(_, c)| *c != live[0].1) {
         for (name, commit) in &live {
@@ -784,6 +790,21 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
                     others.join(", ")
                 ),
             ));
+        }
+    } else {
+        // They agree, on a commit `origin/main` has moved past.
+        for (name, h) in &hosts {
+            if let Some(since) = h.behind_since.filter(|t| now - *t >= BEHIND) {
+                out.push(finding(
+                    "build",
+                    *name,
+                    format!(
+                        "runs {}, behind origin/main for {} (agent-fleet self-update)",
+                        short(h.commit.as_deref()),
+                        ago(now, since)
+                    ),
+                ));
+            }
         }
     }
     for (key, r) in &s.resources {
@@ -879,6 +900,7 @@ mod tests {
                 disk_total: 0,
                 agents: 0,
                 commit: None,
+                behind_since: None,
                 ts: now,
                 started: None,
             },
@@ -925,6 +947,7 @@ mod tests {
             disk_total: 0,
             agents: 0,
             commit: None,
+            behind_since: None,
             ts: now - Duration::minutes(ago_min),
             started: None,
         };
@@ -985,6 +1008,7 @@ mod tests {
             disk_total: 0,
             agents: 0,
             commit: Some(commit.into()),
+            behind_since: None,
             ts: now,
             started: None,
         };
@@ -1031,6 +1055,7 @@ mod tests {
                 disk_total: 0,
                 agents: 0,
                 commit: Some("aaa".into()),
+                behind_since: None,
                 ts: now,
                 started: Some(now - Duration::minutes(5)),
             },
@@ -1090,6 +1115,7 @@ mod tests {
             disk_total: 0,
             agents: 0,
             commit: None,
+            behind_since: None,
             ts: now,
             started: Some(now - Duration::minutes(started_min_ago)),
         };
@@ -1263,6 +1289,7 @@ mod tests {
                 disk_total: 1,
                 agents: 0,
                 commit: commit.map(str::to_string),
+                behind_since: None,
                 ts: now - Duration::minutes(age),
                 started: None,
             };
@@ -1285,6 +1312,38 @@ mod tests {
         assert_eq!(
             f[2].detail,
             "runs unknown; a 1111111, b 1111111 (agent-fleet self-update)"
+        );
+    }
+
+    #[test]
+    fn a_fleet_on_one_commit_behind_origin_main_is_a_finding_and_one_on_main_is_not() {
+        let now = Utc::now();
+        let mut s = State::default();
+        let host = |s: &mut State, name: &str, behind_min: Option<i64>| {
+            let h = crate::state::Host {
+                disk_free: 1,
+                disk_total: 1,
+                agents: 0,
+                commit: Some("1111111aaaa".into()),
+                behind_since: behind_min.map(|m| now - Duration::minutes(m)),
+                ts: now,
+                started: None,
+            };
+            s.hosts.insert(name.into(), h);
+        };
+        host(&mut s, "a", None);
+        host(&mut s, "b", None);
+        assert!(findings(&s, now).is_empty(), "on origin/main");
+        host(&mut s, "a", Some(5));
+        host(&mut s, "b", Some(4));
+        assert!(findings(&s, now).is_empty(), "behind, the update has time");
+        host(&mut s, "a", Some(40));
+        host(&mut s, "b", Some(16));
+        let f = findings(&s, now);
+        assert_eq!(kinds(&f), vec![("build", "a"), ("build", "b")], "{f:#?}");
+        assert_eq!(
+            f[0].detail,
+            "runs 1111111, behind origin/main for 40m (agent-fleet self-update)"
         );
     }
 
