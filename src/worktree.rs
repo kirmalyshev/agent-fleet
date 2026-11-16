@@ -588,7 +588,7 @@ pub async fn run(
         }
     }
     if clean && !execute {
-        out += "dry run; agent-fleet dev clean --execute to do it\n";
+        out += "dry run; the same command with --execute does it\n";
     }
     out
 }

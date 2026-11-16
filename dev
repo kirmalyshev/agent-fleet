@@ -1,13 +1,13 @@
 #!/bin/sh
 # Developer helpers for this repository: `agent-fleet dev`, built from this checkout.
 #
-#   ./dev ls               every worktree of the connected repos: branch, PR, commits not in
-#                          main, uncommitted files, and what clean would do with it
+#   ./dev ls               this repo's worktrees: branch, PR, commits not in main,
+#                          uncommitted files, and what clean would do with it
 #   ./dev clean            what clean would retire, stop and delete (a dry run)
 #   ./dev clean --execute  do it
 #
-# `./dev <cmd> --help` has the rules; `--repo kirmalyshev/agent-fleet` limits ls and clean to
-# this repository.
+# ls and clean cover only this repository; `agent-fleet dev ls|clean` covers every connected one.
 set -eu
-[ $# -gt 0 ] || { sed -n '2,7s/^# \{0,1\}//p' "$0"; exit 1; }
+[ $# -gt 0 ] || { sed -n '2,9s/^# \{0,1\}//p' "$0"; exit 1; }
+case $1 in ls | clean) set -- "$@" --repo kirmalyshev/agent-fleet ;; esac
 exec cargo run -q --manifest-path "$(dirname "$0")/Cargo.toml" -- dev "$@"
