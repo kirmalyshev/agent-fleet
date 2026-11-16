@@ -75,6 +75,33 @@ agent-fleet api schema          JSON Schema of events and state (schema/agent-fl
 6. **Every machine has a copy.** The host agent copies the whole log locally. When the hub is
    down, reads still work from that copy.
 
+## Install
+
+```sh
+cargo install --path .
+agent-fleet init
+```
+
+`agent-fleet init` writes this machine's `fleet.toml` and `brief.md` into the user config dir
+(`~/.config/agent-fleet` on Linux; `AGENT_FLEET_CONFIG_DIR` overrides it). They are the rules
+`spawn` uses for every repository: a profile for each agent program found on `PATH` (claude,
+codex, devin), one default rule, and a comment on every key. It never overwrites a file. Edit
+them, then start the hub and the host as in the quick start below.
+
+## Connect a repository
+
+```sh
+cd <checkout of owner/repo>
+agent-fleet repo add owner/repo        # or: agent-fleet repo add owner/repo <checkout>
+agent-fleet repo ls
+agent-fleet repo rm owner/repo
+```
+
+`repo add` records the checkout in the machine's `fleet.toml` (`[repos]`). It refuses a directory
+that is not a git checkout and a checkout whose `origin` is another repository. The host re-reads
+the list at each spawn and scan, so no restart is needed. A repository with its own
+`.agent-fleet/fleet.toml` uses that file instead of the machine's rules.
+
 ## Quick start
 
 ```sh

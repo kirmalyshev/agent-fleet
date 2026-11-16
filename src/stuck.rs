@@ -720,8 +720,8 @@ pub fn on_quota(host: &Host, s: &State, id: &str, now: DateTime<Utc>) -> Option<
         return None;
     }
     let sp = s.spawn_of(id)?;
-    let checkout = host.cfg.checkouts.get(&sp.request.repo)?;
-    let (cfg, _) = crate::spawn::load(checkout).ok()?;
+    let checkout = host.cfg.checkouts_now().ok()?.remove(&sp.request.repo)?;
+    let (cfg, _) = crate::spawn::load_in(&checkout, host.cfg.config_dir.as_deref()).ok()?;
     let prof = cfg.profiles.get(&sp.request.profile)?;
     let to = prof.on_quota.as_deref()?;
     let target = cfg.profiles.get(to)?;

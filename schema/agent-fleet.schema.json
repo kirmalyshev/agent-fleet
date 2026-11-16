@@ -1016,7 +1016,7 @@
               "type": "string"
             },
             "profile": {
-              "description": "The routing profile that was picked. The host resolves its `kind`, `args`, `unset_env`\nand the checkout's `ready` script from its OWN `.agent-fleet/fleet.toml` — a request\nnever carries executable configuration.",
+              "description": "The routing profile that was picked. The host resolves its `kind`, `args`, `unset_env`\nand the `ready` script from its checkout's `.agent-fleet/fleet.toml`, else the machine's\n— a request never carries executable configuration.",
               "type": "string"
             },
             "replaces": {
@@ -1027,7 +1027,7 @@
               ]
             },
             "repo": {
-              "description": "`owner/repo`; the host maps it to a checkout (`host --repo owner/repo=<dir>`).",
+              "description": "`owner/repo`; the host maps it to a checkout (`agent-fleet repo add`, `host --repo`).",
               "type": "string"
             },
             "session": {
@@ -2864,7 +2864,7 @@
               "type": "string"
             },
             "profile": {
-              "description": "The routing profile that was picked. The host resolves its `kind`, `args`, `unset_env`\nand the checkout's `ready` script from its OWN `.agent-fleet/fleet.toml` — a request\nnever carries executable configuration.",
+              "description": "The routing profile that was picked. The host resolves its `kind`, `args`, `unset_env`\nand the `ready` script from its checkout's `.agent-fleet/fleet.toml`, else the machine's\n— a request never carries executable configuration.",
               "type": "string"
             },
             "replaces": {
@@ -2875,7 +2875,7 @@
               ]
             },
             "repo": {
-              "description": "`owner/repo`; the host maps it to a checkout (`host --repo owner/repo=<dir>`).",
+              "description": "`owner/repo`; the host maps it to a checkout (`agent-fleet repo add`, `host --repo`).",
               "type": "string"
             },
             "session": {
