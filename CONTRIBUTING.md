@@ -39,10 +39,10 @@ use a raw `kill`; without the time limit only a human can stop them.
 
 ## Worktrees
 
-`./dev <cmd>` is `agent-fleet dev <cmd>`, built from your checkout (see the README's
-[Clean up worktrees](README.md#clean-up-worktrees)). `./dev ls` lists the worktrees of this
-repository and of the others connected on your machine (`--repo kirmalyshev/agent-fleet` for this
-one only): branch, PR, commits not in `origin/main`, uncommitted files, and what `clean` would do.
+`./dev <cmd>` is `agent-fleet dev <cmd>`, built from your checkout, with `ls` and `clean` limited
+to this repository (see the README's [Clean up worktrees](README.md#clean-up-worktrees);
+`agent-fleet dev ls|clean` covers every connected repository). `./dev ls` lists its worktrees:
+branch, PR, commits not in `origin/main`, uncommitted files, and what `clean` would do.
 `./dev clean` shows which worktrees of merged or closed PRs it would remove, the processes it would
 stop there, and which finished local branches it would delete; `--execute` does it. It needs `gh`
 for PR states.
