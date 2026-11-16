@@ -25,6 +25,10 @@ pub struct Config {
     /// name (at any depth) or exact path.
     #[serde(default = "default_guarded")]
     pub guarded: Vec<String>,
+    /// The host's watch loop runs the `doctor --apply` step itself (close superseded PRs, tell
+    /// the root coordinator of the rest). Off unless set.
+    #[serde(default)]
+    pub apply: bool,
 }
 
 fn default_days() -> u32 {
@@ -43,6 +47,7 @@ impl Default for Config {
             repos: Vec::new(),
             days: default_days(),
             guarded: default_guarded(),
+            apply: false,
         }
     }
 }
@@ -166,6 +171,7 @@ pub fn classify(
 async fn gh(bin: &str, args: &[&str]) -> Result<Value> {
     let out = tokio::process::Command::new(bin)
         .args(args)
+        .kill_on_drop(true)
         .output()
         .await
         .with_context(|| format!("run gh {}", args.join(" ")))?;
@@ -396,6 +402,150 @@ fn missing(e: &anyhow::Error) -> bool {
         .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 
+/// The `--apply` outcome of one orphan, as a finding-detail suffix: a `Close` runs `gh pr close`,
+/// a report adds nothing.
+pub async fn close_note(bin: &str, o: &Orphan) -> String {
+    match &o.action {
+        Action::Close { by } => match close(bin, &o.repo, o.number, *by).await {
+            Ok(()) => "; closed, branch kept".into(),
+            Err(e) => format!("; close failed: {e:#}"),
+        },
+        Action::Report(_) => String::new(),
+    }
+}
+
+/// What the watch loop does with the orphans of one scan.
+#[derive(Debug, PartialEq)]
+pub enum Act {
+    Close(Orphan),
+    /// A `msg.sent` to the root coordinator.
+    Tell {
+        to: String,
+        key: String,
+        text: String,
+    },
+}
+
+/// A report is told again only after this long without a change.
+pub const RETELL: Duration = Duration::days(7);
+
+/// Close each `Close`; tell the root coordinator of each `Report` it was not told of within
+/// `RETELL` (the log is the dedupe across restarts).
+pub fn acts(
+    orphans: Vec<Orphan>,
+    s: &crate::state::State,
+    events: &[crate::event::Event],
+    now: DateTime<Utc>,
+) -> Vec<Act> {
+    let root = root_of(s);
+    let mut out = Vec::new();
+    for o in orphans {
+        if matches!(o.action, Action::Close { .. }) {
+            out.push(Act::Close(o));
+            continue;
+        }
+        let key = format!("{}#{}", o.repo, o.number);
+        if let Some(to) = root.clone()
+            && !already_told(s, &to, &key)
+            && !crate::watch::unsent(events, vec![to.clone()], "orphan-pr", &key, now - RETELL)
+                .is_empty()
+        {
+            out.push(Act::Tell {
+                text: format!("{key} has no live agent: {}", o.detail),
+                to,
+                key,
+            });
+        }
+    }
+    out
+}
+
+/// `owner/repo` of a git remote URL (`git@host:o/r.git`, `https://host/o/r`, `ssh://git@host/o/r`).
+pub fn slug_of(url: &str) -> Option<String> {
+    let path = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    let path = path.rsplit_once(':').map_or(path, |(h, p)| {
+        if p.contains('/') && !h.ends_with("http") && !h.ends_with("https") && !h.ends_with("ssh") {
+            p
+        } else {
+            path
+        }
+    });
+    let mut parts = path.rsplit('/');
+    let (r, o) = (parts.next()?, parts.next()?);
+    (!r.is_empty() && !o.is_empty() && !o.contains(':')).then(|| format!("{o}/{r}"))
+}
+
+/// The note a retire adds to its outcome line when the branch it retired still has an open PR:
+/// `(PR number, line)`. `Ok(None)` when it has none; an error when that could not be found out.
+pub async fn retire_note(bin: &str, repo: &str, branch: &str) -> Result<Option<(u64, String)>> {
+    retire_note_within(bin, repo, branch, RETIRE_TIMEOUT).await
+}
+
+async fn retire_note_within(
+    bin: &str,
+    repo: &str,
+    branch: &str,
+    limit: std::time::Duration,
+) -> Result<Option<(u64, String)>> {
+    // The TUI waits on this: a hung `gh` must not freeze it (kill_on_drop ends the child).
+    tokio::time::timeout(limit, retire_note_inner(bin, repo, branch))
+        .await
+        .map_err(|_| anyhow::anyhow!("gh did not answer in {}s", limit.as_secs_f32()))?
+}
+
+const RETIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+async fn retire_note_inner(bin: &str, repo: &str, branch: &str) -> Result<Option<(u64, String)>> {
+    let url = tokio::process::Command::new("git")
+        .args(["-C", repo, "remote", "get-url", "origin"])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("run git remote get-url")?;
+    if !url.status.success() {
+        bail!("{repo} has no origin remote");
+    }
+    let slug =
+        slug_of(&String::from_utf8_lossy(&url.stdout)).context("origin is not owner/repo")?;
+    let v = gh(
+        bin,
+        &[
+            "pr", "list", "-R", &slug, "--head", branch, "--state", "open", "--json", "number",
+        ],
+    )
+    .await?;
+    let Some(n) = v
+        .as_array()
+        .context("gh pr list: not a list")?
+        .first()
+        .map(|p| p["number"].as_u64().context("gh pr list: no number"))
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        n,
+        format!("PR {slug}#{n} is still open: a coordinator item now"),
+    )))
+}
+
+/// The configs the watch loop acts on: one per spawn checkout (`owner/repo` → path) whose
+/// fleet.toml sets `apply`. Read from the checkouts, never from the process's directory: a
+/// service manager starts the host in `/`. A checkout whose fleet.toml cannot be read is an error.
+pub fn watch_configs(checkouts: &BTreeMap<String, std::path::PathBuf>) -> Result<Vec<Config>> {
+    let mut out = Vec::new();
+    for (repo, dir) in checkouts {
+        let c = config(dir).with_context(|| format!("{repo}: fleet.toml"))?;
+        out.extend(watch_enabled(c));
+    }
+    Ok(out)
+}
+
+/// The config the watch loop acts on: only a fleet.toml that sets `apply` and names repos.
+pub fn watch_enabled(cfg: Option<Config>) -> Option<Config> {
+    cfg.filter(|c| c.apply && !c.repos.is_empty())
+}
+
 /// The root coordinator's agent id.
 pub fn root_of(s: &crate::state::State) -> Option<String> {
     s.roles
@@ -534,6 +684,241 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config(dir.path()).unwrap().unwrap().repos, ["o/r"]);
+    }
+
+    #[test]
+    fn apply_is_off_unless_set_and_slugs_come_from_any_remote_form() {
+        assert!(!Config::default().apply);
+        let c: Config = toml::from_str("repos = [\"o/r\"]\napply = true").unwrap();
+        assert!(c.apply);
+        for u in [
+            "git@host.example:o/r.git\n",
+            "https://host.example/o/r",
+            "https://host.example/o/r.git/",
+            "ssh://git@host.example/o/r.git",
+        ] {
+            assert_eq!(slug_of(u).as_deref(), Some("o/r"), "{u}");
+        }
+        assert_eq!(slug_of("r"), None);
+    }
+
+    #[test]
+    fn the_watch_reads_each_checkouts_fleet_toml_not_the_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = |name: &str, apply: bool| {
+            let c = dir.path().join(name).join(".agent-fleet");
+            std::fs::create_dir_all(&c).unwrap();
+            std::fs::write(
+                c.join("fleet.toml"),
+                format!(
+                    "brief = \"b.md\"\n[profiles.p]\nkind = \"claude\"\n[[rules]]\nprofile = \"p\"\n[orphan_pr]\nrepos = [\"o/{name}\"]\napply = {apply}\n"
+                ),
+            )
+            .unwrap();
+            dir.path().join(name)
+        };
+        let checkouts = BTreeMap::from([
+            ("o/on".to_string(), mk("on", true)),
+            ("o/off".to_string(), mk("off", false)),
+            ("o/none".to_string(), dir.path().join("none")),
+        ]);
+        let got = watch_configs(&checkouts).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].repos, ["o/on"]);
+        let broken = BTreeMap::from([("o/b".to_string(), {
+            let d = mk("b", true);
+            std::fs::write(d.join(".agent-fleet/fleet.toml"), "nope = 1").unwrap();
+            d
+        })]);
+        assert!(watch_configs(&broken).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_hung_gh_gives_up_instead_of_freezing_the_retire() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success()
+            && std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["remote", "add", "origin", "https://host.example/o/r"])
+                .status()
+                .unwrap()
+                .success();
+        assert!(ok);
+        let bin = dir.path().join("gh");
+        std::fs::write(&bin, "#!/bin/sh\nexec sleep 600\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = retire_note_within(
+            bin.to_str().unwrap(),
+            repo.to_str().unwrap(),
+            "s-1",
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("did not answer"), "{e:#}");
+    }
+
+    #[test]
+    fn the_watch_acts_only_on_apply_with_repos() {
+        let on = || Config {
+            repos: vec!["o/r".into()],
+            apply: true,
+            ..Config::default()
+        };
+        assert!(watch_enabled(None).is_none());
+        assert!(watch_enabled(Some(Config::default())).is_none());
+        assert!(
+            watch_enabled(Some(Config {
+                apply: false,
+                ..on()
+            }))
+            .is_none()
+        );
+        assert!(
+            watch_enabled(Some(Config {
+                repos: vec![],
+                ..on()
+            }))
+            .is_none()
+        );
+        assert!(watch_enabled(Some(on())).is_some());
+    }
+
+    #[test]
+    fn a_pending_tell_blocks_a_re_tell_even_past_a_week() {
+        let mut s = with_root();
+        s.msgs.insert(
+            "m".into(),
+            crate::state::Msg {
+                from: "x".into(),
+                to: "agent:h/s/root".into(),
+                kind: "orphan-pr".into(),
+                reference: "o/r#2".into(),
+                text: "t".into(),
+                since: now(),
+            },
+        );
+        let old = [told("o/r#2", now() - Duration::days(9))];
+        assert!(
+            acts(
+                vec![orphan(2, Action::Report("a draft waits for a person"))],
+                &s,
+                &old,
+                now()
+            )
+            .is_empty()
+        );
+    }
+
+    fn orphan(n: u64, action: Action) -> Orphan {
+        Orphan {
+            repo: "o/r".into(),
+            number: n,
+            age: Duration::days(5),
+            detail: "s: 5d quiet".into(),
+            action,
+        }
+    }
+
+    fn with_root() -> crate::state::State {
+        let mut s = crate::state::State::default();
+        s.roles.insert(
+            "agent:h/s/root".into(),
+            crate::state::Role {
+                level: crate::event::Level::RootCoordinator,
+                lead: None,
+                domain: None,
+                by: "x".into(),
+                since: now(),
+            },
+        );
+        s
+    }
+
+    fn told(key: &str, at: DateTime<Utc>) -> crate::event::Event {
+        use crate::event::*;
+        let mut e = Envelope::new(
+            Actor {
+                kind: ActorKind::Host,
+                id: "host:h".into(),
+            },
+            "p",
+            Known::MsgSent(MsgSent {
+                to: "agent:h/s/root".into(),
+                kind: "orphan-pr".into(),
+                reference: key.into(),
+                text: "t".into(),
+            }),
+        );
+        e.ts = at;
+        e.into_event()
+    }
+
+    #[test]
+    fn the_watch_closes_what_is_superseded_and_tells_the_root_once_a_week() {
+        let s = with_root();
+        let mk = || {
+            vec![
+                orphan(1, Action::Close { by: Some(9) }),
+                orphan(2, Action::Report("a draft waits for a person")),
+            ]
+        };
+        let a = acts(mk(), &s, &[], now());
+        assert!(matches!(&a[0], Act::Close(o) if o.number == 1));
+        assert!(matches!(&a[1], Act::Tell { key, .. } if key == "o/r#2"));
+        // Told two days ago: quiet. Told eight days ago: again.
+        let two = [told("o/r#2", now() - Duration::days(2))];
+        assert_eq!(acts(mk(), &s, &two, now()).len(), 1);
+        let eight = [told("o/r#2", now() - Duration::days(8))];
+        assert_eq!(acts(mk(), &s, &eight, now()).len(), 2);
+        // No root coordinator: nobody to tell, the close still runs.
+        let none = acts(mk(), &crate::state::State::default(), &[], now());
+        assert_eq!(none.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_retired_branch_with_an_open_pr_gets_a_note_and_one_without_gets_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            )
+        };
+        git(&["init", "-q"]);
+        git(&["remote", "add", "origin", "git@host.example:o/r.git"]);
+        let bin = dir.path().join("gh");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\ncase \"$*\" in\n  *\"-R o/r --head s-1 \"*) echo '[{\"number\":7}]' ;;\n  *) echo '[]' ;;\nesac\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (gh, repo) = (bin.to_str().unwrap(), repo.to_str().unwrap());
+        let (n, line) = retire_note(gh, repo, "s-1").await.unwrap().unwrap();
+        assert_eq!(n, 7);
+        assert!(line.contains("o/r#7 is still open"), "{line}");
+        assert!(retire_note(gh, repo, "s-2").await.unwrap().is_none());
+        assert!(retire_note("/nonexistent/gh", repo, "s-1").await.is_err());
+        assert!(retire_note(gh, "/nonexistent", "s-1").await.is_err());
     }
 
     #[test]
