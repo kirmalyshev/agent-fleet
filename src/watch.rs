@@ -96,6 +96,8 @@ pub struct Seen {
     pub orphans: HashMap<u32, (String, Option<String>)>,
     /// Processes with a listening TCP socket: servers, kept on purpose.
     pub listening: HashSet<u32>,
+    /// Processes with an established TCP connection: a command holding one waits on the network.
+    pub connected: HashSet<u32>,
     /// When each process's stdout/stderr file last changed; `None` when it could not be read,
     /// and then nothing is proved hung.
     pub output_at: Option<HashMap<u32, DateTime<Utc>>>,
@@ -149,6 +151,12 @@ impl Watch {
         for (agent, apid) in &seen.agents {
             for &shell in t.kids(*apid).to_vec().iter() {
                 if SHELLS.contains(&now.0[&shell].name.as_str()) {
+                    // A tool shell runs one command; a connection anywhere in it (`gh … --watch
+                    // | tail`) makes all of it a network wait, not classified, its streaks ended.
+                    if now.tree(shell).iter().any(|p| seen.connected.contains(p)) {
+                        t.skip(shell);
+                        continue;
+                    }
                     for c in t.kids(shell).to_vec() {
                         t.visit(c, agent);
                     }
@@ -360,27 +368,35 @@ pub fn recipients(s: &State, agent: Option<&str>) -> Vec<String> {
 }
 
 /// Each process matching `is` whose parent does not, with it and the matching ones under it.
+/// Tops of one agent in one process group (a pipeline) are one: the lowest pid's.
 pub fn tops(
     v: &[Classified],
     procs: &Procs,
     is: impl Fn(&Verdict) -> bool,
 ) -> Vec<(u32, Vec<u32>)> {
     let hit: HashSet<u32> = v.iter().filter(|c| is(&c.verdict)).map(|c| c.pid).collect();
-    let mut out: Vec<(u32, Vec<u32>)> = hit
+    let mut each: Vec<u32> = hit
         .iter()
         .copied()
         .filter(|p| procs.0.get(p).is_none_or(|x| !hit.contains(&x.ppid)))
-        .map(|top| {
-            let mut pids: Vec<u32> = procs
-                .tree(top)
-                .into_iter()
-                .filter(|p| hit.contains(p))
-                .collect();
-            pids.sort_unstable();
-            (top, pids)
-        })
         .collect();
-    out.sort();
+    each.sort_unstable();
+    let group = |p: u32| {
+        let agent = v.iter().find(|c| c.pid == p).map(|c| &c.agent);
+        procs.0.get(&p)?.pgid.map(|g| (g, agent))
+    };
+    let mut out: Vec<(u32, Vec<u32>)> = Vec::new();
+    for top in each {
+        let pids = procs.tree(top).into_iter().filter(|p| hit.contains(p));
+        let g = group(top);
+        match out.iter_mut().find(|(t, _)| g.is_some() && group(*t) == g) {
+            Some((_, all)) => all.extend(pids),
+            None => out.push((top, pids.collect())),
+        }
+    }
+    for (_, pids) in &mut out {
+        pids.sort_unstable();
+    }
     out
 }
 
@@ -432,18 +448,13 @@ async fn run(cmd: &str, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Listening processes, and when each of `pids`' stdout/stderr files last changed. `None`
-/// when `lsof` gives no answer: then nothing is proved hung.
-async fn machine(pids: &[u32]) -> Option<(HashSet<u32>, HashMap<u32, DateTime<Utc>>)> {
-    let listening = parse_lsof_pids(
-        &run(
-            crate::scan::lsof_path(),
-            &["-wnP", "-iTCP", "-sTCP:LISTEN", "-Fp"],
-        )
-        .await?,
-    );
+/// Listening and connected processes, and when each of `pids`' stdout/stderr files last
+/// changed. `None` when `lsof` gives no answer: then nothing is proved hung.
+async fn machine(pids: &[u32]) -> Option<(Tcp, HashMap<u32, DateTime<Utc>>)> {
+    let args = ["-wnP", "-iTCP", "-sTCP:LISTEN,ESTABLISHED", "-FpT"];
+    let tcp = parse_lsof_tcp(&run(crate::scan::lsof_path(), &args).await?);
     if pids.is_empty() {
-        return Some((listening, HashMap::new()));
+        return Some((tcp, HashMap::new()));
     }
     let csv: Vec<String> = pids.iter().map(u32::to_string).collect();
     let args = ["-wnP", "-a", "-d", "1,2", "-Fpftn", "-p", &csv.join(",")];
@@ -463,7 +474,7 @@ async fn machine(pids: &[u32]) -> Option<(HashSet<u32>, HashMap<u32, DateTime<Ut
             Some((pid, t))
         })
         .collect();
-    Some((listening, output_at))
+    Some((tcp, output_at))
 }
 
 /// The simulators booted on this host; empty off macOS or when `simctl` gives no answer.
@@ -668,8 +679,8 @@ async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {
         .flat_map(|(_, a)| procs.tree(*a))
         .collect();
     match machine(&pids).await {
-        Some((listening, output_at)) => {
-            seen.listening = listening;
+        Some(((listening, connected), output_at)) => {
+            (seen.listening, seen.connected) = (listening, connected);
             seen.output_at = Some(output_at);
         }
         None => seen.output_at = None,
@@ -884,11 +895,34 @@ pub fn parse_lsof_files(s: &str) -> HashMap<u32, Vec<String>> {
     out
 }
 
-/// `lsof -F p` output → the pids it lists.
-pub fn parse_lsof_pids(s: &str) -> HashSet<u32> {
-    s.lines()
-        .filter_map(|l| l.strip_prefix('p')?.parse().ok())
-        .collect()
+/// Pids with a listening TCP socket, pids with an established TCP connection.
+type Tcp = (HashSet<u32>, HashSet<u32>);
+
+/// `lsof -F pT` output → its `Tcp`. A pid listed without a state (`TST=`) counts as listening,
+/// as all listed pids did before the state was read.
+pub fn parse_lsof_tcp(s: &str) -> Tcp {
+    let (mut states, mut pid): (HashMap<u32, Vec<&str>>, Option<u32>) = (HashMap::new(), None);
+    for l in s.lines() {
+        if let Some(p) = l.strip_prefix('p') {
+            pid = p.parse().ok();
+            if let Some(p) = pid {
+                states.entry(p).or_default();
+            }
+        } else if let (Some(st), Some(p)) = (l.strip_prefix("TST="), pid) {
+            states.entry(p).or_default().push(st);
+        }
+    }
+    let with = |f: fn(&Vec<&str>) -> bool| {
+        states
+            .iter()
+            .filter(|(_, s)| f(s))
+            .map(|(p, _)| *p)
+            .collect()
+    };
+    (
+        with(|s| s.is_empty() || s.contains(&"LISTEN")),
+        with(|s| s.contains(&"ESTABLISHED")),
+    )
 }
 
 fn same(a: &Proc, b: &Proc) -> bool {
@@ -1158,6 +1192,58 @@ mod tests {
         let v = w.step(wedged(0), at(4), &seen());
         let t = tops(&v, w.last().unwrap(), |v| matches!(v, Verdict::Hung(_)));
         assert_eq!(t, vec![(30, vec![30, 31])]);
+    }
+
+    /// `gh pr checks 7 --watch | tail -2`: the tool shell's fork (30) runs `gh` (31), `tail`
+    /// (32) writes the tool's output file; one process group, the tool shell's.
+    fn pipeline() -> Procs {
+        let mut t = tree(&[
+            (
+                30,
+                SHELL,
+                "zsh",
+                "/bin/zsh -c eval 'gh pr checks 7 --watch | tail -2'",
+                0,
+                4,
+            ),
+            (31, 30, "gh", "gh pr checks 7 --watch", 0, 4),
+            (32, SHELL, "tail", "tail -2", 0, 4),
+        ]);
+        for p in [SHELL, 30, 31, 32] {
+            t.0.get_mut(&p).unwrap().pgid = Some(SHELL);
+        }
+        t
+    }
+
+    #[test]
+    fn a_pipeline_waiting_on_the_network_is_never_hung() {
+        let mut w = Watch::default();
+        let mut s = seen();
+        s.output_at = Some([(32, at(-4))].into());
+        s.connected.insert(31);
+        for m in [0, 2, 4, 6, 8] {
+            let v = w.step(pipeline(), at(m), &s);
+            for pid in [30, 31, 32] {
+                assert_eq!(verdict(&v, pid), None, "pid {pid} at {m}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_wedged_pipeline_is_hung_and_one_report() {
+        let mut w = Watch::default();
+        let mut s = seen();
+        s.output_at = Some([(32, at(-4))].into());
+        s.connected.insert(99);
+        for m in [0, 2] {
+            w.step(pipeline(), at(m), &s);
+        }
+        let v = w.step(pipeline(), at(4), &s);
+        for pid in [30, 31, 32] {
+            assert!(matches!(verdict(&v, pid), Some(Verdict::Hung(_))), "{v:#?}");
+        }
+        let t = tops(&v, w.last().unwrap(), |v| matches!(v, Verdict::Hung(_)));
+        assert_eq!(t, vec![(30, vec![30, 31, 32])]);
     }
 
     #[test]
@@ -1450,7 +1536,8 @@ mod tests {
             parse_lsof_files(s),
             [(30, vec!["/tmp/out.log".to_string()])].into()
         );
-        assert_eq!(parse_lsof_pids("p5\nf3\np7\n"), [5, 7].into());
+        let tcp = "p5\nTST=LISTEN\nTQR=0\nTST=ESTABLISHED\np7\nTST=ESTABLISHED\np9\nf3\n";
+        assert_eq!(parse_lsof_tcp(tcp), ([5, 9].into(), [5, 7].into()));
     }
 
     #[test]

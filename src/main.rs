@@ -34,7 +34,7 @@ use store::Store;
 
 /// One event log for a fleet of coding agents: presence, tasks, blockers, asks and doorbells.
 #[derive(Parser)]
-#[command(version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("AGENT_FLEET_SHORT"), ")"), about)]
+#[command(version = env!("AGENT_FLEET_VERSION"), about)]
 struct Cli {
     /// Which fleet: one instance per project or product, each with its own hub, log, token,
     /// spool and replica.
@@ -79,6 +79,15 @@ enum Cmd {
         /// follows a replaced binary only after this passes.
         #[arg(long)]
         check: bool,
+    },
+    /// Mint a token that may post only as `host:<name>` (and its agents) or `agent:<name>` (the
+    /// agents on that host), into the hub's token table. Run it where the hub runs.
+    MintToken {
+        /// `host:<name>` or `agent:<name>`.
+        scope: String,
+        /// A new file (mode 0600) to write the token to; copy it to that host.
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Run the host agent for one herdr session: presence, disk, replica, doorbell delivery,
     /// and spawn requests for this host.
@@ -796,8 +805,16 @@ async fn main() -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| ctx.paths.token());
             let token = client::read_or_create_token(&token_file)?;
+            let tokens = hub::Tokens::load(token, &ctx.paths.hub_tokens())?;
             let db = db.clone().unwrap_or_else(|| ctx.paths.hub_db());
-            hub::serve(listen, &db, &ctx.paths.hub_file(), token).await?;
+            hub::serve(listen, &db, &ctx.paths.hub_file(), tokens).await?;
+        }
+        Cmd::MintToken { scope, out } => {
+            hub::mint(&ctx.paths.hub_tokens(), scope, out)?;
+            eprintln!(
+                "wrote a {scope} token to {}; restart the hub to accept it",
+                out.display()
+            );
         }
         Cmd::Host {
             herdr_socket,
@@ -1112,16 +1129,21 @@ async fn main() -> Result<()> {
             };
             // The caller's worktree is the one the fleet assigned at spawn (`spawn.result`), or, for
             // a hand-started agent, where its host first saw it; never its pane's live cwd, which
-            // follows a `cd`. No record fails closed.
+            // follows a `cd`; and never a main checkout. No record fails closed.
             let homes = match (&state, ctx.me().await) {
                 (Some(s), Ok(a)) => {
-                    let trees: Vec<_> = s
+                    let here: Vec<_> = s
                         .worktrees
                         .values()
                         .filter(|w| w.state.host == host)
+                        .collect();
+                    let trees: Vec<_> = here.iter().map(|w| w.state.path.clone()).collect();
+                    let mains: Vec<_> = here
+                        .iter()
+                        .filter(|w| w.state.path == w.state.repo)
                         .map(|w| w.state.path.clone())
                         .collect();
-                    kill::homes(&a.id, &s.assigned_worktrees(&host), &trees)
+                    kill::homes(&a.id, &s.assigned_worktrees(&host), &trees, &mains)
                 }
                 _ => Default::default(),
             };

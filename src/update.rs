@@ -116,16 +116,15 @@ pub(crate) async fn can_follow(
     says: &str,
 ) -> Result<(), String> {
     let running = running.ok_or("this hub does not know which commit it runs")?;
-    let new: String = says
-        .rfind('(')
-        .map(|open| {
-            says[open + 1..]
-                .chars()
-                .take_while(char::is_ascii_hexdigit)
-                .collect()
-        })
-        .unwrap_or_default();
-    if new.len() < 7 {
+    // `--version` prints `agent-fleet <version> <commit>`; the commit is the last word (a
+    // leading paren is still accepted). A line with no commit ("agent-fleet 0.1.0") has none.
+    let last = says.split_whitespace().last().unwrap_or_default();
+    let new: String = last
+        .trim_start_matches('(')
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect();
+    if new.len() < 7 || new.len() != last.trim_start_matches('(').trim_end_matches(')').len() {
         return Err(format!("it does not say which commit it is ({says:?})"));
     }
     if running.starts_with(new.as_str()) {
@@ -335,27 +334,52 @@ async fn update_waiting(
         .arg(&root);
     let built = limited(build, BUILD)
         .await
-        .with_context(|| format!("run {}", cargo.display()));
-    let done = built.and_then(|out| {
-        if !out.status.success() {
-            return Err(anyhow!(
-                "cargo install: {}",
-                tail(String::from_utf8_lossy(&out.stderr).trim())
-            ));
-        }
-        // The new binary has proved nothing yet: keep the old one reachable.
+        .with_context(|| format!("run {}", cargo.display()))
+        .and_then(|out| {
+            if !out.status.success() {
+                bail!(
+                    "cargo install: {}",
+                    tail(String::from_utf8_lossy(&out.stderr).trim())
+                );
+            }
+            Ok(())
+        });
+    let new = root.join("bin/agent-fleet");
+    let built = match built {
+        Ok(()) => reports(&new, &head).await,
+        err => err,
+    };
+    let done = built.and_then(|()| {
+        // The new binary has proved nothing past `--version` yet: keep the old one reachable.
         let prev = exe.with_file_name(format!(
             "{}.prev",
             exe.file_name().unwrap_or_default().to_string_lossy()
         ));
         // No rollback copy, no update.
         keep_prev(exe, &prev, true)?;
-        std::fs::rename(root.join("bin/agent-fleet"), exe)
-            .with_context(|| format!("move the build to {}", exe.display()))
+        std::fs::rename(&new, exe).with_context(|| format!("move the build to {}", exe.display()))
     });
     clean(&root);
     done?;
     Ok(Outcome::Replaced(head))
+}
+
+/// Fails unless the build at `new` runs and its `--version` names `head`: a build of anything
+/// else, or one that does not start, never replaces the binary.
+async fn reports(new: &Path, head: &str) -> Result<()> {
+    let mut c = tokio::process::Command::new(new);
+    c.arg("--version");
+    let out = limited(c, GIT)
+        .await
+        .with_context(|| format!("run {} --version", new.display()))?;
+    let said = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() || !said.split_whitespace().any(|w| w == head) {
+        bail!(
+            "the build reports {:?}, not {head}; the old binary is kept",
+            said.trim()
+        );
+    }
+    Ok(())
 }
 
 /// Removes a build directory; a leftover is logged, `sweep` retries it later.
@@ -521,6 +545,9 @@ struct Timer {
     /// The `origin/main` commit this host last asked itself to update to. A target that failed
     /// to build is not asked for again until `origin/main` moves.
     asked_for: Option<String>,
+    /// Since when the fetch has found `origin/main` ahead of this binary's commit; `host.health`
+    /// reports it, so `doctor` sees a fleet that agrees on an old commit.
+    behind_since: Option<chrono::DateTime<Utc>>,
 }
 
 /// What a tick runs against.
@@ -620,12 +647,9 @@ async fn tick<I: Io>(io: &I, c: &Ctx<'_>, seen: &mut Seen) {
 }
 
 /// `origin/main` when this binary's commit is an ancestor of it and not it: the host is behind.
-/// Takes the clone's lock for the fetch; another update running means nothing to say now.
+/// The caller holds the clone's lock for the fetch.
 async fn behind(clone: &Path, running: Option<&str>) -> Result<Option<String>> {
     let Some(running) = running else {
-        return Ok(None);
-    };
-    let Ok(_lock) = lock(clone).await else {
         return Ok(None);
     };
     git_in(clone, &["fetch", "--quiet", "origin", "main"], PULL).await?;
@@ -662,9 +686,14 @@ async fn timer<I: Io>(io: &I, c: &Ctx<'_>, t: &mut Timer) {
     if !io.pending().is_empty() {
         return;
     }
+    // Another update running means nothing to say now; what is known about being behind stays.
+    let Ok(_lock) = lock(c.clone).await else {
+        return;
+    };
     match behind(c.clone, c.running).await {
-        Ok(Some(target)) if t.asked_for.as_deref() != Some(target.as_str()) => {
-            if io.ask().await {
+        Ok(Some(target)) => {
+            t.behind_since.get_or_insert_with(Utc::now);
+            if t.asked_for.as_deref() != Some(target.as_str()) && io.ask().await {
                 io.note(format!(
                     "update: running {}, origin/main is {}; asked this host to update",
                     short(c.running),
@@ -673,7 +702,8 @@ async fn timer<I: Io>(io: &I, c: &Ctx<'_>, t: &mut Timer) {
                 t.asked_for = Some(target);
             }
         }
-        Ok(_) => {}
+        Ok(None) => t.behind_since = None,
+        // A failed fetch tells nothing: the clock keeps running.
         Err(e) => eprintln!("agent-fleet host: update check: {e:#}"),
     }
 }
@@ -689,7 +719,7 @@ pub async fn update_loop(host: Arc<Host>) {
         Err(err) => eprintln!("agent-fleet host: update: {err:#}"),
     }
     let me = host.cfg.host.clone();
-    let io = HostIo(host);
+    let io = HostIo(host.clone());
     let mut seen = Seen::default();
     let mut timer_state = Timer::default();
     loop {
@@ -705,6 +735,7 @@ pub async fn update_loop(host: Arc<Host>) {
         };
         tick(&io, &c, &mut seen).await;
         timer(&io, &c, &mut timer_state).await;
+        *host.behind_since.lock().unwrap() = timer_state.behind_since;
     }
 }
 
@@ -819,11 +850,19 @@ mod tests {
     }
 
     /// An origin with one commit on `main`, a clone of it, and a binary dir with a fake `cargo`
-    /// that "builds" a script printing `new`.
+    /// that "builds" a script whose `--version` names the clone's head.
     fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
-        fixture_with(
-            "while [ $# -gt 0 ]; do [ \"$1\" = --root ] && root=$2; shift; done\n\
-             mkdir -p \"$root/bin\" && echo new > \"$root/bin/agent-fleet\"\n",
+        fixture_with(&builds(r#""$(git -C "$src" rev-parse HEAD)""#))
+    }
+
+    /// A fake `cargo install` body whose build answers `--version` with `commit` (shell words).
+    fn builds(commit: &str) -> String {
+        format!(
+            r#"while [ $# -gt 0 ]; do case $1 in --root) root=$2;; --path) src=$2;; esac; shift; done
+mkdir -p "$root/bin"
+printf '#!/bin/sh\necho agent-fleet 0.1.0 %s\n' {commit} > "$root/bin/agent-fleet"
+chmod +x "$root/bin/agent-fleet"
+"#
         )
     }
 
@@ -894,9 +933,9 @@ mod tests {
         let second = sh(&origin, &["rev-parse", "HEAD"]);
         assert_eq!(
             update(&clone, &exe, Some(&first)).await.unwrap(),
-            Outcome::Replaced(second)
+            Outcome::Replaced(second.clone())
         );
-        assert_eq!(std::fs::read_to_string(&exe).unwrap().trim(), "new");
+        assert!(std::fs::read_to_string(&exe).unwrap().contains(&second));
         let left: Vec<_> = std::fs::read_dir(exe.parent().unwrap())
             .unwrap()
             .map(|e| e.unwrap().file_name())
@@ -930,6 +969,27 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(left.len(), 2, "no build dir, no .prev: {left:?}");
+    }
+
+    #[tokio::test]
+    async fn a_build_reporting_another_commit_is_never_installed() {
+        let (_t, origin, clone, exe) = fixture_with(&builds(&"0".repeat(40)));
+        newer(&origin);
+        let err = update(&clone, &exe, None).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("the old binary is kept"),
+            "{err:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "old");
+        let left: Vec<_> = std::fs::read_dir(exe.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            left.len(),
+            2,
+            "cargo and the binary, no build, no .prev: {left:?}"
+        );
     }
 
     #[tokio::test]
@@ -1346,9 +1406,11 @@ mod tests {
         let c = ctx(&clone, &exe, running);
         timer(&io, &c, &mut t).await;
         assert!(io.log.borrow().is_empty(), "up to date: no request");
+        assert!(t.behind_since.is_none());
         newer(&origin);
         timer(&io, &c, &mut t).await;
         assert_eq!(*io.log.borrow(), ["ask"], "behind: one request");
+        let since = t.behind_since.expect("behind since the fetch saw it");
         // The request is answered; still behind (it built nothing, say): not asked again.
         io.pending.borrow_mut().clear();
         timer(&io, &c, &mut t).await;
@@ -1356,6 +1418,12 @@ mod tests {
         sh(&origin, &["commit", "-q", "--allow-empty", "-m", "three"]);
         timer(&io, &c, &mut t).await;
         assert_eq!(io.log.borrow().len(), 2, "origin/main moved: asked again");
+        assert_eq!(t.behind_since, Some(since), "behind since the first time");
+        // origin/main went back (a revert, say) to the commit this binary runs: not behind.
+        sh(&origin, &["reset", "-q", "--hard", &first]);
+        io.pending.borrow_mut().clear();
+        timer(&io, &c, &mut t).await;
+        assert!(t.behind_since.is_none(), "on origin/main again");
     }
 
     #[tokio::test]
@@ -1432,16 +1500,23 @@ mod tests {
         let exe = Ok(exe);
         let io = Fake::default();
         let c = ctx(&clone, &exe, Some(&first));
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let mut t = Timer {
+            behind_since: Some(since),
+            ..Timer::default()
+        };
         let held = lock(&clone).await.unwrap();
-        timer(&io, &c, &mut Timer::default()).await;
+        timer(&io, &c, &mut t).await;
         assert!(io.log.borrow().is_empty(), "an update is running");
         drop(held);
         sh(&clone, &["remote", "set-url", "origin", "/nonexistent"]);
-        timer(&io, &c, &mut Timer::default()).await;
+        t.last = None;
+        timer(&io, &c, &mut t).await;
         assert!(
             io.log.borrow().is_empty(),
             "origin unreachable: logged, no request"
         );
+        assert_eq!(t.behind_since, Some(since), "neither resets the clock");
     }
 
     #[tokio::test]
@@ -1652,6 +1727,7 @@ mod tests {
                     disk_total: 0,
                     agents: 0,
                     commit: commit.map(String::from),
+                    behind_since: None,
                     ts,
                     started: None,
                 },
@@ -1764,10 +1840,10 @@ mod tests {
             std::fs::write(&bin, body).unwrap();
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         };
-        put("#!/bin/sh\necho 'agent-fleet 0.1.0 (abc1234)'\n");
+        put("#!/bin/sh\necho 'agent-fleet 0.1.0 abc1234'\n");
         assert_eq!(
             binary_says(&bin).await.unwrap(),
-            "agent-fleet 0.1.0 (abc1234)"
+            "agent-fleet 0.1.0 abc1234"
         );
         put("#!/bin/sh\necho boom; exit 3\n");
         assert!(binary_says(&bin).await.is_err(), "exits non-zero");
@@ -1790,7 +1866,7 @@ mod tests {
         sh(&clone, &["checkout", "-q", "-b", "side", &old]);
         sh(&clone, &["commit", "-q", "--allow-empty", "-m", "side"]);
         let side = sh(&clone, &["rev-parse", "HEAD"]);
-        let says = |c: &str| format!("agent-fleet 0.1.0 ({})", &c[..7]);
+        let says = |c: &str| format!("agent-fleet 0.1.0 {c}");
         let can = |running: Option<&str>, says: &str| {
             let (clone, running, says) =
                 (clone.clone(), running.map(String::from), says.to_string());
@@ -1809,9 +1885,12 @@ mod tests {
         assert!(can(Some(&new), &says(&side)).await.is_err(), "unrelated");
         // Unknown means no: a commit git has not heard of, no commit, no clone.
         assert!(
-            can(Some(&new), "agent-fleet 0.1.0 (0123456)")
-                .await
-                .is_err()
+            can(
+                Some(&new),
+                "agent-fleet 0.1.0 0123456789abcdef0123456789abcdef01234567"
+            )
+            .await
+            .is_err()
         );
         assert!(can(None, &says(&old)).await.is_err(), "own commit unknown");
         assert!(

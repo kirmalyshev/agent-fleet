@@ -14,9 +14,9 @@ fn run(home: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
-fn git_short() -> Option<String> {
+fn git_head() -> Option<String> {
     let out = Command::new("git")
-        .args(["rev-parse", "--short=7", "HEAD"])
+        .args(["rev-parse", "HEAD"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .ok()?;
@@ -49,20 +49,17 @@ fn version_names_the_commit_the_binary_was_built_from() {
     let out = run(home.path(), &["--version"]);
     assert!(out.status.success());
     let says = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let (name, rest) = says.split_once(' ').unwrap();
-    assert_eq!(name, "agent-fleet", "{says}");
-    let (version, commit) = rest.split_once(" (").expect(&says);
-    assert_eq!(version, env!("CARGO_PKG_VERSION"), "{says}");
-    let commit = commit.strip_suffix(')').expect(&says);
-    match git_short() {
-        // Built in a checkout: the commit the hub's follow check reads.
-        Some(head) => {
-            assert_eq!(commit.len(), 7, "{says}");
-            assert!(commit.chars().all(|c| c.is_ascii_hexdigit()), "{says}");
-            // The build may be older than HEAD (a stale artifact); it is never empty.
-            assert!(!head.is_empty());
+    let words: Vec<&str> = says.split_whitespace().collect();
+    assert_eq!(words[0], "agent-fleet", "{says}");
+    assert_eq!(words[1], env!("CARGO_PKG_VERSION"), "{says}");
+    match git_head() {
+        // Built in a checkout: the last word is the commit the hub's follow check reads.
+        Some(_) => {
+            assert_eq!(words.len(), 3, "{says}");
+            assert_eq!(words[2].len(), 40, "{says}");
+            assert!(words[2].chars().all(|c| c.is_ascii_hexdigit()), "{says}");
         }
-        None => assert_eq!(commit, "unknown", "{says}"),
+        None => assert_eq!(words.len(), 2, "no git: no commit: {says}"),
     }
 }
 

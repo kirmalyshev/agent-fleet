@@ -513,6 +513,14 @@
               "minimum": 0,
               "type": "integer"
             },
+            "behind_since": {
+              "description": "Since when the host's fetch has found `origin/main` ahead of `commit`; absent when it is\nnot behind, or cannot tell.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "commit": {
               "description": "The commit the host's binary was built from; absent when built outside a git checkout.",
               "type": [
@@ -2314,6 +2322,14 @@
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
+            },
+            "behind_since": {
+              "description": "Since when that commit has been behind `origin/main`, as its last `host.health` said.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "commit": {
               "description": "The commit its binary was built from, as its last `host.health` said.",

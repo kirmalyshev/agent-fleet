@@ -1,14 +1,17 @@
 //! `agent-fleet hub`: the log, the fold, and the one sequencer for exclusive writes, over HTTP + SSE.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::net::SocketAddr;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use axum::extract::{Query, Request, State as AxState};
+use axum::extract::{Extension, Query, Request, State as AxState};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -21,7 +24,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::event::{self, Known, Reject};
+use crate::event::{self, ActorKind, Known, Reject};
 use crate::state::State;
 use crate::stats::{self, Dist};
 use crate::store::{Store, UnknownCursor};
@@ -108,9 +111,9 @@ impl Hub {
         }))
     }
 
-    /// Validates and appends one event. Runs under the hub lock, so the 409 check and the append
-    /// are one step: this is the sequencer.
-    pub fn submit(&mut self, raw: &Value) -> Result<Accepted, Reject> {
+    /// Validates and appends one event posted with a token of `scope`. Runs under the hub lock,
+    /// so the 409 check and the append are one step: this is the sequencer.
+    pub fn submit_as(&mut self, raw: &Value, scope: &Scope) -> Result<Accepted, Reject> {
         let internal = |err: anyhow::Error| Reject::Internal(err.to_string());
         // A known id is acknowledged before anything else, so replaying an event this hub
         // already accepted never fails, even if the rules have tightened since.
@@ -123,6 +126,12 @@ impl Hub {
             });
         }
         let e = event::parse_strict(raw)?;
+        if !scope.may_post(&e.actor) {
+            return Err(Reject::Forbidden(format!(
+                "this token may not post as {}",
+                e.actor.id
+            )));
+        }
         if let (Known::TaskAssigned(_), Some(task)) = (&e.body, &e.task)
             && let Some(owner) = self.state.owner_of(task)
         {
@@ -204,6 +213,121 @@ impl Hub {
         self.append(msg.into_event())?;
         self.append(answered.into_event())
     }
+}
+
+/// Which actors a bearer token may post as.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Scope {
+    /// The shared token file: every actor, except a host that has a token of its own (named here).
+    Shared(Arc<BTreeSet<String>>),
+    /// `host:<name>` in the token table: that host and the agents on it.
+    Host(String),
+    /// `agent:<name>` in the token table: the agents on that host.
+    Agents(String),
+}
+
+impl Scope {
+    fn may_post(&self, a: &event::Actor) -> bool {
+        let host = a.id.strip_prefix("host:");
+        let agent_host =
+            a.id.strip_prefix("agent:")
+                .and_then(|r| r.split('/').next());
+        match (self, &a.kind) {
+            (Scope::Shared(own), ActorKind::Host) => !host.is_some_and(|h| own.contains(h)),
+            (Scope::Shared(_), _) => true,
+            (Scope::Host(h), ActorKind::Host) => host == Some(h),
+            (Scope::Host(h) | Scope::Agents(h), ActorKind::Agent) => agent_host == Some(h),
+            _ => false,
+        }
+    }
+}
+
+fn parse_scope(s: &str) -> Result<Scope> {
+    let (kind, name) = s.split_once(':').unwrap_or_default();
+    if name.is_empty() || name.contains(|c: char| c == '/' || c.is_whitespace()) {
+        bail!("scope {s:?}: expected host:<name> or agent:<name>");
+    }
+    match kind {
+        "host" => Ok(Scope::Host(name.into())),
+        "agent" => Ok(Scope::Agents(name.into())),
+        _ => bail!("scope {s:?}: expected host:<name> or agent:<name>"),
+    }
+}
+
+/// The hub's bearer tokens: the shared token file, and the scoped ones in the token table.
+pub struct Tokens {
+    shared: String,
+    scoped: Vec<(String, Scope)>,
+    /// Hosts with a `host:` token, which the shared token may no longer post as.
+    own: Arc<BTreeSet<String>>,
+}
+
+impl Tokens {
+    pub fn new(shared: String) -> Self {
+        Self {
+            shared,
+            scoped: Vec::new(),
+            own: Arc::default(),
+        }
+    }
+
+    /// The shared token plus the table's `<scope> <token>` lines; no table is an empty one.
+    pub fn load(shared: String, table: &Path) -> Result<Self> {
+        let text = match std::fs::read_to_string(table) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("read {}", table.display())),
+        };
+        let mut t = Self::new(shared);
+        let mut own = BTreeSet::new();
+        for (n, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            // Never echo the line: it holds a token.
+            let mut words = line.split_whitespace();
+            let (Some(scope), Some(token), None) = (words.next(), words.next(), words.next())
+            else {
+                bail!("{}:{}: expected `<scope> <token>`", table.display(), n + 1);
+            };
+            let scope =
+                parse_scope(scope).with_context(|| format!("{}:{}", table.display(), n + 1))?;
+            if let Scope::Host(h) = &scope {
+                own.insert(h.clone());
+            }
+            t.scoped.push((token.into(), scope));
+        }
+        t.own = Arc::new(own);
+        Ok(t)
+    }
+
+    /// Compares against every token, so timing does not tell which one matched.
+    fn scope_of(&self, presented: &str) -> Option<Scope> {
+        let p = presented.as_bytes();
+        let mut found = same(p, self.shared.as_bytes()).then(|| Scope::Shared(self.own.clone()));
+        for (t, s) in &self.scoped {
+            if same(p, t.as_bytes()) {
+                found = Some(s.clone());
+            }
+        }
+        found
+    }
+}
+
+/// `agent-fleet mint-token`: a new token for `scope` in `out` (mode 0600, never overwritten),
+/// and its line in the hub's token table. The hub reads the table when it starts.
+pub fn mint(table: &Path, scope: &str, out: &Path) -> Result<()> {
+    parse_scope(scope)?;
+    let token = crate::client::write_new_token(out)?;
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(table)
+        .with_context(|| format!("open {}", table.display()))?;
+    writeln!(f, "{scope} {token}")?;
+    Ok(())
 }
 
 type Shared = Arc<Mutex<Hub>>;
@@ -350,7 +474,12 @@ async fn followable(exe: &Path) -> Result<(), String> {
 /// this instance's clients look: the loopback one when given, so a client on this host does not
 /// depend on the network the other addresses ride (3 Nov: a Tailscale blip cut the hub off from
 /// its own host).
-pub async fn serve(listen: &[SocketAddr], db: &Path, hub_file: &Path, token: String) -> Result<()> {
+pub async fn serve(
+    listen: &[SocketAddr],
+    db: &Path,
+    hub_file: &Path,
+    tokens: Tokens,
+) -> Result<()> {
     if let Some(a) = listen.iter().find(|a| a.ip().is_unspecified()) {
         bail!("refusing to listen on {a}: bind a specific address (default 127.0.0.1)");
     }
@@ -394,7 +523,7 @@ pub async fn serve(listen: &[SocketAddr], db: &Path, hub_file: &Path, token: Str
     );
     std::fs::write(hub_file, format!("http://{}\n", hub_file_addr(&bound)?))?;
     let shared: Shared = Arc::new(Mutex::new(hub));
-    let app = router_shared(shared.clone(), token);
+    let app = router_shared(shared.clone(), tokens);
     match exe {
         Ok(exe) => {
             let at = exe.clone();
@@ -452,11 +581,16 @@ fn hub_file_addr(listen: &[SocketAddr]) -> Result<SocketAddr> {
         .context("--listen: no address")
 }
 
+/// A router whose one token may post as anyone the hub accepts.
 pub fn router(hub: Hub, token: String) -> Router {
-    router_shared(Arc::new(Mutex::new(hub)), token)
+    scoped_router(hub, Tokens::new(token))
 }
 
-fn router_shared(hub: Shared, token: String) -> Router {
+pub fn scoped_router(hub: Hub, tokens: Tokens) -> Router {
+    router_shared(Arc::new(Mutex::new(hub)), tokens)
+}
+
+fn router_shared(hub: Shared, tokens: Tokens) -> Router {
     let api = Router::new()
         .route("/events", post(post_event).get(get_events))
         .route("/events/stream", get(stream))
@@ -465,7 +599,7 @@ fn router_shared(hub: Shared, token: String) -> Router {
         .route("/board", get(get_board))
         .route("/board/answer", post(post_answer))
         .route("/schema", get(|| async { Json(event::api_schema()) }))
-        .layer(middleware::from_fn_with_state(Arc::new(token), auth));
+        .layer(middleware::from_fn_with_state(Arc::new(tokens), auth));
     // The board page holds no data: it asks for the token and reads `/board` with it.
     Router::new()
         .route("/", get(board_page))
@@ -511,8 +645,19 @@ struct AnswerBody {
     approve: bool,
 }
 
-/// The one way a human writes: the token holder answers an Inbox question from the board.
-async fn post_answer(AxState(hub): AxState<Shared>, Json(b): Json<AnswerBody>) -> Response {
+/// The one way a human writes: the holder of the shared token answers an Inbox question from
+/// the board. A scoped token is a host's or an agent's, never the operator's.
+async fn post_answer(
+    AxState(hub): AxState<Shared>,
+    Extension(scope): Extension<Scope>,
+    Json(b): Json<AnswerBody>,
+) -> Response {
+    if !matches!(scope, Scope::Shared(_)) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "only the shared token answers the board",
+        );
+    }
     let result = hub.lock().unwrap().answer(&b.ask, &b.answer, b.approve);
     match result {
         Ok(a) => Json(json!({ "id": a.id })).into_response(),
@@ -523,16 +668,17 @@ async fn post_answer(AxState(hub): AxState<Shared>, Json(b): Json<AnswerBody>) -
     }
 }
 
-async fn auth(AxState(token): AxState<Arc<String>>, req: Request, next: Next) -> Response {
-    let ok = req
+async fn auth(AxState(tokens): AxState<Arc<Tokens>>, mut req: Request, next: Next) -> Response {
+    let scope = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|t| same(t.as_bytes(), token.as_bytes()));
-    if !ok {
+        .and_then(|t| tokens.scope_of(t));
+    let Some(scope) = scope else {
         return error(StatusCode::UNAUTHORIZED, "missing or wrong bearer token");
-    }
+    };
+    req.extensions_mut().insert(scope);
     next.run(req).await
 }
 
@@ -555,10 +701,14 @@ fn read_error(e: anyhow::Error) -> Response {
     error(status, &e.to_string())
 }
 
-async fn post_event(AxState(hub): AxState<Shared>, Json(raw): Json<Value>) -> Response {
+async fn post_event(
+    AxState(hub): AxState<Shared>,
+    Extension(scope): Extension<Scope>,
+    Json(raw): Json<Value>,
+) -> Response {
     let started = Instant::now();
     let mut h = hub.lock().unwrap();
-    let result = h.submit(&raw);
+    let result = h.submit_as(&raw, &scope);
     let outcome = match &result {
         Ok(a) if a.duplicate => "duplicate",
         Ok(_) => "accepted",
@@ -762,6 +912,138 @@ mod tests {
 
     fn hub() -> Hub {
         Hub::new(Store::memory().unwrap()).unwrap()
+    }
+
+    impl Hub {
+        /// Posted with the shared token and no host holding its own.
+        fn submit(&mut self, raw: &Value) -> Result<Accepted, Reject> {
+            self.submit_as(raw, &Scope::Shared(Arc::default()))
+        }
+    }
+
+    /// A note from `actor` (`host:<h>` or `agent:<h>/…`): both kinds may write `msg.sent`.
+    fn note(actor: &str) -> Value {
+        let kind = if actor.starts_with("host:") {
+            ActorKind::Host
+        } else {
+            ActorKind::Agent
+        };
+        let e = Envelope::new(
+            Actor {
+                kind,
+                id: actor.into(),
+            },
+            "p",
+            Known::MsgSent(MsgSent {
+                to: "agent:a/s/x".into(),
+                kind: "NOTE".into(),
+                reference: "r".into(),
+                text: "hi".into(),
+            }),
+        );
+        serde_json::to_value(e).unwrap()
+    }
+
+    #[test]
+    fn a_token_posts_only_the_actors_its_scope_names() {
+        let mut h = hub();
+        let host_a = Scope::Host("a".into());
+        let agents_a = Scope::Agents("a".into());
+        let shared = Scope::Shared(Arc::new(BTreeSet::from(["a".to_string()])));
+        for (scope, actor, ok) in [
+            (&host_a, "host:a", true),
+            (&host_a, "agent:a/s/x", true),
+            (&host_a, "host:b", false),
+            (&host_a, "host:ab", false),
+            (&host_a, "agent:b/s/x", false),
+            (&agents_a, "agent:a/s/x", true),
+            (&agents_a, "host:a", false),
+            (&agents_a, "agent:b/s/x", false),
+            // The shared token keeps every host that has no token of its own.
+            (&shared, "host:b", true),
+            (&shared, "agent:a/s/x", true),
+            (&shared, "host:a", false),
+        ] {
+            let got = h.submit_as(&note(actor), scope);
+            assert_eq!(got.is_ok(), ok, "{scope:?} posting as {actor}: {got:?}");
+            if !ok {
+                assert!(matches!(got, Err(Reject::Forbidden(_))), "{got:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_bad_token_table_is_refused_without_echoing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("hub-tokens");
+        for bad in [
+            "host:a",
+            "human:x s3cret",
+            "host: s3cret",
+            "host:a/b s3cret",
+            "host:a s3cret x",
+        ] {
+            std::fs::write(&table, bad).unwrap();
+            let err = format!("{:#}", Tokens::load("t".into(), &table).err().unwrap());
+            assert!(!err.contains("s3cret"), "{err}");
+        }
+        assert!(Tokens::load("t".into(), &dir.path().join("none")).is_ok());
+        assert!(mint(&table, "operator", &dir.path().join("x")).is_err());
+        assert!(!dir.path().join("x").exists(), "no token for a bad scope");
+    }
+
+    #[tokio::test]
+    async fn minted_tokens_bind_the_actor_over_http() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (table, host_a, agent_a) = (
+            dir.path().join("hub-tokens"),
+            dir.path().join("host-a"),
+            dir.path().join("agent-a"),
+        );
+        mint(&table, "host:a", &host_a).unwrap();
+        mint(&table, "agent:a", &agent_a).unwrap();
+        assert!(mint(&table, "host:a", &host_a).is_err(), "never overwrites");
+        for f in [&table, &host_a] {
+            let mode = std::fs::metadata(f).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{}", f.display());
+        }
+        let read = |p: &Path| std::fs::read_to_string(p).unwrap();
+        let (host_a, agent_a) = (read(&host_a), read(&agent_a));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = scoped_router(hub(), Tokens::load("shared".into(), &table).unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = reqwest::Client::new();
+        let post = |token: &str, actor: &str| {
+            http.post(format!("{base}/events"))
+                .bearer_auth(token)
+                .json(&note(actor))
+                .send()
+        };
+        for (token, actor, status) in [
+            (host_a.as_str(), "host:a", 200),
+            (host_a.as_str(), "agent:a/s/x", 200),
+            (host_a.as_str(), "host:b", 403),
+            (agent_a.as_str(), "host:a", 403),
+            (agent_a.as_str(), "agent:a/s/x", 200),
+            ("shared", "host:a", 403),
+            ("shared", "host:b", 200),
+            ("shared", "agent:b/s/x", 200),
+            ("wrong", "agent:a/s/x", 401),
+        ] {
+            let got = post(token, actor).await.unwrap().status();
+            assert_eq!(got, status, "posting as {actor}");
+        }
+        // Reads stay open to every valid token; the board's human channel does not.
+        let state = http.get(format!("{base}/state")).bearer_auth(&agent_a);
+        assert_eq!(state.send().await.unwrap().status(), 200);
+        let answer = http
+            .post(format!("{base}/board/answer"))
+            .bearer_auth(&host_a)
+            .json(&json!({ "ask": "x", "answer": "y" }));
+        assert_eq!(answer.send().await.unwrap().status(), 403);
     }
 
     fn assign(agent: &str) -> Value {
@@ -1087,7 +1369,8 @@ mod tests {
             .map(|a| a.parse().unwrap())
             .collect();
         let (db, hf) = (dir.path().join("h.db"), hub_file.clone());
-        let task = tokio::spawn(async move { serve(&addrs, &db, &hf, "t".into()).await });
+        let task =
+            tokio::spawn(async move { serve(&addrs, &db, &hf, Tokens::new("t".into())).await });
         for _ in 0..100 {
             if std::fs::read_to_string(&hub_file).is_ok_and(|s| s.ends_with('\n')) {
                 break;
@@ -1122,7 +1405,7 @@ mod tests {
                 &addrs,
                 &dir.path().join("h.db"),
                 &dir.path().join("hub"),
-                "t".into(),
+                Tokens::new("t".into()),
             )
             .await
             .unwrap_err();
