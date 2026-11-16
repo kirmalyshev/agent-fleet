@@ -15,6 +15,7 @@ mod store;
 mod stuck;
 mod tui;
 mod ui;
+mod watch;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -184,16 +185,19 @@ enum Cmd {
         #[arg(long, conflicts_with = "level")]
         clear: bool,
     },
-    /// Spawn an agent on an issue: the project's `.agent-fleet/fleet.toml` picks the profile
+    /// Spawn an agent on an issue, or with `--title` on work that has none: the project's `.agent-fleet/fleet.toml` picks the profile
     /// and host, the host agent runs it (worktree, env scrub, agent start, the brief) and
     /// answers `spawn.result`. Follows the hub until the result arrives (10 min).
     Spawn {
-        /// `<owner/repo>#<issue>`
+        /// `<owner/repo>#<issue>`, or `<owner/repo>` with `--title`
         target: String,
+        /// What the work is, for a target with no issue: the task's title and `@@TITLE@@`.
+        #[arg(long)]
+        title: Option<String>,
         /// Extra context for the rules and the `@@SCOPE@@` token.
         #[arg(long)]
         scope: Option<String>,
-        /// The agent's name [default: the profile's prefix + the issue number].
+        /// The agent's name [default: the profile's prefix + the issue number, or the title's words].
         #[arg(long)]
         name: Option<String>,
         /// The new worktree's branch [default: the name].
@@ -248,6 +252,9 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// What the log says of a process on this host: `hung`, `orphan`, `waiting` (in a lock's
+    /// queue), `no report` (not hung, or not watched), or `gone`.
+    Proc { pid: u32 },
     /// What needs a look: stale, hung or heavy agents, duplicate work, forgotten worktrees,
     /// unpushed commits.
     Doctor {
@@ -819,6 +826,17 @@ async fn main() -> Result<()> {
                 print!("{}", ui::stats(&v)?);
             }
         }
+        Cmd::Proc { pid } => {
+            let (verdict, detail) = if scan::alive(*pid) {
+                watch::verdict_of(&ctx.state().await?, &ctx.host_name(), *pid, now)
+            } else {
+                ("gone", None)
+            };
+            println!(
+                "{verdict}{}",
+                detail.map(|d| format!(": {d}")).unwrap_or_default()
+            );
+        }
         Cmd::Doctor { json } => {
             let f = doctor::findings(&ctx.state().await?, now);
             if *json {
@@ -960,23 +978,40 @@ async fn main() -> Result<()> {
             let t = kill::table()?;
             let me = std::process::id();
             let host = ctx.host_name();
-            let state = ctx.state().await.ok();
-            let orphans: std::collections::BTreeSet<u32> =
-                state.as_ref().map_or_else(Default::default, |s| {
-                    doctor::findings(s, now)
-                        .iter()
-                        .filter(|f| f.kind == "orphan")
-                        .filter_map(|f| s.worktree_procs.get(&f.subject))
-                        .filter(|p| p.procs.host == host)
-                        .flat_map(|p| p.procs.pids.iter().copied())
-                        .collect()
-                });
-            // The scan is minutes old: on Linux the pid must still be in a deleted directory.
+            let state = ctx
+                .state()
+                .await
+                .inspect_err(|e| {
+                    eprintln!("agent-fleet kill: no state, so no orphan or hung proof: {e:#}")
+                })
+                .ok();
+            let orphans = state
+                .as_ref()
+                .map_or_else(Default::default, |s| doctor::killable(s, now, &host));
+            // The scan is minutes old: on Linux the pid must still be in the directory doctor named.
             let still_orphaned = |pid: u32| {
-                orphans.contains(&pid)
-                    && (!cfg!(target_os = "linux")
-                        || std::fs::read_link(format!("/proc/{pid}/cwd"))
-                            .is_ok_and(|c| c.to_string_lossy().ends_with(" (deleted)")))
+                orphans.get(&pid).is_some_and(|dir| {
+                    !cfg!(target_os = "linux")
+                        || std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|c| {
+                            let c = c.to_string_lossy();
+                            std::path::Path::new(c.trim_end_matches(" (deleted)")).starts_with(dir)
+                        })
+                })
+            };
+            // A hung report holds for the process that hung, not a later one with its pid.
+            let hung = state
+                .as_ref()
+                .map_or_else(Default::default, |s| doctor::hung_pids(s, &host, now));
+            let live = (!hung.is_empty())
+                .then(scan::Procs::read)
+                .unwrap_or_default();
+            let hung_ok = |pid: u32| {
+                hung.get(&pid).is_some_and(|since| {
+                    live.0
+                        .get(&pid)
+                        .and_then(|p| p.started)
+                        .is_some_and(|t| t <= *since)
+                })
             };
             // The caller's worktree is the one the fleet assigned at spawn (`spawn.result`), never
             // its pane's live cwd, which follows a `cd`; no record fails closed.
@@ -995,9 +1030,16 @@ async fn main() -> Result<()> {
             let refused: Vec<(u32, String)> = pids
                 .iter()
                 .filter_map(|&pid| {
-                    kill::judge_in(&t, me, pid, || still_orphaned(pid), &homes, &scan::cwd_of)
-                        .err()
-                        .map(|why| (pid, why))
+                    kill::judge_in(
+                        &t,
+                        me,
+                        pid,
+                        |foreign| hung_ok(pid) || (!foreign && still_orphaned(pid)),
+                        &homes,
+                        &scan::cwd_of,
+                    )
+                    .err()
+                    .map(|why| (pid, why))
                 })
                 .collect();
             if !refused.is_empty() {
@@ -1142,6 +1184,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Spawn {
             target,
+            title,
             scope,
             name,
             branch,
@@ -1153,7 +1196,16 @@ async fn main() -> Result<()> {
             no_wait,
         } => {
             let (repo, issue_n) = spawn::parse_target(target)?;
-            let issue = spawn::gh_issue(&repo, issue_n).await?;
+            let issue = match (issue_n, title) {
+                (Some(_), Some(_)) => bail!("--title is for a target with no issue"),
+                (Some(n), None) => spawn::gh_issue(&repo, n).await?,
+                (None, Some(t)) => spawn::Issue {
+                    repo: repo.clone(),
+                    title: t.clone(),
+                    labels: Vec::new(),
+                },
+                (None, None) => bail!("{repo} names no issue: say what the work is with --title"),
+            };
             let (cfg, cfg_dir) = spawn::find()?;
             // With no fleet state, caps and quotas are consulted as empty — say so.
             let (state, note) = ctx.snapshot_state().await.unwrap_or_else(|e| {
@@ -1179,9 +1231,15 @@ async fn main() -> Result<()> {
                 &ctx.host_name(),
             )?;
             let prof = &cfg.profiles[&d.profile];
-            let name = name
-                .clone()
-                .unwrap_or_else(|| format!("{}{}", prof.prefix, issue.number));
+            let name = name.clone().unwrap_or_else(|| match issue_n {
+                Some(n) => format!("{}{n}", prof.prefix),
+                // herdr caps an agent name at 32 characters.
+                None => format!(
+                    "{}{}",
+                    prof.prefix,
+                    spawn::title_slug(&issue.title, 32usize.saturating_sub(prof.prefix.len()))
+                ),
+            });
             if name.is_empty() || name.contains(['/', ':', ' ']) {
                 bail!("agent name {:?} is not usable in an agent id", name);
             }
@@ -1203,6 +1261,14 @@ async fn main() -> Result<()> {
                 Err(_) if *dry_run => "?".into(),
                 Err(e) => return Err(anyhow::anyhow!("{e:#}")),
             };
+            let task = match issue_n {
+                Some(n) => spawn::task_id(&repo, n),
+                None => format!("task:{}/{name}", spawn::task_project(&repo)),
+            };
+            let target_ref = match issue_n {
+                Some(n) => format!("{repo}#{n}"),
+                None => repo.clone(),
+            };
             let mut vals = cfg.vars.clone();
             for (k, v) in set {
                 vals.insert(k.clone(), v.clone());
@@ -1212,7 +1278,9 @@ async fn main() -> Result<()> {
                 ("KIND", d.profile.as_str()),
                 ("PROGRAM", prof.kind.as_str()),
                 ("SLUG", repo.as_str()),
-                ("ISSUE", &issue.number.to_string()),
+                ("ISSUE", &issue_n.map_or(String::new(), |n| n.to_string())),
+                ("REF", target_ref.as_str()),
+                ("TASK", task.as_str()),
                 ("TITLE", issue.title.as_str()),
                 ("BRANCH", branch.as_str()),
                 ("SCOPE", scope.as_deref().unwrap_or("")),
@@ -1227,7 +1295,7 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("read {}", cfg_dir.join(&cfg.brief).display()))?;
             let brief = spawn::render(spawn::brief_body(&src), &vals)?;
             if *dry_run {
-                println!("spawn {repo}#{} \"{}\"", issue.number, issue.title);
+                println!("spawn {target_ref} \"{}\"", issue.title);
                 println!("rule      {}", d.why);
                 println!("profile   {} (kind {})", d.profile, prof.kind);
                 println!("host      {}", d.host);
@@ -1236,34 +1304,46 @@ async fn main() -> Result<()> {
                 println!("branch    {branch}");
                 println!("level     {}", d.level);
                 println!("lead      {lead}");
+                println!("task      {task}");
                 println!("--- brief ---");
                 print!("{brief}");
                 return Ok(());
             }
             println!(
-                "spawn {repo}#{} → {} ({}) on {} as {name} · {}",
-                issue.number, d.profile, prof.kind, d.host, d.why
+                "spawn {target_ref} → {} ({}) on {} as {name} · {}",
+                d.profile, prof.kind, d.host, d.why
             );
             let me = me.map_err(|e| anyhow::anyhow!("{e:#}"))?;
-            let task = spawn::task_id(&repo, issue.number);
             if !state.tasks.contains_key(&task) {
                 let created = Envelope::new(
                     me.clone(),
                     spawn::task_project(&repo),
                     Known::TaskCreated(TaskCreated {
                         title: issue.title.clone(),
-                        url: Some(format!("https://github.com/{repo}/issues/{}", issue.number)),
+                        url: issue_n.map(|n| format!("https://github.com/{repo}/issues/{n}")),
                     }),
                 );
                 ctx.client()?.write_exclusive(&created.task(&task)).await?;
             }
+            // The host assigns an issue's task itself; with no issue the CLI does it below.
+            let assign = issue_n.is_none().then(|| {
+                Envelope::new(
+                    me.clone(),
+                    spawn::task_project(&repo),
+                    Known::TaskAssigned(TaskAssigned {
+                        agent: agent.clone(),
+                        lead: Some(lead.clone()),
+                    }),
+                )
+                .task(&task)
+            });
             let req = SpawnRequested {
                 name,
                 agent,
                 host: d.host.clone(),
                 session: cfg.session.clone(),
                 repo: repo.clone(),
-                issue: Some(issue.number),
+                issue: issue_n,
                 branch,
                 profile: d.profile.clone(),
                 brief,
@@ -1282,6 +1362,10 @@ async fn main() -> Result<()> {
                 .await?;
             if !no_wait {
                 spawn::wait_result(&ctx.client()?, &id).await?;
+                if let Some(assign) = assign {
+                    ctx.client()?.write_exclusive(&assign).await?;
+                    println!("task.assigned {task}");
+                }
             }
         }
         Cmd::Handoff { agent, to, note } => {

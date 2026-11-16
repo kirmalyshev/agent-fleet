@@ -691,6 +691,117 @@
           ],
           "type": "object"
         },
+        "ProcessHung": {
+          "additionalProperties": false,
+          "description": "A process an agent started that the watch tick found hung: at most 1% CPU, no change to a\nstdout/stderr file, and no new or working child for two ticks in a row. `pid` is the\ntopmost hung process, `pids` it and every hung process under it. `evidence` absent clears\nit (see `watch::to_clear`).",
+          "properties": {
+            "agent": {
+              "description": "The agent that started it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "checked": {
+              "description": "When the host last confirmed it hung; it re-reports every tick it does.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "command": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "evidence": {
+              "description": "CPU, the last output, the deepest descendant's command.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pids": {
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "since": {
+              "description": "When it was first found hung.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "started": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "host",
+            "pid"
+          ],
+          "type": "object"
+        },
+        "ProcessOrphaned": {
+          "additionalProperties": false,
+          "description": "A process on the writer's host doctor proved an orphan: reparented to init with its\ndevice gone, or a lock's recorded owner dead. `why`/`cwd`/`since` absent clears it —\nthe process is gone or somebody's parent chain claimed it.",
+          "properties": {
+            "cwd": {
+              "description": "Where it runs, when the platform reports one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "since": {
+              "description": "When the proof first held.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "why": {
+              "description": "The proof: `\"group leader dead\"`, `\"device gone\"`, or `\"<resource> lock owner dead\"`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "host",
+            "pid"
+          ],
+          "type": "object"
+        },
         "QuotaWindow": {
           "additionalProperties": false,
           "description": "One quota window: `used_pct` of the limit spent, resetting at `resets_at`.",
@@ -1730,6 +1841,38 @@
         {
           "properties": {
             "data": {
+              "$ref": "#/$defs/ProcessOrphaned"
+            },
+            "type": {
+              "const": "proc.orphaned",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/ProcessHung"
+            },
+            "type": {
+              "const": "proc.hung",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
               "$ref": "#/$defs/AgentStuck"
             },
             "type": {
@@ -1809,6 +1952,14 @@
       "$defs": {
         "Agent": {
           "properties": {
+            "finished": {
+              "description": "When its state last became `done`; cleared on the next `working`. An agent that\nfinished its turn and sits idle is parked awaiting work, not stalled.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "host": {
               "type": "string"
             },
@@ -2100,6 +2251,110 @@
             "ref",
             "text",
             "since"
+          ],
+          "type": "object"
+        },
+        "Orphan": {
+          "description": "A process the host's scan proved an orphan: reparented to init, its device gone or its\nlock's recorded owner dead.",
+          "properties": {
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "since": {
+              "description": "First proved.",
+              "format": "date-time",
+              "type": "string"
+            },
+            "why": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "host",
+            "pid",
+            "why",
+            "since"
+          ],
+          "type": "object"
+        },
+        "ProcessHung": {
+          "additionalProperties": false,
+          "description": "A process an agent started that the watch tick found hung: at most 1% CPU, no change to a\nstdout/stderr file, and no new or working child for two ticks in a row. `pid` is the\ntopmost hung process, `pids` it and every hung process under it. `evidence` absent clears\nit (see `watch::to_clear`).",
+          "properties": {
+            "agent": {
+              "description": "The agent that started it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "checked": {
+              "description": "When the host last confirmed it hung; it re-reports every tick it does.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "command": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "evidence": {
+              "description": "CPU, the last output, the deepest descendant's command.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pids": {
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "since": {
+              "description": "When it was first found hung.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "started": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "host",
+            "pid"
           ],
           "type": "object"
         },
@@ -2947,6 +3202,14 @@
           },
           "type": "object"
         },
+        "hung": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ProcessHung"
+          },
+          "default": {},
+          "description": "Hung processes by `<host>:<pid>` of the topmost one, `since` always set.",
+          "type": "object"
+        },
         "last": {
           "description": "Id of the last event folded in.",
           "type": [
@@ -2967,6 +3230,14 @@
             "$ref": "#/$defs/Msg"
           },
           "description": "Undelivered doorbells by the id of their `msg.sent`.",
+          "type": "object"
+        },
+        "orphans": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Orphan"
+          },
+          "default": {},
+          "description": "Processes each host proved orphaned, keyed `<host>:<pid>`.",
           "type": "object"
         },
         "quotas": {

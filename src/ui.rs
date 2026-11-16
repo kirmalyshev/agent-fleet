@@ -525,6 +525,7 @@ mod tests {
                     state,
                     since: now,
                     worked: None,
+                    finished: None,
                     usage: None,
                 },
             );
@@ -573,6 +574,7 @@ mod tests {
                 state: AgentState::Working,
                 since: now,
                 worked: None,
+                finished: None,
                 usage: None,
             },
         );
@@ -666,6 +668,7 @@ mod tests {
                 state: AgentState::Idle,
                 since: now - chrono::Duration::minutes(10),
                 worked: None,
+                finished: None,
                 usage: None,
             },
         );

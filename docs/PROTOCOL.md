@@ -99,6 +99,8 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | spawn | `spawn.requested` | name, agent, host, session, repo, issue?, branch, profile, brief, level?, lead?, worktree?, replaces?, why | | agent, host |
 | | `spawn.result` | agent, ok, pane?, worktree?, error? | re = the request | host |
 | | `agent.unmanaged` | host, pid, program?, cwd?, since? — no `program` clears the report | | host |
+| | `proc.orphaned` | host, pid, cwd?, why?, since? — no `why` clears the report | | host |
+| | `proc.hung` | host, pid, pids[]?, agent?, command?, started?, evidence?, since?, checked? — the topmost hung process an agent started and the hung ones under it (the watch tick, every 2 min); no `evidence` clears the report; folded only from the host actor it names (`host:<host>`) | | host |
 | | `agent.stuck` | agent, cause?, detail, until? — no `cause` clears the record | | host |
 | | `agent.signal` | agent, program, signal, detail? — `prompt`/`turn_end` clear the agent's stored signal | | agent |
 
@@ -293,10 +295,10 @@ how many worktrees may hold any of a set of resources at once.
 | Finding | When |
 |---|---|
 | `stale` | an agent idle, done or blocked for 2 h |
-| `hung` | working for 30 min at under 2% CPU, its worktree unchanged as long |
+| `hung` | working for 30 min at under 2% CPU, its worktree unchanged as long; or (subject `<host>:<pid>`) a process the watch tick reported in `proc.hung` |
 | `heavy` | an agent's tree, or a worktree's processes, over 4 GB or 200% CPU |
 | `duplicate` | two agents in one worktree, or two agents' worktrees changing the same files (lockfiles aside) |
-| `forgotten` | a worktree no agent works in, with unsaved work for an hour, or clean and 3 days untouched; running processes are named |
+| `forgotten` | a worktree no agent works in, with unsaved work for an hour, or clean and 3 days untouched, or clean with processes still running 10 min after it last changed; running processes are named, and `agent-fleet kill` accepts them unless the worktree is a main checkout |
 | `unpushed` | an agent's worktree holding commits no remote has for an hour |
 | `orphan` | processes running in a deleted worktree, with their pids |
 | `breach` | more worktrees hold a rule's resources than its `max`, while the rule lasts |
@@ -436,11 +438,15 @@ refuses, killing nothing, when any pid is:
 - a terminal multiplexer (`herdr`), a pane's shell, an agent (`claude`, `devin`, `codex`, or what
   a pane's shell runs), an `agent-fleet` daemon, or an ancestor of any of them;
 - the caller's own ancestor (its shell, its script's parent, its agent);
-- inside another agent's process tree.
+- inside another agent's process tree, unless a `proc.hung` report names it (below).
 
-It kills the caller's own processes (its agent's tree) and orphans `doctor` proved (on Linux, still
-in a deleted directory): TERM, then KILL after `--grace` seconds. Each refusal is logged as
-`kill.refused`.
+It kills the caller's own processes (its agent's tree) and orphans `doctor` proved: processes in
+a deleted worktree or a `forgotten` linked worktree (never a repository's main checkout) (on
+Linux, still in that directory). It also kills the pids of a `proc.hung` report on the caller's
+host, also inside another agent's tree, when the live process started before the report's
+`since` (a later one with that pid is not the one that hung) and the report was `checked` in
+the last 6 minutes (one nobody re-checks proves nothing). TERM, then KILL after `--grace`
+seconds. Each refusal is logged as `kill.refused`.
 
 `agent-fleet hook bash` is a PreToolUse hook for Claude Code (tool `Bash`) and Devin CLI (tool
 `exec`, which also reads hooks from `.claude/settings.json`) that refuses (exit 2) a shell command
@@ -475,10 +481,63 @@ daemon` or `claude daemon`, and everything under such a process; the
 process's directory is known on Linux only), re-sent without `program` once the process is gone;
 `agent-fleet doctor` shows them as `unmanaged` findings.
 
+The same scan proves orphans and reports them as `proc.orphaned` (`why` says which proof
+held; no `why` clears it). A process reparented to init that is a device or test tool —
+`xcodebuild`, `maestro` (named `maestro`, or `java` whose args carry `maestro.cli.AppKt` or
+`/.maestro/lib/`), `simctl`, `idb`, `xctest`, a `WebDriverAgentRunner`, or `log stream` —
+whose process-group leader is dead (the group id names no live process) is an orphan once it
+is two minutes old — the floor only spares a script mid-`exec`; its descendants are orphans
+with it. When the leader is alive the older proof remains: two hours and a UDID that is
+neither connected (`devicectl list devices`) nor booted (`simctl list devices booted`); a tool
+that names no device, or a list the toolchain cannot produce, proves nothing that way. And a
+lock's recorded holder still alive under init while its `owner` file names a dead process is
+an orphan whatever program it runs — the tool list does not apply — and so is every member of
+the lock's recorded `pgid` group whose ancestry reaches init or a proved pid: an owner that
+exits normally releases the lock first, so a member of its group under a still-held lock is
+an orphan by definition, with no age or device check. The device list is only read when a
+reparented tool exists to check. Doctor shows them as `orphan` findings and `agent-fleet
+kill` accepts them.
+
+### The watch tick
+
+Every 2 minutes the host classifies every process an agent started: everything under the
+shells its agent program runs (an agent's own process, its pane shell and its other direct
+children — MCP servers — are never classified), plus the proved orphans, each claimed by the
+agent whose worktree it runs in. A process under 2 minutes old or with no start time is not
+classified, nor is one with a listening TCP socket (a server it keeps) or `mcp` in a non-flag word of its argv (an
+MCP server started through a shell), or anything under them. Each gets one state:
+
+- `working`: over 1% CPU over the interval, its stdout/stderr file changed, a child started
+  since the last tick, a device tool other than `simctl bootstatus` (`xcodebuild`, `maestro`,
+  `simctl`, `idb`, `xctest`, …), or a descendant that is any of these, waits, or listens;
+- `waiting`: in a watched lock's queue (`<lock>.waiting/`), with the lock and since when;
+  nothing under it is classified;
+- `hung`: none of the above for 2 ticks in a row. Output on a pipe or terminal is not seen, so
+  it does not count as work. When `lsof` gives no answer (an error, a timeout), nothing is hung and the tick does not count;
+  a tick after a gap of more than two intervals (the machine slept) only re-reads the table;
+- `orphan`: a `proc.orphaned` proof holds.
+
+The topmost hung process of a chain is reported as `proc.hung` with every hung pid under it,
+its command, start, and evidence (CPU, the output file's last change, the deepest descendant's
+command, the lock it holds), re-sent every tick that confirms it with `checked`. The report
+clears when its pid is gone or is now another process, when a parent's report covers it, or
+when its agent's tree was walked and found it working or waiting, or when no tick confirmed it
+for 6 minutes and it is not idle now; until then a tree the tick could not read, or a process that left the tree,
+leaves it standing. A `hung` or `orphan` process, and a
+`waiting` one past 30 minutes, are told once per episode — a `msg.sent` of kind `HUNG`,
+`ORPHAN` or `WAITING` with `ref` `<host>:<pid>` — to the agent that started it, its lead and
+the root coordinator; a hung tell waits until its report is in the log. An orphan proved by a
+dead lock owner also lists the simulators booted on the host, which may keep its holder alive,
+with the `xcrun simctl shutdown` that releases them. Doctor shows `proc.hung` as `hung` findings
+(subject `<host>:<pid>`), `agent-fleet kill` accepts its pids as above, and `agent-fleet proc
+<pid>` prints what the log says of a pid on this host: `hung`, `orphan`, `waiting`, `no report`
+or `gone`. Nothing is killed automatically.
+
 ## Spawning
 
 The fleet starts agents itself. `<checkout>/.agent-fleet/fleet.toml` in the project says how
-(`docs/fleet.example.toml` ships one): a `session`, a `base` ref (default `origin/main`), a
+(`docs/fleet.example.toml` ships one): a `session` (absent: the herdr session the CLI runs
+in, from `HERDR_SESSION`), a `base` ref (default `origin/main`), a
 `brief` template next to the file with `@@KEY@@` placeholders, an optional `ready` script run
 inside a new worktree before the agent starts, `[vars]` for extra tokens, `[profiles]` —
 a `kind` (the `agent.start`/`agent.quota` program), `args`, `unset_env`, a `prefix` for agent
@@ -488,6 +547,10 @@ whole words against the issue's title and labels — never the `--scope` text, w
 work and never picks the worker; `label:x` matches only
 a label named x. Config errors name the line that is wrong: an unknown profile, a fallback
 cycle, two defaults, no default.
+
+A checkout with no `.agent-fleet/fleet.toml` uses the machine's own: `fleet.toml` and its brief
+in the user config directory (`~/.config/agent-fleet` on Linux, `AGENT_FLEET_CONFIG_DIR`
+overrides it). The checkout's file wins whenever it exists.
 
 `agent-fleet spawn <owner/repo>#<issue>` reads the issue with `gh issue view` (`AGENT_FLEET_GH`
 names the binary), picks the rule — `--profile`, `--host` and `--level` override it. A profile at
@@ -501,6 +564,12 @@ LEVEL, LEAD, HANDOFF (empty unless a handoff), the `[vars]` and `--set KEY=VALUE
 never re-expanded and a placeholder with no value refuses the spawn. `--dry-run` prints the
 decision and the brief and writes nothing; otherwise `spawn.requested` is written and the CLI
 follows the hub until `spawn.result` arrives (10 min, `--no-wait` skips the wait).
+
+Work with no issue: `agent-fleet spawn <owner/repo> --title "<what>"`. The rules match on the
+title, the default name is the profile's prefix plus the title's words (32 characters at most),
+ISSUE renders empty, and the task is `task:<repo name>/<name>`. The CLI creates that task and,
+once `spawn.result` is ok, assigns it to the new agent; under `--no-wait` it stays unassigned.
+Every brief also has REF (`owner/repo#N`, or `owner/repo` with no issue) and TASK (the task id).
 
 The host agent serves requests naming its host and session, against a checkout given as
 `--repo <owner/repo>=<dir>` (a bare `--repo <dir>` watches a checkout and derives the slug from

@@ -262,6 +262,10 @@ pub enum Known {
     SpawnResult(SpawnResult),
     #[serde(rename = "agent.unmanaged")]
     AgentUnmanaged(AgentUnmanaged),
+    #[serde(rename = "proc.orphaned")]
+    ProcessOrphaned(ProcessOrphaned),
+    #[serde(rename = "proc.hung")]
+    ProcessHung(ProcessHung),
     #[serde(rename = "agent.stuck")]
     AgentStuck(AgentStuck),
     #[serde(rename = "agent.signal")]
@@ -631,6 +635,54 @@ pub struct AgentUnmanaged {
     pub since: Option<DateTime<Utc>>,
 }
 
+/// A process an agent started that the watch tick found hung: at most 1% CPU, no change to a
+/// stdout/stderr file, and no new or working child for two ticks in a row. `pid` is the
+/// topmost hung process, `pids` it and every hung process under it. `evidence` absent clears
+/// it (see `watch::to_clear`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessHung {
+    pub host: String,
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pids: Vec<u32>,
+    /// The agent that started it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<DateTime<Utc>>,
+    /// CPU, the last output, the deepest descendant's command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    /// When it was first found hung.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<DateTime<Utc>>,
+    /// When the host last confirmed it hung; it re-reports every tick it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked: Option<DateTime<Utc>>,
+}
+
+/// A process on the writer's host doctor proved an orphan: reparented to init with its
+/// device gone, or a lock's recorded owner dead. `why`/`cwd`/`since` absent clears it —
+/// the process is gone or somebody's parent chain claimed it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessOrphaned {
+    pub host: String,
+    pub pid: u32,
+    /// Where it runs, when the platform reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The proof: `"group leader dead"`, `"device gone"`, or `"<resource> lock owner dead"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    /// When the proof first held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<DateTime<Utc>>,
+}
+
 /// Why an agent on the writer's host is stopped, read off its screen. Sent when the cause
 /// appears or changes; `cause` absent clears the record once the agent works again.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -768,6 +820,8 @@ impl Known {
             Self::SpawnRequested(_) => "spawn.requested",
             Self::SpawnResult(_) => "spawn.result",
             Self::AgentUnmanaged(_) => "agent.unmanaged",
+            Self::ProcessOrphaned(_) => "proc.orphaned",
+            Self::ProcessHung(_) => "proc.hung",
             Self::AgentStuck(_) => "agent.stuck",
             Self::AgentSignal(_) => "agent.signal",
         }
@@ -792,6 +846,8 @@ impl Known {
             | Self::ResourceReleased(_)
             | Self::AgentQuota(_)
             | Self::AgentUnmanaged(_)
+            | Self::ProcessOrphaned(_)
+            | Self::ProcessHung(_)
             | Self::AgentStuck(_) => &[Host],
             Self::MsgDelivered(_) | Self::SpawnResult(_) => &[Host],
             Self::AskRaised(_) | Self::Handoff(_) | Self::AgentSignal(_) => &[Agent],
@@ -963,6 +1019,7 @@ fn parse(raw: &Value, human_channel: bool) -> Result<Envelope<Known>, Reject> {
             .collect(),
         Known::SpawnResult(r) => vec![&r.agent],
         Known::AgentStuck(s) => vec![&s.agent],
+        Known::ProcessHung(h) => h.agent.iter().collect(),
         Known::AgentSignal(s) => vec![&s.agent],
         _ => vec![],
     };

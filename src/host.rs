@@ -174,6 +174,33 @@ fn on_path(name: &str) -> bool {
         .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
 }
 
+/// The UDIDs still usable by a device/test tool: anything `devicectl` sees connected plus
+/// every booted simulator. `None` when the toolchain cannot answer — a list that may be
+/// incomplete proves no device gone, so the whole stray pass skips rather than guesses.
+async fn live_devices() -> Option<HashSet<String>> {
+    if !cfg!(target_os = "macos") {
+        return Some(HashSet::new());
+    }
+    async fn out_of(args: &[&str]) -> Option<String> {
+        let out = tokio::process::Command::new("xcrun")
+            .args(args)
+            .output()
+            .await
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+    let connected = out_of(&["devicectl", "list", "devices"]).await?;
+    let booted = out_of(&["simctl", "list", "devices", "booted"]).await?;
+    Some(
+        scan::udids(&connected)
+            .union(&scan::udids(&booted))
+            .cloned()
+            .collect(),
+    )
+}
+
 impl Host {
     pub(crate) fn new(cfg: Config, client: Client, replica: Store) -> Self {
         Self {
@@ -266,6 +293,41 @@ impl Host {
             eprintln!("agent-fleet host: replica append: {err}");
         }
         true
+    }
+
+    /// Each herdr pane the fleet knows: its agent and the pane's shell pid. A pane herdr cannot
+    /// describe is skipped.
+    pub(crate) async fn pane_shells(&self) -> Result<Vec<(String, u32)>> {
+        let list = herdr_call(&self.cfg.herdr_socket, "agent.list", json!({})).await?;
+        let Some(agents) = list["agents"].as_array() else {
+            bail!("agent.list answered without agents");
+        };
+        let mut out = Vec::new();
+        for a in agents {
+            let pane = a["pane_id"].as_str().unwrap_or_default();
+            let Some(agent) = self
+                .panes
+                .lock()
+                .unwrap()
+                .get(pane)
+                .map(|l| l.agent.clone())
+            else {
+                continue;
+            };
+            let target = json!({ "pane_id": pane });
+            let info = match herdr_call(&self.cfg.herdr_socket, "pane.process_info", target).await {
+                Ok(info) => info,
+                Err(err) => {
+                    bump(&self.n.herdr_errors);
+                    eprintln!("agent-fleet host: watch: processes of {pane}: {err:#}");
+                    continue;
+                }
+            };
+            if let Some(shell) = info["process_info"]["shell_pid"].as_u64() {
+                out.push((agent, shell as u32));
+            }
+        }
+        Ok(out)
     }
 
     pub(crate) fn presence(&self, body: Known) -> Envelope<Known> {
@@ -828,6 +890,60 @@ impl Host {
                 .await;
             }
         }
+        // Orphans only this host can prove: a reparented device/test tool whose group
+        // leader is dead (or, the older proof, whose device is gone), a lock's recorded
+        // holder alive under init after its owner died, and every member of the dead
+        // owner's group. A dead leader needs no device list, so a toolchain that cannot
+        // answer narrows the proofs, never blocks them.
+        let mut proved: HashMap<u32, String> = HashMap::new();
+        let live = if procs.0.values().any(scan::may_be_stray) {
+            live_devices().await
+        } else {
+            None
+        };
+        for &pid in procs.0.keys() {
+            if let Some(why) = scan::stray(&procs, pid, live.as_ref(), chrono::Utc::now()) {
+                proved.insert(pid, why.to_string());
+            }
+        }
+        for (name, dir) in &self.cfg.locks {
+            for pid in scan::lock_orphan(dir, &procs) {
+                proved
+                    .entry(pid)
+                    .or_insert_with(|| format!("{name} lock owner dead"));
+            }
+        }
+        scan::descendants(&procs, &mut proved);
+        let now = chrono::Utc::now();
+        let mut seen_strays = HashSet::new();
+        for (pid, why) in proved {
+            let cwd = procs.0.get(&pid).and_then(|p| p.cwd.clone());
+            seen_strays.insert(pid);
+            let key = format!("{}:{pid}", self.cfg.host);
+            let known = state.orphans.get(&key);
+            if known.is_none_or(|o| o.why != why || o.cwd != cwd) {
+                self.publish(self.presence(Known::ProcessOrphaned(ProcessOrphaned {
+                    host: self.cfg.host.clone(),
+                    pid,
+                    cwd,
+                    why: Some(why),
+                    since: Some(known.map_or(now, |o| o.since)),
+                })))
+                .await;
+            }
+        }
+        for o in state.orphans.values() {
+            if o.host == self.cfg.host && !seen_strays.contains(&o.pid) {
+                self.publish(self.presence(Known::ProcessOrphaned(ProcessOrphaned {
+                    host: self.cfg.host.clone(),
+                    pid: o.pid,
+                    cwd: None,
+                    why: None,
+                    since: None,
+                })))
+                .await;
+            }
+        }
         Ok(())
     }
 
@@ -1088,6 +1204,7 @@ pub async fn run(cfg: Config, client: Client) -> Result<()> {
         r = tokio::spawn(host.clone().presence_loop()) => bail!("presence stopped: {r:?}"),
         r = tokio::spawn(host.clone().scan_loop()) => bail!("scans stopped: {r:?}"),
         r = tokio::spawn(host.clone().lock_loop()) => bail!("lock reads stopped: {r:?}"),
+        r = tokio::spawn(crate::watch::watch_loop(host.clone())) => bail!("the watch tick stopped: {r:?}"),
         r = tokio::spawn(crate::spawn::spawn_loop(host.clone())) => bail!("spawning stopped: {r:?}"),
     }
 }

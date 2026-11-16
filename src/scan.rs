@@ -18,6 +18,12 @@ pub struct Proc {
     /// `None` when unreadable; a deleted directory keeps its old path and `deleted`.
     pub cwd: Option<String>,
     pub deleted: bool,
+    /// The argv as one line, when the platform reports it.
+    pub args: Option<String>,
+    /// When the process started, when the platform reports it.
+    pub started: Option<DateTime<Utc>>,
+    /// The process-group id — the group leader's pid — when the platform reports it.
+    pub pgid: Option<u32>,
 }
 
 /// Every process on this machine at one moment. Empty outside Linux and macOS.
@@ -34,6 +40,9 @@ impl Procs {
                 libc::sysconf(libc::_SC_PAGESIZE).max(1) as u64,
             )
         };
+        let boot = std::fs::read_to_string("/proc/stat")
+            .ok()
+            .and_then(|s| parse_btime(&s));
         let mut all = HashMap::new();
         let Ok(dir) = std::fs::read_dir("/proc") else {
             return Self(all);
@@ -42,9 +51,10 @@ impl Procs {
             let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse().ok()) else {
                 continue;
             };
-            let Some((ppid, ticks, pages)) = std::fs::read_to_string(entry.path().join("stat"))
-                .ok()
-                .and_then(|s| parse_stat(&s))
+            let Some((ppid, ticks, pages, boot_ticks, pgid)) =
+                std::fs::read_to_string(entry.path().join("stat"))
+                    .ok()
+                    .and_then(|s| parse_stat(&s))
             else {
                 continue;
             };
@@ -53,6 +63,18 @@ impl Procs {
                 .map(|p| p.to_string_lossy().into_owned());
             let deleted = cwd.as_deref().is_some_and(|c| c.ends_with(" (deleted)"));
             let name = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+            let args = std::fs::read(entry.path().join("cmdline"))
+                .ok()
+                .map(|b| {
+                    b.split(|&c| c == 0)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| String::from_utf8_lossy(s).into_owned())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .filter(|s| !s.is_empty());
+            let started =
+                boot.and_then(|b| DateTime::from_timestamp(b + (boot_ticks / tick) as i64, 0));
             all.insert(
                 pid,
                 Proc {
@@ -62,6 +84,9 @@ impl Procs {
                     name: name.trim().to_string(),
                     cwd: cwd.map(|c| c.trim_end_matches(" (deleted)").to_string()),
                     deleted,
+                    args,
+                    started,
+                    pgid: Some(pgid),
                 },
             );
         }
@@ -72,7 +97,7 @@ impl Procs {
     #[cfg(target_os = "macos")]
     pub fn read() -> Self {
         let out = std::process::Command::new("ps")
-            .args(["-axo", "pid=,ppid=,rss=,time=,comm="])
+            .args(["-axo", "pid=,ppid=,pgid=,rss=,time=,lstart=,args="])
             .output()
             .ok()
             .filter(|o| o.status.success())
@@ -233,21 +258,30 @@ pub fn by_worktree(
     out
 }
 
-/// `ps -axo pid=,ppid=,rss=,time=,comm=` → pid → Proc (macOS; `ps` reports no cwd).
+/// `ps -axo pid=,ppid=,pgid=,rss=,time=,lstart=,args=` → pid → Proc (macOS; `ps` reports no
+/// cwd). `lstart` is five words (`Sat Nov 15 21:31:45 2025`), `args` the rest, and the
+/// name is argv[0]'s basename — which also covers a path with a space in it.
 #[cfg(any(target_os = "macos", test))]
 pub fn parse_ps(s: &str) -> HashMap<u32, Proc> {
     s.lines()
         .filter_map(|l| {
-            let mut f = l.split_whitespace();
-            let (pid, ppid, rss_kb) = (
-                f.next()?.parse().ok()?,
-                f.next()?.parse().ok()?,
-                f.next()?.parse().ok()?,
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let (pid, ppid, pgid, rss_kb) = (
+                f.first()?.parse().ok()?,
+                f.get(1)?.parse().ok()?,
+                f.get(2)?.parse().ok()?,
+                f.get(3)?.parse().ok()?,
             );
-            let cpu_ms = parse_ps_time(f.next()?)?;
-            let comm = f.collect::<Vec<_>>().join(" ");
+            let cpu_ms = parse_ps_time(f.get(4)?)?;
+            let started = parse_lstart(&f.get(5..10)?.join(" "));
+            let argv0 = f.get(10)?;
             // macOS gives a path, and a login shell is `-zsh`.
-            let name = comm.rsplit('/').next()?.trim_start_matches('-').to_string();
+            let name = argv0
+                .rsplit('/')
+                .next()?
+                .trim_start_matches('-')
+                .to_string();
+            let args = f.get(10..).map(|a| a.join(" ")).filter(|a| !a.is_empty());
             Some((
                 pid,
                 Proc {
@@ -257,10 +291,23 @@ pub fn parse_ps(s: &str) -> HashMap<u32, Proc> {
                     name,
                     cwd: None,
                     deleted: false,
+                    args,
+                    started,
+                    pgid: Some(pgid),
                 },
             ))
         })
         .collect()
+}
+
+/// `ps` lstart, `Sat Nov 15 21:31:45 2025` in the local zone, → Utc.
+#[cfg(any(target_os = "macos", test))]
+fn parse_lstart(s: &str) -> Option<DateTime<Utc>> {
+    chrono::NaiveDateTime::parse_from_str(s, "%a %b %d %H:%M:%S %Y")
+        .ok()?
+        .and_local_timezone(chrono::Local)
+        .single()
+        .map(|t| t.to_utc())
 }
 
 /// `ps` TIME, `[[dd-]hh:]mm:ss[.ss]` → milliseconds.
@@ -279,12 +326,26 @@ fn parse_ps_time(s: &str) -> Option<u64> {
     Some(((days * 24 + hour) * 3600 + min * 60 + sec.parse::<u64>().ok()?) * 1000 + ms)
 }
 
-/// `/proc/<pid>/stat` → (ppid, utime + stime + cutime + cstime ticks, rss pages).
-pub fn parse_stat(s: &str) -> Option<(u32, u64, u64)> {
+/// `/proc/<pid>/stat` → (ppid, utime + stime + cutime + cstime ticks, rss pages,
+/// starttime ticks since boot, pgrp).
+pub fn parse_stat(s: &str) -> Option<(u32, u64, u64, u64, u32)> {
     // The command name may hold spaces and parens; the fields after the last `)` do not.
     let f: Vec<&str> = s[s.rfind(')')? + 1..].split_whitespace().collect();
     let n = |i: usize| f.get(i)?.parse::<u64>().ok();
-    Some((n(1)? as u32, n(11)? + n(12)? + n(13)? + n(14)?, n(21)?))
+    Some((
+        n(1)? as u32,
+        n(11)? + n(12)? + n(13)? + n(14)?,
+        n(21)?,
+        n(19)?,
+        n(2)? as u32,
+    ))
+}
+
+/// `/proc/stat`'s `btime` line: the epoch second the machine booted.
+#[cfg(any(target_os = "linux", test))]
+pub fn parse_btime(s: &str) -> Option<i64> {
+    s.lines()
+        .find_map(|l| l.strip_prefix("btime ")?.trim().parse().ok())
 }
 
 async fn git(dir: &str, args: &[&str]) -> Option<String> {
@@ -508,6 +569,169 @@ pub fn read_lock(dir: &Path) -> Lock {
     Lock { holder, waiting }
 }
 
+/// A reparented device/test tool whose device is gone must outlive its session by this
+/// much before that is proof it can never work again.
+pub const STRAY_MIN: chrono::Duration = chrono::Duration::hours(2);
+
+/// A reparented device/test tool whose process-group leader is dead needs only a short
+/// floor: long enough that a script mid-`exec` — its leader gone for a breath — is not
+/// caught in the gap.
+pub const STRAY_LEADER_MIN: chrono::Duration = chrono::Duration::minutes(2);
+
+/// `true` when the process is a device or test tool a dead session can leave behind:
+/// `xcodebuild`, `maestro`, `simctl`, `idb`, `xctest`, the WDA runner, `log stream`, or a
+/// `java` running maestro — the CLI's real name, since it runs as `java -classpath
+/// …/.maestro/lib/… maestro.cli.AppKt`.
+pub(crate) fn device_tool(p: &Proc) -> bool {
+    matches!(
+        p.name.as_str(),
+        "xcodebuild" | "maestro" | "simctl" | "idb" | "xctest"
+    ) || p.name.starts_with("WebDriverAgentRunner")
+        || (p.name == "log" && p.args.as_deref().is_some_and(|a| a.contains("log stream")))
+        || (p.name == "java"
+            && p.args
+                .as_deref()
+                .is_some_and(|a| a.contains("maestro.cli.AppKt") || a.contains("/.maestro/lib/")))
+}
+
+/// A cheap prefilter: reparented to init and tool-shaped — worth collecting device lists for.
+/// The real proof is `stray`.
+pub fn may_be_stray(p: &Proc) -> bool {
+    p.ppid == 1 && device_tool(p)
+}
+
+/// `abcdef01-2345-6789-abcd-ef0123456789` — the shape a UDID argument takes.
+fn udid_shaped(w: &str) -> bool {
+    w.len() == 36
+        && w.chars().filter(|&c| c == '-').count() == 4
+        && w.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// Every UDID-shaped word in `devicectl`/`simctl` output.
+pub fn udids(s: &str) -> HashSet<String> {
+    s.split_whitespace()
+        .filter(|w| udid_shaped(w))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The UDID the tool's argv targets: `id=` inside `-destination`, `--udid`/`-d`'s word, then
+/// the first UDID-shaped bare argument (a `simctl` verb takes its device positionally).
+fn device_of(args: &str) -> Option<String> {
+    let w: Vec<&str> = args.split_whitespace().collect();
+    for (i, t) in w.iter().enumerate() {
+        if t.starts_with("-destination")
+            && let Some(id) = [*t, w.get(i + 1).copied().unwrap_or("")]
+                .iter()
+                .flat_map(|s| s.split(','))
+                .find_map(|p| p.strip_prefix("id="))
+        {
+            return Some(id.to_string());
+        }
+        if (*t == "--udid" || *t == "-d")
+            && let Some(u) = w.get(i + 1)
+        {
+            return Some(u.to_string());
+        }
+        if let Some(u) = t.strip_prefix("--udid=") {
+            return Some(u.to_string());
+        }
+    }
+    w.iter().find(|t| udid_shaped(t)).map(|s| s.to_string())
+}
+
+/// A process reparented to init that can do no more work, proved two ways. Its
+/// process-group leader's pid is the group id itself: a group id no live process owns is
+/// a dead session, so a device/test tool in it past `STRAY_LEADER_MIN` is an orphan
+/// whatever its device — the floor only spares a script mid-`exec`. A tool whose leader
+/// is alive needs the older proof: `STRAY_MIN` old and aiming at a UDID in `live` — the
+/// devices still connected or booted — nowhere. A tool that names no device, one we
+/// cannot date, and (for the second proof) a `live` the toolchain could not produce are
+/// never proved.
+pub fn stray(
+    procs: &Procs,
+    pid: u32,
+    live: Option<&HashSet<String>>,
+    now: DateTime<Utc>,
+) -> Option<&'static str> {
+    let p = procs.0.get(&pid)?;
+    if p.ppid != 1 || !device_tool(p) {
+        return None;
+    }
+    let age = now - p.started?;
+    if age >= STRAY_LEADER_MIN
+        && p.pgid
+            .is_some_and(|g| g != pid && !procs.0.contains_key(&g))
+    {
+        return Some("group leader dead");
+    }
+    let dev = p.args.as_deref().and_then(device_of)?;
+    (age >= STRAY_MIN && live.is_some_and(|l| !l.contains(&dev))).then_some("device gone")
+}
+
+/// Every process still parented into a proved orphan joins the proof, inheriting its
+/// ancestor's `why`.
+pub fn descendants(procs: &Procs, proved: &mut HashMap<u32, String>) {
+    loop {
+        let new: Vec<(u32, String)> = procs
+            .0
+            .iter()
+            .filter(|(k, p)| !proved.contains_key(*k) && proved.contains_key(&p.ppid))
+            .map(|(&k, p)| (k, proved[&p.ppid].clone()))
+            .collect();
+        if new.is_empty() {
+            break;
+        }
+        proved.extend(new);
+    }
+}
+
+/// The pids orphaned under a held lock: the recorded `pid` holder alive under init while
+/// `owner` names a dead process — nobody's pane could have started it — plus every member
+/// of the lock's recorded `pgid` group whose ancestry reaches init or a proved pid, and
+/// everything still parented into a proved pid. The tool list does not apply, and neither
+/// does an age or device check: an owner that exits normally releases the lock first, so
+/// a member of its group under a still-held lock is an orphan by definition. No `pgid`
+/// file, or a member still parented by a live process outside the group, proves nothing
+/// beyond the holder.
+pub fn lock_orphan(dir: &Path, procs: &Procs) -> Vec<u32> {
+    let pid_in = |name: &str| line(&dir.join(name), 0).and_then(|l| l.parse::<u32>().ok());
+    let mut out = Vec::new();
+    let Some(owner) = pid_in("owner") else {
+        return out;
+    };
+    if alive(owner) {
+        return out;
+    }
+    let Some(pid) = pid_in("pid") else {
+        return out;
+    };
+    if procs.0.get(&pid).is_none_or(|p| p.ppid != 1) {
+        return out;
+    }
+    let mut proved: HashSet<u32> = [pid].into_iter().collect();
+    let group = pid_in("pgid");
+    loop {
+        let new: Vec<u32> = procs
+            .0
+            .iter()
+            .filter(|(k, p)| {
+                !proved.contains(*k)
+                    && (proved.contains(&p.ppid)
+                        || (p.ppid == 1 && group.is_some_and(|g| p.pgid == Some(g))))
+            })
+            .map(|(&k, _)| k)
+            .collect();
+        if new.is_empty() {
+            break;
+        }
+        proved.extend(new);
+    }
+    out.extend(proved);
+    out.sort_unstable();
+    out
+}
+
 /// How a lock changed since it was last read: who let go, who took it, who joined the queue.
 /// `before: None` is the first read, which owes a full release ahead of what it found.
 #[derive(Debug, PartialEq)]
@@ -611,10 +835,10 @@ pub fn cwd_of(pid: u32) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn procs(list: &[(u32, u32, &str)]) -> Procs {
+    fn procs(list: &[(u32, u32, u32, &str)]) -> Procs {
         Procs(
             list.iter()
-                .map(|&(pid, ppid, name)| {
+                .map(|&(pid, ppid, pgid, name)| {
                     (
                         pid,
                         Proc {
@@ -624,6 +848,9 @@ mod tests {
                             name: name.into(),
                             cwd: None,
                             deleted: false,
+                            args: None,
+                            started: None,
+                            pgid: Some(pgid),
                         },
                     )
                 })
@@ -635,12 +862,12 @@ mod tests {
     fn under_walks_the_parent_chain() {
         // herdr(1) → shell(10) → claude(11); stray claude(20); host(30) → devin(31)
         let t = procs(&[
-            (1, 0, "herdr"),
-            (10, 1, "zsh"),
-            (11, 10, "claude"),
-            (20, 0, "claude"),
-            (30, 0, "agent-fleet"),
-            (31, 30, "devin"),
+            (1, 0, 1, "herdr"),
+            (10, 1, 1, "zsh"),
+            (11, 10, 10, "claude"),
+            (20, 0, 20, "claude"),
+            (30, 0, 30, "agent-fleet"),
+            (31, 30, 30, "devin"),
         ]);
         assert!(t.under(11, "herdr"));
         assert!(!t.under(20, "herdr"));
@@ -708,19 +935,237 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_whose_group_leader_is_dead_is_a_stray() {
+        // The owner (pgid 45872) died nine minutes ago; its java driver sits under init in
+        // the dead group on a still-booted sim — too young and too attached for the
+        // device-gone proof, orphaned all the same.
+        let now = Utc::now();
+        let tool = |_pid, ppid, pgid, name: &str, args: &str, m: i64| Proc {
+            ppid,
+            cpu_ms: 0,
+            rss_kb: 0,
+            name: name.into(),
+            cwd: None,
+            deleted: false,
+            args: Some(args.into()),
+            started: Some(now - chrono::Duration::minutes(m)),
+            pgid: Some(pgid),
+        };
+        let mut t = procs(&[
+            (65813, 1, 45872, "java"),
+            (555, 1, 555, "zsh"),
+            (666, 1, 555, "maestro"),
+        ]);
+        {
+            let j = t.0.get_mut(&65813).unwrap();
+            j.args = Some(
+                "java -classpath /u/.maestro/lib/maestro-cli.jar maestro.cli.AppKt test flow.yaml"
+                    .into(),
+            );
+            j.started = Some(now - chrono::Duration::minutes(9));
+        }
+        t.0.get_mut(&666).unwrap().started = Some(now - chrono::Duration::minutes(30));
+        let live: HashSet<String> = HashSet::new();
+        // Maestro runs as `java`: its args name it, and the dead leader proves it.
+        assert_eq!(
+            stray(&t, 65813, Some(&live), now),
+            Some("group leader dead")
+        );
+        // A plain java in the same dead group is nobody's device tool.
+        t.0.insert(
+            65814,
+            tool(65814, 1, 45872, "java", "java -jar something.jar", 9),
+        );
+        assert_eq!(
+            stray(&t, 65814, Some(&live), now),
+            None,
+            "java is a tool only when maestro's args say so"
+        );
+        let s = |pid, min, table: &Procs| {
+            let p = tool(pid, 1, 45872, "xcodebuild", "xcodebuild test", min);
+            let mut t = Procs(table.0.clone());
+            t.0.insert(pid, p);
+            stray(&t, pid, Some(&live), now)
+        };
+        assert_eq!(s(70001, 9, &t), Some("group leader dead"));
+        // Each condition on its own is no proof.
+        assert_eq!(s(70001, 1, &t), None, "younger than the floor");
+        assert_eq!(
+            stray(&t, 666, Some(&live), now),
+            None,
+            "leader 666 alive (somebody's own terminal run)"
+        );
+        assert_eq!(
+            stray(&t, 555, Some(&live), now),
+            None,
+            "zsh is no device tool"
+        );
+        // A child of a proved member is `descendants`' work, not `stray`'s.
+        let mut t2 = Procs(t.0.clone());
+        t2.0.insert(
+            67397,
+            tool(67397, 65813, 45872, "xcodebuild", "xcodebuild test", 9),
+        );
+        assert_eq!(stray(&t2, 67397, Some(&live), now), None, "ppid ≠ 1");
+        // The leader may name itself: a tool that leads its own group has a live leader.
+        let t3 = procs(&[(1, 1, 1, "xcodebuild")]);
+        let p = tool(7, 1, 7, "xcodebuild", "xcodebuild test", 9);
+        let mut t3 = Procs(t3.0.clone());
+        t3.0.insert(7, p);
+        assert_eq!(stray(&t3, 7, Some(&live), now), None, "it is the leader");
+        // No device list needed for this proof.
+        let t4 = procs(&[(1, 1, 1, "xcodebuild")]);
+        let p = tool(7, 1, 45872, "xcodebuild", "xcodebuild test", 9);
+        let mut t4 = Procs(t4.0.clone());
+        t4.0.insert(7, p);
+        assert_eq!(stray(&t4, 7, None, now), Some("group leader dead"));
+    }
+
+    #[test]
+    fn a_reparented_tool_whose_device_is_gone_is_a_stray() {
+        let now = Utc::now();
+        let dev = "ABCDEF01-2345-6789-ABCD-EF0123456789";
+        // Each tool leads its own live group, so only the device-gone proof can fire.
+        let proc = |pid, ppid, name: &str, args: &str, h: i64| {
+            let mut t = procs(&[(pid, 1, pid, name)]);
+            let p = t.0.get_mut(&pid).unwrap();
+            p.ppid = ppid;
+            p.args = Some(args.into());
+            p.started = Some(now - chrono::Duration::hours(h));
+            t
+        };
+        let live: HashSet<String> = HashSet::new();
+        let x = format!(
+            "xcodebuild -destination id={dev} test-without-building -xctestrun /w/.build/wda/x.xctestrun"
+        );
+        // All conditions met: ppid 1, a known tool, leader alive, older than STRAY_MIN,
+        // device gone.
+        let t = proc(9, 1, "xcodebuild", &x, 3);
+        assert_eq!(stray(&t, 9, Some(&live), now), Some("device gone"));
+        // Each one missing is no proof.
+        let t = proc(9, 42, "xcodebuild", &x, 3);
+        assert_eq!(stray(&t, 9, Some(&live), now), None, "ppid ≠ 1");
+        let t = proc(9, 1, "zsh", "zsh", 3);
+        assert_eq!(stray(&t, 9, Some(&live), now), None, "not a tool");
+        let t = proc(9, 1, "xcodebuild", &x, 1);
+        assert_eq!(stray(&t, 9, Some(&live), now), None, "too young");
+        let live: HashSet<String> = [dev.to_string()].into_iter().collect();
+        let t = proc(9, 1, "xcodebuild", &x, 3);
+        assert_eq!(stray(&t, 9, Some(&live), now), None, "device there");
+        // The toolchain that cannot answer proves nothing this way.
+        let live: HashSet<String> = HashSet::new();
+        let t = proc(9, 1, "xcodebuild", &x, 3);
+        assert_eq!(stray(&t, 9, None, now), None, "no list, no proof");
+        let t = proc(9, 1, "xcodebuild", "xcodebuild build -scheme app", 3);
+        assert_eq!(
+            stray(&t, 9, Some(&live), now),
+            None,
+            "no device named is no proof"
+        );
+        // `simctl` takes its device positionally; `log stream` is a tool only by its args.
+        let boot = format!("simctl bootstatus {dev} -b");
+        let t = proc(9, 1, "simctl", &boot, 3);
+        assert_eq!(stray(&t, 9, Some(&live), now), Some("device gone"));
+        let stream = format!("log stream --device {dev}");
+        let t = proc(9, 1, "log", &stream, 3);
+        assert_eq!(stray(&t, 9, Some(&live), now), Some("device gone"));
+        let t = proc(9, 1, "log", "log show", 3);
+        assert_eq!(stray(&t, 9, Some(&live), now), None);
+        let t = proc(
+            9,
+            1,
+            "WebDriverAgentRunner-Runner",
+            "WebDriverAgentRunner-Runner -XCTest",
+            3,
+        );
+        assert_eq!(
+            stray(&t, 9, Some(&live), now),
+            None,
+            "the runner names no UDID to check"
+        );
+    }
+
+    #[test]
+    fn a_dead_lock_owner_with_a_reparented_holder_is_an_orphan() {
+        // 15 Nov: the shard (pid 27634, `sh scripts/e2e.sh`) held the sim lock while its
+        // recorded owner (23363) was dead and init had adopted it.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sim.lock");
+        std::fs::create_dir(&dir).unwrap();
+        let me = std::process::id();
+        let t = procs(&[
+            (27634, 1, 27634, "sh"),
+            (2, 400, 2, "sh"),
+            (23363, 1, 23363, "sh"),
+        ]);
+        std::fs::write(dir.join("owner"), "999999999\n").unwrap();
+        std::fs::write(dir.join("pid"), "27634\n").unwrap();
+        assert_eq!(lock_orphan(&dir, &t), vec![27634]);
+        // A live owner holds the lock — nothing to prove.
+        std::fs::write(dir.join("owner"), format!("{me}\n")).unwrap();
+        assert!(lock_orphan(&dir, &t).is_empty(), "owner alive");
+        // A dead holder is no orphan; a holder still under a live parent is not.
+        std::fs::write(dir.join("owner"), "999999999\n").unwrap();
+        std::fs::write(dir.join("pid"), "888888888\n").unwrap();
+        assert!(lock_orphan(&dir, &t).is_empty(), "holder gone too");
+        std::fs::write(dir.join("pid"), "2\n").unwrap();
+        assert!(lock_orphan(&dir, &t).is_empty(), "holder still parented");
+    }
+
+    #[test]
+    fn a_dead_lock_owner_orphans_its_whole_group() {
+        // The e2e shard's owner died after a maestro failure. Left under a still-held lock:
+        // the holder `sh` in its own group, the java driver and its WDA xcodebuild in the
+        // dead owner's group — all orphans by definition, no matter their age or device.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sim.lock");
+        std::fs::create_dir(&dir).unwrap();
+        let t = procs(&[
+            (48607, 1, 48607, "sh"),             // the recorded holder, its own group
+            (65813, 1, 45872, "java"),           // a member of the dead owner's group
+            (67397, 65813, 45872, "xcodebuild"), // a member's child, same group
+            (70000, 999, 45872, "maestro"),      // a member still parented outside it
+            (999, 1, 999, "zsh"),                // that live parent, a foreign group
+        ]);
+        std::fs::write(dir.join("owner"), "999999999\n").unwrap();
+        std::fs::write(dir.join("pid"), "48607\n").unwrap();
+        // No `pgid` file: nothing beyond the holder is proved.
+        assert_eq!(lock_orphan(&dir, &t), vec![48607]);
+        std::fs::write(dir.join("pgid"), "45872\n").unwrap();
+        assert_eq!(lock_orphan(&dir, &t), vec![48607, 65813, 67397]);
+    }
+
+    #[test]
+    fn orphans_sweep_their_descendants() {
+        let t = procs(&[
+            (10, 1, 10, "java"),
+            (11, 10, 10, "xcodebuild"),
+            (12, 11, 12, "runner"), // a grandchild, another group
+            (20, 1, 20, "zsh"),
+            (21, 20, 20, "vim"),
+        ]);
+        let mut proved: HashMap<u32, String> = [(10, "w".to_string())].into_iter().collect();
+        descendants(&t, &mut proved);
+        let mut keys: Vec<u32> = proved.keys().copied().collect();
+        keys.sort();
+        assert_eq!(keys, vec![10, 11, 12]);
+        assert_eq!(proved[&12], "w", "a descendant inherits its root's why");
+    }
+
+    #[test]
     fn stat_line_with_a_tricky_name() {
         let s = "42 (a) b (c)) S 7 42 42 0 -1 4194560 100 0 0 0 150 50 10 5 20 0 3 0 1000 9000 512 rest";
-        assert_eq!(parse_stat(s), Some((7, 215, 512)));
+        assert_eq!(parse_stat(s), Some((7, 215, 512, 1000, 42)));
         assert_eq!(parse_stat("garbage"), None);
     }
 
     #[test]
     fn ps_output_parses_every_time_shape() {
-        let s = "    1      0  12345   0:05.50 /sbin/launchd\n\
-                 \x20  42      1  20480  12:34:56 /opt/bin/herdr\n\
-                 \x20  99     42   4096 2-03:04:05 /usr/bin/claude\n\
-                 \x20 100     42    512   7:08.09 -zsh\n\
-                 \x20   7      1   1024   1:00.00 /opt/my tool/agent-fleet\n\
+        let s = "    1      0      1  12345   0:05.50 Sat Nov 15 20:00:01 2025 /sbin/launchd\n\
+                 \x20  42      1      1  20480  12:34:56 Sat Nov 15 08:00:01 2025 /opt/bin/herdr\n\
+                 \x20  99     42     42   4096 2-03:04:05 Sat Nov 15 18:00:01 2025 /usr/bin/claude\n\
+                 \x20 100     42     42    512   7:08.09 Sat Nov 15 19:00:01 2025 -zsh\n\
+                 \x20   7      1      7   1024   1:00.00 Sat Nov 15 19:30:01 2025 /opt/tool/agent-fleet -p my proj\n\
                  \x20 bad line\n";
         let t = Procs(parse_ps(s));
         assert_eq!(t.0.len(), 5);
@@ -734,7 +1179,13 @@ mod tests {
             (1, 20480, "herdr")
         );
         assert_eq!(p(99).name, "claude", "a path yields its basename");
-        assert_eq!(p(7).name, "agent-fleet", "even one with a space in it");
+        assert_eq!(p(7).name, "agent-fleet");
+        assert_eq!(
+            p(7).args.as_deref(),
+            Some("/opt/tool/agent-fleet -p my proj")
+        );
+        assert!(p(7).started.is_some(), "lstart folds to a start time");
+        assert_eq!(p(99).pgid, Some(42));
         assert_eq!(p(100).name, "zsh", "a login shell drops its dash");
         assert!(p(1).cwd.is_none() && !p(1).deleted);
         assert!(t.under(99, "herdr"), "the ancestor walk works off it");
@@ -780,6 +1231,9 @@ mod tests {
             name: "p".into(),
             cwd: Some(cwd.into()),
             deleted,
+            args: None,
+            started: None,
+            pgid: None,
         }
     }
 
@@ -975,7 +1429,7 @@ mod tests {
 
     #[test]
     fn a_daemons_children_are_infrastructure_too() {
-        let t = procs(&[(1, 0, "codex"), (2, 1, "codex"), (3, 2, "codex")]);
+        let t = procs(&[(1, 0, 1, "codex"), (2, 1, 1, "codex"), (3, 2, 2, "codex")]);
         let infra: HashSet<u32> = [1].into_iter().collect();
         assert!(t.under_any(3, &infra));
         assert!(!t.under_any(3, &HashSet::new()));

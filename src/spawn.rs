@@ -20,11 +20,12 @@ use crate::state::{Spawn, State};
 
 // ---------- the project's fleet.toml ----------
 
-/// `session` and `brief` are required; `base` defaults to `origin/main`.
+/// `brief` is required; `session` defaults to the caller's herdr session, `base` to `origin/main`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FleetConfig {
-    /// The herdr session agents run in.
+    /// The herdr session agents run in; absent, the session the CLI runs in (`HERDR_SESSION`).
+    #[serde(default = "default_session")]
     pub session: String,
     /// The branch point for a new worktree.
     #[serde(default = "default_base")]
@@ -42,6 +43,10 @@ pub struct FleetConfig {
     /// First match wins; a rule with no `match` is the default.
     #[serde(default)]
     pub rules: Vec<Rule>,
+}
+
+fn default_session() -> String {
+    std::env::var("HERDR_SESSION").unwrap_or_default()
 }
 
 fn default_base() -> String {
@@ -227,11 +232,25 @@ impl FleetConfig {
 }
 
 /// `dir/.agent-fleet/fleet.toml`, and the directory it lives in (the brief template sits there).
+/// A checkout with no fleet.toml of its own uses the machine's: `<user config dir>/agent-fleet`.
 pub fn load(dir: &Path) -> Result<(FleetConfig, PathBuf)> {
-    let dir = dir.join(".agent-fleet");
+    let mut dir = dir.join(".agent-fleet");
+    if !dir.join("fleet.toml").exists()
+        && let Some(user) = user_config_dir().filter(|d| d.join("fleet.toml").exists())
+    {
+        dir = user;
+    }
     let src = std::fs::read_to_string(dir.join("fleet.toml"))
         .with_context(|| format!("read {}", dir.join("fleet.toml").display()))?;
     Ok((FleetConfig::parse(&src)?, dir))
+}
+
+/// `AGENT_FLEET_CONFIG_DIR`, else the platform's user config dir for agent-fleet.
+fn user_config_dir() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("AGENT_FLEET_CONFIG_DIR") {
+        return Some(PathBuf::from(d));
+    }
+    directories::ProjectDirs::from("", "", "agent-fleet").map(|p| p.config_dir().to_path_buf())
 }
 
 /// The fleet.toml of the git checkout holding the current directory.
@@ -244,7 +263,13 @@ pub fn find() -> Result<(FleetConfig, PathBuf)> {
         bail!("not in a git checkout; run spawn inside the project");
     }
     let top = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    load(Path::new(&top))
+    let found = load(Path::new(&top))?;
+    if found.0.session.is_empty() {
+        bail!(
+            "fleet.toml names no `session` and HERDR_SESSION is not set; run inside herdr or set `session`"
+        );
+    }
+    Ok(found)
 }
 
 // ---------- routing ----------
@@ -254,7 +279,6 @@ pub fn find() -> Result<(FleetConfig, PathBuf)> {
 pub struct Issue {
     /// `owner/repo`: a profile's cap counts only this repo's agents.
     pub repo: String,
-    pub number: u64,
     pub title: String,
     pub labels: Vec<String>,
 }
@@ -284,7 +308,6 @@ pub async fn gh_issue(repo: &str, n: u64) -> Result<Issue> {
     let v: Value = serde_json::from_slice(&out.stdout).context("gh issue view: bad JSON")?;
     Ok(Issue {
         repo: repo.to_string(),
-        number: n,
         title: v["title"].as_str().unwrap_or_default().to_string(),
         labels: v["labels"]
             .as_array()
@@ -296,17 +319,37 @@ pub async fn gh_issue(repo: &str, n: u64) -> Result<Issue> {
 }
 
 /// `<owner/repo>#<issue>`.
-pub fn parse_target(s: &str) -> Result<(String, u64)> {
-    let Some((repo, n)) = s.rsplit_once('#') else {
-        bail!("not <owner/repo>#<issue>: {s}")
+pub fn parse_target(s: &str) -> Result<(String, Option<u64>)> {
+    let (repo, n) = match s.rsplit_once('#') {
+        Some((repo, n)) => (repo, Some(n)),
+        None => (s, None),
     };
     if repo.split('/').count() != 2 || repo.split('/').any(str::is_empty) {
-        bail!("not <owner/repo>#<issue>: {s}");
+        bail!("not <owner/repo>#<issue> or <owner/repo>: {s}");
     }
-    let n: u64 = n
-        .parse()
-        .with_context(|| format!("not an issue number: {n}"))?;
+    let n = n
+        .map(|n| {
+            n.parse::<u64>()
+                .with_context(|| format!("not an issue number: {n}"))
+        })
+        .transpose()?;
     Ok((repo.to_string(), n))
+}
+
+/// An agent-name tail from a title: lowercase words joined by `-`, at most `max` characters.
+pub fn title_slug(title: &str, max: usize) -> String {
+    let mut out = String::new();
+    for c in title.chars() {
+        if out.len() >= max {
+            break;
+        }
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_end_matches('-').to_string()
 }
 
 /// `owner/repo` from a git remote URL, or `None` when it isn't a GitHub remote.
@@ -1582,6 +1625,15 @@ async fn stuck(
         if suppressed {
             continue;
         }
+        // A cause first classified this pass earns no push yet: a hold or queue record landing
+        // between the verdict and the next pass turns the page into one a wait never earned.
+        // Only a cause already in `agent.stuck` — seen before this pass — may page a lead.
+        if cause
+            .as_ref()
+            .is_none_or(|(c, _)| state.stuck.get(id).is_none_or(|w| w.cause != c.kind))
+        {
+            continue;
+        }
         let Some((kind, mut text)) = crate::doctor::hung(state, a, now)
             .map(|d| ("HUNG", d))
             .or_else(|| crate::doctor::stalled(a, now, min).map(|d| ("STALLED", d)))
@@ -1742,6 +1794,19 @@ pub async fn spawn_loop(host: Arc<Host>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_target_with_no_issue_parses_and_a_title_makes_a_name() {
+        assert_eq!(parse_target("o/r#12").unwrap(), ("o/r".into(), Some(12)));
+        assert_eq!(parse_target("o/r").unwrap(), ("o/r".into(), None));
+        assert!(parse_target("o/r#x").is_err());
+        assert!(parse_target("just-a-name").is_err());
+        assert_eq!(
+            title_slug("Directory: sort NEW options!", 30),
+            "directory-sort-new-options"
+        );
+        assert_eq!(title_slug("Directory: sort new options", 10), "directory");
+    }
     use crate::client::Client;
     use crate::host::Config;
     use crate::store::Store;
@@ -1806,7 +1871,6 @@ profile = "devin"
     fn issue(title: &str, labels: &[&str]) -> Issue {
         Issue {
             repo: "o/r".into(),
-            number: 7,
             title: title.into(),
             labels: labels.iter().map(|l| l.to_string()).collect(),
         }
@@ -1879,6 +1943,7 @@ profile = "devin"
                     state: AgentState::Idle,
                     since: Utc::now(),
                     worked: None,
+                    finished: None,
                     usage: None,
                 },
             );
@@ -2662,6 +2727,7 @@ profile = "devin"
                 state: AgentState::Working,
                 since: Utc::now(),
                 worked: None,
+                finished: None,
                 usage: None,
             },
         );
@@ -2784,6 +2850,7 @@ profile = "devin"
                     state: st,
                     since: Utc::now(),
                     worked: None,
+                    finished: None,
                     usage: None,
                 },
             );
@@ -3043,7 +3110,18 @@ profile = "devin"
                 state: AgentState::Idle,
                 since: Utc::now() - chrono::Duration::minutes(20),
                 worked: Some(Utc::now() - chrono::Duration::minutes(40)),
+                finished: None,
                 usage: None,
+            },
+        );
+        // The push needs the cause already recorded on an earlier pass.
+        s.stuck.insert(
+            "agent:h/s/a".into(),
+            crate::state::Stuck {
+                cause: crate::event::StuckCause::Waiting,
+                detail: "idle".into(),
+                until: None,
+                since: Utc::now() - chrono::Duration::minutes(15),
             },
         );
         if let Some(l) = lead {
@@ -3074,6 +3152,7 @@ profile = "devin"
             cwd: None,
             ts: Utc::now(),
         });
+        s.stuck.get_mut("agent:h/s/a").unwrap().cause = crate::event::StuckCause::Unknown;
         s
     }
 
@@ -3088,6 +3167,7 @@ profile = "devin"
                 state: AgentState::Working,
                 since: Utc::now(),
                 worked: Some(Utc::now()),
+                finished: None,
                 usage: None,
             },
         );
@@ -3178,6 +3258,135 @@ profile = "devin"
         )
         .await;
         assert_eq!(msgs(&host).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_first_classification_earns_no_push() {
+        // A hold or queue record can land between the verdict and the event fold: only a
+        // cause `agent.stuck` already shows — one a previous pass classified — may page.
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run(dir.path(), &[]).await;
+        let mut s = stalled_state(Some("agent:h/s/lead"));
+        s.stuck.clear();
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
+        assert!(msgs(&host).is_empty(), "first seen this pass: no push");
+        // The record stands from then on: the next pass tells the lead once.
+        s.stuck.insert(
+            "agent:h/s/a".into(),
+            crate::state::Stuck {
+                cause: crate::event::StuckCause::Waiting,
+                detail: "idle".into(),
+                until: None,
+                since: Utc::now() - chrono::Duration::minutes(15),
+            },
+        );
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
+        let got = msgs(&host);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, "STALLED");
+    }
+
+    #[tokio::test]
+    async fn a_wait_landing_between_passes_never_pages() {
+        // 15 Nov o-2927: HUNG went out 15s before its sim-queue record folded. The first
+        // pass classifies but pushes nothing; the next sees the wait and stays silent.
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run(dir.path(), &[]).await;
+        let mut s = hung_state(Some("agent:h/s/lead"));
+        s.stuck.clear();
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
+        assert!(msgs(&host).is_empty());
+        // The queue record lands: the agent waits on `sim` from its worktree.
+        let now = Utc::now();
+        s.stuck.insert(
+            "agent:h/s/a".into(),
+            crate::state::Stuck {
+                cause: crate::event::StuckCause::Unknown,
+                detail: "no known cause".into(),
+                until: None,
+                since: now - chrono::Duration::minutes(1),
+            },
+        );
+        s.worktrees.insert(
+            crate::state::worktree_key("h", "/w/a"),
+            crate::state::Worktree {
+                state: crate::event::WorktreeState {
+                    host: "h".into(),
+                    path: "/w/a".into(),
+                    repo: "/r/main".into(),
+                    branch: Some("b".into()),
+                    head: "abc".into(),
+                    unpushed: 0,
+                    dirty: 0,
+                    files: vec![],
+                    last_commit: now,
+                    in_main: false,
+                },
+                since: now - chrono::Duration::minutes(40),
+            },
+        );
+        s.agents
+            .get_mut("agent:h/s/a")
+            .unwrap()
+            .usage
+            .as_mut()
+            .unwrap()
+            .cwd = Some("/w/a".into());
+        s.resources.insert(
+            "h:sim".into(),
+            crate::state::Resource {
+                host: "h".into(),
+                resource: "sim".into(),
+                holder: Some(crate::state::Hold {
+                    pid: 9,
+                    cwd: Some("/w/b".into()),
+                    scope: Some("~5m".into()),
+                    since: now,
+                }),
+                waiting: vec![crate::state::Hold {
+                    pid: 11,
+                    cwd: Some("/w/a".into()),
+                    scope: None,
+                    since: now,
+                }],
+            },
+        );
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
+        assert!(
+            msgs(&host).is_empty(),
+            "a resource wait is no hang: {:?}",
+            msgs(&host)
+        );
     }
 
     #[tokio::test]
@@ -3374,6 +3583,7 @@ profile = "devin"
                 state: AgentState::Working,
                 since: Utc::now(),
                 worked: Some(Utc::now()),
+                finished: None,
                 usage: None,
             },
         );
@@ -3414,6 +3624,7 @@ profile = "devin"
                 state: AgentState::Working,
                 since: Utc::now(),
                 worked: Some(Utc::now()),
+                finished: None,
                 usage: Some(crate::state::Usage {
                     rss_kb: None,
                     cpu_pct: None,
@@ -3521,6 +3732,7 @@ profile = "devin"
                 state: AgentState::Idle,
                 since: now - chrono::Duration::minutes(60),
                 worked: None,
+                finished: None,
                 usage: None,
             },
         );
@@ -3535,6 +3747,7 @@ profile = "devin"
                 state: AgentState::Idle,
                 since: now - chrono::Duration::minutes(15),
                 worked: Some(now - min - chrono::Duration::seconds(90)),
+                finished: None,
                 usage: None,
             },
         );
@@ -3547,6 +3760,7 @@ profile = "devin"
                 state: AgentState::Idle,
                 since: now,
                 worked: None,
+                finished: None,
                 usage: None,
             },
         );
@@ -3647,6 +3861,7 @@ profile = "devin"
         .await;
         let mut s = stalled_state(Some("agent:h/s/lead"));
         s.agents.get_mut("agent:h/s/a").unwrap().since = Utc::now() - chrono::Duration::minutes(5);
+        s.stuck.clear();
         stuck(
             &host,
             &s,
@@ -3891,6 +4106,7 @@ profile = "devin"
                 state: AgentState::Idle,
                 since: Utc::now() - chrono::Duration::minutes(20),
                 worked: None,
+                finished: None,
                 usage: None,
             },
         );
@@ -4116,6 +4332,7 @@ profile = "devin"
                 state: AgentState::Idle,
                 since: Utc::now() - chrono::Duration::minutes(20),
                 worked: None,
+                finished: None,
                 usage: None,
             },
         );

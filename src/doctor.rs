@@ -20,6 +20,8 @@ pub const HEAVY_CPU_PCT: u32 = 200;
 pub const UNPUSHED: Duration = Duration::hours(1);
 /// A clean worktree nobody works in, untouched this long, is clutter.
 pub const ABANDONED: Duration = Duration::days(3);
+/// A clean worktree nobody works in, still running processes this long after it last changed.
+pub const LEFTOVER: Duration = Duration::minutes(10);
 /// A refused kill stays a finding this long.
 pub const REFUSED: Duration = Duration::hours(1);
 /// Queued this long for a resource: worth a look at who holds it.
@@ -32,6 +34,8 @@ pub const SPAWN_UNANSWERED: Duration = Duration::minutes(5);
 pub const STALLED: Duration = Duration::minutes(crate::spawn::STALL_MIN as i64);
 /// A failed spawn stays a finding this long.
 pub const SPAWN_FAILED: Duration = Duration::hours(1);
+/// A `proc.hung` report confirmed this recently is kill proof: three watch ticks.
+pub const HUNG_FRESH: Duration = Duration::minutes(6);
 /// Files every branch touches; sharing them is not duplicate work.
 const SHARED_BY_ALL: &[&str] = &[
     "bun.lock",
@@ -206,12 +210,16 @@ pub fn resource_wait(s: &State, a: &Agent) -> Option<(String, DateTime<Utc>, Opt
     None
 }
 
-/// `stalled`: idle or blocked at least `min` since it last worked. The host's push uses this
-/// exact predicate, so the board and the notice can never disagree.
+/// `stalled`: idle or blocked at least `min` since it last worked — but never parked: an
+/// agent that reached `done` and has not worked since awaits its next assignment, and an
+/// idle stretch there is the `stale` finding's to name, not a stall's. The host's push uses
+/// this exact predicate, so the board and the notice can never disagree.
 pub fn stalled(a: &Agent, now: DateTime<Utc>, min: Duration) -> Option<String> {
     let idle_for = now - a.since;
+    let parked = a.finished.is_some_and(|f| a.worked.is_none_or(|w| w <= f));
     (matches!(a.state, AgentState::Idle | AgentState::Blocked)
         && idle_for >= min
+        && !parked
         && a.worked.is_some())
     .then(|| format!("idle for {}m since it worked", idle_for.num_minutes()))
 }
@@ -264,6 +272,54 @@ pub fn escalate<'a>(s: &'a State, id: &str) -> Option<&'a str> {
 /// "; <who> told" when a stuck agent has somebody, "; nobody to tell" when it does not.
 fn told(s: &State, id: &str) -> String {
     escalate(s, id).map_or_else(|| "; nobody to tell".to_string(), |t| format!("; {t} told"))
+}
+
+/// Pids on `host` that doctor proves orphaned, with the directory each runs in. A repo's main
+/// checkout is never included: its processes may be the human's. The host's own `proc.orphaned`
+/// proofs — a reparented tool whose device is gone, a lock whose recorded owner died — count
+/// the same: their `cwd`, when the platform reports one, is the directory to check.
+pub fn killable(
+    s: &State,
+    now: DateTime<Utc>,
+    host: &str,
+) -> std::collections::BTreeMap<u32, String> {
+    let mut out: std::collections::BTreeMap<u32, String> = findings(s, now)
+        .iter()
+        .filter(|f| {
+            f.kind == "orphan"
+                || (f.kind == "forgotten"
+                    && s.worktrees
+                        .get(&f.subject)
+                        .is_some_and(|w| w.state.path != w.state.repo))
+        })
+        .filter_map(|f| s.worktree_procs.get(&f.subject))
+        .filter(|p| p.procs.host == host)
+        .flat_map(|p| p.procs.pids.iter().map(|&pid| (pid, p.procs.path.clone())))
+        .collect();
+    for o in s.orphans.values().filter(|o| o.host == host) {
+        out.insert(o.pid, o.cwd.clone().unwrap_or_else(|| "/".into()));
+    }
+    out
+}
+
+/// Pids on `host` a `proc.hung` report names, with when it was first found hung: a live
+/// process with that pid that started later is not the one that hung. Only a report the host
+/// confirmed within `HUNG_FRESH` counts: one nobody re-checks proves nothing for `kill`.
+pub fn hung_pids(
+    s: &State,
+    host: &str,
+    now: DateTime<Utc>,
+) -> std::collections::BTreeMap<u32, DateTime<Utc>> {
+    s.hung
+        .values()
+        .filter(|h| h.host == host && h.checked.is_some_and(|c| now - c <= HUNG_FRESH))
+        .flat_map(|h| {
+            let since = h.since.unwrap_or(DateTime::<Utc>::MIN_UTC);
+            std::iter::once(h.pid)
+                .chain(h.pids.iter().copied())
+                .map(move |p| (p, since))
+        })
+        .collect()
 }
 
 pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
@@ -441,6 +497,44 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
             ));
         }
     }
+    for (key, o) in &s.orphans {
+        out.push(finding(
+            "orphan",
+            key.clone(),
+            format!(
+                "reparented {}, {} — kill: agent-fleet kill {}",
+                o.pid, o.why, o.pid
+            ),
+        ));
+    }
+    for (key, h) in &s.hung {
+        let pids: Vec<String> = std::iter::once(h.pid)
+            .chain(h.pids.iter().copied().filter(|&p| p != h.pid))
+            .map(|p| p.to_string())
+            .collect();
+        let up = h
+            .started
+            .map(|t| format!(", up {}", ago(now, t)))
+            .unwrap_or_default();
+        out.push(finding(
+            "hung",
+            key.clone(),
+            format!(
+                "{} (pid {}{up}{}) hung {}: {} — kill: agent-fleet kill {}",
+                h.command
+                    .as_deref()
+                    .map_or("?".into(), crate::watch::short_cmd),
+                h.pid,
+                h.agent
+                    .as_deref()
+                    .map(|a| format!(", {}", crate::host::short(a)))
+                    .unwrap_or_default(),
+                h.since.map_or("?".into(), |t| ago(now, t)),
+                h.evidence.as_deref().unwrap_or("?"),
+                pids.join(" ")
+            ),
+        ));
+    }
     for (key, w) in &s.worktrees {
         let st = &w.state;
         let running = s.worktree_procs.get(key).map_or(String::new(), |p| {
@@ -465,7 +559,11 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
                         st.dirty
                     ),
                 ));
-            } else if !unsaved && st.path != st.repo && now - st.last_commit >= ABANDONED {
+            } else if !unsaved
+                && st.path != st.repo
+                && (now - st.last_commit >= ABANDONED
+                    || (!running.is_empty() && unchanged >= LEFTOVER))
+            {
                 let what = if running.is_empty() {
                     ": remove it"
                 } else {
@@ -629,6 +727,7 @@ mod tests {
             state,
             since,
             worked: None,
+            finished: None,
             usage: Some(Usage {
                 rss_kb: Some(rss_kb),
                 cpu_pct: Some(cpu),
@@ -756,6 +855,166 @@ mod tests {
         );
     }
 
+    fn leftover_state(agent_in_it: bool) -> (State, DateTime<Utc>) {
+        use crate::event::WorktreeProcs;
+        use crate::state::Procs;
+        let now = Utc::now();
+        let mut s = State::default();
+        let key = worktree_key("h", "/w/fresh");
+        let mut w = tree("/w/fresh", &[], 0, 0, now - Duration::hours(3));
+        w.since = now - Duration::minutes(20);
+        s.worktrees.insert(key.clone(), w);
+        s.worktree_procs.insert(
+            key,
+            Procs {
+                procs: WorktreeProcs {
+                    host: "h".into(),
+                    path: "/w/fresh".into(),
+                    procs: 1,
+                    rss_kb: 1024,
+                    cpu_pct: 0,
+                    names: vec!["server".into()],
+                    pids: vec![77],
+                    orphaned: false,
+                },
+                ts: now,
+            },
+        );
+        if agent_in_it {
+            s.agents.insert(
+                "agent:h/s/a".into(),
+                agent(AgentState::Working, now, "/w/fresh", 0, 1024),
+            );
+        }
+        (s, now)
+    }
+
+    #[test]
+    fn a_clean_agentless_worktree_still_running_processes_is_found() {
+        let (s, now) = leftover_state(false);
+        let f = findings(&s, now);
+        assert_eq!(kinds(&f), vec![("forgotten", "h:/w/fresh")], "{f:#?}");
+        assert_eq!(
+            killable(&s, now, "h").get(&77).map(String::as_str),
+            Some("/w/fresh")
+        );
+        assert!(
+            f[0].detail.contains("still runs 1 process"),
+            "{}",
+            f[0].detail
+        );
+        let (mut s, now) = leftover_state(false);
+        s.worktrees.values_mut().for_each(|w| w.since = now);
+        assert!(findings(&s, now).is_empty(), "inside the grace");
+    }
+
+    #[test]
+    fn a_watch_notice_goes_to_the_agent_its_lead_and_the_root_once_each() {
+        let now = Utc::now();
+        let role = |level: Level, lead: Option<&str>| crate::state::Role {
+            level,
+            lead: lead.map(str::to_string),
+            domain: None,
+            by: "agent:h/s/root".into(),
+            since: now,
+        };
+        let mut s = State::default();
+        for id in ["agent:h/s/a", "agent:h/s/root"] {
+            s.agents
+                .insert(id.into(), agent(AgentState::Working, now, "/w/a", 0, 1));
+        }
+        s.roles
+            .insert("agent:h/s/root".into(), role(Level::RootCoordinator, None));
+        s.roles.insert(
+            "agent:h/s/a".into(),
+            role(Level::Implementer, Some("agent:h/s/lead")),
+        );
+        let r = crate::watch::recipients;
+        assert_eq!(
+            r(&s, Some("agent:h/s/a")),
+            vec!["agent:h/s/a", "agent:h/s/lead", "agent:h/s/root"]
+        );
+        s.roles.get_mut("agent:h/s/a").unwrap().lead = None;
+        assert_eq!(
+            r(&s, Some("agent:h/s/a")),
+            vec!["agent:h/s/a", "agent:h/s/root"],
+            "no lead: the root once"
+        );
+        assert_eq!(
+            r(&s, None),
+            vec!["agent:h/s/root"],
+            "an orphan nobody claims"
+        );
+    }
+
+    #[test]
+    fn a_hung_process_is_a_finding_and_names_its_pids_for_kill() {
+        let now = Utc::now();
+        let mut s = State::default();
+        s.hung.insert(
+            "h:30".into(),
+            crate::event::ProcessHung {
+                host: "h".into(),
+                pid: 30,
+                pids: vec![30, 31],
+                agent: Some("agent:h/s/o-1".into()),
+                command: Some("bash scripts/e2e.sh".into()),
+                started: Some(now - Duration::minutes(20)),
+                evidence: Some("0% CPU, output not a file".into()),
+                since: Some(now - Duration::minutes(4)),
+                checked: Some(now - Duration::minutes(1)),
+            },
+        );
+        let f = findings(&s, now);
+        assert_eq!(kinds(&f), vec![("hung", "h:30")], "{f:#?}");
+        assert!(
+            f[0].detail.contains("bash scripts/e2e.sh (pid 30")
+                && f[0].detail.contains("o-1")
+                && f[0].detail.contains("0% CPU")
+                && f[0].detail.ends_with("agent-fleet kill 30 31"),
+            "{}",
+            f[0].detail
+        );
+        let k = hung_pids(&s, "h", now);
+        assert_eq!(k.keys().copied().collect::<Vec<_>>(), vec![30, 31]);
+        assert_eq!(k[&31], now - Duration::minutes(4));
+        assert!(hung_pids(&s, "other", now).is_empty());
+        assert!(
+            hung_pids(&s, "h", now + HUNG_FRESH).is_empty(),
+            "a report nobody re-checked is no proof"
+        );
+        assert!(
+            killable(&s, now, "h").is_empty(),
+            "a hung report is no orphan proof"
+        );
+    }
+
+    #[test]
+    fn an_occupied_worktree_running_processes_is_not_found() {
+        let (s, now) = leftover_state(true);
+        assert!(findings(&s, now).is_empty());
+        assert!(killable(&s, now, "h").is_empty());
+    }
+
+    #[test]
+    fn a_main_checkout_with_dirty_files_is_found_but_not_killable() {
+        let (mut s, now) = leftover_state(false);
+        let w = s.worktrees.values_mut().next().unwrap();
+        w.state.repo = w.state.path.clone();
+        w.state.dirty = 2;
+        w.since = now - Duration::hours(2);
+        let f = findings(&s, now);
+        assert_eq!(kinds(&f), vec![("forgotten", "h:/w/fresh")], "{f:#?}");
+        assert!(killable(&s, now, "h").is_empty());
+    }
+
+    #[test]
+    fn a_clean_agentless_worktree_without_processes_is_unchanged() {
+        let (mut s, now) = leftover_state(false);
+        s.worktree_procs.clear();
+        assert!(findings(&s, now).is_empty());
+    }
+
     #[test]
     fn two_agents_in_one_worktree_is_duplicate_work() {
         let now = Utc::now();
@@ -851,6 +1110,19 @@ mod tests {
         let f = findings(&s, now);
         let r = f.iter().find(|f| f.subject == "agent:h/s/root").unwrap();
         assert_eq!(r.detail, "idle for 20m since it worked; nobody to tell");
+    }
+
+    #[test]
+    fn a_parked_agent_is_stale_never_stalled() {
+        let now = Utc::now();
+        // Reached `done` and idle since: parked awaiting work — `stale` names it, `stalled` does not.
+        let mut a = agent(AgentState::Idle, now - Duration::minutes(20), "/w/a", 0, 1);
+        a.worked = Some(now - Duration::minutes(40));
+        a.finished = Some(now - Duration::minutes(25));
+        assert_eq!(stalled(&a, now, STALLED), None);
+        // Working again after the finish re-arms the stall: a long idle then is one.
+        a.worked = Some(now - Duration::minutes(15));
+        assert!(stalled(&a, now, STALLED).is_some());
     }
 
     #[test]
