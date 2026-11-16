@@ -442,7 +442,11 @@ refuses, killing nothing, when any pid is:
 
 It kills the caller's own processes (its agent's tree) and orphans `doctor` proved: processes in
 a deleted worktree or a `forgotten` linked worktree (never a repository's main checkout) (on
-Linux, still in that directory). It also kills the pids of a `proc.hung` report on the caller's
+Linux, still in that directory). It kills an orphan (parent pid 1, `systemd` or `launchd`) whose
+working directory is inside the caller's worktree, unless that path is also inside a worktree
+recorded for another agent. The caller's worktree is the one from its most recent `spawn.result`
+answered ok on this host, never one it requested for itself and never its pane's live cwd. With
+no such record the orphan is refused. It also kills the pids of a `proc.hung` report on the caller's
 host, also inside another agent's tree, when the live process started before the report's
 `since` (a later one with that pid is not the one that hung) and the report was `checked` in
 the last 6 minutes (one nobody re-checks proves nothing). TERM, then KILL after `--grace`
