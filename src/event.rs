@@ -318,6 +318,10 @@ pub struct HostHealth {
     /// The commit the host's binary was built from; absent when built outside a git checkout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// Since when the host's fetch has found `origin/main` ahead of `commit`; absent when it is
+    /// not behind, or cannot tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind_since: Option<DateTime<Utc>>,
 }
 
 /// The host agent's own vitals. Counters run from the host's start, so a drop in `uptime_s`

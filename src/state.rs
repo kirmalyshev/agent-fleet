@@ -86,6 +86,9 @@ pub struct Host {
     /// The commit its binary was built from, as its last `host.health` said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// Since when that commit has been behind `origin/main`, as its last `host.health` said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind_since: Option<DateTime<Utc>>,
     pub ts: DateTime<Utc>,
     /// When the host process started: that report's time less its `uptime_s`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -682,6 +685,7 @@ impl State {
                         disk_total: d.disk_total,
                         agents: d.agents,
                         commit: d.commit.clone(),
+                        behind_since: d.behind_since,
                         ts,
                         started: d
                             .stats
@@ -2120,6 +2124,7 @@ mod tests {
                     disk_total: 2,
                     agents: 0,
                     commit: None,
+                    behind_since: None,
                     stats: uptime_s.map(|u| HostStats {
                         uptime_s: u,
                         ..HostStats::default()
@@ -2204,6 +2209,7 @@ mod tests {
                     disk_total: 2,
                     agents: 0,
                     commit: Some(commit.into()),
+                    behind_since: None,
                     stats: None,
                 }),
             );
@@ -2246,6 +2252,7 @@ mod tests {
                     disk_total: 2,
                     agents: 0,
                     commit: Some("aaa".into()),
+                    behind_since: None,
                     stats: None,
                 }),
             );
@@ -2293,6 +2300,7 @@ mod tests {
                 disk_total: 2,
                 agents: 0,
                 commit: None,
+                behind_since: None,
                 stats: None,
             }),
         )
@@ -2303,6 +2311,7 @@ mod tests {
             disk_total: 0,
             agents: 0,
             commit: Some(commit.into()),
+            behind_since: None,
             ts: now,
             started: None,
         };
@@ -2368,6 +2377,7 @@ mod tests {
                 disk_total: 2,
                 agents: 0,
                 commit: Some("aaa".into()),
+                behind_since: None,
                 stats: None,
             }),
         )
@@ -2413,6 +2423,7 @@ mod tests {
             agents: 0,
             stats: None,
             commit: Some("abc".into()),
+            behind_since: None,
         });
         let mut s = State::default();
         s.apply(&by("host:h1", health).into_event());
