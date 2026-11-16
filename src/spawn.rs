@@ -46,6 +46,12 @@ pub struct FleetConfig {
     /// `[orphan_pr]`: which repos `doctor` looks at for PRs no live agent owns.
     #[serde(default)]
     pub orphan_pr: crate::orphanpr::Config,
+    /// `[repos]`: `owner/repo` → this machine's checkout. Read only from the machine's own
+    /// fleet.toml (`agent-fleet repo add`); ignored in a checkout's. The host reads it through
+    /// `setup::registered`, which needs no valid rules.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub repos: BTreeMap<String, PathBuf>,
 }
 
 fn default_session() -> String {
@@ -237,19 +243,27 @@ impl FleetConfig {
 /// `dir/.agent-fleet/fleet.toml`, and the directory it lives in (the brief template sits there).
 /// A checkout with no fleet.toml of its own uses the machine's: `<user config dir>/agent-fleet`.
 pub fn load(dir: &Path) -> Result<(FleetConfig, PathBuf)> {
-    let mut dir = dir.join(".agent-fleet");
-    if !dir.join("fleet.toml").exists()
-        && let Some(user) = user_config_dir().filter(|d| d.join("fleet.toml").exists())
-    {
-        dir = user;
-    }
-    let src = std::fs::read_to_string(dir.join("fleet.toml"))
-        .with_context(|| format!("read {}", dir.join("fleet.toml").display()))?;
-    Ok((FleetConfig::parse(&src)?, dir))
+    load_in(dir, machine_dir().as_deref())
 }
 
-/// `AGENT_FLEET_CONFIG_DIR`, else the platform's user config dir for agent-fleet.
-fn user_config_dir() -> Option<PathBuf> {
+/// `load` with the machine's config dir given: the checkout's own fleet.toml replaces the
+/// machine's wholesale whenever it exists. Errors name the file that was read.
+pub fn load_in(dir: &Path, machine: Option<&Path>) -> Result<(FleetConfig, PathBuf)> {
+    let mut dir = dir.join(".agent-fleet");
+    if !dir.join("fleet.toml").exists()
+        && let Some(m) = machine.filter(|d| d.join("fleet.toml").exists())
+    {
+        dir = m.to_path_buf();
+    }
+    let file = dir.join("fleet.toml");
+    let src = std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
+    let cfg = FleetConfig::parse(&src).with_context(|| file.display().to_string())?;
+    Ok((cfg, dir))
+}
+
+/// `AGENT_FLEET_CONFIG_DIR`, else the platform's user config dir for agent-fleet: where the
+/// machine's fleet.toml, brief.md and connected repos live.
+pub fn machine_dir() -> Option<PathBuf> {
     if let Some(d) = std::env::var_os("AGENT_FLEET_CONFIG_DIR") {
         return Some(PathBuf::from(d));
     }
@@ -1031,11 +1045,15 @@ async fn check_wire_fields(checkout: &Path, r: &SpawnRequested) -> Result<()> {
     Ok(())
 }
 
-/// The profile the request names, read from the checkout's OWN fleet.toml: the host decides
-/// `kind`, `args`, `unset_env` and `ready` itself — a request never carries them.
-fn host_profile(cfg_dir: &Path, r: &SpawnRequested) -> Result<(FleetConfig, Profile)> {
-    let (cfg, _) = load(cfg_dir)
-        .with_context(|| format!("read {}", cfg_dir.join(".agent-fleet/fleet.toml").display()))?;
+/// The profile the request names, read from the host's checkout's fleet.toml, or the machine's
+/// when it has none: the host decides `kind`, `args`, `unset_env` and `ready` itself — a request
+/// never carries them. Errors name the file that was used.
+fn host_profile(
+    checkout: &Path,
+    machine: Option<&Path>,
+    r: &SpawnRequested,
+) -> Result<(FleetConfig, Profile)> {
+    let (cfg, dir) = load_in(checkout, machine)?;
     let p = cfg
         .profiles
         .get(&r.profile)
@@ -1043,11 +1061,16 @@ fn host_profile(cfg_dir: &Path, r: &SpawnRequested) -> Result<(FleetConfig, Prof
             format!(
                 "profile {:?} is not in {}",
                 r.profile,
-                cfg_dir.join(".agent-fleet/fleet.toml").display()
+                dir.join("fleet.toml").display()
             )
         })?
         .clone();
     Ok((cfg, p))
+}
+
+/// No checkout of `repo` on this host: how to connect one.
+pub fn no_checkout(repo: &str) -> anyhow::Error {
+    anyhow!("no checkout for {repo} on this host: run `agent-fleet repo add {repo} <dir>` there")
 }
 
 /// The whole request: worktree or workspace, ready, env scrub, agent start, brief. `made`
@@ -1065,12 +1088,12 @@ async fn run_spawn(
             r.session
         );
     }
-    let Some(checkout) = host.cfg.checkouts.get(&r.repo).cloned() else {
-        bail!("no checkout for {} (host --repo {}=<dir>)", r.repo, r.repo);
+    let Some(checkout) = host.cfg.checkouts_now()?.remove(&r.repo) else {
+        return Err(no_checkout(&r.repo));
     };
     // The profile and its launch config always come from the HOST's checkout — a handoff's
     // worktree is the agent's own tree and is never read for config.
-    let (cfg, prof) = host_profile(&checkout, r)?;
+    let (cfg, prof) = host_profile(&checkout, host.cfg.config_dir.as_deref(), r)?;
     check_wire_fields(&checkout, r).await?;
     let res = match &r.worktree {
         Some(wt) => {
@@ -1184,7 +1207,12 @@ async fn undo(host: &Host, r: &SpawnRequested, made: &Made) {
         let _ = herdr_call(sock, "pane.close", json!({ "pane_id": p })).await;
     }
     if made.fresh {
-        let checkout = host.cfg.checkouts.get(&r.repo).cloned().unwrap_or_default();
+        let checkout = host
+            .cfg
+            .checkouts_now()
+            .ok()
+            .and_then(|mut c| c.remove(&r.repo))
+            .unwrap_or_default();
         if let Some(ws) = &made.workspace {
             let _ = herdr_call(
                 sock,
@@ -1450,10 +1478,10 @@ pub async fn hand_off(
 ) -> Result<()> {
     let checkout = host
         .cfg
-        .checkouts
-        .get(&sp.request.repo)
-        .with_context(|| format!("no checkout for {}", sp.request.repo))?;
-    let (cfg, cfg_dir) = load(checkout)?;
+        .checkouts_now()?
+        .remove(&sp.request.repo)
+        .ok_or_else(|| no_checkout(&sp.request.repo))?;
+    let (cfg, cfg_dir) = load_in(&checkout, host.cfg.config_dir.as_deref())?;
     let req = handoff_request(
         state,
         &cfg,
@@ -1493,6 +1521,12 @@ async fn handoffs(
     let prefix = agent_prefix(&host.cfg.host, &host.cfg.session);
     // A failed replacement frees the agent: dedupe counts only pending or successful ones.
     done.retain(|id| replacement_open(state, id));
+    // A config that cannot be read fails the spawn that needs it, which says why; here the
+    // flags' checkouts still serve.
+    let checkouts = host
+        .cfg
+        .checkouts_now()
+        .unwrap_or_else(|_| host.cfg.checkouts.clone());
     for (id, a) in &state.agents {
         if !id.starts_with(&prefix) || done.contains(id) {
             continue;
@@ -1508,10 +1542,10 @@ async fn handoffs(
         if replacement_open(state, id) {
             continue;
         }
-        let Some(checkout) = host.cfg.checkouts.get(&sp.request.repo).cloned() else {
+        let Some(checkout) = checkouts.get(&sp.request.repo) else {
             continue;
         };
-        let (cfg, _) = match load(&checkout) {
+        let (cfg, _) = match load_in(checkout, host.cfg.config_dir.as_deref()) {
             Ok(x) => x,
             Err(e) => {
                 if warned.insert(id.clone()) {
@@ -2262,6 +2296,7 @@ profile = "devin"
             data_dir: dir.to_path_buf(),
             repos: Vec::new(),
             checkouts: [("o/r".to_string(), dir.join("co"))].into_iter().collect(),
+            config_dir: None,
             locks: Vec::new(),
             stall_min: 15,
             stuck_act,

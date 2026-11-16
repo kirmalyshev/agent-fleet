@@ -1,48 +1,78 @@
-session = "work"                 # herdr session agents run in; absent = the session the CLI runs in
-base = "origin/main"             # branch point for a new worktree
-brief = "brief.md"               # template next to fleet.toml; @@KEY@@ placeholders
-ready = "scripts/worktree-ready.sh"   # optional; run inside a NEW worktree with its path as $1, before the agent starts
+# fleet.toml: how `agent-fleet spawn` starts agents, and which repositories this machine serves.
+#
+# `agent-fleet init` writes this file, with a profile for each agent program it finds on PATH,
+# into the user config dir (~/.config/agent-fleet on Linux; AGENT_FLEET_CONFIG_DIR overrides
+# it), next to brief.md. These are the machine's rules: every connected repository uses them,
+# unless the repository has its own `.agent-fleet/fleet.toml`, which then replaces this file
+# wholesale for that repository ([repos] below is only ever read from the machine's file).
+# A commented-out key shows its default or an example: uncomment it to use it.
 
-[vars]                           # extra brief tokens
-ORG = "example"
+# session = "work"               # herdr session agents run in; absent = the session the CLI runs in (HERDR_SESSION)
+# base = "origin/main"           # branch point for a new worktree
+brief = "brief.md"               # brief template next to this file; @@KEY@@ placeholders: NAME, KIND, PROGRAM,
+                                 # SLUG, ISSUE, TITLE, BRANCH, SCOPE, HOST, LEVEL, LEAD, HANDOFF, REF, TASK,
+                                 # each [vars] key and each `spawn --set KEY=VALUE`
+# ready = "scripts/worktree-ready.sh"   # run inside a NEW worktree with its path as $1, before the agent starts
+
+# [vars]                         # extra brief tokens: @@ORG@@ renders "example"
+# ORG = "example"
+
+# Profiles: how to start one agent program. One profile per program found on PATH; add more,
+# e.g. one per model. Keys:
+#   kind        the program: claude, codex or devin (agent.start's kind and agent.quota's kind)
+#   args        extra arguments for the program, e.g. ["--model", "opus"]
+#   unset_env   variables cleared in the pane's shell before the agent starts
+#   prefix      the default agent name is prefix + issue number; profiles never share a prefix
+#   cap         live agents of this profile per repository; absent = no cap
+#   fallback    the profile used when this one's quota is out, and `agent-fleet handoff`'s default
+#   on_quota    the ONLY automatic handoff (host --stuck-act required): a stuck agent whose kind
+#               is out of quota with a KNOWN reset >30m away moves to this profile, if its kind
+#               still has quota on this host
+#   handoff_min minutes a spawned agent has to reach `working` before its lead is told (default 5)
+
+[profiles.claude]
+kind = "claude"
+args = []
+prefix = "c-"
+
+[profiles.codex]
+kind = "codex"
+args = []
+prefix = "x-"
 
 [profiles.devin]
-kind = "devin"                   # program, matches agent.up kind and agent.quota kind
-args = []                        # extra args for herdr agent.start
-prefix = "dv-"                   # default agent name = prefix + issue number
-cap = 2                          # live agents of this profile for this repo; absent = no cap
-fallback = "sonnet"              # spawn-time routing when this kind's quota is out, and the default for `agent-fleet handoff`
-on_quota = "haiku"               # the ONLY automatic handoff (host --stuck-act required): a stuck agent whose kind is out with a KNOWN reset >30m away; haiku must still have quota on this host
-handoff_min = 5                  # see Handoff
-[profiles.sonnet]
-kind = "claude"
-args = ["--model", "sonnet", "--dangerously-skip-permissions"]
-unset_env = ["CLAUDE_CONFIG_DIR"]   # cleared in the pane's shell before the agent starts
-prefix = "s-"
-[profiles.opus]
-kind = "claude"
-args = ["--model", "opus", "--dangerously-skip-permissions"]
-unset_env = ["CLAUDE_CONFIG_DIR"]
-prefix = "o-"
-[profiles.haiku]
-kind = "claude"                  # the claude account's limits apply; a claude agent is never handed to it on the same host
-args = ["--model", "haiku", "--dangerously-skip-permissions"]
-unset_env = ["CLAUDE_CONFIG_DIR"]
-prefix = "h-"
+kind = "devin"
+args = []
+prefix = "dv-"
 
-[[rules]]                        # first match wins; a rule with no `match` is the default
-match = ["ios", "simulator", "label:mobile"]
-profile = "devin"
-host = "mac.local"               # optional; default: the host running the CLI
-level = "implementer"            # agent.role level declared for the new agent (default implementer)
-[[rules]]
-match = ["research", "design", "audit", "label:design"]
-profile = "opus"
-[[rules]]
-profile = "devin"
+# [profiles.opus]                # a second claude profile, picked by a rule below
+# kind = "claude"
+# args = ["--model", "opus"]
+# prefix = "o-"
+# cap = 2
+# fallback = "claude"
 
-[orphan_pr]                      # doctor: open PRs no live agent owns (off while `repos` is empty)
-repos = ["owner/repo"]
-days = 3                         # quiet this long before a PR is an orphan (default 3)
-guarded = ["AGENTS.md", "CLAUDE.md", "README.md", "docs/", "schema/"] # reported, never closed (`dir/` = prefix); this is the default, and setting it replaces it
-apply = false                   # true: the host watch loop closes superseded PRs and tells the root of the rest
+# Rules route an issue to a profile: the first rule that matches wins, so the default rule
+# (no `match`) comes last. `match` keywords are OR'd, case-insensitive whole words against the
+# issue's title and labels; `label:x` matches only a label named x. Optional keys:
+#   host   the host to spawn on (default: the host running the CLI)
+#   level  the agent.role level of the new agent (default implementer)
+# [[rules]]
+# match = ["research", "design", "label:design"]
+# profile = "opus"
+# host = "build-box"
+
+[[rules]]                        # the default rule
+profile = "claude"
+
+# Pull requests no live agent owns (`agent-fleet doctor`, finding `orphan-pr`).
+# [orphan_pr]
+# repos = ["owner/repo"]         # absent = every repository in [repos]; [] = off
+# days = 3                       # quiet this long before a PR is an orphan
+# guarded = ["AGENTS.md", "CLAUDE.md", "README.md", "docs/", "schema/"]  # reported, never closed (`dir/` = prefix); setting it replaces this default
+# apply = false                  # true: the host watch loop closes superseded PRs and tells the root coordinator of the rest
+
+# Repositories connected on this machine: "owner/repo" = "<checkout>". Edit with
+# `agent-fleet repo add <owner/repo> [<dir>]` and `agent-fleet repo rm <owner/repo>`; the host
+# re-reads this table at each spawn and each scan, so no restart is needed.
+[repos]

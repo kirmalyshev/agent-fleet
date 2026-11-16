@@ -759,14 +759,14 @@ pub struct SpawnRequested {
     pub host: String,
     /// The herdr session it runs in.
     pub session: String,
-    /// `owner/repo`; the host maps it to a checkout (`host --repo owner/repo=<dir>`).
+    /// `owner/repo`; the host maps it to a checkout (`agent-fleet repo add`, `host --repo`).
     pub repo: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue: Option<u64>,
     pub branch: String,
     /// The routing profile that was picked. The host resolves its `kind`, `args`, `unset_env`
-    /// and the checkout's `ready` script from its OWN `.agent-fleet/fleet.toml` — a request
-    /// never carries executable configuration.
+    /// and the `ready` script from its checkout's `.agent-fleet/fleet.toml`, else the machine's
+    /// — a request never carries executable configuration.
     pub profile: String,
     /// The rendered brief.
     pub brief: String,
