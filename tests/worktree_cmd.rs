@@ -109,6 +109,14 @@ fn clean_retires_finished_work_in_every_connected_repo_and_keeps_the_rest() {
             wt.to_str().unwrap(),
         ],
     );
+    let busy = branch(&a, "busy", true, true); // merged PR, a leftover process: stopped, retired
+    // Orphaned, as a leftover is: not under the agent that may be running this test.
+    let out = Command::new("sh")
+        .args(["-c", "sleep 60 >/dev/null 2>&1 & echo $!"])
+        .current_dir(t.join("busy"))
+        .output()
+        .unwrap();
+    let sleeper = String::from_utf8_lossy(&out.stdout).trim().to_string();
     branch(&a, "local", false, false); // local-only commit: kept
     branch(&a, "pushed", false, true); // on origin: deleted
     let b = repo(t, "b");
@@ -119,6 +127,7 @@ fn clean_retires_finished_work_in_every_connected_repo_and_keeps_the_rest() {
         pr("open", "OPEN", &open, 2),
         pr("dirty", "MERGED", &dirty, 3),
         pr("locked", "MERGED", &locked, 4),
+        pr("busy", "MERGED", &busy, 5),
     ];
     let gh = format!(
         "#!/bin/sh\ncase \"$*\" in\n*owner/a*) echo '[{}]' ;;\n*owner/b*) echo '[{}]' ;;\n\
@@ -172,7 +181,21 @@ fn clean_retires_finished_work_in_every_connected_repo_and_keeps_the_rest() {
     let only_b = fleet(&["worktree", "clean", "--repo", "owner/b"]);
     assert!(!only_b.contains("owner/a"), "{only_b}");
 
+    // Only Linux reads a process's cwd; elsewhere no leftover is seen.
+    let linux = cfg!(target_os = "linux");
+    if linux {
+        assert!(dry.contains(&format!("stop {sleeper} sleep 60")), "{dry}");
+    }
     let out = fleet(&["worktree", "clean", "--execute"]);
+    if linux {
+        assert!(out.contains(&format!("stopped {sleeper} TERM")), "{out}");
+        let alive = Command::new("kill")
+            .args(["-0", &sleeper])
+            .status()
+            .unwrap();
+        assert!(!alive.success(), "{sleeper} still runs");
+    }
+    assert!(!t.join("busy").exists(), "{out}");
     assert!(out.contains("[merged: pr]"), "{out}");
     assert!(out.contains("[closed: pr]"), "{out}");
     assert!(out.contains("delete pushed (pushed)"), "{out}");

@@ -106,9 +106,11 @@ A local branch is finished when its tip is the head of one of your merged or clo
 default branch, or is in `origin/<branch>`. A branch with an open PR, or with commits nowhere else,
 is never deleted. Only a finished PR retires a worktree, and never the main checkout, the one you
 are in, a locked one, one an agent works in (by the fleet's log, the same rule as `doctor`'s
-`forgotten`), one with uncommitted files, or one processes run in. It never unlocks a worktree or
-stops a process: a lock whose pid is gone is called stale with its `git worktree unlock` command,
-and processes `doctor` proved orphans come with their `agent-fleet kill` command. A worktree is retired as the TUI's `x` does it:
+`forgotten`), or one with uncommitted files. Processes left in a worktree it retires are stopped
+first (TERM, then KILL after 5 s); `ls` and the dry run list them, pid and command. A process an
+agent program runs, a herdr pane and your own shell are never stopped: one of those in a worktree
+keeps it. It never unlocks a worktree: a lock whose pid is gone is called stale, with its
+`git worktree unlock` command. A worktree is retired as the TUI's `x` does it:
 `.agent-fleet/hook retire <path>`, else `git worktree remove`. `gh` (`AGENT_FLEET_GH`) reads the
 PRs, one `gh pr list` per repository.
 

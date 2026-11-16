@@ -6,12 +6,15 @@
 //! `origin/<branch>` (`pushed`). A branch with an open PR is never stale, and local-only commits
 //! are never deleted. Only `pr` retires a worktree: one just made off main is `in main` too.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
+use crate::scan::Procs;
 use crate::state::{State, worktree_key};
 use crate::tui::Fleet;
 
@@ -52,14 +55,14 @@ pub fn stale(
 }
 
 /// Why the worktree at `path` must stay even when its branch is finished; `None` when it may go.
-/// `lock` and `procs` are already said (`lock_note`, `procs_note`).
+/// `lock` is already said (`lock_note`); `guarded` are processes clean must not stop.
 fn blocked(
     main: bool,
     here: bool,
     lock: Option<String>,
     agents: &[String],
     dirty: usize,
-    procs: Option<String>,
+    guarded: &[String],
 ) -> Option<String> {
     if main {
         Some("main checkout".into())
@@ -72,8 +75,13 @@ fn blocked(
         Some(format!("{} works in it", names.join(", ")))
     } else if dirty > 0 {
         Some(format!("{dirty} uncommitted files"))
+    } else if !guarded.is_empty() {
+        Some(format!(
+            "{} runs in it (an agent's or yours)",
+            guarded.join(", ")
+        ))
     } else {
-        procs
+        None
     }
 }
 
@@ -110,28 +118,110 @@ fn lock_note(reason: &str, repo: &Path, path: &str, alive: impl Fn(u32) -> bool)
     }
 }
 
-/// What keeps a worktree processes run in: `names`, and when every one of `pids` (all of them,
-/// `total`) is an orphan doctor proved (`killable`), the `agent-fleet kill` that stops them.
-/// Clean never stops a process itself.
-fn procs_note(
-    names: &[String],
-    pids: &[u32],
-    total: u32,
-    killable: &BTreeMap<u32, String>,
-) -> String {
-    let what = format!("{} runs in it", names.join(", "));
-    if !pids.is_empty()
-        && pids.len() == total as usize
-        && pids.iter().all(|p| killable.contains_key(p))
-    {
-        let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
-        format!(
-            "{what}, proved orphans: agent-fleet kill {}",
-            pids.join(" ")
-        )
-    } else {
-        what
+/// A process clean stops before it retires a worktree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Leftover {
+    pub pid: u32,
+    /// Tells the process from a later one that reused its pid.
+    pub started: Option<DateTime<Utc>>,
+    pub command: String,
+}
+
+fn inside(cwd: &str, dir: &str) -> bool {
+    cwd == dir || cwd.starts_with(&format!("{dir}/"))
+}
+
+/// The processes whose cwd is in `path`: the leftovers clean stops, and the names of those it
+/// must not: a multiplexer and its panes, anything an agent program runs (`kill::AGENTS`, at any
+/// depth), and the caller and its ancestors (`mine`).
+fn leftovers(procs: &Procs, path: &str, mine: &HashSet<u32>) -> (Vec<Leftover>, Vec<String>) {
+    let agents: HashSet<u32> = procs
+        .0
+        .iter()
+        .filter(|(_, p)| crate::kill::AGENTS.contains(&p.name.as_str()))
+        .map(|(&pid, _)| pid)
+        .collect();
+    let (mut stop, mut guarded) = (Vec::new(), BTreeSet::new());
+    for (&pid, p) in &procs.0 {
+        if !p.cwd.as_deref().is_some_and(|c| inside(c, path)) {
+            continue;
+        }
+        if crate::scan::is_terminal(procs, p)
+            || procs.under_any(pid, &agents)
+            || mine.contains(&pid)
+        {
+            guarded.insert(p.name.clone());
+        } else {
+            stop.push(Leftover {
+                pid,
+                started: p.started,
+                command: p.args.clone().unwrap_or_else(|| p.name.clone()),
+            });
+        }
     }
+    stop.sort_by_key(|l| l.pid);
+    (stop, guarded.into_iter().collect())
+}
+
+/// `pid` and its ancestors in `procs`.
+fn lineage(procs: &Procs, pid: u32) -> HashSet<u32> {
+    let mut out = HashSet::from([pid]);
+    let mut at = pid;
+    while let Some(p) = procs.0.get(&at).map(|p| p.ppid) {
+        if p == 0 || !out.insert(p) {
+            break;
+        }
+        at = p;
+    }
+    out
+}
+
+/// Seconds between TERM and KILL, as `agent-fleet kill`'s default.
+const GRACE: Duration = Duration::from_secs(5);
+
+/// TERM, then KILL after `grace`, each of `them` still in `dir`: the table is re-read before each
+/// signal, and a pid whose start time or cwd changed (reused) is never hit. `Err` when one
+/// survives: the worktree then stays.
+async fn stop(them: &[Leftover], dir: &str, grace: Duration) -> Result<String, String> {
+    let still = |procs: &Procs, l: &Leftover| {
+        procs.0.get(&l.pid).is_some_and(|p| {
+            p.started == l.started && p.cwd.as_deref().is_some_and(|c| inside(c, dir))
+        })
+    };
+    let signal = |pid: u32, sig| unsafe { libc::kill(pid as i32, sig) };
+    let now = Procs::read();
+    let them: Vec<&Leftover> = them.iter().filter(|l| still(&now, l)).collect();
+    for l in &them {
+        // SAFETY: kill only sends a signal.
+        signal(l.pid, libc::SIGTERM);
+    }
+    let deadline = std::time::Instant::now() + grace;
+    let mut left = them.clone();
+    while !left.is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let now = Procs::read();
+        left.retain(|l| still(&now, l));
+    }
+    for l in &left {
+        signal(l.pid, libc::SIGKILL);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let now = Procs::read();
+    if let Some(l) = left.iter().find(|l| still(&now, l)) {
+        return Err(format!("pid {} survived KILL", l.pid));
+    }
+    let said: Vec<String> = them
+        .iter()
+        .map(|l| {
+            let how = if left.iter().any(|k| k.pid == l.pid) {
+                "KILL"
+            } else {
+                "TERM"
+            };
+            format!("{} {how}", l.pid)
+        })
+        .collect();
+    Ok(format!("stopped {}", said.join(", ")))
 }
 
 /// The repositories to look at: the machine's `[repos]`, the main checkouts of the worktrees
@@ -209,6 +299,8 @@ struct Row {
     verdict: String,
     reason: Option<&'static str>,
     retire: bool,
+    /// The processes clean stops before it retires this worktree.
+    stops: Vec<Leftover>,
 }
 
 /// One repository, read: its worktrees and the stale branches no worktree has out.
@@ -220,7 +312,7 @@ struct Scan {
     notes: Vec<String>,
 }
 
-fn scan(slug: &str, dir: &Path, s: &State, host: &str, here: &Path) -> Result<Scan> {
+fn scan(slug: &str, dir: &Path, s: &State, host: &str, here: &Path, procs: &Procs) -> Result<Scan> {
     let mut notes = Vec::new();
     if git(dir, &["fetch", "origin", "--prune", "--quiet"]).is_none() {
         notes.push("fetch failed, origin may be stale".into());
@@ -236,7 +328,7 @@ fn scan(slug: &str, dir: &Path, s: &State, host: &str, here: &Path) -> Result<Sc
         bail!("{} is not a git checkout", dir.display());
     };
     let workers = crate::doctor::workers(s);
-    let killable = crate::doctor::killable(s, chrono::Utc::now(), host);
+    let mine = lineage(procs, std::process::id());
     let locks = locks(&list);
     let why = |b: &str, tip: &str| {
         let remote = format!("refs/remotes/origin/{b}");
@@ -247,18 +339,21 @@ fn scan(slug: &str, dir: &Path, s: &State, host: &str, here: &Path) -> Result<Sc
     let mut rows = Vec::new();
     for (i, (path, tip, branch)) in crate::scan::parse_worktrees(&list).into_iter().enumerate() {
         let key = worktree_key(host, &path);
-        let procs = s
-            .worktree_procs
-            .get(&key)
-            .filter(|p| p.procs.procs > 0)
-            .map(|p| procs_note(&p.procs.names, &p.procs.pids, p.procs.procs, &killable));
+        let (stops, guarded) = leftovers(procs, &path, &mine);
         let lock = locks
             .get(&path)
             .map(|r| lock_note(r, dir, &path, crate::scan::alive));
         let agents = workers.get(&key).cloned().unwrap_or_default();
         let dirty =
             git(Path::new(&path), &["status", "--porcelain"]).map_or(0, |o| o.lines().count());
-        let block = blocked(i == 0, here.starts_with(&path), lock, &agents, dirty, procs);
+        let block = blocked(
+            i == 0,
+            here.starts_with(&path),
+            lock,
+            &agents,
+            dirty,
+            &guarded,
+        );
         let reason = branch.as_deref().and_then(|b| why(b, &tip));
         let (verdict, retire) = match (reason, block) {
             (Some("pr"), None) => ("retire (pr)".into(), true),
@@ -285,6 +380,7 @@ fn scan(slug: &str, dir: &Path, s: &State, host: &str, here: &Path) -> Result<Sc
             verdict,
             reason,
             retire,
+            stops: if retire { stops } else { vec![] },
         });
     }
     let out: BTreeSet<&str> = rows.iter().filter_map(|r| r.branch.as_deref()).collect();
@@ -326,10 +422,21 @@ pub async fn run(
     let here = std::env::current_dir().unwrap_or_default();
     let host = fleet.host();
     let gh = std::env::var("AGENT_FLEET_GH").unwrap_or_else(|_| "gh".into());
+    let procs = Procs::read();
     let mut out = String::new();
+    // One line per process clean stops, under its worktree's line.
+    let stops = |r: &Row| -> String {
+        r.stops
+            .iter()
+            .map(|l| {
+                let cmd: String = l.command.chars().take(100).collect();
+                format!("      stop {} {cmd}\n", l.pid)
+            })
+            .collect()
+    };
     for (slug, dir) in repos {
         out += &format!("{slug} {}\n", dir.display());
-        let sc = match scan(slug, dir, s, &host, &here) {
+        let sc = match scan(slug, dir, s, &host, &here, &procs) {
             Ok(sc) => sc,
             Err(e) => {
                 out += &format!("  skipped: {e:#}\n");
@@ -354,6 +461,7 @@ pub async fn run(
                     r.verdict,
                     r.path
                 );
+                out += &stops(r);
             }
             continue;
         }
@@ -362,6 +470,7 @@ pub async fn run(
             if r.retire {
                 let b = r.branch.as_deref().unwrap_or("-");
                 out += &format!("  retire {} [{b}: pr]\n", r.path);
+                out += &stops(r);
             } else if r.reason == Some("pr") {
                 out += &format!("  keep worktree {}: {}\n", r.path, &r.verdict[6..]);
             }
@@ -382,6 +491,15 @@ pub async fn run(
         git(dir, &["worktree", "prune"]);
         let mut branches: Vec<&str> = sc.delete.iter().map(|(b, _)| b.as_str()).collect();
         for r in retire {
+            if !r.stops.is_empty() {
+                match stop(&r.stops, &r.path, GRACE).await {
+                    Ok(line) => out += &format!("  {line}\n"),
+                    Err(e) => {
+                        out += &format!("  could not stop all in {}: {e}; kept\n", r.path);
+                        continue;
+                    }
+                }
+            }
             match crate::tui::retire(&repo, &r.path).await {
                 Ok(()) => {
                     out += &format!(
@@ -462,29 +580,29 @@ mod tests {
     #[test]
     fn what_keeps_a_worktree() {
         let none: [String; 0] = [];
-        assert_eq!(blocked(false, false, None, &none, 0, None), None);
+        assert_eq!(blocked(false, false, None, &none, 0, &none), None);
         assert_eq!(
-            blocked(true, false, None, &none, 0, None).unwrap(),
+            blocked(true, false, None, &none, 0, &none).unwrap(),
             "main checkout"
         );
         assert_eq!(
-            blocked(false, true, None, &none, 0, None).unwrap(),
+            blocked(false, true, None, &none, 0, &none).unwrap(),
             "you are in it"
         );
         assert_eq!(
-            blocked(false, false, None, &none, 2, None).unwrap(),
+            blocked(false, false, None, &none, 2, &none).unwrap(),
             "2 uncommitted files"
         );
         let lock = Some("locked".to_string());
         assert_eq!(
-            blocked(false, true, lock, &none, 2, None).unwrap(),
+            blocked(false, true, lock, &none, 2, &none).unwrap(),
             "locked",
             "lock first"
         );
-        let procs = Some("bun runs in it".to_string());
+        let bun = ["bun".to_string()];
         assert_eq!(
-            blocked(false, false, None, &none, 0, procs).unwrap(),
-            "bun runs in it"
+            blocked(false, false, None, &none, 0, &bun).unwrap(),
+            "bun runs in it (an agent's or yours)"
         );
     }
 
@@ -510,23 +628,71 @@ mod tests {
         assert_eq!(lock_note("", repo, "/w/bare", |_| false), "locked");
     }
 
+    fn proc(ppid: u32, name: &str, cwd: &str) -> crate::scan::Proc {
+        crate::scan::Proc {
+            ppid,
+            cpu_ms: 0,
+            rss_kb: 0,
+            name: name.into(),
+            cwd: Some(cwd.into()),
+            deleted: false,
+            args: Some(format!("{name} --flag")),
+            started: None,
+            pgid: None,
+        }
+    }
+
     #[test]
-    fn only_proved_orphans_get_a_kill_command() {
-        let names = ["bun".to_string()];
-        let killable = BTreeMap::from([(41, "/w".to_string()), (42, "/w".to_string())]);
+    fn leftovers_are_stopped_but_never_an_agents_a_panes_or_the_callers() {
+        let procs = Procs(std::collections::HashMap::from([
+            (1, proc(0, "init", "/")),
+            (10, proc(1, "bun", "/w/done/web")), // left behind: stopped
+            (20, proc(1, "herdr", "/w/done")),
+            (21, proc(20, "zsh", "/w/done")), // a pane's shell
+            (30, proc(1, "claude", "/w/other")),
+            (31, proc(30, "bash", "/w/other")),
+            (32, proc(31, "cargo", "/w/done")), // an agent elsewhere runs it here
+            (40, proc(1, "sh", "/w/done")),     // the caller's ancestor
+            (41, proc(40, "agent-fleet", "/w/done")),
+            (50, proc(1, "vite", "/w/donee")), // a sibling directory
+        ]));
+        let mine = lineage(&procs, 41);
+        assert_eq!(mine, HashSet::from([41, 40, 1]));
+        let (stop, guarded) = leftovers(&procs, "/w/done", &mine);
+        let pids: Vec<u32> = stop.iter().map(|l| l.pid).collect();
+        assert_eq!(pids, [10]);
+        assert_eq!(stop[0].command, "bun --flag");
+        assert_eq!(guarded, ["agent-fleet", "cargo", "herdr", "sh", "zsh"]);
+        let none: [String; 0] = [];
         assert_eq!(
-            procs_note(&names, &[41, 42], 2, &killable),
-            "bun runs in it, proved orphans: agent-fleet kill 41 42"
+            blocked(false, false, None, &none, 0, &guarded[1..2]).unwrap(),
+            "cargo runs in it (an agent's or yours)"
         );
-        assert_eq!(
-            procs_note(&names, &[41, 43], 2, &killable),
-            "bun runs in it"
-        );
-        assert_eq!(
-            procs_note(&names, &[41], 2, &killable),
-            "bun runs in it",
-            "pids cut off"
-        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_leftover_is_stopped_and_a_reused_pid_is_not_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        // Orphaned, as a leftover is: not under the agent that may be running this test.
+        let out = std::process::Command::new("sh")
+            .args(["-c", "sleep 60 >/dev/null 2>&1 & echo $!"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        let procs = Procs::read();
+        let (them, _) = leftovers(&procs, &path, &HashSet::new());
+        assert!(them.iter().any(|l| l.pid == pid), "{them:?}");
+        let mut reused = them.clone();
+        for l in &mut reused {
+            l.started = l.started.map(|t| t - chrono::Duration::seconds(5));
+        }
+        assert_eq!(stop(&reused, &path, GRACE).await.unwrap(), "stopped ");
+        assert!(crate::scan::alive(pid), "another start time: not hit");
+        let line = stop(&them, &path, GRACE).await.unwrap();
+        assert!(line.contains(&format!("{pid} TERM")), "{line}");
     }
 
     fn state_with(path: &str, cwd: &str) -> State {
@@ -579,7 +745,7 @@ mod tests {
             .remove(&worktree_key("h", "/w/c-1"))
             .unwrap();
         assert_eq!(
-            blocked(false, false, None, &agents, 0, None).unwrap(),
+            blocked(false, false, None, &agents, 0, &[]).unwrap(),
             "c-1 works in it"
         );
         let s = state_with("/w/c-1", "/elsewhere");
