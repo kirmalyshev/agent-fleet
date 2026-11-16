@@ -106,28 +106,99 @@ pub(crate) async fn binary_says(exe: &Path) -> Result<String> {
     Ok(says)
 }
 
-/// Whether the build that `says` (a `--version` line) was made from an older commit than the one
-/// running (`running`, full): a rollback, which a hub does not follow. Judged by git in `clone`;
-/// when that cannot tell (no clone, an unknown commit), it is not a rollback.
-pub(crate) async fn is_rollback(clone: &Path, running: Option<&str>, says: &str) -> bool {
-    // `--version` prints `agent-fleet <version> <commit>`; the commit is the last word.
-    let (Some(running), Some(last)) = (running, says.split_whitespace().last()) else {
-        return false;
-    };
+/// Whether a hub running `running` (full commit) may follow the build that `says` (its
+/// `--version` line): only to the same commit or one built on top of it. An older or unrelated
+/// build (a rollback), a commit git does not know, no clone to ask, a line with no commit: all
+/// refuse, with the reason. Judged by git in `clone`.
+pub(crate) async fn can_follow(
+    clone: &Path,
+    running: Option<&str>,
+    says: &str,
+) -> Result<(), Refusal> {
+    let running = running
+        .ok_or_else(|| Refusal::Definite("this hub does not know which commit it runs".into()))?;
+    // `--version` prints `agent-fleet <version> <commit>`; the commit is the last word (a
+    // leading paren is still accepted). A line with no commit ("agent-fleet 0.1.0") has none.
+    let last = says.split_whitespace().last().unwrap_or_default();
     let new: String = last
         .trim_start_matches('(')
         .chars()
         .take_while(char::is_ascii_hexdigit)
         .collect();
-    if new.len() < 7 || running.starts_with(new.as_str()) {
-        return false;
+    if new.len() < 7 || new.len() != last.trim_start_matches('(').trim_end_matches(')').len() {
+        return Err(Refusal::Definite(format!(
+            "it does not say which commit it is ({says:?})"
+        )));
+    }
+    if running.starts_with(new.as_str()) {
+        return Ok(());
     }
     let mut c = tokio::process::Command::new("git");
     c.arg("-C")
         .arg(clone)
-        .args(["merge-base", "--is-ancestor", &new, running]);
-    // 0: the new commit is an ancestor of the running one (older); 1: not; anything else: unknown.
-    matches!(limited(c, GIT).await.map(|o| o.status.code()), Ok(Some(0)))
+        .args(["merge-base", "--is-ancestor", running, &new]);
+    // 0: the running commit is an ancestor of the new one (newer); 1: not (older, or unrelated);
+    // anything else (git missing, a timeout, a commit it has not fetched): cannot tell yet.
+    let cannot = |why: String| {
+        Refusal::Retry(format!(
+            "git cannot tell whether {new} is newer than {} in {}: {why}",
+            short(Some(running)),
+            clone.display()
+        ))
+    };
+    match limited(c, GIT).await {
+        Ok(o) => match o.status.code() {
+            Some(0) => Ok(()),
+            Some(1) => Err(Refusal::Definite(format!(
+                "it is an older or unrelated build ({says})"
+            ))),
+            _ => Err(cannot(format!(
+                "git exited {}: {}",
+                o.status,
+                tail(String::from_utf8_lossy(&o.stderr).trim())
+            ))),
+        },
+        Err(e) => Err(cannot(format!("{e:#}"))),
+    }
+}
+
+/// Why a replaced binary is not followed. `Definite`: it is what it is (an older build, a log it
+/// cannot read); the hub stops asking until the file is replaced again. `Retry`: nothing was
+/// proved (a timeout, git unavailable); the hub asks again later.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Refusal {
+    Definite(String),
+    Retry(String),
+}
+
+impl Refusal {
+    pub(crate) fn why(&self) -> &str {
+        match self {
+            Refusal::Definite(w) | Refusal::Retry(w) => w,
+        }
+    }
+}
+
+/// Runs `c`: Ok when it exits 0. It ran and failed: `Definite`, with what it said. It did not run
+/// or did not finish: `Retry`.
+pub(crate) async fn probe(c: tokio::process::Command, limit: Duration) -> Result<(), Refusal> {
+    let out = limited(c, limit)
+        .await
+        .map_err(|e| Refusal::Retry(format!("{e:#}")))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let said = String::from_utf8_lossy(&out.stderr);
+    let said = tail(said.trim());
+    Err(Refusal::Definite(format!(
+        "exited {}: {}",
+        out.status,
+        if said.is_empty() {
+            "(no output)"
+        } else {
+            &said
+        }
+    )))
 }
 
 /// Whether git should be told `ssh -o BatchMode=yes`: not when the operator chose an ssh command
@@ -1813,10 +1884,10 @@ chmod +x "$root/bin/agent-fleet"
             std::fs::write(&bin, body).unwrap();
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         };
-        put("#!/bin/sh\necho 'agent-fleet 0.1.0 (abc1234)'\n");
+        put("#!/bin/sh\necho 'agent-fleet 0.1.0 abc1234'\n");
         assert_eq!(
             binary_says(&bin).await.unwrap(),
-            "agent-fleet 0.1.0 (abc1234)"
+            "agent-fleet 0.1.0 abc1234"
         );
         put("#!/bin/sh\necho boom; exit 3\n");
         assert!(binary_says(&bin).await.is_err(), "exits non-zero");
@@ -1831,37 +1902,148 @@ chmod +x "$root/bin/agent-fleet"
     }
 
     #[tokio::test]
-    async fn a_build_of_an_older_commit_is_a_rollback_and_nothing_else_is() {
+    async fn a_hub_follows_only_the_same_commit_or_one_built_on_it() {
         let (_t, _origin, clone, _exe) = fixture();
         let old = sh(&clone, &["rev-parse", "HEAD"]);
         sh(&clone, &["commit", "-q", "--allow-empty", "-m", "two"]);
         let new = sh(&clone, &["rev-parse", "HEAD"]);
+        sh(&clone, &["checkout", "-q", "-b", "side", &old]);
+        sh(&clone, &["commit", "-q", "--allow-empty", "-m", "side"]);
+        let side = sh(&clone, &["rev-parse", "HEAD"]);
         let says = |c: &str| format!("agent-fleet 0.1.0 {c}");
-        let rb = |running: Option<&str>, says: &str| {
+        let can = |running: Option<&str>, says: &str| {
             let (clone, running, says) =
                 (clone.clone(), running.map(String::from), says.to_string());
-            async move { is_rollback(&clone, running.as_deref(), &says).await }
+            async move { can_follow(&clone, running.as_deref(), &says).await }
         };
         assert!(
-            rb(Some(&new), &says(&old)).await,
-            "older than the running one"
+            can(Some(&old), &says(&new)).await.is_ok(),
+            "newer: an update"
         );
-        assert!(!rb(Some(&old), &says(&new)).await, "newer: an update");
-        assert!(!rb(Some(&new), &says(&new)).await, "the same commit");
         assert!(
-            !rb(Some(&new), "agent-fleet 0.1.0 (0123456)").await,
-            "unknown to git: not a rollback"
+            can(Some(&new), &says(&new)).await.is_ok(),
+            "the same commit rebuilt"
         );
-        assert!(!rb(None, &says(&old)).await, "running commit unknown");
+        let e = can(Some(&new), &says(&old)).await.unwrap_err();
         assert!(
-            !rb(Some(&new), "agent-fleet 0.1.0").await,
+            matches!(&e, Refusal::Definite(w) if w.contains("older or unrelated")),
+            "{e:?}"
+        );
+        assert!(
+            matches!(
+                can(Some(&new), &says(&side)).await,
+                Err(Refusal::Definite(_))
+            ),
+            "unrelated"
+        );
+        // Unknown means no: a commit git has not heard of, no commit, no clone.
+        assert!(
+            can(
+                Some(&new),
+                "agent-fleet 0.1.0 0123456789abcdef0123456789abcdef01234567"
+            )
+            .await
+            .is_err()
+        );
+        assert!(can(None, &says(&old)).await.is_err(), "own commit unknown");
+        assert!(
+            can(Some(&new), "agent-fleet 0.1.0").await.is_err(),
             "no commit in the line"
         );
-        assert!(!rb(Some(&new), "agent-fleet 0.1.0 (unknown)").await);
         assert!(
-            !is_rollback(Path::new("/nonexistent"), Some(&new), &says(&old)).await,
-            "no clone"
+            can(Some(&new), "agent-fleet 0.1.0 (unknown)")
+                .await
+                .is_err()
         );
+        assert!(
+            can_follow(Path::new("/nonexistent"), Some(&new), &says(&old))
+                .await
+                .is_err()
+        );
+        assert!(
+            can_follow(Path::new("/nonexistent"), Some(&old), &says(&new))
+                .await
+                .is_err(),
+            "no clone: cannot tell"
+        );
+    }
+
+    #[tokio::test]
+    async fn what_git_cannot_tell_is_retried_and_says_why() {
+        let (_t, _origin, clone, _exe) = fixture();
+        let new = sh(&clone, &["rev-parse", "HEAD"]);
+        let ask = |clone: &Path, says: String| {
+            let (clone, new) = (clone.to_path_buf(), new.clone());
+            async move { can_follow(&clone, Some(&new), &says).await }
+        };
+        // A commit git has not fetched (exit 128): ask again later, with git's own words.
+        let e = ask(
+            &clone,
+            "agent-fleet 0.1.0 0123456789abcdef0123456789abcdef01234567".into(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&e, Refusal::Retry(w) if w.contains("git exited") && w.contains("128")),
+            "{e:?}"
+        );
+        // No clone to ask: git cannot run there.
+        let e = ask(
+            Path::new("/nonexistent"),
+            format!("agent-fleet 0.1.0 {}", "a".repeat(40)),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(e, Refusal::Retry(_)), "{e:?}");
+        // A line that names no commit, and an unknown own commit, are definite.
+        assert!(matches!(
+            ask(&clone, "agent-fleet 0.1.0".into()).await,
+            Err(Refusal::Definite(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_did_not_run_is_retried_and_one_that_said_nothing_is_readable() {
+        let none = tokio::process::Command::new("/nonexistent/agent-fleet");
+        assert!(matches!(
+            probe(none, Duration::from_secs(5)).await,
+            Err(Refusal::Retry(_))
+        ));
+        let mut quiet = tokio::process::Command::new("sh");
+        quiet.arg("-c").arg("exit 4");
+        match probe(quiet, Duration::from_secs(5)).await {
+            Err(Refusal::Definite(w)) => assert!(w.contains("(no output)"), "{w}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_probe_passes_on_exit_zero_and_reports_what_a_failure_said() {
+        let t = tempfile::tempdir().unwrap();
+        let sh_c = |script: &str| {
+            let mut c = tokio::process::Command::new("sh");
+            c.arg("-c").arg(script);
+            c
+        };
+        assert!(probe(sh_c("exit 0"), Duration::from_secs(5)).await.is_ok());
+        let e = probe(
+            sh_c("echo 'the log holds 3 events' >&2; exit 1"),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&e, Refusal::Definite(w) if w.contains("the log holds 3 events")),
+            "{e:?}"
+        );
+        let e = probe(sh_c("sleep 30"), Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, Refusal::Retry(w) if w.contains("timed out")),
+            "a timeout proved nothing: {e:?}"
+        );
+        drop(t);
     }
 
     #[test]

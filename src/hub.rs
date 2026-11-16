@@ -49,17 +49,34 @@ pub struct Accepted {
     pub duplicate: bool,
 }
 
+/// Folds the whole log. The hub only ever appends events it validated: one it cannot fold now
+/// means the binary and the log drifted apart, and a skipped `task.assigned` would let a task be
+/// granted twice.
+fn fold_log(store: &Store) -> Result<State> {
+    let state = State::fold(&store.all()?);
+    if state.unknown > 0 {
+        bail!(
+            "the log holds {} events this hub cannot read; run the build that wrote them",
+            state.unknown
+        );
+    }
+    Ok(state)
+}
+
+/// `agent-fleet hub --check`: whether this binary can start a hub on the log at `db` and the
+/// token table at `tokens`, reading both and writing neither: the checks `serve` makes before it
+/// listens. Returns how many events the log holds.
+pub fn check(db: &Path, tokens: &Path) -> Result<u64> {
+    let store = Store::open_readonly(db)?;
+    fold_log(&store)?;
+    // The shared token is read (or made) by the real start; its table is parsed by this binary.
+    Tokens::load(String::new(), tokens)?;
+    store.len()
+}
+
 impl Hub {
     pub fn new(store: Store) -> Result<Self> {
-        let state = State::fold(&store.all()?);
-        // The hub only ever appends events it validated. One it cannot fold now means the binary
-        // and the log drifted apart, and a skipped `task.assigned` would let a task be granted twice.
-        if state.unknown > 0 {
-            bail!(
-                "the log holds {} events this hub cannot read; run the build that wrote them",
-                state.unknown
-            );
-        }
+        let state = fold_log(&store)?;
         Ok(Self {
             store,
             state,
@@ -400,55 +417,100 @@ async fn follow_binary<V, Fut>(
     path: PathBuf,
     start: Option<(u64, u64)>,
     poll: Duration,
+    retry: Duration,
     verify: V,
     changed: impl FnOnce(),
 ) where
     V: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<(), String>>,
+    Fut: std::future::Future<Output = Result<(), crate::update::Refusal>>,
 {
+    use crate::update::Refusal;
     let mut settle = Settle::new(start);
+    // A definite refusal stands until the file is replaced again; one that proved nothing (a
+    // timeout, git unavailable) is asked again after `retry`, logged when its reason changes.
     let mut refused: Option<(u64, u64)> = None;
+    let mut retry_at: Option<tokio::time::Instant> = None;
+    let mut said = String::new();
     loop {
         tokio::time::sleep(poll).await;
         let Seen::Replaced(id) = settle.step(file_id(&path)) else {
+            retry_at = None;
+            said.clear();
             continue;
         };
-        if refused == Some(id) {
+        if refused == Some(id) || retry_at.is_some_and(|t| tokio::time::Instant::now() < t) {
             continue;
         }
-        match verify().await {
+        let verdict = verify().await;
+        let (why, definite) = match &verdict {
             Ok(()) => {
+                // The checks took a while: if the file was replaced again meanwhile, what passed
+                // is not what would be run. Look at the new one (the settle state sees it).
+                if file_id(&path) != Some(id) {
+                    continue;
+                }
                 changed();
                 return;
             }
-            Err(why) => {
-                eprintln!(
-                    "agent-fleet hub: {} was replaced but is not followed: {why}",
-                    path.display()
-                );
-                refused = Some(id);
-            }
+            Err(r) => (r.why().to_string(), matches!(r, Refusal::Definite(_))),
+        };
+        if said != why {
+            eprintln!(
+                "agent-fleet hub: {} was replaced but is not followed{}: {why}",
+                path.display(),
+                if definite { "" } else { " yet" }
+            );
+            said = why;
+        }
+        if definite {
+            refused = Some(id);
+        } else {
+            retry_at = Some(tokio::time::Instant::now() + retry);
         }
     }
 }
 
-/// The real check: the new binary runs, and is not an older commit than this one.
-async fn followable(exe: &Path) -> Result<(), String> {
-    let says = crate::update::binary_says(exe)
-        .await
-        .map_err(|e| format!("{e:#}"))?;
-    if crate::update::is_rollback(
+/// How long the new binary may take to read the whole log.
+const CHECK_LIMIT: Duration = Duration::from_secs(120);
+/// How soon a follow check that proved nothing is run again.
+const RETRY: Duration = Duration::from_secs(60);
+
+/// The real check before the exec: the new binary runs and names itself, it is the same commit
+/// as this one or built on it (not a rollback; unknown refuses), and it can run this hub's log
+/// (`hub --check`, read-only, with this hub's own arguments): replacing the only hub with a
+/// binary that cannot start would leave no hub.
+async fn followable(exe: &Path) -> Result<(), crate::update::Refusal> {
+    followable_with(
+        exe,
         Path::new(crate::update::CLONE),
         crate::update::COMMIT,
-        &says,
+        CHECK_LIMIT,
     )
     .await
-    {
-        return Err(format!(
-            "it is an older build ({says}); restart the hub by hand to run it"
-        ));
-    }
-    Ok(())
+}
+
+async fn followable_with(
+    exe: &Path,
+    clone: &Path,
+    running: Option<&str>,
+    limit: Duration,
+) -> Result<(), crate::update::Refusal> {
+    use crate::update::Refusal;
+    // It did not run, or not in time: nothing is proved either way.
+    let says = crate::update::binary_says(exe)
+        .await
+        .map_err(|e| Refusal::Retry(format!("{e:#}")))?;
+    crate::update::can_follow(clone, running, &says).await?;
+    let mut check = tokio::process::Command::from(restart_command(exe));
+    check.arg("--check");
+    crate::update::probe(check, limit)
+        .await
+        .map_err(|e| match e {
+            Refusal::Definite(w) => Refusal::Definite(format!("it cannot run this hub's log: {w}")),
+            Refusal::Retry(w) => {
+                Refusal::Retry(format!("could not run {} hub --check: {w}", exe.display()))
+            }
+        })
 }
 
 /// Serves the hub on every address in `listen`. Once bound, writes one URL to `hub_file`, where
@@ -513,6 +575,7 @@ pub async fn serve(
                 exe,
                 started_as,
                 BINARY_POLL,
+                RETRY,
                 move || {
                     let exe = check.clone();
                     async move { followable(&exe).await }
@@ -773,6 +836,213 @@ async fn stream(AxState(hub): AxState<Shared>, Query(q): Query<Cursor>) -> Respo
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_file_replaced_again_while_it_was_being_checked_is_checked_again_before_the_exec() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("agent-fleet");
+        std::fs::write(&exe, "old").unwrap();
+        std::fs::hard_link(&exe, dir.path().join("held")).unwrap();
+        let (changed, asked) = (
+            std::sync::Arc::new(AtomicBool::new(false)),
+            std::sync::Arc::new(AtomicUsize::new(0)),
+        );
+        let (flag, count, path) = (changed.clone(), asked.clone(), exe.clone());
+        let dir_path = dir.path().to_path_buf();
+        let task = tokio::spawn(follow_binary(
+            exe.clone(),
+            file_id(&exe),
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            move || {
+                let n = count.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // A second rename lands while the first is being checked.
+                    let again = dir_path.join(".again");
+                    std::fs::write(&again, "again").unwrap();
+                    std::fs::rename(&again, &path).unwrap();
+                }
+                async { Ok(()) }
+            },
+            move || flag.store(true, Ordering::SeqCst),
+        ));
+        let first = dir.path().join(".first");
+        std::fs::write(&first, "first").unwrap();
+        std::fs::rename(&first, &exe).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("followed the one that was in place after the checks")
+            .unwrap();
+        assert!(changed.load(Ordering::SeqCst));
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            2,
+            "checked twice: once per file"
+        );
+    }
+
+    #[test]
+    fn the_check_reads_the_token_table_this_binary_would_start_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hub.db");
+        drop(Store::open(&db).unwrap());
+        let table = dir.path().join("hub-tokens");
+        assert_eq!(check(&db, &table).unwrap(), 0, "no table is an empty one");
+        std::fs::write(&table, "# tokens\nhost:mac s3cret\n").unwrap();
+        assert_eq!(check(&db, &table).unwrap(), 0);
+        std::fs::write(&table, "bogus:scope tok\n").unwrap();
+        let e = check(&db, &table).unwrap_err();
+        assert!(format!("{e:#}").contains("bogus"), "{e:#}");
+    }
+
+    /// A clone with two commits and a fake binary: `--version` says `says`; anything else is the
+    /// check, which records its arguments and exits `code` (after `sleep` seconds).
+    struct Follow {
+        _dir: tempfile::TempDir,
+        clone: PathBuf,
+        exe: PathBuf,
+        argv: PathBuf,
+        old: String,
+        new: String,
+    }
+
+    fn follow_fx() -> Follow {
+        let dir = tempfile::tempdir().unwrap();
+        let clone = dir.path().join("clone");
+        std::fs::create_dir(&clone).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&clone)
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+        let old = git(&["rev-parse", "HEAD"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+        let new = git(&["rev-parse", "HEAD"]);
+        let (exe, argv) = (dir.path().join("agent-fleet"), dir.path().join("argv"));
+        Follow {
+            _dir: dir,
+            clone,
+            exe,
+            argv,
+            old,
+            new,
+        }
+    }
+
+    fn script(f: &Follow, says: &str, code: i32, sleep: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let body = format!(
+            "#!/bin/sh\ncase \"$1\" in --version) echo 'agent-fleet 0.1.0 {says}'; exit 0;; esac\n\
+             echo \"$@\" > {}\nsleep {sleep}\necho boom >&2\nexit {code}\n",
+            f.argv.display()
+        );
+        std::fs::write(&f.exe, body).unwrap();
+        std::fs::set_permissions(&f.exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_new_binary_must_pass_the_check_with_the_hubs_own_arguments_to_be_followed() {
+        use crate::update::Refusal;
+        let f = follow_fx();
+        let limit = Duration::from_secs(5);
+        script(&f, &f.new, 0, 0);
+        followable_with(&f.exe, &f.clone, Some(&f.old), limit)
+            .await
+            .unwrap();
+        let said = std::fs::read_to_string(&f.argv).unwrap();
+        assert!(
+            said.trim_end().ends_with("--check"),
+            "ran the check: {said:?}"
+        );
+        // The check fails: definite, and it says why.
+        script(&f, &f.new, 1, 0);
+        let e = followable_with(&f.exe, &f.clone, Some(&f.old), limit)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, Refusal::Definite(w) if w.contains("cannot run this hub's log") && w.contains("boom")),
+            "{e:?}"
+        );
+        // It does not finish in time: nothing proved, ask again.
+        script(&f, &f.new, 0, 30);
+        let e = followable_with(&f.exe, &f.clone, Some(&f.old), Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, Refusal::Retry(w) if w.contains("hub --check")),
+            "{e:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_older_build_is_refused_before_it_is_ever_asked_to_check_the_log() {
+        use crate::update::Refusal;
+        let f = follow_fx();
+        script(&f, &f.old, 0, 0);
+        let e = followable_with(&f.exe, &f.clone, Some(&f.new), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, Refusal::Definite(_)), "{e:?}");
+        assert!(!f.argv.exists(), "the check was not run");
+    }
+
+    #[tokio::test]
+    async fn a_check_that_proved_nothing_is_asked_again_and_a_definite_refusal_is_not() {
+        use crate::update::Refusal;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("agent-fleet");
+        std::fs::write(&exe, "old").unwrap();
+        std::fs::hard_link(&exe, dir.path().join("held")).unwrap();
+        let (changed, asked) = (
+            std::sync::Arc::new(AtomicBool::new(false)),
+            std::sync::Arc::new(AtomicUsize::new(0)),
+        );
+        let (flag, count) = (changed.clone(), asked.clone());
+        let task = tokio::spawn(follow_binary(
+            exe.clone(),
+            file_id(&exe),
+            Duration::from_millis(10),
+            Duration::from_millis(50),
+            move || {
+                let n = count.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n < 2 {
+                        Err(Refusal::Retry("git timed out".into()))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            move || flag.store(true, Ordering::SeqCst),
+        ));
+        let new = dir.path().join(".new");
+        std::fs::write(&new, "new").unwrap();
+        std::fs::rename(&new, &exe).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("retried until it could tell")
+            .unwrap();
+        assert!(changed.load(Ordering::SeqCst));
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            3,
+            "twice nothing proved, then yes"
+        );
+    }
+
     #[test]
     fn a_replacement_counts_only_once_the_same_new_file_stays_for_two_polls() {
         let (old, a, b) = (Some((1, 1)), Some((1, 2)), Some((1, 3)));
@@ -810,11 +1080,12 @@ mod tests {
             exe.clone(),
             file_id(&exe),
             Duration::from_millis(10),
+            Duration::from_millis(10),
             move || {
                 let n = count.fetch_add(1, Ordering::SeqCst);
                 async move {
                     if n == 0 {
-                        Err("half written".to_string())
+                        Err(crate::update::Refusal::Definite("half written".to_string()))
                     } else {
                         Ok(())
                     }
@@ -868,6 +1139,7 @@ mod tests {
         let task = tokio::spawn(follow_binary(
             exe.clone(),
             file_id(&exe),
+            Duration::from_millis(10),
             Duration::from_millis(10),
             || async { Ok(()) },
             move || flag.store(true, Ordering::SeqCst),

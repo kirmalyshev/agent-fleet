@@ -75,6 +75,10 @@ enum Cmd {
         /// [default: <data dir>/hub.db]
         #[arg(long)]
         db: Option<PathBuf>,
+        /// Read the log and fold it, read-only, and exit 0 when this binary can run it. A hub
+        /// follows a replaced binary only after this passes.
+        #[arg(long)]
+        check: bool,
     },
     /// Mint a token that may post only as `host:<name>` (and its agents) or `agent:<name>` (the
     /// agents on that host), into the hub's token table. Run it where the hub runs.
@@ -789,7 +793,12 @@ async fn main() -> Result<()> {
     let now = Utc::now();
     match &ctx.cli.cmd {
         Cmd::Api { .. } => unreachable!(),
-        Cmd::Hub { listen, db } => {
+        Cmd::Hub { listen, db, check } => {
+            if *check {
+                let db = db.clone().unwrap_or_else(|| ctx.paths.hub_db());
+                println!("ok: {} events", hub::check(&db, &ctx.paths.hub_tokens())?);
+                return Ok(());
+            }
             let token_file = ctx
                 .cli
                 .token_file
