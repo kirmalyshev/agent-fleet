@@ -35,11 +35,14 @@ pub const SPAWN_UNANSWERED: Duration = Duration::minutes(5);
 pub const STALLED: Duration = Duration::minutes(crate::spawn::STALL_MIN as i64);
 /// A failed spawn stays a finding this long.
 pub const SPAWN_FAILED: Duration = Duration::hours(1);
-/// A host's latest self-update that failed is a finding for this long after the request; one a
-/// live host left unanswered is a finding from `UPDATE_UNANSWERED` after it.
+/// A host's latest self-update that failed is a finding for this long after the request, and
+/// longer while the host still runs the commit it failed on (nothing will ask it again until
+/// `origin/main` moves); one a live host left unanswered is a finding from `UPDATE_UNANSWERED`
+/// after it.
 pub const UPDATE_FAILED: Duration = Duration::hours(2);
-/// More than a build takes (`update::BUILD`, 30 min): the answer comes after the build.
-pub const UPDATE_UNANSWERED: Duration = Duration::minutes(40);
+/// Above the longest an update can take to answer: the wait for another update's lock plus a
+/// build (`update::LOCK_WAIT` + `update::BUILD`, 65 min).
+pub const UPDATE_UNANSWERED: Duration = Duration::minutes(70);
 /// A `proc.hung` report confirmed this recently is kill proof: three watch ticks.
 pub const HUNG_FRESH: Duration = Duration::minutes(6);
 /// A host whose `host.health` is older than this is not compared for `build`.
@@ -524,16 +527,27 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
         let up = now - h.ts < Duration::minutes(3);
         // Newest first: a request too young to judge does not hide an older failure.
         for u in &by_since {
+            // A request already stale when the host started was ignored by it, not left
+            // unanswered.
+            let ignored = h
+                .started
+                .is_some_and(|st| st - u.since >= crate::update::REQUEST_MAX_AGE);
             let concerns = u.results.contains_key(host)
-                || (up && u.host.as_deref().is_none_or(|t| t == host) && u.since <= h.ts);
+                || (up
+                    && !ignored
+                    && u.host.as_deref().is_none_or(|t| t == host)
+                    && u.since <= h.ts);
             let age = now - u.since;
             if !concerns {
                 continue;
             }
-            if age >= UPDATE_FAILED {
+            let r = u.results.get(host);
+            let still_failed =
+                r.is_some_and(|r| !r.ok && r.commit.is_some() && r.commit == h.commit);
+            if age >= UPDATE_FAILED && !still_failed {
                 break;
             }
-            let why = match u.results.get(host) {
+            let why = match r {
                 Some(r) if !r.ok => {
                     format!(
                         "failed: {}",
@@ -865,6 +879,7 @@ mod tests {
                 agents: 0,
                 commit: None,
                 ts: now,
+                started: None,
             },
         );
         s.updates.insert(
@@ -890,11 +905,11 @@ mod tests {
         s.updates.clear();
         s.updates.insert("c".into(), up(3, Some("mac"), vec![]));
         assert!(findings(&s, now).is_empty(), "too soon");
-        s.updates.insert("c".into(), up(45, Some("mac"), vec![]));
+        s.updates.insert("c".into(), up(75, Some("mac"), vec![]));
         let f = findings(&s, now);
         assert!(f[0].detail.contains("not answered"), "{f:#?}");
         // Asked of another host, or an hour old: nothing.
-        s.updates.insert("c".into(), up(45, Some("other"), vec![]));
+        s.updates.insert("c".into(), up(75, Some("other"), vec![]));
         assert!(findings(&s, now).is_empty());
         s.updates.insert("c".into(), up(150, Some("mac"), vec![]));
         assert!(findings(&s, now).is_empty());
@@ -910,6 +925,7 @@ mod tests {
             agents: 0,
             commit: None,
             ts: now - Duration::minutes(ago_min),
+            started: None,
         };
         let up = |mins: i64, results: Vec<UpdateResult>| crate::state::Update {
             by: "host:ops".into(),
@@ -949,6 +965,87 @@ mod tests {
             up(5, vec![UpdateResult { ok: true, ..failed }]),
         );
         assert!(findings(&s, now).is_empty());
+    }
+
+    #[test]
+    fn the_unanswered_limit_is_above_the_longest_an_update_takes_to_answer() {
+        let longest = crate::update::LOCK_WAIT + crate::update::BUILD;
+        assert!(UPDATE_UNANSWERED > Duration::from_std(longest).unwrap());
+        assert!(UPDATE_FAILED > UPDATE_UNANSWERED);
+    }
+
+    #[test]
+    fn a_failure_stays_a_finding_while_the_host_runs_the_commit_it_failed_on() {
+        use crate::event::UpdateResult;
+        let now = Utc::now();
+        let mut s = State::default();
+        let host = |commit: &str| crate::state::Host {
+            disk_free: 0,
+            disk_total: 0,
+            agents: 0,
+            commit: Some(commit.into()),
+            ts: now,
+            started: None,
+        };
+        let failed = UpdateResult {
+            host: "mac".into(),
+            ok: false,
+            commit: Some("aaa".into()),
+            error: Some("cargo install: boom".into()),
+        };
+        let up = crate::state::Update {
+            by: "host:ops".into(),
+            since: now - Duration::hours(5),
+            host: None,
+            results: [("mac".to_string(), failed.clone())].into(),
+        };
+        s.updates.insert("a".into(), up.clone());
+        s.hosts.insert("mac".into(), host("aaa"));
+        let f = findings(&s, now);
+        assert_eq!(
+            kinds(&f),
+            vec![("update", "host:mac")],
+            "5 h on, still on aaa: {f:#?}"
+        );
+        // It moved on to another commit: the failure is history.
+        s.hosts.insert("mac".into(), host("bbb"));
+        assert!(findings(&s, now).is_empty());
+        // An older host's failure names no commit: the time limit applies.
+        s.hosts.insert("mac".into(), host("aaa"));
+        let mut old = up;
+        old.results.get_mut("mac").unwrap().commit = None;
+        s.updates.insert("a".into(), old);
+        assert!(findings(&s, now).is_empty());
+    }
+
+    #[test]
+    fn a_request_older_than_the_limit_when_the_host_started_was_ignored_not_unanswered() {
+        let now = Utc::now();
+        let mut s = State::default();
+        let host = |started_min_ago: i64| crate::state::Host {
+            disk_free: 0,
+            disk_total: 0,
+            agents: 0,
+            commit: None,
+            ts: now,
+            started: Some(now - Duration::minutes(started_min_ago)),
+        };
+        s.updates.insert(
+            "r".into(),
+            crate::state::Update {
+                by: "host:ops".into(),
+                since: now - Duration::minutes(90),
+                host: None,
+                results: Default::default(),
+            },
+        );
+        // Started 60 min ago: the request was 30 min old then, past the limit: ignored.
+        s.hosts.insert("mac".into(), host(60));
+        assert!(findings(&s, now).is_empty());
+        // Started 80 min ago: it was 10 min old, fresh: the host should have answered.
+        s.hosts.insert("mac".into(), host(80));
+        let f = findings(&s, now);
+        assert_eq!(kinds(&f), vec![("update", "host:mac")], "{f:#?}");
     }
 
     #[test]
@@ -1104,6 +1201,7 @@ mod tests {
                 agents: 0,
                 commit: commit.map(str::to_string),
                 ts: now - Duration::minutes(age),
+                started: None,
             };
             s.hosts.insert(name.into(), h);
         };

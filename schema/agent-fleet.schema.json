@@ -2289,6 +2289,14 @@
               "minimum": 0,
               "type": "integer"
             },
+            "started": {
+              "description": "When the host process started: that report's time less its `uptime_s`.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "ts": {
               "format": "date-time",
               "type": "string"

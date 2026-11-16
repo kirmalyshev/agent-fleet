@@ -87,6 +87,9 @@ pub struct Host {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
     pub ts: DateTime<Utc>,
+    /// When the host process started: that report's time less its `uptime_s`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<DateTime<Utc>>,
 }
 
 /// An `update.requested` and each host's `update.result`.
@@ -674,6 +677,10 @@ impl State {
                         agents: d.agents,
                         commit: d.commit.clone(),
                         ts,
+                        started: d
+                            .stats
+                            .as_ref()
+                            .map(|s| ts - chrono::Duration::seconds(s.uptime_s as i64)),
                     },
                 );
             }
@@ -2067,6 +2074,36 @@ mod tests {
             commit: Some(commit.into()),
             error: None,
         })
+    }
+
+    #[test]
+    fn a_host_reports_when_its_process_started() {
+        let mut s = State::default();
+        let health = |uptime_s: Option<u64>| {
+            ev(
+                ActorKind::Host,
+                Known::HostHealth(HostHealth {
+                    host: "h".into(),
+                    disk_free: 1,
+                    disk_total: 2,
+                    agents: 0,
+                    commit: None,
+                    stats: uptime_s.map(|u| HostStats {
+                        uptime_s: u,
+                        ..HostStats::default()
+                    }),
+                }),
+            )
+            .into_event()
+        };
+        let e = health(Some(600));
+        s.apply(&e);
+        assert_eq!(
+            s.hosts["h"].started,
+            Some(e.ts - chrono::Duration::seconds(600))
+        );
+        s.apply(&health(None));
+        assert_eq!(s.hosts["h"].started, None, "an old host says nothing");
     }
 
     #[test]
