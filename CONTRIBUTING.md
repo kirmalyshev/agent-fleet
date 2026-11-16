@@ -37,6 +37,15 @@ timeout 30m agent-fleet hub --listen 127.0.0.1:7799 &
 `agent-fleet kill` refuses every `agent-fleet` process, throwaway ones too, and an agent must not
 use a raw `kill`; without the time limit only a human can stop them.
 
+## Worktrees
+
+`./dev ls` lists this repository's worktrees: branch, PR, commits not in `origin/main`,
+uncommitted files, whether a process runs in it, and what `clean` would do. `./dev clean` shows
+which worktrees of merged or closed PRs it would remove and which finished local branches it
+would delete; `./dev clean --execute` does it. It never touches an open PR's branch, local-only
+commits, the main checkout, the worktree you are in, uncommitted changes, or a worktree a
+process runs in. It needs `gh` for PR states and `lsof` for the processes.
+
 ## Code map
 
 One crate, one binary. `docs/PROTOCOL.md` is the spec, `schema/` the generated JSON Schema.
