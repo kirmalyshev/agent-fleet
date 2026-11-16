@@ -297,13 +297,22 @@ pub fn killable(
     for o in s.orphans.values().filter(|o| o.host == host) {
         out.insert(o.pid, o.cwd.clone().unwrap_or_else(|| "/".into()));
     }
-    // The watch tick's `hung` verdict is proof too: no CPU, output or working child for two ticks.
-    for h in s.hung.values().filter(|h| h.host == host) {
-        for &pid in std::iter::once(&h.pid).chain(&h.pids) {
-            out.entry(pid).or_insert_with(|| "/".into());
-        }
-    }
     out
+}
+
+/// Pids on `host` a `proc.hung` report names, with when it was first found hung: a live
+/// process with that pid that started later is not the one that hung.
+pub fn hung_pids(s: &State, host: &str) -> std::collections::BTreeMap<u32, DateTime<Utc>> {
+    s.hung
+        .values()
+        .filter(|h| h.host == host)
+        .flat_map(|h| {
+            let since = h.since.unwrap_or(DateTime::<Utc>::MIN_UTC);
+            std::iter::once(h.pid)
+                .chain(h.pids.iter().copied())
+                .map(move |p| (p, since))
+        })
+        .collect()
 }
 
 pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
@@ -932,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hung_process_is_a_finding_and_its_tree_is_killable() {
+    fn a_hung_process_is_a_finding_and_names_its_pids_for_kill() {
         let now = Utc::now();
         let mut s = State::default();
         s.hung.insert(
@@ -958,9 +967,14 @@ mod tests {
             "{}",
             f[0].detail
         );
-        let k = killable(&s, now, "h");
+        let k = hung_pids(&s, "h");
         assert_eq!(k.keys().copied().collect::<Vec<_>>(), vec![30, 31]);
-        assert!(killable(&s, now, "other").is_empty());
+        assert_eq!(k[&31], now - Duration::minutes(4));
+        assert!(hung_pids(&s, "other").is_empty());
+        assert!(
+            killable(&s, now, "h").is_empty(),
+            "a hung report is no orphan proof"
+        );
     }
 
     #[test]

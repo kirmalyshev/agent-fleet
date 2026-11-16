@@ -693,7 +693,7 @@
         },
         "ProcessHung": {
           "additionalProperties": false,
-          "description": "A process an agent started that the watch tick found hung: no CPU, no output and no\nworking child for two ticks in a row. `pid` is the topmost hung process, `pids` it and\nevery hung process under it. `evidence` absent clears it — it worked again or is gone.",
+          "description": "A process an agent started that the watch tick found hung: at most 1% CPU, no change to a\nstdout/stderr file, and no new or working child for two ticks in a row. `pid` is the\ntopmost hung process, `pids` it and every hung process under it. `evidence` absent clears\nit (see `watch::to_clear`).",
           "properties": {
             "agent": {
               "description": "The agent that started it.",
@@ -2282,7 +2282,7 @@
         },
         "ProcessHung": {
           "additionalProperties": false,
-          "description": "A process an agent started that the watch tick found hung: no CPU, no output and no\nworking child for two ticks in a row. `pid` is the topmost hung process, `pids` it and\nevery hung process under it. `evidence` absent clears it — it worked again or is gone.",
+          "description": "A process an agent started that the watch tick found hung: at most 1% CPU, no change to a\nstdout/stderr file, and no new or working child for two ticks in a row. `pid` is the\ntopmost hung process, `pids` it and every hung process under it. `evidence` absent clears\nit (see `watch::to_clear`).",
           "properties": {
             "agent": {
               "description": "The agent that started it.",

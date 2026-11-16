@@ -635,9 +635,10 @@ pub struct AgentUnmanaged {
     pub since: Option<DateTime<Utc>>,
 }
 
-/// A process an agent started that the watch tick found hung: no CPU, no output and no
-/// working child for two ticks in a row. `pid` is the topmost hung process, `pids` it and
-/// every hung process under it. `evidence` absent clears it — it worked again or is gone.
+/// A process an agent started that the watch tick found hung: at most 1% CPU, no change to a
+/// stdout/stderr file, and no new or working child for two ticks in a row. `pid` is the
+/// topmost hung process, `pids` it and every hung process under it. `evidence` absent clears
+/// it (see `watch::to_clear`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessHung {
@@ -1015,6 +1016,7 @@ fn parse(raw: &Value, human_channel: bool) -> Result<Envelope<Known>, Reject> {
             .collect(),
         Known::SpawnResult(r) => vec![&r.agent],
         Known::AgentStuck(s) => vec![&s.agent],
+        Known::ProcessHung(h) => h.agent.iter().collect(),
         Known::AgentSignal(s) => vec![&s.agent],
         _ => vec![],
     };

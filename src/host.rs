@@ -299,8 +299,11 @@ impl Host {
     /// describe is skipped.
     pub(crate) async fn pane_shells(&self) -> Result<Vec<(String, u32)>> {
         let list = herdr_call(&self.cfg.herdr_socket, "agent.list", json!({})).await?;
+        let Some(agents) = list["agents"].as_array() else {
+            bail!("agent.list answered without agents");
+        };
         let mut out = Vec::new();
-        for a in list["agents"].as_array().into_iter().flatten() {
+        for a in agents {
             let pane = a["pane_id"].as_str().unwrap_or_default();
             let Some(agent) = self
                 .panes
@@ -312,10 +315,13 @@ impl Host {
                 continue;
             };
             let target = json!({ "pane_id": pane });
-            let Ok(info) = herdr_call(&self.cfg.herdr_socket, "pane.process_info", target).await
-            else {
-                bump(&self.n.herdr_errors);
-                continue;
+            let info = match herdr_call(&self.cfg.herdr_socket, "pane.process_info", target).await {
+                Ok(info) => info,
+                Err(err) => {
+                    bump(&self.n.herdr_errors);
+                    eprintln!("agent-fleet host: watch: processes of {pane}: {err:#}");
+                    continue;
+                }
             };
             if let Some(shell) = info["process_info"]["shell_pid"].as_u64() {
                 out.push((agent, shell as u32));

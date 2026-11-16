@@ -1,6 +1,7 @@
 //! The watch tick: every process an agent started, classified `working`, `waiting`, `hung` or
-//! `orphan`. One classifier, pure: the host feeds it two process tables and what it read off
-//! the machine; doctor, `kill` and `agent-fleet proc` read the verdicts it left in the log.
+//! `orphan`. One classifier, pure: the host feeds it a process table each tick and what it
+//! read off the machine. The host logs `hung` as `proc.hung`; doctor, `kill` and
+//! `agent-fleet proc` read that, the host's `proc.orphaned` proofs and the lock queues.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -32,7 +33,7 @@ pub enum Verdict {
         on: String,
         since: DateTime<Utc>,
     },
-    /// Idle this tick but not yet for `HUNG_TICKS`.
+    /// Idle this tick, but not yet for `HUNG_TICKS` ticks or not provably (no `output_at`).
     Idle,
     Hung(Evidence),
     /// Proved orphaned; `why` is the proof.
@@ -93,7 +94,7 @@ pub struct Seen {
     pub waiting: HashMap<u32, (String, DateTime<Utc>)>,
     /// Proved orphans: pid → (why, the agent whose worktree it runs in).
     pub orphans: HashMap<u32, (String, Option<String>)>,
-    /// Processes with a listening socket: servers, kept on purpose.
+    /// Processes with a listening TCP socket: servers, kept on purpose.
     pub listening: HashSet<u32>,
     /// When each process's stdout/stderr file last changed; `None` when it could not be read,
     /// and then nothing is proved hung.
@@ -105,20 +106,28 @@ pub struct Seen {
 pub struct Watch {
     prev: Option<(Procs, DateTime<Utc>)>,
     idle: HashMap<(u32, Option<DateTime<Utc>>), u32>,
+    /// The last step only remembered its table: it classified nothing.
+    fresh: bool,
 }
 
 impl Watch {
-    /// The table the last tick read.
+    /// The table the last tick read, when that tick classified it.
     pub fn last(&self) -> Option<&Procs> {
-        self.prev.as_ref().map(|(p, _)| p)
+        self.prev.as_ref().filter(|_| !self.fresh).map(|(p, _)| p)
     }
 
-    /// One tick. The first only remembers the table: CPU needs two.
+    /// One tick. The first only remembers the table: CPU needs two. So does a tick after a
+    /// gap of more than two intervals (the machine slept): idle streaks only count real ticks.
     pub fn step(&mut self, now: Procs, at: DateTime<Utc>, seen: &Seen) -> Vec<Classified> {
-        let Some((before, then)) = self.prev.take() else {
-            self.prev = Some((now, at));
+        let Some((before, then)) = self
+            .prev
+            .take()
+            .filter(|(_, then)| at - *then <= Duration::from_std(EVERY * 2).unwrap_or(MIN_AGE))
+        else {
+            (self.prev, self.fresh) = (Some((now, at)), true);
             return Vec::new();
         };
+        self.fresh = false;
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
         for (&pid, p) in &now.0 {
             children.entry(p.ppid).or_default().push(pid);
@@ -133,6 +142,7 @@ impl Watch {
             children,
             streaks: &self.idle,
             next: HashMap::new(),
+            visited: HashSet::new(),
             out: Vec::new(),
         };
         for (agent, apid) in &seen.agents {
@@ -153,7 +163,13 @@ impl Watch {
                 });
             }
         }
-        let (mut out, next) = (t.out, t.next);
+        let (mut out, mut next, visited) = (t.out, t.next, t.visited);
+        // A live process this tick did not walk (its pane unreadable) keeps its streak.
+        for (k, n) in &self.idle {
+            if !visited.contains(k) && now.0.get(&k.0).is_some_and(|p| p.started == k.1) {
+                next.insert(*k, *n);
+            }
+        }
         out.sort_by_key(|c| c.pid);
         self.idle = next;
         self.prev = Some((now, at));
@@ -172,6 +188,7 @@ struct Tick<'a> {
     children: HashMap<u32, Vec<u32>>,
     streaks: &'a HashMap<(u32, Option<DateTime<Utc>>), u32>,
     next: HashMap<(u32, Option<DateTime<Utc>>), u32>,
+    visited: HashSet<(u32, Option<DateTime<Utc>>)>,
     out: Vec<Classified>,
 }
 
@@ -238,9 +255,16 @@ impl Tick<'_> {
             }
             return true;
         }
-        if self.seen.listening.contains(&pid) {
+        // ponytail: "mcp" in the argv marks an MCP server started through a shell; a task
+        // whose argv merely names mcp is skipped too. A listener is a server it keeps.
+        let mcp = p
+            .args
+            .as_deref()
+            .is_some_and(|a| a.to_lowercase().contains("mcp"));
+        if mcp || self.seen.listening.contains(&pid) {
             return true;
         }
+        self.visited.insert(key);
         let mut busy = false;
         for c in self.kids(pid).to_vec() {
             busy |= self.visit(c, agent);
@@ -273,8 +297,8 @@ impl Tick<'_> {
 
 // ---------- the host's tick ----------
 
-/// The watch's verdict on `pid` as the log has it: `hung`, `orphan`, `waiting` (in a lock's
-/// queue), else `working`; with its evidence.
+/// What the log says of `pid`: `hung` (a `proc.hung` report), `orphan` (a `proc.orphaned`
+/// proof), `waiting` (in a lock's queue), else `no report`; with its evidence.
 pub fn verdict_of(
     s: &State,
     host: &str,
@@ -297,7 +321,7 @@ pub fn verdict_of(
             return ("waiting", Some(d));
         }
     }
-    ("working", None)
+    ("no report", None)
 }
 
 /// Who hears about a process: the agent that started it, its lead, and the root coordinator.
@@ -360,36 +384,60 @@ fn agent_in(s: &State, host: &str, cwd: &str) -> Option<String> {
 }
 
 /// `lsof` with `args`, its stdout when it ran (it exits 1 when it lists nothing).
-async fn lsof(args: &[&str]) -> Option<String> {
-    let out = tokio::process::Command::new("lsof")
+/// How long one `lsof` or `simctl` call may take before the tick gives up on it.
+const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// `cmd args`' stdout when it answered: exit 0, or exit 1 with nothing on stderr (`lsof` lists
+/// nothing, or a pid exited meanwhile). An error, a signal or a timeout is no answer.
+async fn run(cmd: &str, args: &[&str]) -> Option<String> {
+    let call = tokio::process::Command::new(cmd)
         .args(args)
         .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-        .ok()?;
+        .kill_on_drop(true)
+        .output();
+    let out = match tokio::time::timeout(TOOL_TIMEOUT, call).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            eprintln!("agent-fleet host: watch: {cmd}: {e}");
+            return None;
+        }
+        Err(_) => {
+            eprintln!("agent-fleet host: watch: {cmd} {args:?} timed out");
+            return None;
+        }
+    };
+    let err = String::from_utf8_lossy(&out.stderr);
+    match out.status.code() {
+        Some(0) => {}
+        Some(1) if err.trim().is_empty() => {}
+        _ => {
+            eprintln!("agent-fleet host: watch: {cmd} {args:?}: {}", err.trim());
+            return None;
+        }
+    }
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Listening processes, and when each of `pids`' stdout/stderr files last changed. `None`
-/// when `lsof` cannot answer: then nothing is proved hung.
+/// when `lsof` gives no answer: then nothing is proved hung.
 async fn machine(pids: &[u32]) -> Option<(HashSet<u32>, HashMap<u32, DateTime<Utc>>)> {
-    let listening = parse_lsof_pids(&lsof(&["-nP", "-iTCP", "-sTCP:LISTEN", "-Fp"]).await?);
+    let listening = parse_lsof_pids(&run("lsof", &["-nP", "-iTCP", "-sTCP:LISTEN", "-Fp"]).await?);
     if pids.is_empty() {
         return Some((listening, HashMap::new()));
     }
     let csv: Vec<String> = pids.iter().map(u32::to_string).collect();
-    let files =
-        parse_lsof_files(&lsof(&["-nP", "-a", "-d", "1,2", "-Fpftn", "-p", &csv.join(",")]).await?);
+    let args = ["-nP", "-a", "-d", "1,2", "-Fpftn", "-p", &csv.join(",")];
+    let files = parse_lsof_files(&run("lsof", &args).await?);
     let output_at = files
         .into_iter()
         .filter_map(|(pid, fs)| {
+            // A file it cannot stat counts as just written: unknown output proves nothing.
             let t = fs
                 .iter()
-                .filter_map(|f| {
-                    Some(DateTime::<Utc>::from(
-                        std::fs::metadata(f).ok()?.modified().ok()?,
-                    ))
+                .map(|f| {
+                    std::fs::metadata(f)
+                        .and_then(|m| m.modified())
+                        .map_or_else(|_| Utc::now(), DateTime::<Utc>::from)
                 })
                 .max()?;
             Some((pid, t))
@@ -398,27 +446,85 @@ async fn machine(pids: &[u32]) -> Option<(HashSet<u32>, HashMap<u32, DateTime<Ut
     Some((listening, output_at))
 }
 
-/// The booted simulators' UDIDs; empty off macOS or when `simctl` cannot answer.
+/// The simulators booted on this host; empty off macOS or when `simctl` gives no answer.
 async fn booted() -> Vec<String> {
-    let Ok(out) = tokio::process::Command::new("xcrun")
-        .args(["simctl", "list", "devices", "booted"])
-        .output()
-        .await
-    else {
+    let Some(out) = run("xcrun", &["simctl", "list", "devices", "booted"]).await else {
         return Vec::new();
     };
-    let mut v: Vec<String> = crate::scan::udids(&String::from_utf8_lossy(&out.stdout))
-        .into_iter()
-        .collect();
+    let mut v: Vec<String> = crate::scan::udids(&out).into_iter().collect();
     v.sort();
     v
 }
 
-/// Every `EVERY`: classify what the agents started, report hung processes, and tell each
-/// agent and its coordinator once about a hung or orphaned process and a wait over 30 min.
+/// The `proc.hung` reports on `host` to clear. A report that is still a top (`tops`) stands;
+/// so does one whose agent's tree this tick could not walk. Otherwise it clears when its pid
+/// is gone or is now another process, when another report now covers it, or when its walked
+/// tree found it neither idle nor hung.
+pub fn to_clear(
+    s: &State,
+    host: &str,
+    v: &[Classified],
+    procs: &Procs,
+    tops: &[(u32, Vec<u32>)],
+    walked: &HashSet<String>,
+) -> Vec<String> {
+    s.hung
+        .iter()
+        .filter(|(_, h)| h.host == host && !tops.iter().any(|(t, _)| *t == h.pid))
+        .filter(|(_, h)| {
+            let Some(p) = procs.0.get(&h.pid) else {
+                return true;
+            };
+            let covered = tops.iter().any(|(_, pids)| pids.contains(&h.pid));
+            let still = v
+                .iter()
+                .any(|c| c.pid == h.pid && matches!(c.verdict, Verdict::Idle | Verdict::Hung(_)));
+            let seen = h.agent.as_ref().is_some_and(|a| walked.contains(a));
+            (h.started.is_some() && p.started != h.started) || covered || (seen && !still)
+        })
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
+/// The waits past `WAIT_MAX`: (process, the lock, since).
+pub fn overdue(
+    v: &[Classified],
+    now: DateTime<Utc>,
+) -> impl Iterator<Item = (&Classified, &String, DateTime<Utc>)> {
+    v.iter().filter_map(move |c| match &c.verdict {
+        Verdict::Waiting { on, since } if now - *since >= WAIT_MAX => Some((c, on, *since)),
+        _ => None,
+    })
+}
+
+/// Who of `to` has not been told `kind` about `key` since `since`: the log is the dedupe
+/// across restarts.
+pub fn unsent(
+    events: &[Event],
+    to: Vec<String>,
+    kind: &str,
+    key: &str,
+    since: DateTime<Utc>,
+) -> Vec<String> {
+    to.into_iter()
+        .filter(|to| {
+            !events.iter().any(|e| {
+                e.ts >= since
+                    && matches!(&e.body, Body::Known(Known::MsgSent(m))
+                        if m.kind == kind && m.reference == key && &m.to == to)
+            })
+        })
+        .collect()
+}
+
+/// Every `EVERY`: classify what the agents started, report hung processes, and tell the agent,
+/// its lead and the root coordinator once about a hung or orphaned process and a wait past
+/// `WAIT_MAX`.
 pub(crate) async fn watch_loop(host: Arc<Host>) {
     let mut w = Watch::default();
     let mut tick = tokio::time::interval(EVERY);
+    // A stalled tick must not fire the next ones back to back: streaks count real intervals.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
         if let Err(err) = once(&host, &mut w).await {
@@ -430,9 +536,13 @@ pub(crate) async fn watch_loop(host: Arc<Host>) {
 async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {
     let shells = host.pane_shells().await?;
     let procs = Procs::read();
+    if procs.0.is_empty() {
+        anyhow::bail!("no process table");
+    }
     let view = host.view()?;
     let s = &view.state;
     let me = host.cfg.host.clone();
+    let walked: HashSet<String> = shells.iter().map(|(a, _)| a.clone()).collect();
     let mut seen = Seen::default();
     for (agent, shell) in &shells {
         for (&pid, p) in &procs.0 {
@@ -468,10 +578,10 @@ async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {
         }
         None => seen.output_at = None,
     }
-    let primed = w.last().is_some();
     let now = Utc::now();
     let v = w.step(procs, now, &seen);
-    let Some(procs) = w.last().filter(|_| primed) else {
+    // A tick that only primed classified nothing: it clears and tells nothing either.
+    let Some(procs) = w.last() else {
         return Ok(());
     };
     let of = |pid: u32| v.iter().find(|c| c.pid == pid);
@@ -488,40 +598,44 @@ async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {
                 (cmd, age)
             })
     };
-    // Hung: one report per topmost hung process, cleared when it works again or is gone.
-    let mut live = HashSet::new();
+    // Hung: one report per topmost hung process.
+    let hung = tops(&v, procs, |v| matches!(v, Verdict::Hung(_)));
     let mins = EVERY.as_secs() as i64 * HUNG_TICKS as i64 / 60;
-    for (top, pids) in tops(&v, procs, |v| matches!(v, Verdict::Hung(_))) {
-        let Some(c) = of(top) else { continue };
+    for (top, pids) in &hung {
+        let Some(c) = of(*top) else { continue };
         let Verdict::Hung(e) = &c.verdict else {
             continue;
         };
         let key = format!("{me}:{top}");
-        live.insert(key.clone());
         let mut evidence = e.text(mins);
         if let Some((_, r)) = holders
             .iter()
-            .find(|(h, _)| pids.contains(h) || procs.under_any(top, &[**h].into()))
+            .find(|(h, _)| pids.contains(h) || procs.under_any(*top, &[**h].into()))
         {
             evidence += &format!("; holds the {r} lock");
         }
-        let known = s.hung.get(&key);
+        let p = &procs.0[top];
+        let known = s.hung.get(&key).filter(|k| k.started == p.started);
         let since = known.and_then(|k| k.since).unwrap_or(now);
-        let p = &procs.0[&top];
-        if known.is_none_or(|k| k.pids != pids) {
-            host.publish(host.presence(Known::ProcessHung(ProcessHung {
-                host: me.clone(),
-                pid: top,
-                pids: pids.clone(),
-                agent: c.agent.clone(),
-                command: Some(p.args.clone().unwrap_or_else(|| p.name.clone())),
-                started: p.started,
-                evidence: Some(evidence.clone()),
-                since: Some(since),
-            })))
-            .await;
+        if known.is_none_or(|k| &k.pids != pids) {
+            let ok = host
+                .publish(host.presence(Known::ProcessHung(ProcessHung {
+                    host: me.clone(),
+                    pid: *top,
+                    pids: pids.clone(),
+                    agent: c.agent.clone(),
+                    command: Some(p.args.clone().unwrap_or_else(|| p.name.clone())),
+                    started: p.started,
+                    evidence: Some(evidence.clone()),
+                    since: Some(since),
+                })))
+                .await;
+            // Its kill line only works once the report is in the log.
+            if !ok && known.is_none() {
+                continue;
+            }
         }
-        let (cmd, age) = up(top);
+        let (cmd, age) = up(*top);
         let list: Vec<String> = pids.iter().map(u32::to_string).collect();
         let text = format!(
             "{cmd} (pid {top}{age}) is hung: {evidence} — kill: agent-fleet kill {}",
@@ -539,14 +653,11 @@ async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {
         )
         .await;
     }
-    for (key, h) in s.hung.iter().filter(|(_, h)| h.host == me) {
-        // Still idle after a restart: its streak is rebuilding, the report stands.
-        if live.contains(key) || of(h.pid).is_some_and(|c| c.verdict == Verdict::Idle) {
-            continue;
-        }
+    for key in to_clear(s, &me, &v, procs, &hung, &walked) {
+        let pid = s.hung[&key].pid;
         host.publish(host.presence(Known::ProcessHung(ProcessHung {
             host: me.clone(),
-            pid: h.pid,
+            pid,
             pids: Vec::new(),
             agent: None,
             command: None,
@@ -557,8 +668,8 @@ async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {
         .await;
     }
     // Orphans: one tell per topmost orphan.
-    let tops_o = tops(&v, procs, |v| matches!(v, Verdict::Orphan { .. }));
-    let lock_dead = tops_o.iter().any(|(t, _)| {
+    let orphans = tops(&v, procs, |v| matches!(v, Verdict::Orphan { .. }));
+    let lock_dead = orphans.iter().any(|(t, _)| {
         of(*t).is_some_and(
             |c| matches!(&c.verdict, Verdict::Orphan { why } if why.contains("lock owner dead")),
         )
@@ -568,7 +679,7 @@ async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {
     } else {
         Vec::new()
     };
-    for (top, pids) in tops_o {
+    for (top, pids) in orphans {
         let Some(c) = of(top) else { continue };
         let Verdict::Orphan { why } = &c.verdict else {
             continue;
@@ -586,7 +697,8 @@ async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {
         if why.contains("lock owner dead") && !devices.is_empty() {
             let d = devices.join(" ");
             text += &format!(
-                "; booted simulators keep it alive: {d} — release: xcrun simctl shutdown {d}"
+                "; simulators booted on this host, which may keep its holder alive: {d} — \
+                 if they are this run's, release: xcrun simctl shutdown <udids>"
             );
         }
         tell(
@@ -601,14 +713,7 @@ async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {
         )
         .await;
     }
-    // Waits over 30 min.
-    for c in &v {
-        let Verdict::Waiting { on, since } = &c.verdict else {
-            continue;
-        };
-        if now - *since < WAIT_MAX {
-            continue;
-        }
+    for (c, on, since) in overdue(&v, now) {
         let key = format!("{me}:{}", c.pid);
         let (cmd, _) = up(c.pid);
         let behind = holders
@@ -619,7 +724,7 @@ async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {
         let text = format!(
             "{cmd} (pid {}) has waited {} for the {on} lock{behind}; nothing waits over {}m",
             c.pid,
-            crate::ui::ago(now, *since),
+            crate::ui::ago(now, since),
             WAIT_MAX.num_minutes()
         );
         tell(
@@ -629,7 +734,7 @@ async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {
             c.agent.as_deref(),
             "WAITING",
             &key,
-            *since,
+            since,
             text,
         )
         .await;
@@ -637,8 +742,7 @@ async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A `msg.sent` of `kind` about `key` to each recipient, once since `since`: the log is the
-/// dedupe across restarts.
+/// A `msg.sent` of `kind` about `key` to each recipient not yet told since `since`.
 #[allow(clippy::too_many_arguments)]
 async fn tell(
     host: &Arc<Host>,
@@ -650,21 +754,14 @@ async fn tell(
     since: DateTime<Utc>,
     text: String,
 ) {
-    for to in recipients(s, agent) {
-        let sent = events.iter().any(|e| {
-            e.ts >= since
-                && matches!(&e.body, Body::Known(Known::MsgSent(m))
-                    if m.kind == kind && m.reference == key && m.to == to)
-        });
-        if !sent {
-            host.publish(host.presence(Known::MsgSent(MsgSent {
-                to,
-                kind: kind.into(),
-                reference: key.into(),
-                text: text.clone(),
-            })))
-            .await;
-        }
+    for to in unsent(events, recipients(s, agent), kind, key, since) {
+        host.publish(host.presence(Known::MsgSent(MsgSent {
+            to,
+            kind: kind.into(),
+            reference: key.into(),
+            text: text.clone(),
+        })))
+        .await;
     }
 }
 
@@ -984,8 +1081,228 @@ mod tests {
             verdict_of(&s, "h", 31, t0()),
             ("hung", Some("0% CPU".into()))
         );
-        assert_eq!(verdict_of(&s, "other", 31, t0()).0, "working");
-        assert_eq!(verdict_of(&s, "h", 99, t0()), ("working", None));
+        assert_eq!(verdict_of(&s, "other", 31, t0()).0, "no report");
+        assert_eq!(verdict_of(&s, "h", 99, t0()), ("no report", None));
+    }
+
+    #[test]
+    fn an_mcp_server_started_through_a_shell_is_never_classified() {
+        let t = || {
+            tree(&[
+                (25, AGENT, "sh", "sh -c npx -y some-mcp", 0, 30),
+                (26, 25, "node", "node some-mcp/index.js", 0, 30),
+            ])
+        };
+        let mut w = Watch::default();
+        for m in [0, 2, 4, 6] {
+            assert_eq!(verdict(&w.step(t(), at(m), &seen()), 26), None);
+        }
+    }
+
+    #[test]
+    fn a_gap_longer_than_two_ticks_only_reprimes() {
+        let mut w = Watch::default();
+        w.step(wedged(0), at(0), &seen());
+        assert_eq!(
+            verdict(&w.step(wedged(0), at(2), &seen()), 30),
+            Some(&Verdict::Idle)
+        );
+        assert!(
+            w.step(wedged(0), at(30), &seen()).is_empty(),
+            "slept: no verdicts"
+        );
+        assert!(
+            w.last().is_none(),
+            "a primed tick hands the host nothing to act on"
+        );
+    }
+
+    #[test]
+    fn a_stale_output_file_is_hung_and_named_in_the_evidence() {
+        let mut w = Watch::default();
+        let mut s = seen();
+        s.output_at = Some([(30, at(-30))].into());
+        for m in [0, 2] {
+            w.step(wedged(0), at(m), &s);
+        }
+        let Some(Verdict::Hung(e)) = verdict(&w.step(wedged(0), at(4), &s), 30).cloned() else {
+            panic!("not hung")
+        };
+        assert_eq!(e.output_at, Some(at(-30)));
+        assert!(e.text(4).contains("no output since 06:30"), "{}", e.text(4));
+    }
+
+    #[test]
+    fn a_tree_left_unwalked_for_a_tick_keeps_its_streak() {
+        let mut w = Watch::default();
+        let none = Seen {
+            agents: Vec::new(),
+            ..seen()
+        };
+        w.step(wedged(0), at(0), &seen());
+        w.step(wedged(0), at(2), &seen());
+        assert_eq!(verdict(&w.step(wedged(0), at(4), &none), 30), None);
+        assert!(matches!(
+            verdict(&w.step(wedged(0), at(6), &seen()), 30),
+            Some(Verdict::Hung(_))
+        ));
+    }
+
+    fn report(pid: u32, started: Option<DateTime<Utc>>) -> ProcessHung {
+        ProcessHung {
+            host: "h".into(),
+            pid,
+            pids: vec![pid],
+            agent: Some("agent:h/s/o-1".into()),
+            command: None,
+            started,
+            evidence: Some("0% CPU".into()),
+            since: Some(at(-2)),
+        }
+    }
+
+    #[test]
+    fn a_report_clears_only_on_proof_it_no_longer_holds() {
+        let procs = wedged(0);
+        let started = procs.0[&30].started;
+        let walked: HashSet<String> = ["agent:h/s/o-1".to_string()].into();
+        let c = |verdict| {
+            vec![Classified {
+                pid: 30,
+                agent: Some("agent:h/s/o-1".into()),
+                verdict,
+            }]
+        };
+        let mut s = State::default();
+        s.hung.insert("h:30".into(), report(30, started));
+        let clear =
+            |s: &State,
+             v: &[Classified],
+             procs: &Procs,
+             tops: &[(u32, Vec<u32>)],
+             w: &HashSet<String>| { to_clear(s, "h", v, procs, tops, w) };
+        let idle = c(Verdict::Idle);
+        assert!(
+            clear(&s, &idle, &procs, &[], &walked).is_empty(),
+            "still idle after a restart"
+        );
+        assert!(
+            clear(&s, &c(Verdict::Working), &procs, &[(30, vec![30])], &walked).is_empty(),
+            "a top stands"
+        );
+        assert_eq!(
+            clear(&s, &c(Verdict::Working), &procs, &[], &walked),
+            vec!["h:30"],
+            "works again"
+        );
+        assert!(
+            clear(&s, &[], &procs, &[], &HashSet::new()).is_empty(),
+            "its tree was not walked"
+        );
+        assert_eq!(
+            clear(&s, &[], &table(&[]), &[], &HashSet::new()),
+            vec!["h:30"],
+            "gone"
+        );
+        s.hung.insert("h:30".into(), report(30, Some(at(-99))));
+        assert_eq!(
+            clear(&s, &idle, &procs, &[], &walked),
+            vec!["h:30"],
+            "a reused pid"
+        );
+        s.hung.insert("h:30".into(), report(30, started));
+        assert_eq!(
+            clear(&s, &idle, &procs, &[(20, vec![20, 30])], &walked),
+            vec!["h:30"],
+            "covered by its parent's report"
+        );
+    }
+
+    #[test]
+    fn a_waiter_is_overdue_past_thirty_minutes() {
+        let w = |min: i64| Classified {
+            pid: 30,
+            agent: None,
+            verdict: Verdict::Waiting {
+                on: "sim".into(),
+                since: at(-min),
+            },
+        };
+        assert_eq!(overdue(&[w(29)], at(0)).count(), 0);
+        let v = [w(31)];
+        let late: Vec<_> = overdue(&v, at(0)).collect();
+        assert_eq!(late.len(), 1);
+        assert_eq!((late[0].1.as_str(), late[0].2), ("sim", at(-31)));
+    }
+
+    #[test]
+    fn a_notice_is_sent_once_per_recipient_since_its_episode_began() {
+        let sent = |ts: DateTime<Utc>, to: &str| {
+            let mut e = crate::event::Envelope::new(
+                crate::event::Actor {
+                    kind: crate::event::ActorKind::Host,
+                    id: "host:h".into(),
+                },
+                "p",
+                Known::MsgSent(MsgSent {
+                    to: to.into(),
+                    kind: "HUNG".into(),
+                    reference: "h:30".into(),
+                    text: String::new(),
+                }),
+            )
+            .into_event();
+            e.ts = ts;
+            e
+        };
+        let log = [sent(at(-10), "b"), sent(at(1), "a")];
+        let to = || vec!["a".to_string(), "b".to_string()];
+        assert_eq!(
+            unsent(&log, to(), "HUNG", "h:30", at(0)),
+            vec!["b"],
+            "b's was an older episode"
+        );
+        assert_eq!(unsent(&log, to(), "WAITING", "h:30", at(0)), to());
+    }
+
+    #[test]
+    fn the_logged_orphan_and_wait_verdicts_read_back() {
+        let mut s = State::default();
+        s.orphans.insert(
+            "h:70".into(),
+            crate::state::Orphan {
+                host: "h".into(),
+                pid: 70,
+                cwd: None,
+                why: "sim lock owner dead".into(),
+                since: at(0),
+            },
+        );
+        s.resources.insert(
+            "h:sim".into(),
+            crate::state::Resource {
+                host: "h".into(),
+                resource: "sim".into(),
+                holder: None,
+                waiting: vec![crate::state::Hold {
+                    pid: 40,
+                    cwd: None,
+                    scope: None,
+                    since: at(-40),
+                }],
+            },
+        );
+        assert_eq!(
+            verdict_of(&s, "h", 70, at(0)),
+            ("orphan", Some("sim lock owner dead".into()))
+        );
+        assert_eq!(verdict_of(&s, "h", 40, at(0)).0, "waiting");
+        assert!(
+            verdict_of(&s, "h", 40, at(0))
+                .1
+                .unwrap()
+                .starts_with("for sim since")
+        );
     }
 
     #[test]

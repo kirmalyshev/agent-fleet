@@ -249,8 +249,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// What the watch tick found a process on this host to be: `hung`, `orphan`, `waiting`, or
-    /// `working` when it left no report (working, or not an agent's).
+    /// What the log says of a process on this host: `hung`, `orphan`, `waiting` (in a lock's
+    /// queue), `no report` (not hung, or not watched), or `gone`.
     Proc { pid: u32 },
     /// What needs a look: stale, hung or heavy agents, duplicate work, forgotten worktrees,
     /// unpushed commits.
@@ -824,8 +824,11 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Proc { pid } => {
-            let (verdict, detail) =
-                watch::verdict_of(&ctx.state().await?, &ctx.host_name(), *pid, now);
+            let (verdict, detail) = if scan::alive(*pid) {
+                watch::verdict_of(&ctx.state().await?, &ctx.host_name(), *pid, now)
+            } else {
+                ("gone", None)
+            };
             println!(
                 "{verdict}{}",
                 detail.map(|d| format!(": {d}")).unwrap_or_default()
@@ -986,12 +989,29 @@ async fn main() -> Result<()> {
                         })
                 })
             };
+            // A hung report holds for the process that hung, not a later one with its pid.
+            let hung = state
+                .as_ref()
+                .map_or_else(Default::default, |s| doctor::hung_pids(s, &host));
+            let live = (!hung.is_empty())
+                .then(scan::Procs::read)
+                .unwrap_or_default();
+            let hung_ok = |pid: u32| {
+                hung.get(&pid).is_some_and(|since| {
+                    live.0
+                        .get(&pid)
+                        .and_then(|p| p.started)
+                        .is_some_and(|t| t <= *since)
+                })
+            };
             let refused: Vec<(u32, String)> = pids
                 .iter()
                 .filter_map(|&pid| {
-                    kill::judge(&t, me, pid, || still_orphaned(pid))
-                        .err()
-                        .map(|why| (pid, why))
+                    kill::judge(&t, me, pid, |foreign| {
+                        hung_ok(pid) || (!foreign && still_orphaned(pid))
+                    })
+                    .err()
+                    .map(|why| (pid, why))
                 })
                 .collect();
             if !refused.is_empty() {
