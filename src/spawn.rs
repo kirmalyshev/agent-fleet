@@ -2208,6 +2208,7 @@ profile = "devin"
             locks: Vec::new(),
             stall_min: 15,
             stuck_act,
+            update: None,
         };
         Arc::new(Host::new(
             cfg,

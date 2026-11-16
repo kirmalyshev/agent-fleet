@@ -36,6 +36,8 @@ pub const STALLED: Duration = Duration::minutes(crate::spawn::STALL_MIN as i64);
 pub const SPAWN_FAILED: Duration = Duration::hours(1);
 /// A `proc.hung` report confirmed this recently is kill proof: three watch ticks.
 pub const HUNG_FRESH: Duration = Duration::minutes(6);
+/// A host's installed build behind `origin/main` this long is a finding (`outdated`).
+pub const OUTDATED: Duration = Duration::minutes(15);
 /// Files every branch touches; sharing them is not duplicate work.
 const SHARED_BY_ALL: &[&str] = &[
     "bun.lock",
@@ -49,7 +51,7 @@ const SHARED_BY_ALL: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Finding {
     /// `stale`, `hung`, `heavy`, `duplicate`, `forgotten`, `unpushed`, `orphan`, `breach`,
-    /// `queued`, `refused`, `role`, `quota`, `spawn`, `unmanaged`, `stalled`.
+    /// `queued`, `refused`, `role`, `quota`, `spawn`, `unmanaged`, `stalled`, `outdated`.
     pub kind: &'static str,
     /// The agent id or `<host>:<path>` it is about.
     pub subject: String,
@@ -535,6 +537,27 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
             ),
         ));
     }
+    for (host, u) in &s.updates {
+        let since = u.since.unwrap_or(now);
+        if now - since < OUTDATED {
+            continue;
+        }
+        out.push(finding(
+            "outdated",
+            format!("host:{host}"),
+            format!(
+                "running {}, origin/main is {}, behind {} ({:?}){}",
+                &u.installed[..u.installed.len().min(7)],
+                u.target.as_deref().map_or("?", |t| &t[..t.len().min(7)]),
+                ago(now, since),
+                u.status,
+                u.why
+                    .as_deref()
+                    .map(|w| format!(": {w}"))
+                    .unwrap_or_default()
+            ),
+        ));
+    }
     for (key, w) in &s.worktrees {
         let st = &w.state;
         let running = s.worktree_procs.get(key).map_or(String::new(), |p| {
@@ -944,6 +967,33 @@ mod tests {
             r(&s, None),
             vec!["agent:h/s/root"],
             "an orphan nobody claims"
+        );
+    }
+
+    #[test]
+    fn a_host_behind_origin_main_past_the_limit_is_an_outdated_finding() {
+        use crate::event::{HostUpdate, UpdateStatus};
+        let now = Utc::now();
+        let mut s = State::default();
+        let up = |mins: i64| HostUpdate {
+            host: "mac".into(),
+            status: UpdateStatus::Blocked,
+            installed: "f517db2aaaa".into(),
+            target: Some("cea5bf6bbbb".into()),
+            why: Some("checkout has uncommitted changes".into()),
+            since: Some(now - Duration::minutes(mins)),
+        };
+        s.updates.insert("mac".into(), up(5));
+        assert!(findings(&s, now).is_empty(), "a fresh gap is no finding");
+        s.updates.insert("mac".into(), up(20));
+        let f = findings(&s, now);
+        assert_eq!(kinds(&f), vec![("outdated", "host:mac")], "{f:#?}");
+        assert!(
+            f[0].detail.contains("running f517db2")
+                && f[0].detail.contains("origin/main is cea5bf6")
+                && f[0].detail.contains("uncommitted"),
+            "{}",
+            f[0].detail
         );
     }
 

@@ -101,6 +101,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `agent.unmanaged` | host, pid, program?, cwd?, since? — no `program` clears the report | | host |
 | | `proc.orphaned` | host, pid, cwd?, why?, since? — no `why` clears the report | | host |
 | | `proc.hung` | host, pid, pids[]?, agent?, command?, started?, evidence?, since?, checked? — the topmost hung process an agent started and the hung ones under it (the watch tick, every 2 min); no `evidence` clears the report; folded only from the host actor it names (`host:<host>`) | | host |
+| | `host.update` | host, status (`current`/`behind`/`blocked`/`failed`), installed, target?, why?, since? — why the running build is not `origin/main` of the host's checkout (`host --self-update`, every 5 min); `current` clears the record; folded only from the host actor it names | | host |
 | | `agent.stuck` | agent, cause?, detail, until? — no `cause` clears the record | | host |
 | | `agent.signal` | agent, program, signal, detail? — `prompt`/`turn_end` clear the agent's stored signal | | agent |
 
@@ -307,6 +308,7 @@ how many worktrees may hold any of a set of resources at once.
 | `role` | an agent's declared lead is down, the lead's level is not above its own, or a second root coordinator is up |
 | `quota` | a program's quota is exhausted, or a window ≥ 90% used resets in the future |
 | `stalled` | an agent idle or blocked for 15 min after it last worked |
+| `outdated` | a host's installed build behind `origin/main` for 15 min: update blocked (dirty, off `main` or diverged checkout), failed (fetch, build or swap; the old binary stays), or installed but not yet restarted. Subject `host:<host>` |
 
 `hung` and `stalled` are also pushed, not only read: the host writes one `msg.sent` per episode
 — `HUNG` or `STALLED`, ref the agent's name, the finding's own detail for text — to the agent's
@@ -653,3 +655,17 @@ the token and the hub database elsewhere.
 Decisions (`decision.*`) and any human channel beyond the Inbox answer, data-defined extension types,
 the web board, code-host ingest, a NATS transport, `agent-fleet run`/`kill` process ownership, Windows.
 These are v2.
+
+## Self-update
+
+`agent-fleet host --self-update <checkout> --restart "<cmd>"…` keeps the installed binary at
+`origin/main`. Every 5 minutes the host fetches `origin/main` and compares it with the commit
+`agent-fleet --version` prints. If they differ and the checkout is clean, on `main` and can
+fast-forward, it pulls, runs `cargo build --release --locked`, copies the binary next to the
+installed one, checks the copy reports the target commit, and renames it over the installed one.
+A rename keeps the old binary whole until the new one is; overwriting in place kills the running
+process on macOS (`OS_REASON_CODESIGNING`). Then it runs each `--restart` command in order
+(`launchctl kickstart -k gui/<uid>/<label>`, `systemctl --user restart <unit>`; this host's own
+service last, so the hub and other services restart first). A dirty, off-`main` or diverged
+checkout, or a failed fetch, build or swap, leaves the old binary and is reported as
+`host.update`, which `doctor` shows as `outdated` after 15 minutes.

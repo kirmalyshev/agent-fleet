@@ -15,6 +15,7 @@ mod store;
 mod stuck;
 mod tui;
 mod ui;
+mod update;
 mod watch;
 
 use std::net::SocketAddr;
@@ -32,7 +33,7 @@ use store::Store;
 
 /// One event log for a fleet of coding agents: presence, tasks, blockers, asks and doorbells.
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("AGENT_FLEET_SHORT"), ")"), about)]
 struct Cli {
     /// Which fleet: one instance per project or product, each with its own hub, log, token,
     /// spool and replica.
@@ -96,6 +97,15 @@ enum Cmd {
         /// host only classifies, records `agent.stuck`, and tells the lead.
         #[arg(long)]
         stuck_act: bool,
+        /// Keep the installed binary at `origin/main` of this checkout: every 5 minutes, if it
+        /// is clean, on main and can fast-forward, pull, build and swap the binary in.
+        #[arg(long)]
+        self_update: Option<PathBuf>,
+        /// A command that restarts a long-running process through its service manager
+        /// (`launchctl kickstart -k gui/501/<label>`, `systemctl --user restart <unit>`), run
+        /// after a self-update, in order, this host's own service last. Repeatable.
+        #[arg(long = "restart", value_parser = parse_restart)]
+        restart: Vec<Vec<String>>,
     },
     /// Protocol metadata.
     Api {
@@ -485,6 +495,14 @@ fn parse_level(s: &str) -> Result<Level, String> {
     })
 }
 
+fn parse_restart(s: &str) -> Result<Vec<String>, String> {
+    let cmd: Vec<String> = s.split_whitespace().map(String::from).collect();
+    if cmd.is_empty() {
+        return Err("empty restart command".into());
+    }
+    Ok(cmd)
+}
+
 fn parse_lock(s: &str) -> Result<(String, PathBuf), String> {
     match s.split_once('=') {
         Some((name, dir)) if !name.is_empty() && !dir.is_empty() => {
@@ -785,6 +803,8 @@ async fn main() -> Result<()> {
             locks,
             stall_min,
             stuck_act,
+            self_update,
+            restart,
         } => {
             let cfg = host::Config {
                 host: ctx.host_name(),
@@ -807,6 +827,13 @@ async fn main() -> Result<()> {
                 locks: locks.clone(),
                 stall_min: *stall_min,
                 stuck_act: *stuck_act,
+                update: self_update
+                    .clone()
+                    .map(|d| {
+                        std::env::current_exe()
+                            .map(|exe| update::Cfg::cargo(d, exe, restart.clone()))
+                    })
+                    .transpose()?,
             };
             host::run(cfg, ctx.client()?).await?;
         }

@@ -88,6 +88,8 @@ pub struct Config {
     /// `host --stuck-act`: let the host act on a stuck cause itself — keystrokes and
     /// handoffs. Off (the default) it only classifies, records `agent.stuck`, and tells.
     pub stuck_act: bool,
+    /// `host --self-update`: keep the installed binary at `origin/main`.
+    pub update: Option<crate::update::Cfg>,
 }
 
 #[derive(Clone)]
@@ -1204,6 +1206,7 @@ pub async fn run(cfg: Config, client: Client) -> Result<()> {
         r = tokio::spawn(host.clone().presence_loop()) => bail!("presence stopped: {r:?}"),
         r = tokio::spawn(host.clone().scan_loop()) => bail!("scans stopped: {r:?}"),
         r = tokio::spawn(host.clone().lock_loop()) => bail!("lock reads stopped: {r:?}"),
+        r = tokio::spawn(crate::update::update_loop(host.clone())) => bail!("self-update stopped: {r:?}"),
         r = tokio::spawn(crate::watch::watch_loop(host.clone())) => bail!("the watch tick stopped: {r:?}"),
         r = tokio::spawn(crate::spawn::spawn_loop(host.clone())) => bail!("spawning stopped: {r:?}"),
     }
@@ -1311,6 +1314,7 @@ mod tests {
             locks: Vec::new(),
             stall_min: 15,
             stuck_act: false,
+            update: None,
         };
         let client = Client::new("http://127.0.0.1:1", "t".into(), dir.join("spool.jsonl"));
         let host = Arc::new(Host::new(
@@ -1454,6 +1458,7 @@ mod tests {
             locks: Vec::new(),
             stall_min: 15,
             stuck_act: false,
+            update: None,
         };
         let host = Host::new(
             cfg,
@@ -1528,6 +1533,7 @@ mod tests {
             locks: Vec::new(),
             stall_min: 15,
             stuck_act: false,
+            update: None,
         };
         let replica = Store::open(&cfg.replica).unwrap();
         replica

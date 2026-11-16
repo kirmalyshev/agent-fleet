@@ -7,8 +7,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::event::{
-    AgentState, Body, Event, Known, Level, ProcessHung, QuotaWindow, ResourceHold, ResourceLimit,
-    SpawnRequested, SpawnResult, StuckCause, TYPE_VERSION, TaskState, WorktreeProcs, WorktreeState,
+    AgentState, Body, Event, HostUpdate, Known, Level, ProcessHung, QuotaWindow, ResourceHold,
+    ResourceLimit, SpawnRequested, SpawnResult, StuckCause, TYPE_VERSION, TaskState, WorktreeProcs,
+    WorktreeState,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -58,6 +59,8 @@ pub struct State {
     /// Hung processes by `<host>:<pid>` of the topmost one, `since` always set.
     #[serde(default)]
     pub hung: BTreeMap<String, ProcessHung>,
+    /// Hosts whose installed build is not `origin/main` (`host.update`), by host.
+    pub updates: BTreeMap<String, HostUpdate>,
     /// Why a stopped agent is stopped, as its host read it off the screen, keyed by agent id.
     #[serde(default)]
     pub stuck: BTreeMap<String, Stuck>,
@@ -847,6 +850,27 @@ impl State {
                     self.hung.remove(&key);
                 }
             }
+            Known::HostUpdate(d)
+                if e.actor.kind != crate::event::ActorKind::Host
+                    || e.actor.id != format!("host:{}", d.host) => {}
+            Known::HostUpdate(d) if d.status == crate::event::UpdateStatus::Current => {
+                self.updates.remove(&d.host);
+            }
+            Known::HostUpdate(d) => {
+                // Behind the same commit since the first report of it.
+                let since = self
+                    .updates
+                    .get(&d.host)
+                    .filter(|u| u.target == d.target)
+                    .and_then(|u| u.since);
+                self.updates.insert(
+                    d.host.clone(),
+                    HostUpdate {
+                        since: since.or(d.since).or(Some(ts)),
+                        ..d.clone()
+                    },
+                );
+            }
             Known::SpawnResult(d) => {
                 if let Some(re) = &e.re
                     && let Some(s) = self.spawns.get_mut(re)
@@ -1318,6 +1342,66 @@ mod tests {
         assert_eq!(h.pids, vec![30, 31]);
         s.apply(&hung(None));
         assert!(s.hung.is_empty());
+    }
+
+    #[test]
+    fn a_host_update_report_dates_the_target_and_clears_when_current() {
+        use crate::event::{HostUpdate, UpdateStatus};
+        let up = |status, target: &str, why: &str| {
+            ev(
+                ActorKind::Host,
+                Known::HostUpdate(HostUpdate {
+                    host: "h".into(),
+                    status,
+                    installed: "aaa".into(),
+                    target: Some(target.into()),
+                    why: Some(why.into()),
+                    since: None,
+                }),
+            )
+            .into_event()
+        };
+        let mut s = State::default();
+        let first = up(UpdateStatus::Blocked, "bbb", "dirty");
+        s.apply(&first);
+        s.apply(&up(UpdateStatus::Failed, "bbb", "build failed"));
+        let u = &s.updates["h"];
+        assert_eq!(u.status, UpdateStatus::Failed);
+        assert_eq!(
+            u.since,
+            Some(first.ts),
+            "same target: dated by the first report"
+        );
+        let moved = up(UpdateStatus::Blocked, "ccc", "dirty");
+        s.apply(&moved);
+        assert_eq!(
+            s.updates["h"].since,
+            Some(moved.ts),
+            "a new target starts over"
+        );
+        s.apply(&up(UpdateStatus::Current, "ccc", ""));
+        assert!(s.updates.is_empty());
+    }
+
+    #[test]
+    fn a_host_update_counts_only_from_the_host_it_names() {
+        use crate::event::{HostUpdate, UpdateStatus};
+        let body = |host: &str| {
+            Known::HostUpdate(HostUpdate {
+                host: host.into(),
+                status: UpdateStatus::Failed,
+                installed: "aaa".into(),
+                target: None,
+                why: None,
+                since: None,
+            })
+        };
+        let mut s = State::default();
+        s.apply(&ev(ActorKind::Agent, body("h")).into_event());
+        s.apply(&ev(ActorKind::Host, body("other")).into_event());
+        assert!(s.updates.is_empty());
+        s.apply(&ev(ActorKind::Host, body("h")).into_event());
+        assert_eq!(s.updates.len(), 1);
     }
 
     #[test]

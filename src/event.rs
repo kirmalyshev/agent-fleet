@@ -266,6 +266,8 @@ pub enum Known {
     ProcessOrphaned(ProcessOrphaned),
     #[serde(rename = "proc.hung")]
     ProcessHung(ProcessHung),
+    #[serde(rename = "host.update")]
+    HostUpdate(HostUpdate),
     #[serde(rename = "agent.stuck")]
     AgentStuck(AgentStuck),
     #[serde(rename = "agent.signal")]
@@ -664,6 +666,39 @@ pub struct ProcessHung {
     pub checked: Option<DateTime<Utc>>,
 }
 
+/// Why the installed `agent-fleet` on a host is not the `origin/main` of its checkout. Sent when
+/// the state or reason changes; `status` `current` clears the record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostUpdate {
+    pub host: String,
+    pub status: UpdateStatus,
+    /// The commit the running binary was built from.
+    pub installed: String,
+    /// `origin/main` of the host's checkout, once fetched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// What stopped the update, or what is left to do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    /// When the host first found itself behind this `target`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateStatus {
+    /// Installed is `origin/main`: clears the record.
+    Current,
+    /// Updated on disk; the running process has not restarted yet.
+    Behind,
+    /// The checkout is dirty, off `main` or diverged: nothing was touched.
+    Blocked,
+    /// The pull, build or swap failed: the old binary stays.
+    Failed,
+}
+
 /// A process on the writer's host doctor proved an orphan: reparented to init with its
 /// device gone, or a lock's recorded owner dead. `why`/`cwd`/`since` absent clears it —
 /// the process is gone or somebody's parent chain claimed it.
@@ -822,6 +857,7 @@ impl Known {
             Self::AgentUnmanaged(_) => "agent.unmanaged",
             Self::ProcessOrphaned(_) => "proc.orphaned",
             Self::ProcessHung(_) => "proc.hung",
+            Self::HostUpdate(_) => "host.update",
             Self::AgentStuck(_) => "agent.stuck",
             Self::AgentSignal(_) => "agent.signal",
         }
@@ -848,6 +884,7 @@ impl Known {
             | Self::AgentUnmanaged(_)
             | Self::ProcessOrphaned(_)
             | Self::ProcessHung(_)
+            | Self::HostUpdate(_)
             | Self::AgentStuck(_) => &[Host],
             Self::MsgDelivered(_) | Self::SpawnResult(_) => &[Host],
             Self::AskRaised(_) | Self::Handoff(_) | Self::AgentSignal(_) => &[Agent],

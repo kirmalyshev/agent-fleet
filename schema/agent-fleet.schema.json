@@ -593,6 +593,50 @@
           ],
           "type": "object"
         },
+        "HostUpdate": {
+          "additionalProperties": false,
+          "description": "Why the installed `agent-fleet` on a host is not the `origin/main` of its checkout. Sent when\nthe state or reason changes; `status` `current` clears the record.",
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "installed": {
+              "description": "The commit the running binary was built from.",
+              "type": "string"
+            },
+            "since": {
+              "description": "When the host first found itself behind this `target`.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "$ref": "#/$defs/UpdateStatus"
+            },
+            "target": {
+              "description": "`origin/main` of the host's checkout, once fetched.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "why": {
+              "description": "What stopped the update, or what is left to do.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "host",
+            "status",
+            "installed"
+          ],
+          "type": "object"
+        },
         "KillRefused": {
           "additionalProperties": false,
           "description": "`agent-fleet kill` refused to signal `pid` on `host`.",
@@ -1200,6 +1244,30 @@
             }
           },
           "type": "object"
+        },
+        "UpdateStatus": {
+          "oneOf": [
+            {
+              "const": "current",
+              "description": "Installed is `origin/main`: clears the record.",
+              "type": "string"
+            },
+            {
+              "const": "behind",
+              "description": "Updated on disk; the running process has not restarted yet.",
+              "type": "string"
+            },
+            {
+              "const": "blocked",
+              "description": "The checkout is dirty, off `main` or diverged: nothing was touched.",
+              "type": "string"
+            },
+            {
+              "const": "failed",
+              "description": "The pull, build or swap failed: the old binary stays.",
+              "type": "string"
+            }
+          ]
         },
         "WorktreeGone": {
           "additionalProperties": false,
@@ -1873,6 +1941,22 @@
         {
           "properties": {
             "data": {
+              "$ref": "#/$defs/HostUpdate"
+            },
+            "type": {
+              "const": "host.update",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
               "$ref": "#/$defs/AgentStuck"
             },
             "type": {
@@ -2209,6 +2293,50 @@
             "disk_total",
             "agents",
             "ts"
+          ],
+          "type": "object"
+        },
+        "HostUpdate": {
+          "additionalProperties": false,
+          "description": "Why the installed `agent-fleet` on a host is not the `origin/main` of its checkout. Sent when\nthe state or reason changes; `status` `current` clears the record.",
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "installed": {
+              "description": "The commit the running binary was built from.",
+              "type": "string"
+            },
+            "since": {
+              "description": "When the host first found itself behind this `target`.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "$ref": "#/$defs/UpdateStatus"
+            },
+            "target": {
+              "description": "`origin/main` of the host's checkout, once fetched.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "why": {
+              "description": "What stopped the update, or what is left to do.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "host",
+            "status",
+            "installed"
           ],
           "type": "object"
         },
@@ -2985,6 +3113,30 @@
           ],
           "type": "object"
         },
+        "UpdateStatus": {
+          "oneOf": [
+            {
+              "const": "current",
+              "description": "Installed is `origin/main`: clears the record.",
+              "type": "string"
+            },
+            {
+              "const": "behind",
+              "description": "Updated on disk; the running process has not restarted yet.",
+              "type": "string"
+            },
+            {
+              "const": "blocked",
+              "description": "The checkout is dirty, off `main` or diverged: nothing was touched.",
+              "type": "string"
+            },
+            {
+              "const": "failed",
+              "description": "The pull, build or swap failed: the old binary stays.",
+              "type": "string"
+            }
+          ]
+        },
         "Usage": {
           "properties": {
             "cpu_pct": {
@@ -3316,6 +3468,13 @@
           "description": "Agent programs outside herdr on each host, keyed `<host>:<pid>`.",
           "type": "object"
         },
+        "updates": {
+          "additionalProperties": {
+            "$ref": "#/$defs/HostUpdate"
+          },
+          "description": "Hosts whose installed build is not `origin/main` (`host.update`), by host.",
+          "type": "object"
+        },
         "worktree_procs": {
           "additionalProperties": {
             "$ref": "#/$defs/Procs"
@@ -3340,6 +3499,7 @@
         "msgs",
         "worktrees",
         "worktree_procs",
+        "updates",
         "unknown"
       ],
       "title": "State",
