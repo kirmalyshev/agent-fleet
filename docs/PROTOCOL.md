@@ -536,7 +536,8 @@ or `gone`. Nothing is killed automatically.
 ## Spawning
 
 The fleet starts agents itself. `<checkout>/.agent-fleet/fleet.toml` in the project says how
-(`docs/fleet.example.toml` ships one): a `session`, a `base` ref (default `origin/main`), a
+(`docs/fleet.example.toml` ships one): a `session` (absent: the herdr session the CLI runs
+in, from `HERDR_SESSION`), a `base` ref (default `origin/main`), a
 `brief` template next to the file with `@@KEY@@` placeholders, an optional `ready` script run
 inside a new worktree before the agent starts, `[vars]` for extra tokens, `[profiles]` —
 a `kind` (the `agent.start`/`agent.quota` program), `args`, `unset_env`, a `prefix` for agent

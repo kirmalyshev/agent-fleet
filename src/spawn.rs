@@ -20,11 +20,12 @@ use crate::state::{Spawn, State};
 
 // ---------- the project's fleet.toml ----------
 
-/// `session` and `brief` are required; `base` defaults to `origin/main`.
+/// `brief` is required; `session` defaults to the caller's herdr session, `base` to `origin/main`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FleetConfig {
-    /// The herdr session agents run in.
+    /// The herdr session agents run in; absent, the session the CLI runs in (`HERDR_SESSION`).
+    #[serde(default = "default_session")]
     pub session: String,
     /// The branch point for a new worktree.
     #[serde(default = "default_base")]
@@ -42,6 +43,10 @@ pub struct FleetConfig {
     /// First match wins; a rule with no `match` is the default.
     #[serde(default)]
     pub rules: Vec<Rule>,
+}
+
+fn default_session() -> String {
+    std::env::var("HERDR_SESSION").unwrap_or_default()
 }
 
 fn default_base() -> String {
@@ -258,7 +263,13 @@ pub fn find() -> Result<(FleetConfig, PathBuf)> {
         bail!("not in a git checkout; run spawn inside the project");
     }
     let top = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    load(Path::new(&top))
+    let found = load(Path::new(&top))?;
+    if found.0.session.is_empty() {
+        bail!(
+            "fleet.toml names no `session` and HERDR_SESSION is not set; run inside herdr or set `session`"
+        );
+    }
+    Ok(found)
 }
 
 // ---------- routing ----------
