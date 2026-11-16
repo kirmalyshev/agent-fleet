@@ -922,20 +922,26 @@ impl State {
             }
         }
         // A failure is kept while its host still runs the commit it failed on: nothing will ask
-        // that host again until `origin/main` moves, and `doctor` reports it until then. Only the
-        // newest such update per host: `doctor` reads no other.
-        let mut newest: BTreeMap<&str, (DateTime<Utc>, &str)> = BTreeMap::new();
+        // that host again until `origin/main` moves, and `doctor` reports it until then. That is
+        // the newest update the host answered, and only if that answer failed: a later success
+        // (even "already current") clears it, as in `doctor`.
+        let mut newest: BTreeMap<&str, (DateTime<Utc>, &str, &UpdateResult)> = BTreeMap::new();
         for (id, u) in &self.updates {
             for (h, r) in &u.results {
-                let on_it = !r.ok
-                    && r.commit.is_some()
-                    && self.hosts.get(h).is_some_and(|x| x.commit == r.commit);
-                if on_it && newest.get(h.as_str()).is_none_or(|(s, _)| u.since > *s) {
-                    newest.insert(h, (u.since, id));
+                if newest.get(h.as_str()).is_none_or(|(t, _, _)| u.since > *t) {
+                    newest.insert(h, (u.since, id, r));
                 }
             }
         }
-        let keep: HashSet<String> = newest.values().map(|(_, id)| id.to_string()).collect();
+        let keep: HashSet<String> = newest
+            .iter()
+            .filter(|(h, (_, _, r))| {
+                !r.ok
+                    && r.commit.is_some()
+                    && self.hosts.get(**h).is_some_and(|x| x.commit == r.commit)
+            })
+            .map(|(_, (_, id, _))| id.to_string())
+            .collect();
         self.updates
             .retain(|id, u| e.ts - u.since <= UPDATE_KEPT || keep.contains(id));
         self.answers
@@ -2341,6 +2347,52 @@ mod tests {
         let mut left: Vec<&str> = s.updates.keys().map(String::as_str).collect();
         left.sort();
         assert_eq!(left, ["both", "fresh"], "{left:?}");
+    }
+
+    #[test]
+    fn a_later_success_ends_the_retention_of_an_older_failure() {
+        let trigger = ev(
+            ActorKind::Host,
+            Known::HostHealth(HostHealth {
+                host: "a".into(),
+                disk_free: 1,
+                disk_total: 2,
+                agents: 0,
+                commit: Some("aaa".into()),
+                stats: None,
+            }),
+        )
+        .into_event();
+        let now = trigger.ts;
+        let answer = |hours: i64, ok: bool| Update {
+            by: "host:x".into(),
+            since: now - chrono::Duration::hours(hours),
+            host: None,
+            results: [(
+                "a".to_string(),
+                UpdateResult {
+                    host: "a".into(),
+                    ok,
+                    commit: Some("aaa".into()),
+                    error: None,
+                },
+            )]
+            .into(),
+        };
+        let mut s = State::default();
+        s.updates.insert("failed".into(), answer(40, false));
+        s.updates.insert("current".into(), answer(30, true));
+        s.apply(&trigger);
+        assert!(
+            s.updates.is_empty(),
+            "cleared by the later success: {:?}",
+            s.updates.keys()
+        );
+        // The other way round, the failure is the newest answer and stays.
+        s.updates.insert("current".into(), answer(40, true));
+        s.updates.insert("failed".into(), answer(30, false));
+        s.apply(&trigger);
+        assert_eq!(s.updates.keys().collect::<Vec<_>>(), ["failed"]);
     }
 
     #[test]
