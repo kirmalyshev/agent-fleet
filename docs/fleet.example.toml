@@ -45,3 +45,4 @@ profile = "devin"
 repos = ["owner/repo"]
 days = 3                         # quiet this long before a PR is an orphan (default 3)
 guarded = ["AGENTS.md", "CLAUDE.md", "README.md", "docs/", "schema/"] # reported, never closed (`dir/` = prefix); this is the default, and setting it replaces it
+apply = false                   # true: the host watch loop closes superseded PRs and tells the root of the rest

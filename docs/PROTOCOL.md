@@ -501,7 +501,11 @@ tell is delivered; a tell still pending is not repeated. The default `guarded` i
 `AGENTS.md`, `CLAUDE.md`, `README.md`, `docs/`, `schema/`; setting it replaces that list. A PR whose
 file list hits `gh`'s cap of 100 counts as guarded. Nothing is closed while a live agent's
 branch is unknown; a repo or row `gh` cannot read is an `orphan-pr` error line, and so is a
-fleet.toml `doctor` cannot read (no fleet.toml, or no checkout, means the check is off). Closing is `doctor --apply` only; the watch loop does not run it.
+fleet.toml `doctor` cannot read (no fleet.toml, or no checkout, means the check is off). With `[orphan_pr] apply = true` (default off) the host's watch loop runs the same step every 30 minutes
+from the fleet.toml of each spawn checkout the host knows (never its working directory: a service starts it in `/`), on its own task with a 5-minute limit: it closes the superseded PRs and tells the root
+coordinator of each other orphan, again 7 days after the last tell and never while one is still pending (the log is the dedupe); with no root coordinator it tells nobody, and the closes still run.
+When the TUI removes a worktree whose branch still has an open PR, its outcome line says so and
+the root coordinator is told: the PR is a coordinator item from then on.
 
 The same scan proves orphans and reports them as `proc.orphaned` (`why` says which proof
 held; no `why` clears it). A process reparented to init that is a device or test tool —
