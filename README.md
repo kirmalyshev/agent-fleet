@@ -33,7 +33,7 @@ agent-fleet hook statusline     Claude Code status-line wrapper: stores rate_lim
                           runs a wrapped status line on the same input
 agent-fleet state --json        the folded state
 agent-fleet tui                 the fleet on one screen, live: agents, worktrees, tasks, findings,
-                          with tell, focus, task done/release/cancel, remove a worktree, kill orphans
+                          resources, the Inbox; `:` runs any CLI command from it (Tab completes)
 agent-fleet ui                  the board in the browser, live: a tree of repositories, worktrees,
                           agents and tasks with every status, plus agents, findings, doorbells, hosts
 agent-fleet ui --text           the board: agents, tasks, blockers, asks, undelivered doorbells, hosts

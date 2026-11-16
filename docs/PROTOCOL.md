@@ -851,11 +851,27 @@ with the cause.
 ## The operator's screen
 
 `agent-fleet tui` shows the state live (every 2 s): agents with their CPU, memory, task and branch;
-worktrees with unpushed and dirty work and what they run; tasks; findings; resources with their
-holder, queue and rules. Writes go through the
-same events as the CLI (`msg.sent`, `task.state`, `task.unassigned`). Two actions are local to
-the machine and ask first: removing a worktree no agent works in, and killing the processes
-left in one (only those still running there, so a reused pid is never hit).
+worktrees with unpushed and dirty work and what they run; tasks; findings, with what `proc` says
+of each pid a finding names; resources with their holder, queue and rules; and the board's Inbox.
+Every action asks first and shows its outcome line.
+
+**Everything the CLI does.** `:` opens a command line that runs the CLI itself: this binary, with
+the screen's `--instance`, `--hub`, `--token-file`, `--as`, `--project` and `--host-name`, in the
+background. So each action writes the same events, with the same checks and refusals, as the
+command typed in a shell. Tab completes commands, agents, tasks, blockers, levels and the
+profiles of fleet.toml. A command that only reads (`stats`, `doctor`, `proc`, `ps`, `ui`, `task
+ls|show`, `role <agent>`) runs at once; any other asks first. `spawn` runs its `--dry-run` first
+and spawns on `y`, following until `spawn.result` as the CLI does. A failure, or an output longer
+than one line, opens over the screen; `o` opens the last one again. The services (`hub`, `host`)
+and the hooks are refused there. Keys fill the command line from the selected row: role and
+handoff for an agent; task add, assign, block, unblock, dep add and rm for a task; kill for a hung
+or orphaned process finding (on this host); a capacity rule; spawn; a tell to the coordinator.
+
+**Asks.** The Asks tab is the board's Inbox: `a` answers and `A` approves an open question
+through `POST /board/answer`, so it needs the shared token, as the board does.
+
+Two actions are local to the machine: removing a worktree no agent works in, and killing the
+processes left in one (only those still running there, so a reused pid is never hit).
 
 **Repository hook.** A repository knows what fleet cannot: which database, caches and
 simulators a worktree holds, and how its stack stops. If its main checkout has an executable

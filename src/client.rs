@@ -482,6 +482,29 @@ impl Client {
         Ok(self.get("/state").await?.json().await?)
     }
 
+    /// Answers an Inbox ask as the board does (`POST /board/answer`, the shared token only).
+    /// Returns the `ask.answered` id.
+    pub async fn answer(&self, ask: &str, answer: &str, approve: bool) -> Result<String> {
+        let res = self
+            .http
+            .post(self.url("/board/answer"))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(10))
+            .json(&serde_json::json!({ "ask": ask, "answer": answer, "approve": approve }))
+            .send()
+            .await?;
+        let status = res.status();
+        let body: Value = res.json().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Refused {
+                status,
+                message: body["error"].as_str().unwrap_or("").to_string(),
+            }
+            .into());
+        }
+        Ok(body["id"].as_str().unwrap_or("").to_string())
+    }
+
     pub async fn stats(&self, since_s: i64) -> Result<Value> {
         Ok(self
             .get(&format!("/stats?since={since_s}"))
