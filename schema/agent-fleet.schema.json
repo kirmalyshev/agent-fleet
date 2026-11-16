@@ -513,13 +513,6 @@
               "minimum": 0,
               "type": "integer"
             },
-            "agents_read_token": {
-              "description": "Whether the uid its agents run as (the owner of its herdr socket) can read the token file\nit posts with: it is that uid, that uid owns the file, or the file is group- or\nother-readable. Absent when it cannot tell.",
-              "type": [
-                "boolean",
-                "null"
-              ]
-            },
             "behind_since": {
               "description": "Since when the host's fetch has found `origin/main` ahead of `commit`; absent when it is\nnot behind, or cannot tell.",
               "format": "date-time",
@@ -2329,13 +2322,6 @@
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
-            },
-            "agents_read_token": {
-              "description": "Whether its agents can read the token it posts with, as its last `host.health` said.",
-              "type": [
-                "boolean",
-                "null"
-              ]
             },
             "behind_since": {
               "description": "Since when that commit has been behind `origin/main`, as its last `host.health` said.",

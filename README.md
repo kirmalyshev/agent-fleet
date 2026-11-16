@@ -40,8 +40,7 @@ agent-fleet ui --text           the board: agents, tasks, blockers, asks, undeli
 agent-fleet stats               doorbell latency and loss, event lag, host and hub vitals
 agent-fleet doctor              stale, hung or heavy agents, duplicate work, forgotten worktrees,
                           unpushed commits, orphaned processes, capacity breaches, long queues,
-                          refused kills, broken role chains, exhausted quotas, stuck spawns,
-                          hosts whose agents can read their token
+                          refused kills, broken role chains, exhausted quotas, stuck spawns
 agent-fleet instances           one fleet per project or product: each has its own hub, log and token
 agent-fleet bench               load-test a throwaway hub: latency, throughput, follower lag, 409 races
 agent-fleet api schema          JSON Schema of events and state (schema/agent-fleet.schema.json)

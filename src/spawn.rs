@@ -2235,7 +2235,6 @@ profile = "devin"
             host: "h".into(),
             session: "s".into(),
             herdr_socket: sock,
-            token_file: dir.join("token"),
             replica: dir.join("replica.db"),
             data_dir: dir.to_path_buf(),
             repos: Vec::new(),

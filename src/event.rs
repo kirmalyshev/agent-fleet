@@ -322,11 +322,6 @@ pub struct HostHealth {
     /// not behind, or cannot tell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub behind_since: Option<DateTime<Utc>>,
-    /// Whether the uid its agents run as (the owner of its herdr socket) can read the token file
-    /// it posts with: it is that uid, that uid owns the file, or the file is group- or
-    /// other-readable. Absent when it cannot tell.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agents_read_token: Option<bool>,
 }
 
 /// The host agent's own vitals. Counters run from the host's start, so a drop in `uptime_s`

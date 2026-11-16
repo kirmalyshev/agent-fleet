@@ -72,7 +72,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | presence | `agent.up` | agent, host, kind?, state, pane? | | host |
 | | `agent.state` | agent, state (`idle` `working` `blocked` `done` `unknown`) | | host |
 | | `agent.down` | agent, reason? | | host |
-| | `host.health` | host, disk_free, disk_total, agents, stats?, commit? (the commit its binary was built from), behind_since? (since when its 5-minute fetch has found `origin/main` ahead of that commit), agents_read_token? (the uid that owns its herdr socket, its agents', can read the token file it posts with: it is that uid, that uid owns the file, or the file is group- or other-readable; absent when it cannot tell) (every minute) | | host |
+| | `host.health` | host, disk_free, disk_total, agents, stats?, commit? (the commit its binary was built from), behind_since? (since when its 5-minute fetch has found `origin/main` ahead of that commit; every minute) | | host |
 | | `agent.usage` | agent, rss_kb?, cpu_pct?, procs?, cwd? (each scan) | | host |
 | | `agent.role` | agent, level? (`root-coordinator` `domain-lead` `implementation-lead` `implementer`; absent `level` removes the role), lead?, domain? | | agent, host |
 | machine | `worktree.state` | host, path, repo, branch?, head, unpushed, dirty, dirty_submodules? (of dirty, moved submodule pointers), files[] (only what still differs from the default branch), last_commit, in_main?, herdr? (a linked worktree under herdr's worktree directory: `[worktrees] directory` in its config, default `~/.herdr/worktrees`) (on change) | | host |
@@ -176,7 +176,7 @@ data itself, not the scan, so the views can say how stale the numbers are.
 A `host:<name>` token stops other machines from posting as `host:<name>`. It does not stop that
 host's own agents. The host agent runs as the Unix user its agents run as, and that user can read
 every token file the host reads. So an agent can post as its own host, for example a `proc.hung`
-that `agent-fleet kill` accepts as proof. `doctor` reports such a host as `token`.
+that `agent-fleet kill` accepts as proof.
 
 The host cannot yet run as a separate user. Each of these host features needs the agents' uid,
 and each runs in the host agent, not in the agents' CLI:
@@ -375,7 +375,6 @@ how many worktrees may hold any of a set of resources at once.
 | `stalled` | an agent idle or blocked for 15 min after it last worked |
 | `update` | a host's latest self-update that it answered `ok:false` (for 2 hours, and for as long as the host's `host.health` still names the commit the failure reports: nothing asks it again until `origin/main` moves; the hub keeps, past its usual day, the update a host answered last if that answer failed on its current commit; a host that has not sent `host.health` for a day is gone, not failing), or that a live host (`host.health` in the last 3 min) has not answered 75 min after it was asked (the wait for another update's lock, 35 min, plus a build, 30, plus git). A request already older than 15 min when the host process started was ignored by it, not left unanswered. A later success clears it. Subject `host:<host>`, with who asked and the error |
 | `build` | hosts that sent `host.health` in the last 10 min report different commits (or one reports none); each such host, with the others' commits. When they all agree: each one whose `behind_since` is 15 min old or more (the fleet is on a commit `origin/main` has left; its self-update did not take), with how long |
-| `token` | a host that sent `host.health` in the last 10 min says its agents can read the token it posts with (`agents_read_token`), so they can post as that host (see Who can post as a host) |
 
 `hung` and `stalled` are also pushed, not only read: the host writes one `msg.sent` per episode
 — `HUNG` or `STALLED`, ref the agent's name, the finding's own detail for text — to the agent's

@@ -89,9 +89,6 @@ pub struct Host {
     /// Since when that commit has been behind `origin/main`, as its last `host.health` said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub behind_since: Option<DateTime<Utc>>,
-    /// Whether its agents can read the token it posts with, as its last `host.health` said.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agents_read_token: Option<bool>,
     pub ts: DateTime<Utc>,
     /// When the host process started: that report's time less its `uptime_s`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -689,7 +686,6 @@ impl State {
                         agents: d.agents,
                         commit: d.commit.clone(),
                         behind_since: d.behind_since,
-                        agents_read_token: d.agents_read_token,
                         ts,
                         started: d
                             .stats
@@ -2129,7 +2125,6 @@ mod tests {
                     agents: 0,
                     commit: None,
                     behind_since: None,
-                    agents_read_token: None,
                     stats: uptime_s.map(|u| HostStats {
                         uptime_s: u,
                         ..HostStats::default()
@@ -2215,7 +2210,6 @@ mod tests {
                     agents: 0,
                     commit: Some(commit.into()),
                     behind_since: None,
-                    agents_read_token: None,
                     stats: None,
                 }),
             );
@@ -2259,7 +2253,6 @@ mod tests {
                     agents: 0,
                     commit: Some("aaa".into()),
                     behind_since: None,
-                    agents_read_token: None,
                     stats: None,
                 }),
             );
@@ -2308,7 +2301,6 @@ mod tests {
                 agents: 0,
                 commit: None,
                 behind_since: None,
-                agents_read_token: None,
                 stats: None,
             }),
         )
@@ -2320,7 +2312,6 @@ mod tests {
             agents: 0,
             commit: Some(commit.into()),
             behind_since: None,
-            agents_read_token: None,
             ts: now,
             started: None,
         };
@@ -2387,7 +2378,6 @@ mod tests {
                 agents: 0,
                 commit: Some("aaa".into()),
                 behind_since: None,
-                agents_read_token: None,
                 stats: None,
             }),
         )
@@ -2434,7 +2424,6 @@ mod tests {
             stats: None,
             commit: Some("abc".into()),
             behind_since: None,
-            agents_read_token: None,
         });
         let mut s = State::default();
         s.apply(&by("host:h1", health).into_event());
