@@ -549,7 +549,9 @@ shells its agent program runs (an agent's own process, its pane shell and its ot
 children — MCP servers — are never classified), plus the proved orphans, each claimed by the
 agent whose worktree it runs in. A process under 2 minutes old or with no start time is not
 classified, nor is one with a listening TCP socket (a server it keeps) or `mcp` in a non-flag word of its argv (an
-MCP server started through a shell), or anything under them. Each gets one state:
+MCP server started through a shell), or anything under them. Nor is a command with an
+established TCP connection anywhere under its shell (a network wait such as `gh pr checks
+--watch | tail`: a poller and its pipe readers sit at 0% CPU between polls). Each gets one state:
 
 - `working`: over 1% CPU over the interval, its stdout/stderr file changed, a child started
   since the last tick, a device tool other than `simctl bootstatus` (`xcodebuild`, `maestro`,
@@ -561,7 +563,9 @@ MCP server started through a shell), or anything under them. Each gets one state
   a tick after a gap of more than two intervals (the machine slept) only re-reads the table;
 - `orphan`: a `proc.orphaned` proof holds.
 
-The topmost hung process of a chain is reported as `proc.hung` with every hung pid under it,
+The topmost hung process of a chain is reported as `proc.hung` with every hung pid under it
+(tops of one agent in one process group, the members of a pipeline, are one report: the
+lowest pid's),
 its command, start, and evidence (CPU, the output file's last change, the deepest descendant's
 command, the lock it holds), re-sent every tick that confirms it with `checked`. The report
 clears when its pid is gone or is now another process, when a parent's report covers it, or
