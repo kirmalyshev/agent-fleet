@@ -435,13 +435,19 @@ async fn run(cmd: &str, args: &[&str]) -> Option<String> {
 /// Listening processes, and when each of `pids`' stdout/stderr files last changed. `None`
 /// when `lsof` gives no answer: then nothing is proved hung.
 async fn machine(pids: &[u32]) -> Option<(HashSet<u32>, HashMap<u32, DateTime<Utc>>)> {
-    let listening = parse_lsof_pids(&run("lsof", &["-wnP", "-iTCP", "-sTCP:LISTEN", "-Fp"]).await?);
+    let listening = parse_lsof_pids(
+        &run(
+            crate::scan::lsof_path(),
+            &["-wnP", "-iTCP", "-sTCP:LISTEN", "-Fp"],
+        )
+        .await?,
+    );
     if pids.is_empty() {
         return Some((listening, HashMap::new()));
     }
     let csv: Vec<String> = pids.iter().map(u32::to_string).collect();
     let args = ["-wnP", "-a", "-d", "1,2", "-Fpftn", "-p", &csv.join(",")];
-    let files = parse_lsof_files(&run("lsof", &args).await?);
+    let files = parse_lsof_files(&run(crate::scan::lsof_path(), &args).await?);
     let output_at = files
         .into_iter()
         .filter_map(|(pid, fs)| {

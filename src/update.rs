@@ -315,7 +315,7 @@ fn keep_prev(exe: &Path, prev: &Path, link: bool) -> Result<()> {
 }
 
 /// The running binary's path. Linux names a binary replaced under it `<path> (deleted)`.
-fn this_exe() -> Result<PathBuf> {
+pub(crate) fn this_exe() -> Result<PathBuf> {
     let exe = std::env::current_exe()?;
     Ok(exe
         .to_str()
@@ -363,6 +363,8 @@ trait Io {
     fn busy_work(&self) -> Vec<String>;
     /// Tells the root coordinator.
     async fn warn(&self, text: String);
+    /// One line for the host's log.
+    fn note(&self, line: String);
     /// One way: no new such work starts, until the process exits.
     fn drain(&self);
     fn exit(&self, code: i32);
@@ -400,6 +402,10 @@ impl Io for HostIo {
 
     fn busy_work(&self) -> Vec<String> {
         self.0.busy_work()
+    }
+
+    fn note(&self, line: String) {
+        eprintln!("agent-fleet host: {line}");
     }
 
     async fn warn(&self, text: String) {
@@ -479,14 +485,24 @@ async fn tick<I: Io>(io: &I, c: &Ctx<'_>, seen: &mut Seen) {
             Err(err) => Err(anyhow!("cannot tell this binary's path: {err:#}")),
         };
         let (commit, error, restart) = match done {
-            Ok(Outcome::Current(c)) => (Some(c), None, false),
-            Ok(Outcome::Replaced(c)) => (Some(c), None, true),
+            Ok(Outcome::Current(head)) => {
+                io.note(format!("update: already at {}", short(Some(&head))));
+                (Some(head), None, false)
+            }
+            Ok(Outcome::Replaced(head)) => {
+                io.note(format!(
+                    "update: built and installed {} (was {}); restarting once spawns and handoffs in flight end",
+                    short(Some(&head)),
+                    short(c.running)
+                ));
+                (Some(head), None, true)
+            }
             // The commit it still runs: a failure leaves it as it was.
-            Err(err) => (
-                c.running.map(String::from),
-                Some(tail(&format!("{err:#}"))),
-                false,
-            ),
+            Err(err) => {
+                let why = tail(&format!("{err:#}"));
+                io.note(format!("update: failed: {why}"));
+                (c.running.map(String::from), Some(why), false)
+            }
         };
         let result = UpdateResult {
             host: c.me.to_string(),
@@ -576,6 +592,11 @@ async fn timer<I: Io>(io: &I, c: &Ctx<'_>, t: &mut Timer) {
     match behind(c.clone, c.running).await {
         Ok(Some(target)) if t.asked_for.as_deref() != Some(target.as_str()) => {
             if io.ask().await {
+                io.note(format!(
+                    "update: running {}, origin/main is {}; asked this host to update",
+                    short(c.running),
+                    short(Some(&target))
+                ));
                 t.asked_for = Some(target);
             }
         }
@@ -930,6 +951,7 @@ mod tests {
         drop_publish: std::cell::Cell<bool>,
         asked: std::cell::Cell<usize>,
         ask_fails: std::cell::Cell<bool>,
+        notes: std::cell::RefCell<Vec<String>>,
         results: std::cell::RefCell<Vec<UpdateResult>>,
     }
 
@@ -962,6 +984,9 @@ mod tests {
         }
         fn busy_work(&self) -> Vec<String> {
             vec!["spawn of agent:h/s/x".into()]
+        }
+        fn note(&self, line: String) {
+            self.notes.borrow_mut().push(line);
         }
         async fn warn(&self, text: String) {
             self.log.borrow_mut().push(format!("warn {text}"));
@@ -1406,6 +1431,61 @@ mod tests {
         let r = &io.results.borrow()[0];
         assert!(!r.ok);
         assert_eq!(r.commit.as_deref(), Some("abc1234"));
+    }
+
+    #[tokio::test]
+    async fn the_host_logs_when_the_timer_asks_and_when_an_update_ends() {
+        let (_t, origin, clone, exe) = fixture();
+        let first = sh(&clone, &["rev-parse", "HEAD"]);
+        let exe = Ok(exe);
+        let io = Fake::default();
+        let c = ctx(&clone, &exe, Some(&first));
+        let mut t = Timer::default();
+        // Up to date: the check says nothing, the update says it is current.
+        timer(&io, &c, &mut t).await;
+        *io.pending.borrow_mut() = ids(&["r0"]);
+        tick(&io, &c, &mut Seen::default()).await;
+        assert_eq!(io.notes.borrow().len(), 1);
+        assert!(
+            io.notes.borrow()[0].starts_with("update: already at "),
+            "{:?}",
+            io.notes
+        );
+        // Behind: the timer logs that it asked, with both commits.
+        io.notes.borrow_mut().clear();
+        newer(&origin);
+        timer(&io, &c, &mut t).await;
+        let notes = io.notes.borrow().clone();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains(&first[..7]) && notes[0].contains("asked this host to update"),
+            "{notes:?}"
+        );
+        // Its request runs: built and installed, then restarting.
+        io.notes.borrow_mut().clear();
+        tick(&io, &c, &mut Seen::default()).await;
+        let notes = io.notes.borrow().clone();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("built and installed") && notes[0].contains(&first[..7]),
+            "{notes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_update_is_logged_with_its_cause() {
+        let (_t, _origin, clone, exe) = fixture();
+        std::fs::write(clone.join("f"), "dirty").unwrap();
+        let exe = Ok(exe);
+        let io = Fake::default();
+        *io.pending.borrow_mut() = ids(&["r1"]);
+        tick(&io, &ctx(&clone, &exe, None), &mut Seen::default()).await;
+        let notes = io.notes.borrow();
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].starts_with("update: failed: ") && notes[0].contains("uncommitted"),
+            "{notes:?}"
+        );
     }
 
     #[tokio::test]

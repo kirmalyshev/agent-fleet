@@ -3,9 +3,9 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use axum::extract::{Query, Request, State as AxState};
@@ -194,6 +194,51 @@ impl Hub {
 
 type Shared = Arc<Mutex<Hub>>;
 
+/// How often the hub looks whether its binary was replaced.
+const BINARY_POLL: Duration = Duration::from_secs(5);
+
+/// A file's identity (device, inode): a rename over the path gives it a new one.
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.dev(), m.ino()))
+}
+
+/// The command that starts this same hub again: the same arguments and environment.
+fn restart_command(exe: &Path) -> std::process::Command {
+    let mut c = std::process::Command::new(exe);
+    c.args(std::env::args_os().skip(1));
+    c
+}
+
+/// Replaces this process with the new binary: same pid, so a supervisor sees no exit, and with
+/// none nothing is lost. Its sockets are close-on-exec, so the new hub binds them again. If the
+/// exec fails, exit 75 and let a supervisor start it.
+fn restart_in_place(exe: &Path) -> ! {
+    use std::os::unix::process::CommandExt;
+    let err = restart_command(exe).exec();
+    eprintln!(
+        "agent-fleet hub: cannot start {}: {err}; exiting",
+        exe.display()
+    );
+    std::process::exit(crate::update::RESTART_STATUS)
+}
+
+/// Calls `changed` once when the file at `path` is replaced: a host's self-update renames a new
+/// binary over the installed one, and a hub still running the old one would stay on the old code
+/// (and the old protocol). A file that is briefly missing is not a change.
+async fn follow_binary(path: PathBuf, poll: Duration, changed: impl FnOnce()) {
+    let start = file_id(&path);
+    loop {
+        tokio::time::sleep(poll).await;
+        let now = file_id(&path);
+        if now.is_some() && now != start {
+            changed();
+            return;
+        }
+    }
+}
+
 /// Serves the hub on every address in `listen`. Once bound, writes one URL to `hub_file`, where
 /// this instance's clients look: the loopback one when given, so a client on this host does not
 /// depend on the network the other addresses ride (3 Nov: a Tailscale blip cut the hub off from
@@ -238,7 +283,20 @@ pub async fn serve(listen: &[SocketAddr], db: &Path, hub_file: &Path, token: Str
         shown.join(", ")
     );
     std::fs::write(hub_file, format!("http://{}\n", hub_file_addr(&bound)?))?;
-    let app = router(hub, token);
+    let shared: Shared = Arc::new(Mutex::new(hub));
+    let app = router_shared(shared.clone(), token);
+    match crate::update::this_exe() {
+        Ok(exe) => {
+            let at = exe.clone();
+            tokio::spawn(follow_binary(exe, BINARY_POLL, move || {
+                // Between requests: one that writes twice (an answer) is not cut in half.
+                let _held = shared.lock().unwrap_or_else(|e| e.into_inner());
+                eprintln!("agent-fleet hub: binary replaced; starting the new one");
+                restart_in_place(&at)
+            }));
+        }
+        Err(e) => eprintln!("agent-fleet hub: cannot follow its binary: {e:#}"),
+    }
     let mut set = tokio::task::JoinSet::new();
     for l in listeners {
         let app = app.clone();
@@ -275,7 +333,10 @@ fn hub_file_addr(listen: &[SocketAddr]) -> Result<SocketAddr> {
 }
 
 pub fn router(hub: Hub, token: String) -> Router {
-    let hub: Shared = Arc::new(Mutex::new(hub));
+    router_shared(Arc::new(Mutex::new(hub)), token)
+}
+
+fn router_shared(hub: Shared, token: String) -> Router {
     let api = Router::new()
         .route("/events", post(post_event).get(get_events))
         .route("/events/stream", get(stream))
@@ -461,6 +522,47 @@ async fn stream(AxState(hub): AxState<Shared>, Query(q): Query<Cursor>) -> Respo
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_hub_restarts_as_the_same_command() {
+        let c = restart_command(Path::new("/opt/agent-fleet"));
+        assert_eq!(c.get_program(), "/opt/agent-fleet");
+        let args: Vec<_> = c.get_args().collect();
+        let mine: Vec<_> = std::env::args_os().skip(1).collect();
+        assert_eq!(args, mine.iter().map(|a| a.as_os_str()).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn the_hub_follows_its_binary_and_ignores_a_file_that_is_briefly_missing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("agent-fleet");
+        std::fs::write(&exe, "old").unwrap();
+        // Keep the old file's inode taken, as the running hub does: a filesystem reuses a freed
+        // one for the next file.
+        std::fs::hard_link(&exe, dir.path().join("held")).unwrap();
+        let changed = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = changed.clone();
+        let task = tokio::spawn(follow_binary(
+            exe.clone(),
+            Duration::from_millis(10),
+            move || flag.store(true, Ordering::SeqCst),
+        ));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(!changed.load(Ordering::SeqCst), "untouched: no change");
+        std::fs::remove_file(&exe).unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(!changed.load(Ordering::SeqCst), "missing is not replaced");
+        // A self-update writes the new binary beside it and renames it over.
+        let new = dir.path().join(".new");
+        std::fs::write(&new, "new").unwrap();
+        std::fs::rename(&new, &exe).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("noticed")
+            .unwrap();
+        assert!(changed.load(Ordering::SeqCst));
+    }
+
     use super::*;
     use crate::event::*;
 

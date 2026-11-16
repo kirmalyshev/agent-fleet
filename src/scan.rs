@@ -815,6 +815,19 @@ fn argv_of(pid: u32) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// `lsof` by absolute path: a supervisor's PATH (launchd's default) lacks `/usr/sbin`, where
+/// macOS keeps it.
+pub fn lsof_path() -> &'static str {
+    pick_lsof(|p| Path::new(p).exists())
+}
+
+fn pick_lsof(exists: impl Fn(&str) -> bool) -> &'static str {
+    ["/usr/sbin/lsof", "/usr/bin/lsof"]
+        .into_iter()
+        .find(|p| exists(p))
+        .unwrap_or("lsof")
+}
+
 /// The working directory of a live process on this machine.
 pub fn cwd_of(pid: u32) -> Option<String> {
     if cfg!(target_os = "linux") {
@@ -822,7 +835,7 @@ pub fn cwd_of(pid: u32) -> Option<String> {
             .ok()
             .map(|p| p.to_string_lossy().into_owned());
     }
-    let out = std::process::Command::new("lsof")
+    let out = std::process::Command::new(lsof_path())
         .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
         .output()
         .ok()?;
@@ -1433,5 +1446,17 @@ mod tests {
         let infra: HashSet<u32> = [1].into_iter().collect();
         assert!(t.under_any(3, &infra));
         assert!(!t.under_any(3, &HashSet::new()));
+    }
+
+    #[test]
+    fn lsof_is_found_by_absolute_path_when_the_supervisor_path_lacks_it() {
+        assert_eq!(pick_lsof(|p| p == "/usr/sbin/lsof"), "/usr/sbin/lsof");
+        assert_eq!(pick_lsof(|p| p == "/usr/bin/lsof"), "/usr/bin/lsof");
+        assert_eq!(
+            pick_lsof(|_| true),
+            "/usr/sbin/lsof",
+            "macOS keeps it in sbin"
+        );
+        assert_eq!(pick_lsof(|_| false), "lsof", "else whatever PATH finds");
     }
 }
