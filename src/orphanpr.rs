@@ -171,6 +171,7 @@ pub fn classify(
 async fn gh(bin: &str, args: &[&str]) -> Result<Value> {
     let out = tokio::process::Command::new(bin)
         .args(args)
+        .kill_on_drop(true)
         .output()
         .await
         .with_context(|| format!("run gh {}", args.join(" ")))?;
@@ -477,8 +478,27 @@ pub fn slug_of(url: &str) -> Option<String> {
 /// The note a retire adds to its outcome line when the branch it retired still has an open PR:
 /// `(PR number, line)`. `Ok(None)` when it has none; an error when that could not be found out.
 pub async fn retire_note(bin: &str, repo: &str, branch: &str) -> Result<Option<(u64, String)>> {
+    retire_note_within(bin, repo, branch, RETIRE_TIMEOUT).await
+}
+
+async fn retire_note_within(
+    bin: &str,
+    repo: &str,
+    branch: &str,
+    limit: std::time::Duration,
+) -> Result<Option<(u64, String)>> {
+    // The TUI waits on this: a hung `gh` must not freeze it (kill_on_drop ends the child).
+    tokio::time::timeout(limit, retire_note_inner(bin, repo, branch))
+        .await
+        .map_err(|_| anyhow::anyhow!("gh did not answer in {}s", limit.as_secs_f32()))?
+}
+
+const RETIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+async fn retire_note_inner(bin: &str, repo: &str, branch: &str) -> Result<Option<(u64, String)>> {
     let url = tokio::process::Command::new("git")
         .args(["-C", repo, "remote", "get-url", "origin"])
+        .kill_on_drop(true)
         .output()
         .await
         .context("run git remote get-url")?;
@@ -507,6 +527,18 @@ pub async fn retire_note(bin: &str, repo: &str, branch: &str) -> Result<Option<(
         n,
         format!("PR {slug}#{n} is still open: a coordinator item now"),
     )))
+}
+
+/// The configs the watch loop acts on: one per spawn checkout (`owner/repo` → path) whose
+/// fleet.toml sets `apply`. Read from the checkouts, never from the process's directory: a
+/// service manager starts the host in `/`. A checkout whose fleet.toml cannot be read is an error.
+pub fn watch_configs(checkouts: &BTreeMap<String, std::path::PathBuf>) -> Result<Vec<Config>> {
+    let mut out = Vec::new();
+    for (repo, dir) in checkouts {
+        let c = config(dir).with_context(|| format!("{repo}: fleet.toml"))?;
+        out.extend(watch_enabled(c));
+    }
+    Ok(out)
 }
 
 /// The config the watch loop acts on: only a fleet.toml that sets `apply` and names repos.
@@ -668,6 +700,72 @@ mod tests {
             assert_eq!(slug_of(u).as_deref(), Some("o/r"), "{u}");
         }
         assert_eq!(slug_of("r"), None);
+    }
+
+    #[test]
+    fn the_watch_reads_each_checkouts_fleet_toml_not_the_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = |name: &str, apply: bool| {
+            let c = dir.path().join(name).join(".agent-fleet");
+            std::fs::create_dir_all(&c).unwrap();
+            std::fs::write(
+                c.join("fleet.toml"),
+                format!(
+                    "brief = \"b.md\"\n[profiles.p]\nkind = \"claude\"\n[[rules]]\nprofile = \"p\"\n[orphan_pr]\nrepos = [\"o/{name}\"]\napply = {apply}\n"
+                ),
+            )
+            .unwrap();
+            dir.path().join(name)
+        };
+        let checkouts = BTreeMap::from([
+            ("o/on".to_string(), mk("on", true)),
+            ("o/off".to_string(), mk("off", false)),
+            ("o/none".to_string(), dir.path().join("none")),
+        ]);
+        let got = watch_configs(&checkouts).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].repos, ["o/on"]);
+        let broken = BTreeMap::from([("o/b".to_string(), {
+            let d = mk("b", true);
+            std::fs::write(d.join(".agent-fleet/fleet.toml"), "nope = 1").unwrap();
+            d
+        })]);
+        assert!(watch_configs(&broken).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_hung_gh_gives_up_instead_of_freezing_the_retire() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success()
+            && std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["remote", "add", "origin", "https://host.example/o/r"])
+                .status()
+                .unwrap()
+                .success();
+        assert!(ok);
+        let bin = dir.path().join("gh");
+        std::fs::write(&bin, "#!/bin/sh\nexec sleep 600\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = retire_note_within(
+            bin.to_str().unwrap(),
+            repo.to_str().unwrap(),
+            "s-1",
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("did not answer"), "{e:#}");
     }
 
     #[test]
