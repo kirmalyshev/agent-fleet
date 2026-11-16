@@ -7,6 +7,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// `gh pr list` cuts `files` at this many; a PR at the cap may hide a guarded file.
+const FILES_CAP: usize = 100;
+const OPEN_LIMIT: usize = 100;
+
 /// `[orphan_pr]` in fleet.toml.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -16,14 +20,14 @@ pub struct Config {
     pub repos: Vec<String>,
     /// Quiet this many days before a PR is an orphan.
     #[serde(default = "default_days")]
-    pub days: i64,
+    pub days: u32,
     /// A PR touching one of these waits for a person. `dir/` is a prefix, anything else a file
     /// name (at any depth) or exact path.
     #[serde(default = "default_guarded")]
     pub guarded: Vec<String>,
 }
 
-fn default_days() -> i64 {
+fn default_days() -> u32 {
     3
 }
 
@@ -103,7 +107,7 @@ pub fn classify(
     let mut out = Vec::new();
     for pr in &snap.open {
         let age = now - pr.updated;
-        if live.contains(&pr.head) || age < Duration::days(cfg.days) {
+        if live.contains(&pr.head) || age < Duration::days(cfg.days.into()) {
             continue;
         }
         let by = snap
@@ -113,7 +117,7 @@ pub fn classify(
             .map(|(n, _)| *n);
         let action = if pr.draft {
             Action::Report("a draft waits for a person")
-        } else if guarded(&pr.files, &cfg.guarded) {
+        } else if pr.files.len() >= FILES_CAP || guarded(&pr.files, &cfg.guarded) {
             Action::Report("touches a guarded surface, waits for a person")
         } else if let Some(by) = by {
             Action::Close { by }
@@ -174,7 +178,8 @@ fn closes(v: &Value) -> Vec<u64> {
         .collect()
 }
 
-/// What `repo` has open, merged and closed, read with `gh` (`AGENT_FLEET_GH` names the binary).
+/// What `repo` has open (at most `OPEN_LIMIT`, else an error), the last 100 merged and 300 issues,
+/// read with `gh`. A row missing a field is an error: a PR is never judged on a guess.
 pub async fn fetch(bin: &str, repo: &str) -> Result<Snapshot> {
     let open = gh(
         bin,
@@ -224,32 +229,45 @@ pub async fn fetch(bin: &str, repo: &str) -> Result<Snapshot> {
         ],
     )
     .await?;
-    let list = |v: &Value| v.as_array().cloned().unwrap_or_default();
+    let list = |what: &str, v: &Value| -> Result<Vec<Value>> {
+        v.as_array()
+            .cloned()
+            .with_context(|| format!("gh {what}: not a list"))
+    };
+    let open = list("pr list --state open", &open)?;
+    if open.len() >= OPEN_LIMIT {
+        bail!(
+            "{} has {OPEN_LIMIT} or more open PRs: the list may be cut short",
+            repo
+        );
+    }
+    // ponytail: merged and issues cap at their limits; past them a PR is reported, not closed.
+    let row = |p: &Value| -> Option<Pr> {
+        Some(Pr {
+            number: p["number"].as_u64()?,
+            head: p["headRefName"].as_str()?.to_string(),
+            draft: p["isDraft"].as_bool()?,
+            updated: p["updatedAt"].as_str()?.parse().ok()?,
+            closes: closes(p),
+            files: p["files"]
+                .as_array()?
+                .iter()
+                .map(|f| f["path"].as_str().map(str::to_string))
+                .collect::<Option<_>>()?,
+        })
+    };
+    let mut prs = Vec::new();
+    for p in &open {
+        prs.push(row(p).with_context(|| format!("gh pr list: unreadable PR {}", p["number"]))?);
+    }
     Ok(Snapshot {
         repo: repo.to_string(),
-        open: list(&open)
-            .iter()
-            .filter_map(|p| {
-                Some(Pr {
-                    number: p["number"].as_u64()?,
-                    head: p["headRefName"].as_str()?.to_string(),
-                    draft: p["isDraft"].as_bool().unwrap_or(false),
-                    updated: p["updatedAt"].as_str()?.parse().ok()?,
-                    closes: closes(p),
-                    files: p["files"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|f| f["path"].as_str().map(str::to_string))
-                        .collect(),
-                })
-            })
-            .collect(),
-        merged: list(&merged)
+        open: prs,
+        merged: list("pr list --state merged", &merged)?
             .iter()
             .filter_map(|p| Some((p["number"].as_u64()?, closes(p))))
             .collect(),
-        issues: list(&issues)
+        issues: list("issue list", &issues)?
             .iter()
             .filter_map(|i| Some((i["number"].as_u64()?, i["state"].as_str()?.to_string())))
             .collect(),
@@ -284,32 +302,60 @@ pub async fn close(bin: &str, repo: &str, n: u64, by: u64) -> Result<()> {
     Ok(())
 }
 
-/// Head branches of the worktrees live agents work in.
-pub fn live_branches(s: &crate::state::State) -> BTreeSet<String> {
-    s.agents
-        .values()
-        .filter_map(|a| crate::doctor::worktree_of(s, a))
-        .filter_map(|(_, w)| w.state.branch.clone())
-        .collect()
+/// Head branches of the worktrees live agents work in, and whether some agent has none we can
+/// name (no cwd report, no worktree, detached HEAD): then any PR might be its.
+pub fn live_branches(s: &crate::state::State) -> (BTreeSet<String>, bool) {
+    let mut set = BTreeSet::new();
+    let mut unknown = false;
+    for a in s.agents.values() {
+        match crate::doctor::worktree_of(s, a).and_then(|(_, w)| w.state.branch.clone()) {
+            Some(b) => {
+                set.insert(b);
+            }
+            None => unknown = true,
+        }
+    }
+    (set, unknown)
 }
 
-/// Every orphan in the configured repos. A repo `gh` cannot read is an error line, not a
-/// silent pass.
+/// Every orphan in the configured repos, and `(repo, error)` for each repo `gh` could not
+/// read: a failure is a line, never a silent pass. With an agent whose branch is unknown, no
+/// PR is closed.
 pub async fn scan(
     bin: &str,
     s: &crate::state::State,
     cfg: &Config,
     now: DateTime<Utc>,
-) -> (Vec<Orphan>, Vec<String>) {
-    let live = live_branches(s);
+) -> (Vec<Orphan>, Vec<(String, String)>) {
+    let (live, unknown) = live_branches(s);
     let (mut found, mut errs) = (Vec::new(), Vec::new());
     for repo in &cfg.repos {
         match fetch(bin, repo).await {
             Ok(snap) => found.extend(classify(&snap, &live, cfg, now)),
-            Err(e) => errs.push(format!("{repo}: {e:#}")),
+            Err(e) => errs.push((repo.clone(), format!("{e:#}"))),
+        }
+    }
+    if unknown {
+        for o in &mut found {
+            if matches!(o.action, Action::Close { .. }) {
+                o.action = Action::Report("an agent's branch is unknown, so nothing is closed");
+            }
         }
     }
     (found, errs)
+}
+
+/// The root coordinator's agent id.
+pub fn root_of(s: &crate::state::State) -> Option<String> {
+    s.roles
+        .iter()
+        .find(|(_, r)| r.level == crate::event::Level::RootCoordinator)
+        .map(|(id, _)| id.clone())
+}
+
+/// An unanswered message to `root` about `key` is open: tell once per PR until it is answered.
+pub fn already_told(s: &crate::state::State, root: &str, key: &str) -> bool {
+    s.msgs.values().any(|m| m.to == root && m.reference == key)
 }
 
 #[cfg(test)]
@@ -441,6 +487,168 @@ esac
         .await;
         assert!(found.is_empty());
         assert_eq!(errs.len(), 1);
+    }
+
+    fn state_with(agents: &[(&str, Option<&str>, Option<&str>)]) -> crate::state::State {
+        // (agent id, cwd, branch of the worktree at /w/<id>)
+        use crate::event::WorktreeState;
+        use crate::state::{Agent, Usage, Worktree, worktree_key};
+        let mut s = crate::state::State::default();
+        for (id, cwd, branch) in agents {
+            s.agents.insert(
+                id.to_string(),
+                Agent {
+                    host: "h".into(),
+                    kind: None,
+                    pane: None,
+                    state: crate::event::AgentState::Working,
+                    since: now(),
+                    worked: None,
+                    finished: None,
+                    usage: Some(Usage {
+                        rss_kb: None,
+                        cpu_pct: None,
+                        procs: None,
+                        cwd: cwd.map(String::from),
+                        ts: now(),
+                    }),
+                },
+            );
+            let path = format!("/w/{id}");
+            s.worktrees.insert(
+                worktree_key("h", &path),
+                Worktree {
+                    state: WorktreeState {
+                        host: "h".into(),
+                        path,
+                        repo: "/r".into(),
+                        branch: branch.map(String::from),
+                        head: "abc".into(),
+                        unpushed: 0,
+                        dirty: 0,
+                        files: vec![],
+                        last_commit: now(),
+                        in_main: false,
+                    },
+                    since: now(),
+                },
+            );
+        }
+        s
+    }
+
+    #[test]
+    fn a_live_agents_worktree_branch_is_owned() {
+        let s = state_with(&[("a", Some("/w/a/src"), Some("s-1"))]);
+        let (set, unknown) = live_branches(&s);
+        assert_eq!((set.contains("s-1"), unknown), (true, false));
+    }
+
+    #[test]
+    fn an_agent_with_no_nameable_branch_makes_the_set_unknown() {
+        for s in [
+            state_with(&[("a", None, Some("s-1"))]),
+            state_with(&[("a", Some("/w/a"), None)]),
+            state_with(&[("a", Some("/elsewhere"), Some("s-1"))]),
+        ] {
+            assert!(live_branches(&s).1);
+        }
+    }
+
+    #[tokio::test]
+    async fn with_an_unknown_agent_branch_nothing_is_closed_and_a_live_branch_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_gh(dir.path());
+        let cfg = Config {
+            repos: vec!["o/r".into()],
+            ..Config::default()
+        };
+        let live = state_with(&[("a", Some("/w/a"), Some("s-1"))]);
+        let (found, _) = scan(&bin, &live, &cfg, "2026-11-16T12:00:00Z".parse().unwrap()).await;
+        assert_eq!(found.len(), 1, "s-1 is owned: {found:?}");
+        let blind = state_with(&[("a", None, None)]);
+        let (found, _) = scan(&bin, &blind, &cfg, "2026-11-16T12:00:00Z".parse().unwrap()).await;
+        assert_eq!(found.len(), 2);
+        assert!(
+            found.iter().all(|o| matches!(o.action, Action::Report(_))),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn guarded_matches_prefix_name_and_exact_path_only() {
+        let g = |f: &str, p: &str| guarded(&[f.to_string()], &[p.to_string()]);
+        assert!(g("docs/a.md", "docs/"));
+        assert!(!g("mydocs/a.md", "docs/"));
+        assert!(g("src/AGENTS.md", "AGENTS.md"));
+        assert!(!g("src/NOTAGENTS.md", "AGENTS.md"));
+        assert!(g("src/x.rs", "src/x.rs"));
+        assert!(!g("src/y.rs", "src/x.rs"));
+    }
+
+    #[test]
+    fn the_age_boundary_and_a_capped_file_list() {
+        assert_eq!(run(&snap(vec![pr(1, "s-1", 3, &[6])]), &[]).len(), 1);
+        let mut big = pr(2, "s-2", 4, &[5]);
+        big.files = (0..FILES_CAP).map(|i| format!("f{i}")).collect();
+        assert!(matches!(
+            run(&snap(vec![big]), &[])[0].action,
+            Action::Report(_)
+        ));
+        let none = pr(3, "s-3", 4, &[]);
+        assert!(
+            run(&snap(vec![none]), &[])[0]
+                .detail
+                .contains("closes no issue")
+        );
+    }
+
+    #[test]
+    fn the_coordinator_is_told_once_until_it_answers() {
+        use crate::state::Msg;
+        let mut s = crate::state::State::default();
+        assert_eq!(root_of(&s), None);
+        s.roles.insert(
+            "agent:h/s/root".into(),
+            crate::state::Role {
+                level: crate::event::Level::RootCoordinator,
+                lead: None,
+                domain: None,
+                by: "x".into(),
+                since: now(),
+            },
+        );
+        assert_eq!(root_of(&s).as_deref(), Some("agent:h/s/root"));
+        assert!(!already_told(&s, "agent:h/s/root", "o/r#1"));
+        s.msgs.insert(
+            "m1".into(),
+            Msg {
+                from: "x".into(),
+                to: "agent:h/s/root".into(),
+                kind: "orphan-pr".into(),
+                reference: "o/r#1".into(),
+                text: "t".into(),
+                since: now(),
+            },
+        );
+        assert!(already_told(&s, "agent:h/s/root", "o/r#1"));
+        assert!(!already_told(&s, "agent:h/s/root", "o/r#2"));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_pr_row_or_a_failed_close_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("gh");
+        std::fs::write(
+            &bad,
+            "#!/bin/sh\ncase \"$6\" in open) echo '[{\"number\":1}]' ;; *) echo '[]' ;; esac\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = fetch(bad.to_str().unwrap(), "o/r").await.unwrap_err();
+        assert!(format!("{e:#}").contains("unreadable PR"), "{e:#}");
+        assert!(close("/nonexistent/gh", "o/r", 1, 9).await.is_err());
     }
 
     #[test]

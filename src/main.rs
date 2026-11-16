@@ -845,7 +845,10 @@ async fn main() -> Result<()> {
         Cmd::Doctor { json, apply } => {
             let state = ctx.state().await?;
             let mut f = doctor::findings(&state, now);
-            let cfg = spawn::find().map(|(c, _)| c.orphan_pr).unwrap_or_default();
+            let (cfg, cfg_err) = match spawn::find() {
+                Ok((c, _)) => (c.orphan_pr, None),
+                Err(e) => (Default::default(), Some(format!("{e:#}"))),
+            };
             let gh = std::env::var("AGENT_FLEET_GH").unwrap_or_else(|_| "gh".into());
             let (orphans, errs) = orphanpr::scan(&gh, &state, &cfg, now).await;
             for o in &orphans {
@@ -875,11 +878,18 @@ async fn main() -> Result<()> {
                     detail,
                 });
             }
-            for e in errs {
+            for (repo, e) in errs {
                 f.push(doctor::Finding {
                     kind: "orphan-pr",
-                    subject: "gh".into(),
+                    subject: repo,
                     detail: format!("could not read: {e}"),
+                });
+            }
+            if let Some(e) = cfg_err {
+                f.push(doctor::Finding {
+                    kind: "orphan-pr",
+                    subject: "fleet.toml".into(),
+                    detail: format!("orphan PRs not checked: {e}"),
                 });
             }
             if *json {
@@ -1486,15 +1496,10 @@ async fn main() -> Result<()> {
 
 /// One tell to the root coordinator per PR while it is unanswered; the result is a detail suffix.
 async fn tell_root(ctx: &Ctx, s: &state::State, key: &str, text: &str) -> String {
-    let Some(root) = s
-        .roles
-        .iter()
-        .find(|(_, r)| r.level == Level::RootCoordinator)
-        .map(|(id, _)| id.clone())
-    else {
+    let Some(root) = orphanpr::root_of(s) else {
         return " (no root coordinator to tell)".into();
     };
-    if s.msgs.values().any(|m| m.to == root && m.reference == key) {
+    if orphanpr::already_told(s, &root, key) {
         return " (coordinator already told)".into();
     }
     let sent = async {
