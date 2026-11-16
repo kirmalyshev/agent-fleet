@@ -86,23 +86,40 @@ async fn limited(mut c: tokio::process::Command, limit: Duration) -> Result<std:
 }
 
 /// Whether git should be told `ssh -o BatchMode=yes`: not when the operator chose an ssh command
-/// (`GIT_SSH_COMMAND`, or `core.sshCommand` in the clone), which BatchMode would override.
-fn wants_batch_ssh(clone: &Path, env_set: bool) -> bool {
-    !env_set
-        && !std::process::Command::new("git")
-            .arg("-C")
-            .arg(clone)
-            .args(["config", "--get", "core.sshCommand"])
-            .output()
-            .is_ok_and(|o| o.status.success())
+/// (`GIT_SSH_COMMAND`, or `core.sshCommand` in the clone), which BatchMode would override. Only
+/// git's "not set" (exit 1) allows it: any other failure leaves the operator's setting alone.
+async fn wants_batch_ssh(clone: &Path, env_set: bool) -> bool {
+    if env_set {
+        return false;
+    }
+    let mut c = tokio::process::Command::new("git");
+    c.arg("-C")
+        .arg(clone)
+        .args(["config", "--get", "core.sshCommand"]);
+    match limited(c, GIT).await.map(|o| o.status.code()) {
+        Ok(Some(1)) => true,
+        Ok(Some(0)) => false,
+        other => {
+            eprintln!(
+                "agent-fleet host: update: cannot read core.sshCommand ({other:?}); leaving ssh as configured"
+            );
+            false
+        }
+    }
+}
+
+/// `git -C <clone> <args>`, told not to prompt for ssh when no ssh command is configured.
+async fn git_command(clone: &Path, args: &[&str]) -> tokio::process::Command {
+    let mut c = tokio::process::Command::new("git");
+    c.arg("-C").arg(clone).args(args);
+    if wants_batch_ssh(clone, std::env::var_os("GIT_SSH_COMMAND").is_some()).await {
+        c.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
+    c
 }
 
 async fn git_in(clone: &Path, args: &[&str], limit: Duration) -> Result<String> {
-    let mut c = tokio::process::Command::new("git");
-    c.arg("-C").arg(clone).args(args);
-    if wants_batch_ssh(clone, std::env::var_os("GIT_SSH_COMMAND").is_some()) {
-        c.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
-    }
+    let c = git_command(clone, args).await;
     let out = limited(c, limit)
         .await
         .with_context(|| format!("git {}", args.join(" ")))?;
@@ -316,6 +333,19 @@ fn pending_for(s: &State, me: &str, now: chrono::DateTime<Utc>) -> Vec<String> {
         .collect()
 }
 
+/// The messages that tell the root coordinator a restart cut work off.
+fn drain_warnings(s: &State, text: &str) -> Vec<MsgSent> {
+    crate::watch::recipients(s, None)
+        .into_iter()
+        .map(|to| MsgSent {
+            to,
+            kind: "UPDATE".into(),
+            reference: "update-drain".into(),
+            text: text.to_string(),
+        })
+        .collect()
+}
+
 /// What a tick needs from its host, so the tick is testable with fakes.
 trait Io {
     /// Requests not yet answered by this host, still fresh.
@@ -370,16 +400,19 @@ impl Io for HostIo {
     }
 
     async fn warn(&self, text: String) {
-        let Ok(view) = self.0.view() else { return };
-        for to in crate::watch::recipients(&view.state, None) {
-            self.0
-                .publish(self.0.presence(Known::MsgSent(MsgSent {
-                    to,
-                    kind: "UPDATE".into(),
-                    reference: "update-drain".into(),
-                    text: text.clone(),
-                })))
-                .await;
+        let view = match self.0.view() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("agent-fleet host: update: cannot tell the coordinator: {e:#}");
+                return;
+            }
+        };
+        let msgs = drain_warnings(&view.state, &text);
+        if msgs.is_empty() {
+            eprintln!("agent-fleet host: update: no root coordinator to tell");
+        }
+        for m in msgs {
+            self.0.publish(self.0.presence(Known::MsgSent(m))).await;
         }
     }
 
@@ -1006,7 +1039,38 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_rollback_copy_leaves_the_previous_one_whole_and_no_temp() {
+    fn keep_prev_is_repeatable_and_works_with_no_previous_copy() {
+        let t = tempfile::tempdir().unwrap();
+        let (exe, prev) = (
+            t.path().join("agent-fleet"),
+            t.path().join("agent-fleet.prev"),
+        );
+        std::fs::write(&exe, "v1").unwrap();
+        keep_prev(&exe, &prev, true).unwrap();
+        // A retried update links the same file again: nothing is left behind.
+        keep_prev(&exe, &prev, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&prev).unwrap(), "v1");
+        assert_eq!(std::fs::read_dir(t.path()).unwrap().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_update_whose_rollback_copy_cannot_be_kept_fails_before_the_rename() {
+        let (_t, origin, clone, exe) = fixture();
+        newer(&origin);
+        // A directory where the rollback copy goes: the rename onto it fails.
+        let prev = exe.with_file_name("agent-fleet.prev");
+        std::fs::create_dir(&prev).unwrap();
+        std::fs::write(prev.join("x"), "x").unwrap();
+        let err = update(&clone, &exe, None).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("keep the old binary"),
+            "{err:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "old");
+    }
+
+    #[test]
+    fn a_rollback_copy_that_cannot_be_made_leaves_the_previous_one_whole_and_no_temp() {
         let t = tempfile::tempdir().unwrap();
         let (exe, prev) = (
             t.path().join("agent-fleet"),
@@ -1031,13 +1095,70 @@ mod tests {
         assert_eq!(left.len(), 1, "no temp left: {left:?}");
     }
 
-    #[test]
-    fn batch_ssh_is_set_only_when_the_operator_chose_no_ssh_command() {
+    #[tokio::test]
+    async fn batch_ssh_is_set_only_when_the_operator_chose_no_ssh_command() {
         let (_t, _origin, clone, _exe) = fixture();
-        assert!(wants_batch_ssh(&clone, false));
-        assert!(!wants_batch_ssh(&clone, true), "GIT_SSH_COMMAND is set");
+        assert!(wants_batch_ssh(&clone, false).await);
+        assert!(
+            !wants_batch_ssh(&clone, true).await,
+            "GIT_SSH_COMMAND is set"
+        );
+        let envs = |c: &tokio::process::Command| {
+            c.as_std()
+                .get_envs()
+                .any(|(k, v)| k == "GIT_SSH_COMMAND" && v.is_some())
+        };
+        assert!(
+            envs(&git_command(&clone, &["status"]).await),
+            "wired into the command"
+        );
         sh(&clone, &["config", "core.sshCommand", "ssh -i /k"]);
-        assert!(!wants_batch_ssh(&clone, false), "core.sshCommand is set");
+        assert!(
+            !wants_batch_ssh(&clone, false).await,
+            "core.sshCommand is set"
+        );
+        assert!(!envs(&git_command(&clone, &["status"]).await));
+        // An unreadable clone is not "unset": the operator's setting is not overridden.
+        assert!(!wants_batch_ssh(Path::new("/nonexistent/clone"), false).await);
+    }
+
+    #[test]
+    fn the_root_coordinator_is_told_and_nobody_when_there_is_none() {
+        let now = Utc::now();
+        let agent = || crate::state::Agent {
+            host: "h".into(),
+            kind: None,
+            pane: None,
+            state: crate::event::AgentState::Working,
+            since: now,
+            worked: None,
+            finished: None,
+            usage: None,
+        };
+        let mut s = State::default();
+        assert!(drain_warnings(&s, "x").is_empty());
+        s.agents.insert("agent:h/s/root".into(), agent());
+        s.roles.insert(
+            "agent:h/s/root".into(),
+            crate::state::Role {
+                level: crate::event::Level::RootCoordinator,
+                lead: None,
+                domain: None,
+                by: "agent:h/s/root".into(),
+                since: now,
+            },
+        );
+        let m = drain_warnings(&s, "cut off");
+        assert_eq!(m.len(), 1);
+        assert_eq!(
+            (
+                m[0].to.as_str(),
+                m[0].kind.as_str(),
+                m[0].reference.as_str(),
+                m[0].text.as_str()
+            ),
+            ("agent:h/s/root", "UPDATE", "update-drain", "cut off")
+        );
     }
 
     #[tokio::test]

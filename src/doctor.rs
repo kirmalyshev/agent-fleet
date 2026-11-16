@@ -521,29 +521,39 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
     by_since.sort_by_key(|u| std::cmp::Reverse(u.since));
     for (host, h) in &s.hosts {
         let up = now - h.ts < Duration::minutes(3);
-        let latest = by_since.iter().find(|u| {
-            u.results.contains_key(host)
-                || (up && u.host.as_deref().is_none_or(|t| t == host) && u.since <= h.ts)
-        });
-        let Some(u) = latest else { continue };
-        let age = now - u.since;
-        if age >= UPDATE_FAILED {
-            continue;
+        // Newest first: a request too young to judge does not hide an older failure.
+        for u in &by_since {
+            let concerns = u.results.contains_key(host)
+                || (up && u.host.as_deref().is_none_or(|t| t == host) && u.since <= h.ts);
+            let age = now - u.since;
+            if !concerns {
+                continue;
+            }
+            if age >= UPDATE_FAILED {
+                break;
+            }
+            let why = match u.results.get(host) {
+                Some(r) if !r.ok => {
+                    format!(
+                        "failed: {}",
+                        r.error.as_deref().unwrap_or("no error reported")
+                    )
+                }
+                None if age >= UPDATE_UNANSWERED => "not answered".to_string(),
+                None => continue,
+                Some(_) => break,
+            };
+            out.push(finding(
+                "update",
+                format!("host:{host}"),
+                format!(
+                    "self-update asked {} ago by {}: {why}",
+                    ago(now, u.since),
+                    u.by
+                ),
+            ));
+            break;
         }
-        let why = match u.results.get(host) {
-            Some(r) if !r.ok => format!("failed: {}", r.error.as_deref().unwrap_or("?")),
-            None if age >= UPDATE_UNANSWERED => "not answered".to_string(),
-            _ => continue,
-        };
-        out.push(finding(
-            "update",
-            format!("host:{host}"),
-            format!(
-                "self-update asked {} ago by {}: {why}",
-                ago(now, u.since),
-                u.by
-            ),
-        ));
     }
     for (key, h) in &s.hung {
         let pids: Vec<String> = std::iter::once(h.pid)
@@ -886,6 +896,57 @@ mod tests {
         s.updates.insert("c".into(), up(20, Some("other"), vec![]));
         assert!(findings(&s, now).is_empty());
         s.updates.insert("c".into(), up(90, Some("mac"), vec![]));
+        assert!(findings(&s, now).is_empty());
+    }
+
+    #[test]
+    fn a_young_request_does_not_hide_an_older_failure_and_a_quiet_host_is_not_blamed() {
+        use crate::event::UpdateResult;
+        let now = Utc::now();
+        let host = |ago_min: i64| crate::state::Host {
+            disk_free: 0,
+            disk_total: 0,
+            agents: 0,
+            commit: None,
+            ts: now - Duration::minutes(ago_min),
+        };
+        let up = |mins: i64, results: Vec<UpdateResult>| crate::state::Update {
+            by: "host:ops".into(),
+            since: now - Duration::minutes(mins),
+            host: None,
+            results: results.into_iter().map(|r| (r.host.clone(), r)).collect(),
+        };
+        let failed = UpdateResult {
+            host: "mac".into(),
+            ok: false,
+            commit: None,
+            error: None,
+        };
+        let mut s = State::default();
+        s.hosts.insert("mac".into(), host(0));
+        s.updates.insert("old".into(), up(30, vec![failed.clone()]));
+        s.updates.insert("new".into(), up(2, vec![]));
+        let f = findings(&s, now);
+        assert_eq!(kinds(&f), vec![("update", "host:mac")], "{f:#?}");
+        assert!(
+            f[0].detail.contains("failed: no error reported"),
+            "{}",
+            f[0].detail
+        );
+        // A host quiet for 10 min is down, not ignoring the request.
+        s.updates.insert("new".into(), up(20, vec![]));
+        s.hosts.insert("mac".into(), host(10));
+        s.updates.remove("old");
+        assert!(findings(&s, now).is_empty(), "stale host");
+        // A request newer than the host's last health: it may not have seen it yet.
+        s.hosts.insert("mac".into(), host(0));
+        s.updates.insert("new".into(), up(-1, vec![]));
+        assert!(findings(&s, now).is_empty());
+        // A success with nothing before it.
+        s.updates.insert(
+            "ok".into(),
+            up(5, vec![UpdateResult { ok: true, ..failed }]),
+        );
         assert!(findings(&s, now).is_empty());
     }
 
