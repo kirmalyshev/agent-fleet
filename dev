@@ -5,11 +5,12 @@
 #                          uncommitted files, and what clean would do with it
 #   ./dev clean            what clean would retire, stop and delete (a dry run)
 #   ./dev clean --execute  do it
+#   ./dev prune            free the slots of deleted worktrees whose services stopped
 #
 # ls and clean cover only this repository (its `origin`, so take no --repo);
 # `agent-fleet dev ls|clean` covers every connected one.
 set -eu
-[ $# -gt 0 ] || { sed -n '2,10s/^# \{0,1\}//p' "$0"; exit 1; }
+[ $# -gt 0 ] || { sed -n '2,11s/^# \{0,1\}//p' "$0"; exit 1; }
 case $1 in ls | clean)
   origin=$(git -C "$(dirname "$0")" remote get-url origin)
   set -- "$@" --repo "$(printf %s "$origin" | sed -E 's#(\.git)?/?$##; s#.*[:/]([^/:]+/[^/:]+)$#\1#')"
