@@ -52,6 +52,8 @@ const LEFTOVER: Duration = Duration::from_secs(45 * 60);
 /// How long a finished update waits for spawns and handoffs in flight (a ready script may run
 /// 15 min) before it exits anyway: a hung one must not keep the old binary running for good.
 const DRAIN_MAX: Duration = Duration::from_secs(20 * 60);
+/// How long an update waits for another update in its clone (a build may take `BUILD`).
+const LOCK_WAIT: Duration = Duration::from_secs(35 * 60);
 /// How often a host looks whether it is behind `origin/main`.
 const CHECK_EVERY: Duration = Duration::from_secs(5 * 60);
 /// How often a finished update looks for the work in flight to end.
@@ -100,11 +102,17 @@ async fn git_in(clone: &Path, args: &[&str], limit: Duration) -> Result<String> 
 }
 
 /// One update at a time per clone: the lock lives in the clone's git dir, so two hosts of one
-/// machine never race on `git pull` or both build. The second is refused, not queued. The file
-/// is only held, never read: dropping it releases the lock.
+/// machine never race on `git pull` or both build. An update waits for it (`wait`), the timer's
+/// fetch does not. The file is only held, never read: dropping it releases the lock.
 struct Lock(#[allow(dead_code)] std::fs::File);
 
+/// Takes the lock at once or fails.
 async fn lock(clone: &Path) -> Result<Lock> {
+    lock_for(clone, Duration::ZERO).await
+}
+
+/// Takes the lock, waiting up to `wait` for another update in the clone to end.
+async fn lock_for(clone: &Path, wait: Duration) -> Result<Lock> {
     use rustix::fs::{FlockOperation, flock};
     let dir = git_in(clone, &["rev-parse", "--absolute-git-dir"], GIT).await?;
     let path = PathBuf::from(dir).join("agent-fleet-update.lock");
@@ -114,12 +122,18 @@ async fn lock(clone: &Path) -> Result<Lock> {
         .write(true)
         .open(&path)
         .with_context(|| format!("open {}", path.display()))?;
-    match flock(&f, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(Lock(f)),
-        Err(e) if e == rustix::io::Errno::WOULDBLOCK => {
-            bail!("another update is running in {}", clone.display())
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match flock(&f, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return Ok(Lock(f)),
+            Err(e) if e == rustix::io::Errno::WOULDBLOCK => {
+                if tokio::time::Instant::now() >= deadline {
+                    bail!("another update is running in {}", clone.display());
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => bail!("lock {}: {e}", path.display()),
         }
-        Err(e) => bail!("lock {}: {e}", path.display()),
     }
 }
 
@@ -155,8 +169,19 @@ pub fn sweep(dir: &Path, older_than: Duration) {
 /// already its head, builds it and renames the build over `exe`. The old binary stays as
 /// `<exe>.prev`: to roll back, rename it over `exe` and restart.
 pub async fn update(clone: &Path, exe: &Path, running: Option<&str>) -> Result<Outcome> {
-    // First: the checks below must hold while this update pulls.
-    let _lock = lock(clone).await?;
+    update_waiting(clone, exe, running, LOCK_WAIT).await
+}
+
+async fn update_waiting(
+    clone: &Path,
+    exe: &Path,
+    running: Option<&str>,
+    wait: Duration,
+) -> Result<Outcome> {
+    // First: the checks below must hold while this update pulls. Another host of this machine
+    // may be building in the same clone: wait for it rather than fail, or this host would
+    // answer `failed` and, with nothing left to ask for, stay on the old binary.
+    let _lock = lock_for(clone, wait).await?;
     let branch = git_in(clone, &["symbolic-ref", "--short", "HEAD"], GIT)
         .await
         .map_err(|e| {
@@ -736,7 +761,9 @@ mod tests {
         std::fs::write(origin.join("f"), "2").unwrap();
         sh(&origin, &["commit", "-qam", "two"]);
         let held = lock(&clone).await.unwrap();
-        let err = update(&clone, &exe, None).await.unwrap_err();
+        let err = update_waiting(&clone, &exe, None, Duration::from_millis(300))
+            .await
+            .unwrap_err();
         assert!(
             format!("{err:#}").contains("another update is running"),
             "{err:#}"
@@ -744,6 +771,22 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&exe).unwrap(), "old");
         drop(held);
         assert!(update(&clone, &exe, None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_update_waits_for_a_sibling_in_the_clone_instead_of_failing() {
+        let (_t, origin, clone, exe) = fixture();
+        std::fs::write(origin.join("f"), "2").unwrap();
+        sh(&origin, &["commit", "-qam", "two"]);
+        let held = lock(&clone).await.unwrap();
+        let (done, _) = tokio::join!(
+            update_waiting(&clone, &exe, None, Duration::from_secs(10)),
+            async {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                drop(held);
+            }
+        );
+        assert!(matches!(done.unwrap(), Outcome::Replaced(_)));
     }
 
     #[tokio::test]

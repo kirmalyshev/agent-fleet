@@ -663,9 +663,10 @@ The update is hardened:
 - **Time limits.** `git pull` 2 min, other git 1 min, `cargo install` 30 min; the process group
   is killed on a timeout and the update answers with the error. No command reads stdin, and git
   never prompts (`GIT_TERMINAL_PROMPT=0`, ssh `BatchMode`; set for every command it runs).
-- **One at a time.** A non-blocking `flock` in the clone's git dir, taken before the checks and
-  held through pull and build: a second update in the same clone (two hosts on one machine) is
-  refused with an error, not raced or queued.
+- **One at a time.** An `flock` in the clone's git dir, taken before the checks and held through
+  pull and build: a second update in the same clone (two hosts on one machine) waits for the
+  first (up to 35 minutes), then runs; it is never raced, and a wait that times out answers with
+  an error. The timer's fetch does not wait: it skips its turn.
 - **Rollback.** The previous binary is kept as `<binary>.prev` (a hard link, else a copy); one
   generation, replaced by each update. If it cannot be kept the update fails before the rename.
   To roll back, rename it over the binary and restart the host.
