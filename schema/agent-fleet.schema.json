@@ -496,6 +496,13 @@
               "minimum": 0,
               "type": "integer"
             },
+            "commit": {
+              "description": "The commit the host's binary was built from; absent when built outside a git checkout.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "disk_free": {
               "description": "Bytes available to unprivileged users on the fleet data volume.",
               "format": "uint64",
@@ -1201,6 +1208,41 @@
           },
           "type": "object"
         },
+        "UpdateRequested": {
+          "additionalProperties": false,
+          "description": "`agent-fleet self-update` asks every host to pull its clone's `main`, rebuild and restart.",
+          "type": "object"
+        },
+        "UpdateResult": {
+          "additionalProperties": false,
+          "description": "One host's answer to the `update.requested` named by `re`.",
+          "properties": {
+            "commit": {
+              "description": "The commit the host runs once restarted (the one it runs now when nothing changed).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "ok": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "host",
+            "ok"
+          ],
+          "type": "object"
+        },
         "WorktreeGone": {
           "additionalProperties": false,
           "properties": {
@@ -1901,6 +1943,38 @@
             "data"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/UpdateRequested"
+            },
+            "type": {
+              "const": "update.requested",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/UpdateResult"
+            },
+            "type": {
+              "const": "update.result",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -2188,6 +2262,13 @@
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
+            },
+            "commit": {
+              "description": "The commit its binary was built from, as its last `host.health` said.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "disk_free": {
               "format": "uint64",
@@ -2985,6 +3066,63 @@
           ],
           "type": "object"
         },
+        "Update": {
+          "description": "An `update.requested` and each host's `update.result`.",
+          "properties": {
+            "by": {
+              "description": "Who asked (the request's actor id).",
+              "type": "string"
+            },
+            "results": {
+              "additionalProperties": {
+                "$ref": "#/$defs/UpdateResult"
+              },
+              "description": "Each host's answer, by host name.",
+              "type": "object"
+            },
+            "since": {
+              "description": "The request's `ts`; the update is pruned `UPDATE_KEPT` after it.",
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "by",
+            "since",
+            "results"
+          ],
+          "type": "object"
+        },
+        "UpdateResult": {
+          "additionalProperties": false,
+          "description": "One host's answer to the `update.requested` named by `re`.",
+          "properties": {
+            "commit": {
+              "description": "The commit the host runs once restarted (the one it runs now when nothing changed).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "ok": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "host",
+            "ok"
+          ],
+          "type": "object"
+        },
         "Usage": {
           "properties": {
             "cpu_pct": {
@@ -3314,6 +3452,14 @@
           },
           "default": {},
           "description": "Agent programs outside herdr on each host, keyed `<host>:<pid>`.",
+          "type": "object"
+        },
+        "updates": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Update"
+          },
+          "default": {},
+          "description": "Self-update requests by their `update.requested` id, kept for 24 h.",
           "type": "object"
         },
         "worktree_procs": {

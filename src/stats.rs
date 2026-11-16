@@ -249,6 +249,7 @@ mod tests {
                 uptime_s,
                 ..Default::default()
             }),
+            commit: None,
         })
     }
 

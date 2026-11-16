@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::event::{
     AgentState, Body, Event, Known, Level, ProcessHung, QuotaWindow, ResourceHold, ResourceLimit,
-    SpawnRequested, SpawnResult, StuckCause, TYPE_VERSION, TaskState, WorktreeProcs, WorktreeState,
+    SpawnRequested, SpawnResult, StuckCause, TYPE_VERSION, TaskState, UpdateResult, WorktreeProcs,
+    WorktreeState,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -49,6 +50,9 @@ pub struct State {
     /// Spawn requests by their `spawn.requested` id; answered ones are kept for 24 h.
     #[serde(default)]
     pub spawns: BTreeMap<String, Spawn>,
+    /// Self-update requests by their `update.requested` id, kept for 24 h.
+    #[serde(default)]
+    pub updates: BTreeMap<String, Update>,
     /// Agent programs outside herdr on each host, keyed `<host>:<pid>`.
     #[serde(default)]
     pub unmanaged: BTreeMap<String, Unmanaged>,
@@ -75,8 +79,24 @@ pub struct Host {
     pub disk_free: u64,
     pub disk_total: u64,
     pub agents: u32,
+    /// The commit its binary was built from, as its last `host.health` said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
     pub ts: DateTime<Utc>,
 }
+
+/// An `update.requested` and each host's `update.result`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Update {
+    /// Who asked (the request's actor id).
+    pub by: String,
+    /// The request's `ts`; the update is pruned `UPDATE_KEPT` after it.
+    pub since: DateTime<Utc>,
+    /// Each host's answer, by host name.
+    pub results: BTreeMap<String, UpdateResult>,
+}
+
+pub const UPDATE_KEPT: chrono::Duration = chrono::Duration::hours(24);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Agent {
@@ -637,6 +657,7 @@ impl State {
                         disk_free: d.disk_free,
                         disk_total: d.disk_total,
                         agents: d.agents,
+                        commit: d.commit.clone(),
                         ts,
                     },
                 );
@@ -856,7 +877,27 @@ impl State {
                     s.answered = Some(ts);
                 }
             }
+            Known::UpdateRequested(_) => {
+                self.updates.insert(
+                    e.id.clone(),
+                    Update {
+                        by: e.actor.id.clone(),
+                        since: ts,
+                        results: BTreeMap::new(),
+                    },
+                );
+            }
+            // Only the host it names may answer for it, and only once.
+            Known::UpdateResult(d) => {
+                if e.actor.id == format!("host:{}", d.host)
+                    && let Some(re) = &e.re
+                    && let Some(u) = self.updates.get_mut(re)
+                {
+                    u.results.entry(d.host.clone()).or_insert_with(|| d.clone());
+                }
+            }
         }
+        self.updates.retain(|_, u| e.ts - u.since <= UPDATE_KEPT);
         self.answers
             .retain(|_, a| e.ts - a.acked.unwrap_or(a.at) <= ANSWER_KEPT);
         // The reducer has no clock: a spawn is pruned once a later event's `ts` is more than
@@ -1895,5 +1936,74 @@ mod tests {
             })
             .collect();
         assert_eq!(State::fold(&events).tasks["task:p/1"].blocked_by.len(), 20);
+    }
+
+    fn by(id: &str, body: Known) -> Envelope<Known> {
+        let kind = if id.starts_with("host:") {
+            ActorKind::Host
+        } else {
+            ActorKind::Agent
+        };
+        let actor = Actor {
+            kind,
+            id: id.into(),
+        };
+        Envelope::new(actor, "p", body)
+    }
+
+    fn update_result(host: &str, commit: &str) -> Known {
+        Known::UpdateResult(UpdateResult {
+            host: host.into(),
+            ok: true,
+            commit: Some(commit.into()),
+            error: None,
+        })
+    }
+
+    #[test]
+    fn each_host_answers_its_own_update_once_and_the_request_is_pruned_after_a_day() {
+        let req = by("agent:h/s/a", Known::UpdateRequested(UpdateRequested {}));
+        let id = req.id.clone();
+        let mut s = State::default();
+        s.apply(&req.into_event());
+        assert_eq!(s.updates[&id].by, "agent:h/s/a");
+        assert!(s.updates[&id].results.is_empty());
+        // another host may not answer for h1
+        let forged = by("host:h2", update_result("h1", "bad")).re(&id);
+        s.apply(&forged.into_event());
+        assert!(s.updates[&id].results.is_empty());
+        for (actor, host, commit) in [("h1", "h1", "abc"), ("h1", "h1", "x"), ("h2", "h2", "def")] {
+            let e = by(&format!("host:{actor}"), update_result(host, commit)).re(&id);
+            s.apply(&e.into_event());
+        }
+        let got: Vec<_> = s.updates[&id]
+            .results
+            .iter()
+            .map(|(h, r)| (h.as_str(), r.commit.as_deref().unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            [("h1", "abc"), ("h2", "def")],
+            "the first answer stands"
+        );
+        let mut late = by("host:h1", update_result("h1", "x")).re("other");
+        late.ts += UPDATE_KEPT + chrono::Duration::seconds(1);
+        s.apply(&late.into_event());
+        assert!(s.updates.is_empty(), "pruned a day after the request");
+    }
+
+    #[test]
+    fn host_health_carries_the_commit() {
+        let health = Known::HostHealth(HostHealth {
+            host: "h1".into(),
+            disk_free: 1,
+            disk_total: 2,
+            agents: 0,
+            stats: None,
+            commit: Some("abc".into()),
+        });
+        let mut s = State::default();
+        s.apply(&by("host:h1", health).into_event());
+        assert_eq!(s.hosts["h1"].commit.as_deref(), Some("abc"));
     }
 }
