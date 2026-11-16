@@ -40,6 +40,8 @@ pub const SPAWN_FAILED: Duration = Duration::hours(1);
 /// `origin/main` moves); one a live host left unanswered is a finding from `UPDATE_UNANSWERED`
 /// after it.
 pub const UPDATE_FAILED: Duration = Duration::hours(2);
+/// A failed update is kept past `UPDATE_FAILED` only while its host reported this recently.
+pub const UPDATE_HOST_RECENT: Duration = Duration::hours(24);
 /// Above the longest an update can take to answer: the wait for another update's lock plus a
 /// build (`update::LOCK_WAIT` + `update::BUILD`, 65 min), with room for the git steps.
 pub const UPDATE_UNANSWERED: Duration = Duration::minutes(75);
@@ -543,8 +545,9 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
                 continue;
             }
             let r = u.results.get(host);
-            let still_failed =
-                r.is_some_and(|r| !r.ok && r.commit.is_some() && r.commit == h.commit);
+            // A host that has not reported for a day is gone, not failing.
+            let still_failed = now - h.ts < UPDATE_HOST_RECENT
+                && r.is_some_and(|r| !r.ok && r.commit.is_some() && r.commit == h.commit);
             if age >= UPDATE_FAILED && !still_failed {
                 break;
             }
@@ -1079,6 +1082,57 @@ mod tests {
         s.updates
             .insert("r".into(), up(80, vec![result(false, "aaa")]));
         assert_eq!(findings(&s, now).len(), 1);
+    }
+
+    #[test]
+    fn a_retained_failure_ends_when_its_host_has_not_reported_for_a_day() {
+        use crate::event::UpdateResult;
+        let now = Utc::now();
+        let mut s = State::default();
+        let host = |reported_ago: Duration| crate::state::Host {
+            disk_free: 0,
+            disk_total: 0,
+            agents: 0,
+            commit: Some("aaa".into()),
+            ts: now - reported_ago,
+            started: None,
+        };
+        s.updates.insert(
+            "a".into(),
+            crate::state::Update {
+                by: "host:ops".into(),
+                since: now - Duration::hours(30),
+                host: None,
+                results: [(
+                    "mac".to_string(),
+                    UpdateResult {
+                        host: "mac".into(),
+                        ok: false,
+                        commit: Some("aaa".into()),
+                        error: Some("boom".into()),
+                    },
+                )]
+                .into(),
+            },
+        );
+        s.hosts.insert("mac".into(), host(Duration::hours(2)));
+        assert_eq!(
+            findings(&s, now).len(),
+            1,
+            "reported 2 h ago: still failing"
+        );
+        s.hosts.insert(
+            "mac".into(),
+            host(UPDATE_HOST_RECENT - Duration::minutes(1)),
+        );
+        assert_eq!(findings(&s, now).len(), 1, "just inside the day");
+        s.hosts.insert("mac".into(), host(UPDATE_HOST_RECENT));
+        assert!(findings(&s, now).is_empty(), "a day exactly: gone");
+        s.hosts.insert("mac".into(), host(Duration::hours(25)));
+        assert!(
+            findings(&s, now).is_empty(),
+            "silent for a day: gone, not failing"
+        );
     }
 
     #[test]

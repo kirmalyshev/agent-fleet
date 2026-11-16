@@ -1,6 +1,6 @@
 //! `state = fold(events)`. Pure: no I/O, no clock.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
@@ -922,16 +922,28 @@ impl State {
             }
         }
         // A failure is kept while its host still runs the commit it failed on: nothing will ask
-        // that host again until `origin/main` moves, and `doctor` reports it until then.
-        let hosts = &self.hosts;
-        self.updates.retain(|_, u| {
-            e.ts - u.since <= UPDATE_KEPT
-                || u.results.iter().any(|(h, r)| {
-                    !r.ok
-                        && r.commit.is_some()
-                        && hosts.get(h).is_some_and(|x| x.commit == r.commit)
-                })
-        });
+        // that host again until `origin/main` moves, and `doctor` reports it until then. That is
+        // the newest update the host answered, and only if that answer failed: a later success
+        // (even "already current") clears it, as in `doctor`.
+        let mut newest: BTreeMap<&str, (DateTime<Utc>, &str, &UpdateResult)> = BTreeMap::new();
+        for (id, u) in &self.updates {
+            for (h, r) in &u.results {
+                if newest.get(h.as_str()).is_none_or(|(t, _, _)| u.since > *t) {
+                    newest.insert(h, (u.since, id, r));
+                }
+            }
+        }
+        let keep: HashSet<String> = newest
+            .iter()
+            .filter(|(h, (_, _, r))| {
+                !r.ok
+                    && r.commit.is_some()
+                    && self.hosts.get(**h).is_some_and(|x| x.commit == r.commit)
+            })
+            .map(|(_, (_, id, _))| id.to_string())
+            .collect();
+        self.updates
+            .retain(|id, u| e.ts - u.since <= UPDATE_KEPT || keep.contains(id));
         self.answers
             .retain(|_, a| e.ts - a.acked.unwrap_or(a.at) <= ANSWER_KEPT);
         // The reducer has no clock: a spawn is pruned once a later event's `ts` is more than
@@ -2211,6 +2223,176 @@ mod tests {
         // It moved on: pruned.
         s.apply(&health("bbb", UPDATE_KEPT.num_seconds() + 120));
         assert!(s.updates.is_empty(), "history once it runs another commit");
+    }
+
+    #[test]
+    fn only_the_newest_failed_update_per_host_outlives_the_day() {
+        let mut s = State::default();
+        let health = |plus: i64| {
+            let mut e = ev(
+                ActorKind::Host,
+                Known::HostHealth(HostHealth {
+                    host: "h".into(),
+                    disk_free: 1,
+                    disk_total: 2,
+                    agents: 0,
+                    commit: Some("aaa".into()),
+                    stats: None,
+                }),
+            );
+            e.ts += chrono::Duration::seconds(plus);
+            e.into_event()
+        };
+        s.apply(&health(1));
+        let mut ids = Vec::new();
+        for hour in [0, 2] {
+            let mut req = by("host:h", Known::UpdateRequested(UpdateRequested::default()));
+            req.ts += chrono::Duration::hours(hour);
+            ids.push(req.id.clone());
+            s.apply(&req.into_event());
+            let mut fail = ev(
+                ActorKind::Host,
+                Known::UpdateResult(UpdateResult {
+                    host: "h".into(),
+                    ok: false,
+                    commit: Some("aaa".into()),
+                    error: None,
+                }),
+            )
+            .re(&ids[ids.len() - 1]);
+            fail.ts += chrono::Duration::hours(hour) + chrono::Duration::seconds(1);
+            s.apply(&fail.into_event());
+        }
+        // 23 h after the first: both fit the day.
+        s.apply(&health(23 * 3600));
+        assert_eq!(s.updates.len(), 2);
+        // 25 h after the first: past the day and not the newest, so gone; the second stays.
+        s.apply(&health(25 * 3600));
+        assert_eq!(s.updates.keys().collect::<Vec<_>>(), [&ids[1]]);
+        // 30 h after the first, 28 h after the second: kept as the newest failure on aaa.
+        s.apply(&health(30 * 3600));
+        assert_eq!(s.updates.keys().collect::<Vec<_>>(), [&ids[1]]);
+    }
+
+    #[test]
+    fn the_newest_failure_is_kept_per_host_and_only_one_on_the_hosts_current_commit() {
+        let trigger = ev(
+            ActorKind::Host,
+            Known::HostHealth(HostHealth {
+                host: "other".into(),
+                disk_free: 1,
+                disk_total: 2,
+                agents: 0,
+                commit: None,
+                stats: None,
+            }),
+        )
+        .into_event();
+        let now = trigger.ts;
+        let host = |commit: &str| Host {
+            disk_free: 0,
+            disk_total: 0,
+            agents: 0,
+            commit: Some(commit.into()),
+            ts: now,
+            started: None,
+        };
+        let res = |h: &str, ok: bool, commit: Option<&str>| {
+            (
+                h.to_string(),
+                UpdateResult {
+                    host: h.into(),
+                    ok,
+                    commit: commit.map(String::from),
+                    error: None,
+                },
+            )
+        };
+        let up = |hours: i64, results: Vec<(String, UpdateResult)>| Update {
+            by: "host:x".into(),
+            since: now - chrono::Duration::hours(hours),
+            host: None,
+            results: results.into_iter().collect(),
+        };
+        let mut s = State::default();
+        s.hosts.insert("a".into(), host("aaa"));
+        s.hosts.insert("b".into(), host("bbb"));
+        // Each host's newest failure on its own commit survives; each older one goes.
+        s.updates
+            .insert("a-old".into(), up(60, vec![res("a", false, Some("aaa"))]));
+        s.updates
+            .insert("a-new".into(), up(40, vec![res("a", false, Some("aaa"))]));
+        s.updates
+            .insert("b-old".into(), up(70, vec![res("b", false, Some("bbb"))]));
+        s.updates
+            .insert("b-new".into(), up(50, vec![res("b", false, Some("bbb"))]));
+        // One update failing on both hosts stays while either needs it.
+        s.updates.insert(
+            "both".into(),
+            up(
+                30,
+                vec![res("a", false, Some("aaa")), res("b", false, Some("bbb"))],
+            ),
+        );
+        // A newer one that failed on another commit, or succeeded, does not displace the
+        // newest failure on the commit the host runs.
+        s.updates.insert(
+            "a-elsewhere".into(),
+            up(26, vec![res("a", false, Some("zzz"))]),
+        );
+        s.updates
+            .insert("a-ok".into(), up(25, vec![res("a", true, Some("aaa"))]));
+        s.updates.insert("fresh".into(), up(1, vec![]));
+        s.apply(&trigger);
+        let mut left: Vec<&str> = s.updates.keys().map(String::as_str).collect();
+        left.sort();
+        assert_eq!(left, ["both", "fresh"], "{left:?}");
+    }
+
+    #[test]
+    fn a_later_success_ends_the_retention_of_an_older_failure() {
+        let trigger = ev(
+            ActorKind::Host,
+            Known::HostHealth(HostHealth {
+                host: "a".into(),
+                disk_free: 1,
+                disk_total: 2,
+                agents: 0,
+                commit: Some("aaa".into()),
+                stats: None,
+            }),
+        )
+        .into_event();
+        let now = trigger.ts;
+        let answer = |hours: i64, ok: bool| Update {
+            by: "host:x".into(),
+            since: now - chrono::Duration::hours(hours),
+            host: None,
+            results: [(
+                "a".to_string(),
+                UpdateResult {
+                    host: "a".into(),
+                    ok,
+                    commit: Some("aaa".into()),
+                    error: None,
+                },
+            )]
+            .into(),
+        };
+        let mut s = State::default();
+        s.updates.insert("failed".into(), answer(40, false));
+        s.updates.insert("current".into(), answer(30, true));
+        s.apply(&trigger);
+        assert!(
+            s.updates.is_empty(),
+            "cleared by the later success: {:?}",
+            s.updates.keys()
+        );
+        // The other way round, the failure is the newest answer and stays.
+        s.updates.insert("current".into(), answer(40, true));
+        s.updates.insert("failed".into(), answer(30, false));
+        s.apply(&trigger);
+        assert_eq!(s.updates.keys().collect::<Vec<_>>(), ["failed"]);
     }
 
     #[test]
