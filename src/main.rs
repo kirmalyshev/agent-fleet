@@ -1090,16 +1090,21 @@ async fn main() -> Result<()> {
             };
             // The caller's worktree is the one the fleet assigned at spawn (`spawn.result`), or, for
             // a hand-started agent, where its host first saw it; never its pane's live cwd, which
-            // follows a `cd`. No record fails closed.
+            // follows a `cd`; and never a main checkout. No record fails closed.
             let homes = match (&state, ctx.me().await) {
                 (Some(s), Ok(a)) => {
-                    let trees: Vec<_> = s
+                    let here: Vec<_> = s
                         .worktrees
                         .values()
                         .filter(|w| w.state.host == host)
+                        .collect();
+                    let trees: Vec<_> = here.iter().map(|w| w.state.path.clone()).collect();
+                    let mains: Vec<_> = here
+                        .iter()
+                        .filter(|w| w.state.path == w.state.repo)
                         .map(|w| w.state.path.clone())
                         .collect();
-                    kill::homes(&a.id, &s.assigned_worktrees(&host), &trees)
+                    kill::homes(&a.id, &s.assigned_worktrees(&host), &trees, &mains)
                 }
                 _ => Default::default(),
             };

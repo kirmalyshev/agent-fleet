@@ -183,14 +183,23 @@ fn home_in<'a>(cwd: &str, worktrees: &'a [String]) -> Option<&'a String> {
         .max_by_key(|w| w.len())
 }
 
-/// `agents` are (id, assigned worktree) on this host; `worktrees` the paths the fleet knows here.
-pub fn homes(me: &str, agents: &[(String, Option<String>)], worktrees: &[String]) -> Homes {
+/// `agents` are (id, assigned worktree) on this host; `worktrees` the paths the fleet knows here,
+/// `mains` those of them that are a repository's main checkout. A main checkout is never the
+/// caller's root: its processes may be the human's (as in `doctor::killable`). It still counts
+/// in `others`, which only ever refuses more.
+pub fn homes(
+    me: &str,
+    agents: &[(String, Option<String>)],
+    worktrees: &[String],
+    mains: &[String],
+) -> Homes {
     let home = |cwd: &Option<String>| cwd.as_deref().and_then(|c| home_in(c, worktrees)).cloned();
     Homes {
         mine: agents
             .iter()
             .find(|(id, _)| id == me)
-            .and_then(|(_, c)| home(c)),
+            .and_then(|(_, c)| home(c))
+            .filter(|w| !mains.contains(w)),
         others: agents
             .iter()
             .filter(|(id, _)| id != me)
@@ -721,7 +730,7 @@ mod tests {
             ("a:blank".into(), None),
         ];
         assert_eq!(
-            homes("a:me", &agents, &wts),
+            homes("a:me", &agents, &wts, &[]),
             Homes {
                 mine: Some("/w/mine".into()),
                 others: vec!["/w/other".into()]
@@ -729,20 +738,74 @@ mod tests {
             "the longest recorded worktree holds the cwd"
         );
         assert_eq!(
-            homes("a:blank", &agents, &wts).mine,
+            homes("a:blank", &agents, &wts, &[]).mine,
             None,
             "no cwd recorded"
         );
         assert_eq!(
-            homes("a:ghost", &agents, &wts).mine,
+            homes("a:ghost", &agents, &wts, &[]).mine,
             None,
             "not an agent here"
         );
         assert_eq!(
-            homes("a:me", &agents, &[]).mine,
+            homes("a:me", &agents, &[], &[]).mine,
             None,
             "no worktree recorded"
         );
+    }
+
+    #[test]
+    fn a_main_checkout_is_never_the_callers_root() {
+        let ag = |id: &str, c: &str| (id.to_string(), Some(c.to_string()));
+        // `/r` and `/s` are main checkouts (path == repo); `/r-wt/*` are linked worktrees of `/r`.
+        let wts: Vec<String> = ["/r", "/s", "/r-wt/hand", "/r-wt/spawned"]
+            .map(String::from)
+            .into();
+        let mains: Vec<String> = ["/r", "/s"].map(String::from).into();
+        let agents = [
+            ag("a:main", "/r/web"),         // hand-started, first seen in a main checkout
+            ag("a:hand", "/r-wt/hand/web"), // hand-started, first seen in a linked worktree
+            ag("a:spawned", "/r-wt/spawned"), // spawn result names a linked worktree
+            ag("a:spawned-main", "/s"),     // spawn result names a main checkout
+        ];
+        let h = |me| homes(me, &agents, &wts, &mains);
+        assert_eq!(h("a:main").mine, None, "first seen in a main checkout");
+        assert_eq!(h("a:hand").mine.as_deref(), Some("/r-wt/hand"));
+        assert_eq!(h("a:spawned").mine.as_deref(), Some("/r-wt/spawned"));
+        assert_eq!(
+            h("a:spawned-main").mine,
+            None,
+            "spawned into a main checkout"
+        );
+        assert!(
+            h("a:hand").others.contains(&"/r".to_string()),
+            "a main checkout still protects its orphans from other agents"
+        );
+
+        let mut t = fleet();
+        t.insert(
+            700,
+            Proc {
+                ppid: 1,
+                name: "bun".into(),
+            },
+        );
+        t.insert(
+            701,
+            Proc {
+                ppid: 1,
+                name: "bun".into(),
+            },
+        );
+        let cwd = |p: u32| match p {
+            700 => Some("/r/web".to_string()),
+            _ => Some("/r-wt/hand/web".to_string()),
+        };
+        let go = |pid, me| judge_in(&t, ME, pid, |_| false, &h(me), &cwd);
+        let main = go(700, "a:main").unwrap_err();
+        assert!(main.contains("records no worktree for you"), "{main}");
+        assert!(go(700, "a:hand").is_err(), "not in the caller's worktree");
+        assert_eq!(go(701, "a:hand"), Ok(()), "a linked worktree still works");
     }
 
     #[test]
