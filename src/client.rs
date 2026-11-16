@@ -100,6 +100,10 @@ impl Paths {
     pub fn token(&self) -> PathBuf {
         self.dir.join("token")
     }
+    /// The hub's table of scoped tokens (`agent-fleet mint-token`).
+    pub fn hub_tokens(&self) -> PathBuf {
+        self.dir.join("hub-tokens")
+    }
 }
 
 pub fn read_token(path: &Path) -> Result<String> {
@@ -119,18 +123,25 @@ pub fn read_token(path: &Path) -> Result<String> {
 /// The hub's token file, created with 32 random bytes and mode 0600 on first start.
 pub fn read_or_create_token(path: &Path) -> Result<String> {
     if !path.exists() {
-        let mut bytes = [0u8; 32];
-        File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?
-            .write_all(hex.as_bytes())?;
+        write_new_token(path)?;
         eprintln!("agent-fleet hub: wrote a new token to {}", path.display());
     }
     read_token(path)
+}
+
+/// 32 random bytes as hex, in a new file of mode 0600; never overwrites one.
+pub fn write_new_token(path: &Path) -> Result<String> {
+    let mut bytes = [0u8; 32];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))?
+        .write_all(hex.as_bytes())?;
+    Ok(hex)
 }
 
 pub struct Client {
