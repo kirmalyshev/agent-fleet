@@ -6,8 +6,12 @@
 #   ./dev clean            what clean would retire, stop and delete (a dry run)
 #   ./dev clean --execute  do it
 #
-# ls and clean cover only this repository; `agent-fleet dev ls|clean` covers every connected one.
+# ls and clean cover only this repository (its `origin`, so take no --repo);
+# `agent-fleet dev ls|clean` covers every connected one.
 set -eu
-[ $# -gt 0 ] || { sed -n '2,9s/^# \{0,1\}//p' "$0"; exit 1; }
-case $1 in ls | clean) set -- "$@" --repo kirmalyshev/agent-fleet ;; esac
+[ $# -gt 0 ] || { sed -n '2,10s/^# \{0,1\}//p' "$0"; exit 1; }
+case $1 in ls | clean)
+  origin=$(git -C "$(dirname "$0")" remote get-url origin)
+  set -- "$@" --repo "$(printf %s "$origin" | sed -E 's#(\.git)?/?$##; s#.*[:/]([^/:]+/[^/:]+)$#\1#')"
+esac
 exec cargo run -q --manifest-path "$(dirname "$0")/Cargo.toml" -- dev "$@"
