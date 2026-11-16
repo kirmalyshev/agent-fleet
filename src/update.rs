@@ -110,10 +110,12 @@ pub(crate) async fn binary_says(exe: &Path) -> Result<String> {
 /// running (`running`, full): a rollback, which a hub does not follow. Judged by git in `clone`;
 /// when that cannot tell (no clone, an unknown commit), it is not a rollback.
 pub(crate) async fn is_rollback(clone: &Path, running: Option<&str>, says: &str) -> bool {
-    let (Some(running), Some(open)) = (running, says.rfind('(')) else {
+    // `--version` prints `agent-fleet <version> <commit>`; the commit is the last word.
+    let (Some(running), Some(last)) = (running, says.split_whitespace().last()) else {
         return false;
     };
-    let new: String = says[open + 1..]
+    let new: String = last
+        .trim_start_matches('(')
         .chars()
         .take_while(char::is_ascii_hexdigit)
         .collect();
@@ -1834,7 +1836,7 @@ chmod +x "$root/bin/agent-fleet"
         let old = sh(&clone, &["rev-parse", "HEAD"]);
         sh(&clone, &["commit", "-q", "--allow-empty", "-m", "two"]);
         let new = sh(&clone, &["rev-parse", "HEAD"]);
-        let says = |c: &str| format!("agent-fleet 0.1.0 ({})", &c[..7]);
+        let says = |c: &str| format!("agent-fleet 0.1.0 {c}");
         let rb = |running: Option<&str>, says: &str| {
             let (clone, running, says) =
                 (clone.clone(), running.map(String::from), says.to_string());
