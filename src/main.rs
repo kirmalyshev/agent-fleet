@@ -1,5 +1,6 @@
 mod bench;
 mod client;
+mod dev;
 mod doctor;
 mod event;
 mod host;
@@ -137,6 +138,12 @@ enum Cmd {
     Repo {
         #[command(subcommand)]
         cmd: RepoCmd,
+    },
+    /// Per-worktree dev environments from the repository's `.agent-fleet/dev.toml`: each worktree
+    /// gets a slot with its own ports and values, runs its own services, and shares the infra.
+    Dev {
+        #[command(subcommand)]
+        cmd: dev::Cmd,
     },
     /// The fleet on one screen, live: agents, worktrees, tasks, findings, resources, asks; `:` runs
     /// any command from it.
@@ -911,13 +918,16 @@ async fn main() -> Result<()> {
     if let Cmd::Init | Cmd::Repo { .. } = &cli.cmd {
         return machine_config(&cli.cmd);
     }
+    if let Cmd::Dev { cmd } = &cli.cmd {
+        return dev::run(cmd).await;
+    }
     let ctx = Ctx {
         paths: Paths::from_env(&cli.instance)?,
         cli,
     };
     let now = Utc::now();
     match &ctx.cli.cmd {
-        Cmd::Api { .. } | Cmd::Init | Cmd::Repo { .. } => unreachable!(),
+        Cmd::Api { .. } | Cmd::Init | Cmd::Repo { .. } | Cmd::Dev { .. } => unreachable!(),
         Cmd::Hub { listen, db, check } => {
             if *check {
                 let db = db.clone().unwrap_or_else(|| ctx.paths.hub_db());

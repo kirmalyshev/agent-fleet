@@ -93,6 +93,20 @@ skills (`.claude/skills`, `.codex/skills`) the same way. A repository with its o
 Try a route without starting anything: `agent-fleet spawn owner/repo#123 --dry-run`. The
 keys are explained in [docs/fleet.example.toml](docs/fleet.example.toml).
 
+## Per-worktree dev environments
+
+A repository with an `.agent-fleet/dev.toml` gets a dev environment per worktree: each worktree
+has a slot with its own ports and values, its own services, and the shared infra.
+
+```sh
+agent-fleet dev up --api --web   # infra, then the services; waits for health, prints URLs
+agent-fleet dev status           # running, healthy, env changed since start
+agent-fleet dev logs api
+agent-fleet dev down             # this worktree's services only; --release frees the slot
+```
+
+The file format, the commands and how slots are shared are in [docs/DEV.md](docs/DEV.md).
+
 ## Quick start
 
 On one machine, with herdr running:
@@ -315,6 +329,7 @@ Flags or environment:
 | `AGENT_FLEET_HOST` | `--host-name` | This machine's name in ids (default the hostname). |
 | `AGENT_FLEET_CONFIG_DIR` | | Where the machine's `fleet.toml` and `brief.md` live. |
 | `AGENT_FLEET_GH` | | The `gh` binary to run. |
+| `AGENT_FLEET_DEV_SHARED` | | Where `dev` publishes each user's slots (default `/var/tmp/agent-fleet-dev`). |
 
 The default data directory is the platform's (`~/.local/share/agent-fleet` on Linux).
 
@@ -343,6 +358,7 @@ From `agent-fleet --help`; every command has its own `--help`.
 | `instances` | The agent-fleet instances on this machine and the hub each one uses |
 | `init` | Write this machine's fleet.toml and brief.md into the user config dir (`AGENT_FLEET_CONFIG_DIR` overrides it): commented templates with a profile for each agent program on PATH and one default rule. Never overwrites an existing file. Lists the user-level Claude and Codex skills that drive terminals (herdr, tmux, cmux) |
 | `repo` | Connect a repository to the fleet on this machine: `add` records its checkout in the machine's fleet.toml, `ls` lists, `rm` disconnects. The host picks changes up without a restart |
+| `dev` | Per-worktree dev environments from the repository's `.agent-fleet/dev.toml`: each worktree gets a slot with its own ports and values, runs its own services, and shares the infra |
 | `tui` | The fleet on one screen, live: agents, worktrees, tasks, findings, resources, asks; `:` runs any command from it |
 | `task` | Tasks: `add` claims (exclusive), `done` finishes, `rm` cancels or releases |
 | `dep` | Dependencies between tasks: <task> is blocked by <on> |
