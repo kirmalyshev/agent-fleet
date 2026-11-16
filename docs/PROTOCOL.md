@@ -724,12 +724,17 @@ replaced (a new device or inode at its path). The same new file must be seen on 
   hub was built from). An older or unrelated build (a rollback), a commit git does not know, no
   clone to ask, or a hub that does not know its own commit: **not followed**, unknown means no;
 - `<binary> hub --check` (the hub's own arguments, plus `--check`) exits 0: it opens the log
-  read-only, folds it, and fails on an event this binary cannot read, the failure that would
-  stop a new hub from starting and leave none. Nothing is written, and a missing log is not
-  created.
+  read-only and folds it, and parses the token table, the two things a new hub does before it
+  listens that can stop it from starting and leave none (an event this binary cannot read, a
+  table line it rejects). Nothing is written, and a missing log is not created.
 
-A replacement that fails any of them is not followed: the hub keeps running, logs why once, and
-looks again only when the file is replaced again (restart the hub by hand to run it anyway).
+A replacement that fails any of them is not followed: the hub keeps running and logs why. When
+the failure is definite (an older or unrelated build, a log or table the binary cannot read, a
+line with no commit) it looks again only when the file is replaced again (restart the hub by
+hand to run it anyway). When nothing was proved (the binary or git did not answer in time, git is
+missing, a commit it has not fetched) it asks again every minute and logs when the reason
+changes. The file is looked at once more after the checks, and if it was replaced meanwhile the
+new one is checked instead.
 Otherwise it waits for the request it is serving to finish and replaces its process with the new
 binary, with the same arguments and environment (`exec`: the same pid, so a supervisor sees no
 exit, and a hub started by hand needs none). If the exec fails it exits with status 75, for a

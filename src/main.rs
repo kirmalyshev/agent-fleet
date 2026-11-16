@@ -796,7 +796,7 @@ async fn main() -> Result<()> {
         Cmd::Hub { listen, db, check } => {
             if *check {
                 let db = db.clone().unwrap_or_else(|| ctx.paths.hub_db());
-                println!("ok: {} events", hub::check(&db)?);
+                println!("ok: {} events", hub::check(&db, &ctx.paths.hub_tokens())?);
                 return Ok(());
             }
             let token_file = ctx
