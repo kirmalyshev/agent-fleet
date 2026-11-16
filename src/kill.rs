@@ -1,5 +1,5 @@
 //! `agent-fleet kill` and the Bash hook that sends agents to it. A process is killed only when it
-//! is the caller's own or an orphan doctor proved; never an agent, a multiplexer pane, the fleet's
+//! is the caller's own, an orphan doctor proved, or a process the watch tick found hung; never an agent, a multiplexer pane, the fleet's
 //! own daemons, or anything above one of them.
 
 use std::collections::HashMap;
@@ -140,12 +140,13 @@ fn protected(t: &Table, me: u32, pid: u32) -> Option<String> {
         })
 }
 
-/// Whether `me` may signal `pid`. `orphan` asks whether doctor proved `pid` an orphan.
+/// Whether `me` may signal `pid`. `proved` asks whether doctor proved `pid` an orphan or the
+/// watch tick found it hung — the one proof that reaches into another agent's tree.
 pub fn judge(
     t: &Table,
     me: u32,
     pid: u32,
-    orphan: impl FnOnce() -> bool,
+    proved: impl Fn() -> bool,
 ) -> std::result::Result<(), String> {
     if !t.contains_key(&pid) {
         return Err(format!("pid {pid}: no such process"));
@@ -158,13 +159,14 @@ pub fn judge(
     let shell = parent(t, me).filter(|_| mine.is_none());
     match agent_of(t, pid) {
         Some(a) if Some(a) == mine => Ok(()),
+        Some(_) if proved() => Ok(()),
         Some(a) => Err(format!(
             "pid {pid} ({}) belongs to another agent's process tree: {} {a}",
             name(t, pid),
             name(t, a)
         )),
         None if shell.is_some_and(|sh| ancestors(t, pid).contains(&sh)) => Ok(()),
-        None if orphan() => Ok(()),
+        None if proved() => Ok(()),
         None => Err(format!(
             "pid {pid} ({}) is not yours: no process of yours started it and doctor has not \
              proved it an orphan",
@@ -473,7 +475,7 @@ pub fn agent_start(line: &str, in_herdr: bool) -> Option<String> {
 pub const HOOK_REFUSAL: &str = "agent-fleet: raw kill, pkill and killall are blocked for fleet agents. \
 Use `agent-fleet kill <pid>...` (find pids with pgrep): it refuses agents, their panes and \
 everything above them, your own ancestors and other agents' processes, and kills your own \
-processes and orphans `agent-fleet doctor` proved, TERM then KILL. `kill -0` passes.";
+processes and the orphans and hung processes `agent-fleet doctor` lists, TERM then KILL. `kill -0` passes.";
 
 pub const UNMANAGED_REFUSAL: &str = "agent-fleet: every agent runs in herdr. Spawn one with \
 `agent-fleet spawn <owner/repo>#<issue>`, or start it in a pane with \
@@ -587,7 +589,12 @@ mod tests {
         let t = fleet();
         assert_eq!(judge(&t, ME, 106, || false), Ok(()));
         assert_eq!(judge(&t, ME, 107, || false), Ok(()));
-        let other = judge(&t, ME, 203, || true).unwrap_err();
+        let other = judge(&t, ME, 203, || false).unwrap_err();
+        assert_eq!(
+            judge(&t, ME, 203, || true),
+            Ok(()),
+            "doctor's hung verdict is proof inside another agent's tree"
+        );
         assert!(
             other.contains("another agent's process tree: devin-cli 202"),
             "{other}"

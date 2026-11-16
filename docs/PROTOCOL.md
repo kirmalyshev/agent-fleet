@@ -441,7 +441,7 @@ refuses, killing nothing, when any pid is:
 - inside another agent's process tree.
 
 It kills the caller's own processes (its agent's tree) and orphans `doctor` proved: processes in a deleted worktree or a `forgotten` linked worktree (never a repository's main checkout) (on Linux, still
-in that directory): TERM, then KILL after `--grace` seconds. Each refusal is logged as
+in that directory), and the pids of a `proc.hung` report on the caller's host — the one proof that reaches into another agent's tree: TERM, then KILL after `--grace` seconds. Each refusal is logged as
 `kill.refused`.
 
 `agent-fleet hook bash` is a PreToolUse hook for Claude Code (tool `Bash`) and Devin CLI (tool

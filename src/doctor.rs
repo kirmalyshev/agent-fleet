@@ -297,6 +297,12 @@ pub fn killable(
     for o in s.orphans.values().filter(|o| o.host == host) {
         out.insert(o.pid, o.cwd.clone().unwrap_or_else(|| "/".into()));
     }
+    // The watch tick's `hung` verdict is proof too: no CPU, output or working child for two ticks.
+    for h in s.hung.values().filter(|h| h.host == host) {
+        for &pid in std::iter::once(&h.pid).chain(&h.pids) {
+            out.entry(pid).or_insert_with(|| "/".into());
+        }
+    }
     out
 }
 
@@ -482,6 +488,34 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
             format!(
                 "reparented {}, {} — kill: agent-fleet kill {}",
                 o.pid, o.why, o.pid
+            ),
+        ));
+    }
+    for (key, h) in &s.hung {
+        let pids: Vec<String> = std::iter::once(h.pid)
+            .chain(h.pids.iter().copied().filter(|&p| p != h.pid))
+            .map(|p| p.to_string())
+            .collect();
+        let up = h
+            .started
+            .map(|t| format!(", up {}", ago(now, t)))
+            .unwrap_or_default();
+        out.push(finding(
+            "hung",
+            key.clone(),
+            format!(
+                "{} (pid {}{up}{}) hung {}: {} — kill: agent-fleet kill {}",
+                h.command
+                    .as_deref()
+                    .map_or("?".into(), crate::watch::short_cmd),
+                h.pid,
+                h.agent
+                    .as_deref()
+                    .map(|a| format!(", {}", crate::host::short(a)))
+                    .unwrap_or_default(),
+                h.since.map_or("?".into(), |t| ago(now, t)),
+                h.evidence.as_deref().unwrap_or("?"),
+                pids.join(" ")
             ),
         ));
     }
@@ -856,6 +890,38 @@ mod tests {
         let (mut s, now) = leftover_state(false);
         s.worktrees.values_mut().for_each(|w| w.since = now);
         assert!(findings(&s, now).is_empty(), "inside the grace");
+    }
+
+    #[test]
+    fn a_hung_process_is_a_finding_and_its_tree_is_killable() {
+        let now = Utc::now();
+        let mut s = State::default();
+        s.hung.insert(
+            "h:30".into(),
+            crate::event::ProcessHung {
+                host: "h".into(),
+                pid: 30,
+                pids: vec![30, 31],
+                agent: Some("agent:h/s/o-1".into()),
+                command: Some("bash scripts/e2e.sh".into()),
+                started: Some(now - Duration::minutes(20)),
+                evidence: Some("0% CPU, output not a file".into()),
+                since: Some(now - Duration::minutes(4)),
+            },
+        );
+        let f = findings(&s, now);
+        assert_eq!(kinds(&f), vec![("hung", "h:30")], "{f:#?}");
+        assert!(
+            f[0].detail.contains("bash scripts/e2e.sh (pid 30")
+                && f[0].detail.contains("o-1")
+                && f[0].detail.contains("0% CPU")
+                && f[0].detail.ends_with("agent-fleet kill 30 31"),
+            "{}",
+            f[0].detail
+        );
+        let k = killable(&s, now, "h");
+        assert_eq!(k.keys().copied().collect::<Vec<_>>(), vec![30, 31]);
+        assert!(killable(&s, now, "other").is_empty());
     }
 
     #[test]
