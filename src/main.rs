@@ -1,5 +1,6 @@
 mod bench;
 mod client;
+mod dev;
 mod doctor;
 mod event;
 mod host;
@@ -139,12 +140,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RepoCmd,
     },
-    /// Worktrees across the connected repositories (`repo add`), the checkouts the host reports
-    /// and the one you are in: `ls` lists them, `clean` retires those of your merged or closed PRs
-    /// and deletes finished local branches.
+    /// Per-worktree dev environments from the repository's `.agent-fleet/dev.toml` (`up`, `down`,
+    /// `status` …: each worktree gets a slot with its own ports and values, runs its own services,
+    /// and shares the infra), and the worktrees of the connected repositories (`ls`, `clean`).
     Dev {
         #[command(subcommand)]
-        cmd: DevCmd,
+        cmd: dev::Cmd,
     },
     /// The fleet on one screen, live: agents, worktrees, tasks, findings, resources, asks; `:` runs
     /// any command from it.
@@ -482,32 +483,6 @@ enum RepoCmd {
     Ls,
     /// Disconnect a repository; its checkout is left alone.
     Rm { repo: String },
-}
-
-#[derive(Subcommand)]
-enum DevCmd {
-    /// Each worktree: branch, PR, commits not in the default branch, uncommitted files, and what
-    /// `clean` would do with it.
-    Ls {
-        /// Only this `owner/repo`.
-        #[arg(long)]
-        repo: Option<String>,
-    },
-    /// What clean would do (a dry run). A branch is finished when its tip is the head of one of
-    /// your merged or closed PRs, is in the default branch, or is in `origin/<branch>`; one with
-    /// an open PR or local-only commits never is. Only a finished PR retires a worktree, and
-    /// never the main checkout, a locked one, the one you are in, one an agent works in, or one
-    /// with uncommitted files. The processes left in a worktree it retires are stopped first;
-    /// a herdr pane, an agent's processes and your own keep the worktree.
-    Clean {
-        /// Only this `owner/repo`.
-        #[arg(long)]
-        repo: Option<String>,
-        /// Stop the leftover processes (TERM, then KILL after 5 s), retire the worktrees
-        /// (`.agent-fleet/hook retire`, else `git worktree remove`) and delete the branches.
-        #[arg(long)]
-        execute: bool,
-    },
 }
 
 #[derive(Subcommand)]
@@ -945,6 +920,11 @@ async fn main() -> Result<()> {
     if let Cmd::Init | Cmd::Repo { .. } = &cli.cmd {
         return machine_config(&cli.cmd);
     }
+    if let Cmd::Dev { cmd } = &cli.cmd
+        && !matches!(cmd, dev::Cmd::Ls { .. } | dev::Cmd::Clean { .. })
+    {
+        return dev::run(cmd).await;
+    }
     let ctx = Ctx {
         paths: Paths::from_env(&cli.instance)?,
         cli,
@@ -1011,8 +991,9 @@ async fn main() -> Result<()> {
         Cmd::Tui => tui::run(&ctx).await?,
         Cmd::Dev { cmd } => {
             let (only, clean, execute) = match cmd {
-                DevCmd::Ls { repo } => (repo, false, false),
-                DevCmd::Clean { repo, execute } => (repo, true, *execute),
+                dev::Cmd::Ls { repo } => (repo, false, false),
+                dev::Cmd::Clean { repo, execute } => (repo, true, *execute),
+                _ => unreachable!("dev::run runs the rest"),
             };
             let s = match ctx.snapshot_state().await {
                 Ok((s, note)) => {
