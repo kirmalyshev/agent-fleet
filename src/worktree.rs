@@ -131,10 +131,17 @@ fn inside(cwd: &str, dir: &str) -> bool {
     cwd == dir || cwd.starts_with(&format!("{dir}/"))
 }
 
+/// `dir` with its symlinks resolved, as a process's cwd is reported (macOS's `/var` is
+/// `/private/var`); as given when it cannot be resolved.
+fn real(dir: &str) -> String {
+    std::fs::canonicalize(dir).map_or_else(|_| dir.to_string(), |p| p.to_string_lossy().into())
+}
+
 /// The processes whose cwd is in `path`: the leftovers clean stops, and the names of those it
 /// must not: a multiplexer and its panes, anything an agent program runs (`kill::AGENTS`, at any
 /// depth), and the caller and its ancestors (`mine`).
 fn leftovers(procs: &Procs, path: &str, mine: &HashSet<u32>) -> (Vec<Leftover>, Vec<String>) {
+    let path = &real(path);
     let agents: HashSet<u32> = procs
         .0
         .iter()
@@ -226,6 +233,7 @@ const GRACE: Duration = Duration::from_secs(5);
 /// signal, and a pid whose start time or cwd changed (reused) is never hit. `Err` when one
 /// survives: the worktree then stays.
 async fn stop(them: &[Leftover], dir: &str, grace: Duration) -> Result<String, String> {
+    let dir = &real(dir);
     let still = |procs: &Procs, l: &Leftover| {
         procs.0.get(&l.pid).is_some_and(|p| {
             p.started == l.started && p.cwd.as_deref().is_some_and(|c| inside(c, dir))
@@ -750,7 +758,11 @@ mod tests {
     #[tokio::test]
     async fn a_leftover_is_stopped_and_a_reused_pid_is_not_hit() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_str().unwrap().to_string();
+        // The worktree path names a symlink; the process's cwd is the resolved directory.
+        let (target, link) = (dir.path().join("real"), dir.path().join("link"));
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let path = link.to_str().unwrap().to_string();
         // Orphaned, as a leftover is: not under the agent that may be running this test.
         let out = std::process::Command::new("sh")
             .args(["-c", "sleep 60 >/dev/null 2>&1 & echo $!"])
