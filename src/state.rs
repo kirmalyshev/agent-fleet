@@ -823,6 +823,10 @@ impl State {
                     }
                 }
             }
+            // Kill proof: only the host it names may report or clear it.
+            Known::ProcessHung(d)
+                if e.actor.kind != crate::event::ActorKind::Host
+                    || e.actor.id != format!("host:{}", d.host) => {}
             Known::ProcessHung(d) => {
                 let key = format!("{}:{}", d.host, d.pid);
                 if d.evidence.is_some() {
@@ -1183,6 +1187,37 @@ mod tests {
         assert_eq!(h.pids, vec![30, 31]);
         s.apply(&hung(None));
         assert!(s.hung.is_empty());
+    }
+
+    #[test]
+    fn a_hung_report_counts_only_from_the_host_it_names() {
+        let body = |host: &str| {
+            Known::ProcessHung(ProcessHung {
+                host: host.into(),
+                pid: 30,
+                pids: vec![30],
+                agent: None,
+                command: None,
+                started: None,
+                evidence: Some("0% CPU".into()),
+                since: None,
+                checked: None,
+            })
+        };
+        let mut s = State::default();
+        s.apply(&ev(ActorKind::Agent, body("h")).into_event());
+        assert!(s.hung.is_empty(), "an agent cannot report a process hung");
+        s.apply(&ev(ActorKind::Host, body("other")).into_event());
+        assert!(s.hung.is_empty(), "host:h cannot report for another host");
+        assert!(crate::doctor::hung_pids(&s, "h", Utc::now()).is_empty());
+        s.apply(&ev(ActorKind::Host, body("h")).into_event());
+        assert_eq!(s.hung.len(), 1);
+        let mut clear = ev(ActorKind::Agent, body("h"));
+        if let Known::ProcessHung(d) = &mut clear.body {
+            d.evidence = None;
+        }
+        s.apply(&clear.into_event());
+        assert_eq!(s.hung.len(), 1, "nor clear one");
     }
 
     #[test]

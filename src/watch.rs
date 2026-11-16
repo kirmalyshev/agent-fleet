@@ -222,7 +222,7 @@ impl Tick<'_> {
         let p = &self.now.0[&pid];
         let bootstatus = p.args.as_deref().is_some_and(|a| a.contains("bootstatus"));
         (crate::scan::device_tool(p) && !bootstatus)
-            || self.used(pid) * 100 > self.ms
+            || self.used(pid).saturating_mul(100) > self.ms
             || self.wrote(pid).is_some_and(|t| t > self.then)
             || self.kids(pid).iter().any(|&c| self.fresh(c))
     }
@@ -296,7 +296,7 @@ impl Tick<'_> {
         self.next.insert(key, streak);
         let verdict = match &self.seen.output_at {
             Some(_) if streak >= HUNG_TICKS => Verdict::Hung(Evidence {
-                cpu_pct: (self.used(pid) * 100 / self.ms) as u32,
+                cpu_pct: (self.used(pid).saturating_mul(100) / self.ms) as u32,
                 output_at: self.wrote(pid),
                 deepest: self.deepest(pid).and_then(|(_, d)| {
                     let d = &self.now.0[&d];
