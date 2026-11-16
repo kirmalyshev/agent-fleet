@@ -128,7 +128,8 @@ enum Cmd {
     Instances,
     /// Write this machine's fleet.toml and brief.md into the user config dir
     /// (`AGENT_FLEET_CONFIG_DIR` overrides it): commented templates with a profile for each agent
-    /// program on PATH and one default rule. Never overwrites an existing file.
+    /// program on PATH and one default rule. Never overwrites an existing file. Lists the
+    /// user-level Claude and Codex skills that drive terminals (herdr, tmux, cmux).
     Init,
     /// Connect a repository to the fleet on this machine: `add` records its checkout in the
     /// machine's fleet.toml, `ls` lists, `rm` disconnects. The host picks changes up without a
@@ -137,7 +138,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RepoCmd,
     },
-    /// The fleet on one screen, live: agents, worktrees, tasks, findings, and the actions on them.
+    /// The fleet on one screen, live: agents, worktrees, tasks, findings, resources, asks; `:` runs
+    /// any command from it.
     Tui,
     /// Tasks: `add` claims (exclusive), `done` finishes, `rm` cancels or releases.
     Task {
@@ -461,7 +463,8 @@ enum ApiCmd {
 enum RepoCmd {
     /// Record `<dir>`'s checkout (default: the one holding the current directory) as
     /// `<owner/repo>`'s. Refuses a directory outside a git checkout and a checkout whose
-    /// `origin` remote is another repository.
+    /// `origin` remote is another repository. Lists the checkout's Claude and Codex skills that
+    /// drive terminals (herdr, tmux, cmux).
     Add {
         /// `owner/repo`.
         repo: String,
@@ -811,6 +814,8 @@ fn machine_config(cmd: &Cmd) -> Result<()> {
                  3. Start the host: agent-fleet host --herdr-socket <socket> --session <name>\n  \
                  4. Connect a repository: agent-fleet repo add <owner/repo> [<checkout>]"
             );
+            let found = setup::terminal_skills(&setup::user_skill_dirs());
+            print!("{}", setup::skills_report(&found));
         }
         Cmd::Repo {
             cmd: RepoCmd::Add { repo, dir: co },
@@ -826,6 +831,8 @@ fn machine_config(cmd: &Cmd) -> Result<()> {
                 "already connected:"
             };
             println!("{what} {repo} {}", top.display());
+            let found = setup::terminal_skills(&setup::project_skill_dirs(&top));
+            print!("{}", setup::skills_report(&found));
         }
         Cmd::Repo { cmd: RepoCmd::Ls } => {
             for (repo, co) in setup::registered(&dir)? {

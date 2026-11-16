@@ -265,6 +265,81 @@ pub fn rm(cfg_dir: &Path, slug: &str) -> Result<()> {
     replace(&p, &new)
 }
 
+/// Words that mark a skill as one that drives terminals and other agents' panes, as herdr does.
+const TERMINAL_WORDS: [&str; 3] = ["herdr", "tmux", "cmux"];
+
+/// Each agent program's user-level skills dir: `$CLAUDE_CONFIG_DIR` or `~/.claude`, and
+/// `$CODEX_HOME` or `~/.codex`, each with `/skills`.
+pub fn user_skill_dirs() -> Vec<(&'static str, PathBuf)> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let dir = |var: &str, dot: &str| {
+        std::env::var_os(var)
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(dot)))
+    };
+    [
+        ("claude", dir("CLAUDE_CONFIG_DIR", ".claude")),
+        ("codex", dir("CODEX_HOME", ".codex")),
+    ]
+    .into_iter()
+    .filter_map(|(k, d)| Some((k, d?.join("skills"))))
+    .collect()
+}
+
+/// A checkout's project-level skills dirs.
+pub fn project_skill_dirs(checkout: &Path) -> Vec<(&'static str, PathBuf)> {
+    vec![
+        ("claude", checkout.join(".claude/skills")),
+        ("codex", checkout.join(".codex/skills")),
+    ]
+}
+
+/// The `<dir>/<skill>/SKILL.md` files that name a terminal multiplexer: (program, file, word).
+/// A dir that cannot be read has none.
+pub fn terminal_skills(
+    dirs: &[(&'static str, PathBuf)],
+) -> Vec<(&'static str, PathBuf, &'static str)> {
+    let mut out = Vec::new();
+    for (kind, dir) in dirs {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut files: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path().join("SKILL.md"))
+            .filter(|p| p.is_file())
+            .collect();
+        files.sort();
+        for f in files {
+            let Ok(text) = std::fs::read_to_string(&f) else {
+                continue;
+            };
+            if let Some(w) = TERMINAL_WORDS
+                .into_iter()
+                .find(|w| crate::spawn::has_word(&text, w))
+            {
+                out.push((*kind, f, w));
+            }
+        }
+    }
+    out
+}
+
+/// What `init` and `repo add` print about such skills: nothing when there are none.
+pub fn skills_report(found: &[(&'static str, PathBuf, &'static str)]) -> String {
+    if found.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\nSkills that drive terminals and other agents' panes:\n");
+    for (kind, f, w) in found {
+        out += &format!("  {kind:<7}{} ({w})\n", f.display());
+    }
+    out += "In a fleet, agents message each other with `agent-fleet tell` and start agents with \
+            `agent-fleet spawn`. Check that these skills do not tell an agent to type into another \
+            agent's pane or start agents by hand instead.\n";
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,5 +605,50 @@ mod tests {
                 .unwrap();
             assert_eq!(c.repos(), want);
         }
+    }
+
+    #[test]
+    fn terminal_skills_are_found_per_program_and_reported() {
+        let d = tempfile::tempdir().unwrap();
+        let skill = |root: &str, name: &str, body: &str| {
+            let s = d.path().join(root).join(name);
+            std::fs::create_dir_all(&s).unwrap();
+            std::fs::write(s.join("SKILL.md"), body).unwrap();
+        };
+        skill(
+            "claude",
+            "herdr",
+            "---\nname: herdr\n---\nControl Herdr panes.",
+        );
+        skill(
+            "claude",
+            "other",
+            "Write docs. Not herdrish, no tmuxy words.",
+        );
+        skill("codex", "mux", "Drives tmux send-keys.");
+        std::fs::write(d.path().join("claude/README"), "herdr").unwrap();
+        let dirs = vec![
+            ("claude", d.path().join("claude")),
+            ("codex", d.path().join("codex")),
+            ("codex", d.path().join("missing")),
+        ];
+        let found = terminal_skills(&dirs);
+        assert_eq!(
+            found,
+            [
+                ("claude", d.path().join("claude/herdr/SKILL.md"), "herdr"),
+                ("codex", d.path().join("codex/mux/SKILL.md"), "tmux"),
+            ]
+        );
+        let r = skills_report(&found);
+        assert!(
+            r.contains("herdr/SKILL.md (herdr)") && r.contains("agent-fleet tell"),
+            "{r}"
+        );
+        assert_eq!(skills_report(&[]), "");
+        assert_eq!(
+            project_skill_dirs(Path::new("/co"))[0].1,
+            Path::new("/co/.claude/skills")
+        );
     }
 }

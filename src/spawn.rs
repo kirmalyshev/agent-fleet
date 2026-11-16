@@ -398,7 +398,7 @@ pub fn slug_of(dir: &Path) -> Option<String> {
 }
 
 /// `word` occurs in `text` case-insensitively and not as part of a longer word.
-fn has_word(text: &str, word: &str) -> bool {
+pub(crate) fn has_word(text: &str, word: &str) -> bool {
     let (t, w) = (text.as_bytes(), word.as_bytes());
     let edge = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     if w.is_empty() || t.len() < w.len() {
