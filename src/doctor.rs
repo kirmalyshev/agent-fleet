@@ -52,7 +52,8 @@ const SHARED_BY_ALL: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Finding {
     /// `stale`, `hung`, `heavy`, `duplicate`, `forgotten`, `unpushed`, `orphan`, `breach`,
-    /// `queued`, `refused`, `role`, `quota`, `spawn`, `unmanaged`, `stalled`, `build`.
+    /// `queued`, `refused`, `role`, `quota`, `spawn`, `unmanaged`, `stalled`, `build`, `orphan-pr`
+    /// (added by `main`).
     pub kind: &'static str,
     /// The agent id or `<host>:<path>` it is about.
     pub subject: String,

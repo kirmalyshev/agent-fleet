@@ -43,6 +43,9 @@ pub struct FleetConfig {
     /// First match wins; a rule with no `match` is the default.
     #[serde(default)]
     pub rules: Vec<Rule>,
+    /// `[orphan_pr]`: which repos `doctor` looks at for PRs no live agent owns.
+    #[serde(default)]
+    pub orphan_pr: crate::orphanpr::Config,
 }
 
 fn default_session() -> String {
