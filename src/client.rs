@@ -544,6 +544,8 @@ mod tests {
                 what: format!("b{n}"),
                 owner: None,
                 unblocks_when: None,
+                pid: None,
+                started: None,
             }),
         )
         .task("task:p/1")

@@ -128,6 +128,9 @@ enum Cmd {
         /// The condition that clears it.
         #[arg(long)]
         until: Option<String>,
+        /// A local process it waits on (a lock holder): resolved once that process is gone.
+        #[arg(long)]
+        pid: Option<u32>,
     },
     /// Signal processes safely: TERM, then KILL after --grace. Refuses agents, panes, the fleet's
     /// daemons and anything above them, your own ancestors and other agents' processes; kills
@@ -965,11 +968,21 @@ async fn main() -> Result<()> {
             what,
             owner,
             until,
+            pid,
         } => {
+            let started = match pid {
+                Some(p) => match scan::Procs::read().0.get(p) {
+                    Some(proc) => proc.started,
+                    None => bail!("pid {p}: no such process"),
+                },
+                None => None,
+            };
             let body = BlockerRaised {
                 what: what.clone(),
                 owner: owner.clone(),
                 unblocks_when: until.clone(),
+                pid: *pid,
+                started,
             };
             ctx.task_event(task, Known::BlockerRaised(body)).await?;
         }

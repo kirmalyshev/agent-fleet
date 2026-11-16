@@ -550,6 +550,13 @@ pub struct BlockerRaised {
     pub owner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unblocks_when: Option<String>,
+    /// A process on the raiser's host the block waits on (a lock holder). That host resolves
+    /// the blocker once the pid is gone or no longer started at `started`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// When `pid` started, read when the blocker was raised: a reused pid started later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<DateTime<Utc>>,
 }
 
 /// Resolves the `blocker.raised` named by the envelope's `re`.

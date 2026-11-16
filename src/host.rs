@@ -944,6 +944,14 @@ impl Host {
                 .await;
             }
         }
+        for (id, pid) in gone_blockers(state, &self.cfg.host, &procs) {
+            let note = Some(format!("pid {pid} is gone"));
+            self.publish(
+                self.presence(Known::BlockerResolved(BlockerResolved { note }))
+                    .re(id),
+            )
+            .await;
+        }
         Ok(())
     }
 
@@ -1168,6 +1176,26 @@ impl Host {
             }
         }
     }
+}
+
+/// Open blockers raised on `host` whose pid is gone or now another process, as `(id, pid)`. An
+/// empty table (a platform that reads none) proves nothing.
+fn gone_blockers(s: &State, host: &str, procs: &scan::Procs) -> Vec<(String, u32)> {
+    if procs.0.is_empty() {
+        return Vec::new();
+    }
+    s.blockers
+        .iter()
+        .filter_map(|(id, b)| {
+            let pid = b.pid?;
+            // `agent:<host>/<session>/<name>` or `host:<host>`.
+            let raiser = b.by.split_once(':')?.1.split('/').next()?;
+            let gone = procs.0.get(&pid).is_none_or(
+                |p| matches!((b.started, p.started), (Some(was), Some(now)) if was != now),
+            );
+            (raiser == host && gone).then(|| (id.clone(), pid))
+        })
+        .collect()
 }
 
 pub(crate) fn short(id: &str) -> &str {
@@ -1512,6 +1540,8 @@ mod tests {
                     what: format!("b{n}"),
                     owner: None,
                     unblocks_when: None,
+                    pid: None,
+                    started: None,
                 }),
             )
             .task("task:p/1");
@@ -1536,5 +1566,58 @@ mod tests {
         let host = Host::new(cfg, client, replica);
         let _ = tokio::time::timeout(Duration::from_secs(1), host.sync_once()).await;
         assert_eq!(host.replica.lock().unwrap().len().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_blocker_whose_pid_is_gone_or_reused_is_resolved_by_its_host() {
+        let t0 = chrono::Utc::now();
+        let proc_at = |started| scan::Proc {
+            ppid: 1,
+            cpu_ms: 0,
+            rss_kb: 0,
+            name: "sim".into(),
+            cwd: None,
+            deleted: false,
+            args: None,
+            started,
+            pgid: None,
+        };
+        let procs = scan::Procs(HashMap::from([
+            (10, proc_at(Some(t0))),
+            (11, proc_at(Some(t0 + chrono::Duration::seconds(5)))),
+            (12, proc_at(None)),
+        ]));
+        let mut s = State::default();
+        for (id, by, pid) in [
+            ("alive", "agent:h/s/a", Some(10)),
+            ("reused", "agent:h/s/a", Some(11)),
+            ("unreadable", "agent:h/s/a", Some(12)),
+            ("dead", "host:h", Some(13)),
+            ("elsewhere", "agent:other/s/a", Some(13)),
+            ("no-pid", "agent:h/s/a", None),
+        ] {
+            s.blockers.insert(
+                id.into(),
+                crate::state::Blocker {
+                    task: None,
+                    what: "sim lock".into(),
+                    owner: None,
+                    unblocks_when: None,
+                    pid,
+                    started: pid.map(|_| t0),
+                    by: by.into(),
+                    since: t0,
+                },
+            );
+        }
+        let mut gone = gone_blockers(&s, "h", &procs);
+        gone.sort();
+        assert_eq!(gone, [("dead".into(), 13), ("reused".into(), 11)]);
+        let empty = scan::Procs::default();
+        assert_eq!(
+            gone_blockers(&s, "h", &empty),
+            [],
+            "no table proves nothing"
+        );
     }
 }

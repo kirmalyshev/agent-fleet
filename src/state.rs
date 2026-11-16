@@ -224,6 +224,11 @@ pub struct Blocker {
     pub what: String,
     pub owner: Option<String>,
     pub unblocks_when: Option<String>,
+    /// The process it waits on, on the raiser's host, and when that process started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<DateTime<Utc>>,
     pub by: String,
     pub since: DateTime<Utc>,
 }
@@ -700,6 +705,8 @@ impl State {
                         what: d.what.clone(),
                         owner: d.owner.clone(),
                         unblocks_when: d.unblocks_when.clone(),
+                        pid: d.pid,
+                        started: d.started,
                         by: e.actor.id.clone(),
                         since: ts,
                     },
@@ -1598,6 +1605,8 @@ mod tests {
             what: "sim".into(),
             owner: None,
             unblocks_when: None,
+            pid: None,
+            started: None,
         }));
         let bid = b.id.clone();
         s.apply(&b.into_event());

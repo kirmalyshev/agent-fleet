@@ -198,6 +198,9 @@ pub fn homes(me: &str, agents: &[(String, Option<String>)], worktrees: &[String]
     }
 }
 
+/// Why a kill of a pid that no longer exists is refused: nothing was there to kill.
+pub const GONE: &str = "no such process";
+
 /// `judge`, plus the caller's recorded worktree (`homes`) and a working-directory lookup: a dev server the
 /// agent backgrounded outlives its Bash shell and is adopted by init, so no ancestry ties it to
 /// the agent any more; an orphan whose cwd is inside `tree` still is the caller's.
@@ -210,7 +213,7 @@ pub fn judge_in(
     cwd: &dyn Fn(u32) -> Option<String>,
 ) -> std::result::Result<(), String> {
     if !t.contains_key(&pid) {
-        return Err(format!("pid {pid}: no such process"));
+        return Err(format!("pid {pid}: {GONE}"));
     }
     if let Some(why) = protected(t, me, pid) {
         return Err(why);
