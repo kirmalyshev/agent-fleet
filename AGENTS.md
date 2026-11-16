@@ -9,3 +9,5 @@
 - Before a commit: `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt`.
 - This repo is public. No hostnames, user or home paths, tokens, or private project names in
   code, docs, tests or commit messages.
+- [CONTRIBUTING.md](CONTRIBUTING.md) has the code map, the conventions, what a PR body states
+  and how CI runs. The README's command table comes from `agent-fleet --help`.

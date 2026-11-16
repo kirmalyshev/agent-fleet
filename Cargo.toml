@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "An event protocol for fleets of coding agents: one log, one fold, one binary."
+repository = "https://github.com/kirmalyshev/agent-fleet"
+readme = "README.md"
+keywords = ["agents", "ai", "coding-agents", "herdr", "event-sourcing"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1"
