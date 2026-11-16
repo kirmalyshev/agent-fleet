@@ -264,6 +264,8 @@ pub enum Known {
     AgentUnmanaged(AgentUnmanaged),
     #[serde(rename = "proc.orphaned")]
     ProcessOrphaned(ProcessOrphaned),
+    #[serde(rename = "proc.hung")]
+    ProcessHung(ProcessHung),
     #[serde(rename = "agent.stuck")]
     AgentStuck(AgentStuck),
     #[serde(rename = "agent.signal")]
@@ -633,6 +635,31 @@ pub struct AgentUnmanaged {
     pub since: Option<DateTime<Utc>>,
 }
 
+/// A process an agent started that the watch tick found hung: no CPU, no output and no
+/// working child for two ticks in a row. `pid` is the topmost hung process, `pids` it and
+/// every hung process under it. `evidence` absent clears it — it worked again or is gone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessHung {
+    pub host: String,
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pids: Vec<u32>,
+    /// The agent that started it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<DateTime<Utc>>,
+    /// CPU, the last output, the deepest descendant's command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    /// When it was first found hung.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<DateTime<Utc>>,
+}
+
 /// A process on the writer's host doctor proved an orphan: reparented to init with its
 /// device gone, or a lock's recorded owner dead. `why`/`cwd`/`since` absent clears it —
 /// the process is gone or somebody's parent chain claimed it.
@@ -790,6 +817,7 @@ impl Known {
             Self::SpawnResult(_) => "spawn.result",
             Self::AgentUnmanaged(_) => "agent.unmanaged",
             Self::ProcessOrphaned(_) => "proc.orphaned",
+            Self::ProcessHung(_) => "proc.hung",
             Self::AgentStuck(_) => "agent.stuck",
             Self::AgentSignal(_) => "agent.signal",
         }
@@ -815,6 +843,7 @@ impl Known {
             | Self::AgentQuota(_)
             | Self::AgentUnmanaged(_)
             | Self::ProcessOrphaned(_)
+            | Self::ProcessHung(_)
             | Self::AgentStuck(_) => &[Host],
             Self::MsgDelivered(_) | Self::SpawnResult(_) => &[Host],
             Self::AskRaised(_) | Self::Handoff(_) | Self::AgentSignal(_) => &[Agent],
