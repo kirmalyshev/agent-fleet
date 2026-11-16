@@ -1472,6 +1472,8 @@ mod tests {
                     files: vec![],
                     last_commit: now,
                     in_main: false,
+                    herdr: false,
+                    dirty_submodules: 0,
                 },
                 since: now,
             },

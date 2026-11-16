@@ -625,20 +625,27 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
         });
         let unsaved = st.unpushed > 0 || st.dirty > 0;
         let unchanged = now - w.since;
+        let submodules = match st.dirty_submodules {
+            0 => String::new(),
+            n if n == st.dirty => " (only submodule pointers moved)".into(),
+            n => format!(" ({n} of them submodule pointers)"),
+        };
+        // Only a worktree herdr or spawn made is the fleet's to call forgotten: a main checkout
+        // or a scratch worktree an agent once stood in is somebody's own.
         if !occupied.contains_key(key) {
-            if unsaved && unchanged >= UNPUSHED {
+            if st.herdr && unsaved && unchanged >= UNPUSHED {
                 out.push(finding(
                     "forgotten",
                     key,
                     format!(
-                        "no agent for {}, {} unpushed commits, {} dirty files{running}",
+                        "no agent for {}, {} unpushed commits, {} dirty files{submodules}{running}",
                         ago(now, w.since),
                         st.unpushed,
                         st.dirty
                     ),
                 ));
             } else if !unsaved
-                && st.path != st.repo
+                && st.herdr
                 && (now - st.last_commit >= ABANDONED
                     || (!running.is_empty() && unchanged >= LEFTOVER))
             {
@@ -866,9 +873,11 @@ mod tests {
                 head: "abc".into(),
                 unpushed,
                 dirty,
+                dirty_submodules: 0,
                 files: files.iter().map(|f| f.to_string()).collect(),
                 last_commit: since,
                 in_main: false,
+                herdr: true,
             },
             since,
         }
@@ -1451,15 +1460,47 @@ mod tests {
     }
 
     #[test]
-    fn a_main_checkout_with_dirty_files_is_found_but_not_killable() {
-        let (mut s, now) = leftover_state(false);
-        let w = s.worktrees.values_mut().next().unwrap();
-        w.state.repo = w.state.path.clone();
-        w.state.dirty = 2;
-        w.since = now - Duration::hours(2);
+    fn only_a_worktree_herdr_made_is_forgotten() {
+        // A main checkout, or a linked worktree outside herdr's directory (a scratchpad): the
+        // host reports neither as herdr's, dirty or clean, with processes or without.
+        for main in [true, false] {
+            for dirty in [2, 0] {
+                let (mut s, now) = leftover_state(false);
+                let w = s.worktrees.values_mut().next().unwrap();
+                if main {
+                    w.state.repo = w.state.path.clone();
+                }
+                w.state.herdr = false;
+                w.state.dirty = dirty;
+                w.state.last_commit = now - Duration::days(5);
+                w.since = now - Duration::hours(2);
+                let f = findings(&s, now);
+                assert!(f.is_empty(), "main {main}, dirty {dirty}: {f:#?}");
+                assert!(killable(&s, now, "h").is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn a_worktree_dirty_only_by_submodule_pointers_says_so() {
+        let now = Utc::now();
+        let mut s = State::default();
+        let mut w = tree("/w/sub", &[], 0, 1, now - Duration::hours(2));
+        w.state.dirty_submodules = 1;
+        s.worktrees.insert(worktree_key("h", "/w/sub"), w);
+        let mut w = tree("/w/mix", &[], 0, 3, now - Duration::hours(2));
+        w.state.dirty_submodules = 1;
+        s.worktrees.insert(worktree_key("h", "/w/mix"), w);
         let f = findings(&s, now);
-        assert_eq!(kinds(&f), vec![("forgotten", "h:/w/fresh")], "{f:#?}");
-        assert!(killable(&s, now, "h").is_empty());
+        let detail = |p: &str| &f.iter().find(|f| f.subject == p).unwrap().detail;
+        assert!(
+            detail("h:/w/sub").contains("1 dirty files (only submodule pointers moved)"),
+            "{f:#?}"
+        );
+        assert!(
+            detail("h:/w/mix").contains("3 dirty files (1 of them submodule pointers)"),
+            "{f:#?}"
+        );
     }
 
     #[test]
