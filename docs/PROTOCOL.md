@@ -310,7 +310,7 @@ how many worktrees may hold any of a set of resources at once.
 | `role` | an agent's declared lead is down, the lead's level is not above its own, or a second root coordinator is up |
 | `quota` | a program's quota is exhausted, or a window ≥ 90% used resets in the future |
 | `stalled` | an agent idle or blocked for 15 min after it last worked |
-| `update` | a host's latest self-update (within the last hour) that it answered `ok:false`, or that a live host (`host.health` in the last 3 min) has not answered 10 min after it was asked; a later success clears it. Subject `host:<host>`, with who asked and the error |
+| `update` | a host's latest self-update (within the last 2 hours) that it answered `ok:false`, or that a live host (`host.health` in the last 3 min) has not answered 40 min after it was asked (an answer comes after the build, up to 30 min); a later success clears it. Subject `host:<host>`, with who asked and the error |
 | `build` | hosts that sent `host.health` in the last 10 min report different commits (or one reports none); each such host, with the others' commits |
 
 `hung` and `stalled` are also pushed, not only read: the host writes one `msg.sent` per episode
@@ -668,7 +668,7 @@ The update is hardened:
 - **Time limits.** `git pull` 2 min, other git 1 min, `cargo install` 30 min; the process group
   is killed on a timeout and the update answers with the error. No command reads stdin, and git
   never prompts (`GIT_TERMINAL_PROMPT=0` for every command it runs; ssh `BatchMode` for git, unless
-  `GIT_SSH_COMMAND` or the clone's `core.sshCommand` is set).
+  `GIT_SSH_COMMAND`, `GIT_SSH` or the clone's `core.sshCommand` is set).
 - **One at a time.** An `flock` in the clone's git dir, taken before the checks and held through
   pull and build: a second update in the same clone (two hosts on one machine) waits for the
   first (up to 35 minutes), then runs; it is never raced, and a wait that times out answers with

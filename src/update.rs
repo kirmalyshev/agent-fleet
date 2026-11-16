@@ -86,7 +86,7 @@ async fn limited(mut c: tokio::process::Command, limit: Duration) -> Result<std:
 }
 
 /// Whether git should be told `ssh -o BatchMode=yes`: not when the operator chose an ssh command
-/// (`GIT_SSH_COMMAND`, or `core.sshCommand` in the clone), which BatchMode would override. Only
+/// (`GIT_SSH_COMMAND` or `GIT_SSH`, or `core.sshCommand` in the clone), which BatchMode would override. Only
 /// git's "not set" (exit 1) allows it: any other failure leaves the operator's setting alone.
 async fn wants_batch_ssh(clone: &Path, env_set: bool) -> bool {
     if env_set {
@@ -112,7 +112,10 @@ async fn wants_batch_ssh(clone: &Path, env_set: bool) -> bool {
 async fn git_command(clone: &Path, args: &[&str]) -> tokio::process::Command {
     let mut c = tokio::process::Command::new("git");
     c.arg("-C").arg(clone).args(args);
-    if wants_batch_ssh(clone, std::env::var_os("GIT_SSH_COMMAND").is_some()).await {
+    // git takes its ssh from GIT_SSH_COMMAND, then core.sshCommand, then GIT_SSH.
+    let chosen =
+        std::env::var_os("GIT_SSH_COMMAND").is_some() || std::env::var_os("GIT_SSH").is_some();
+    if wants_batch_ssh(clone, chosen).await {
         c.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
     }
     c

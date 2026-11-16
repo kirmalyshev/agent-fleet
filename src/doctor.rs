@@ -35,10 +35,11 @@ pub const SPAWN_UNANSWERED: Duration = Duration::minutes(5);
 pub const STALLED: Duration = Duration::minutes(crate::spawn::STALL_MIN as i64);
 /// A failed spawn stays a finding this long.
 pub const SPAWN_FAILED: Duration = Duration::hours(1);
-/// A host's latest self-update that failed, or that a live host left unanswered this long, is
-/// a finding for this long after the request.
-pub const UPDATE_FAILED: Duration = Duration::hours(1);
-pub const UPDATE_UNANSWERED: Duration = Duration::minutes(10);
+/// A host's latest self-update that failed is a finding for this long after the request; one a
+/// live host left unanswered is a finding from `UPDATE_UNANSWERED` after it.
+pub const UPDATE_FAILED: Duration = Duration::hours(2);
+/// More than a build takes (`update::BUILD`, 30 min): the answer comes after the build.
+pub const UPDATE_UNANSWERED: Duration = Duration::minutes(40);
 /// A `proc.hung` report confirmed this recently is kill proof: three watch ticks.
 pub const HUNG_FRESH: Duration = Duration::minutes(6);
 /// A host whose `host.health` is older than this is not compared for `build`.
@@ -889,13 +890,13 @@ mod tests {
         s.updates.clear();
         s.updates.insert("c".into(), up(3, Some("mac"), vec![]));
         assert!(findings(&s, now).is_empty(), "too soon");
-        s.updates.insert("c".into(), up(20, Some("mac"), vec![]));
+        s.updates.insert("c".into(), up(45, Some("mac"), vec![]));
         let f = findings(&s, now);
         assert!(f[0].detail.contains("not answered"), "{f:#?}");
         // Asked of another host, or an hour old: nothing.
-        s.updates.insert("c".into(), up(20, Some("other"), vec![]));
+        s.updates.insert("c".into(), up(45, Some("other"), vec![]));
         assert!(findings(&s, now).is_empty());
-        s.updates.insert("c".into(), up(90, Some("mac"), vec![]));
+        s.updates.insert("c".into(), up(150, Some("mac"), vec![]));
         assert!(findings(&s, now).is_empty());
     }
 
@@ -934,7 +935,7 @@ mod tests {
             f[0].detail
         );
         // A host quiet for 10 min is down, not ignoring the request.
-        s.updates.insert("new".into(), up(20, vec![]));
+        s.updates.insert("new".into(), up(45, vec![]));
         s.hosts.insert("mac".into(), host(10));
         s.updates.remove("old");
         assert!(findings(&s, now).is_empty(), "stale host");
