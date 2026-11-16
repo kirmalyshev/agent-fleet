@@ -402,6 +402,7 @@ fn plan(args: Vec<String>) -> Result<Plan, String> {
         "doctor" if !has("--apply") => Plan::Read(args),
         "task" if matches!(w(1), "ls" | "show") => Plan::Read(args),
         "repo" if w(1) == "ls" => Plan::Read(args),
+        "dev" if matches!(w(1), "ls" | "clean") && !has("--execute") => Plan::Read(args),
         "role" if args.len() == 2 => Plan::Read(args),
         _ => Plan::Write(args),
     })
@@ -878,42 +879,50 @@ async fn act(fleet: &impl Fleet, pending: Pending) -> String {
             }
             out.join(", ")
         }
-        Pending::Remove { repo, path, branch } => {
-            let out = match hook(&repo) {
-                Some(h) => {
-                    tokio::process::Command::new(h)
-                        .args(["retire", &path])
-                        .output()
-                        .await
-                }
-                None => {
-                    tokio::process::Command::new("git")
-                        .args(["-C", &repo, "worktree", "remove", &path])
-                        .output()
-                        .await
-                }
-            };
-            match out {
-                Ok(o) if o.status.success() => {
-                    let gh = std::env::var("AGENT_FLEET_GH").unwrap_or_else(|_| "gh".into());
-                    removed_line(fleet, &gh, &repo, &path, branch.as_deref()).await
-                }
-                Ok(o) => format!(
-                    "refused: {}",
-                    String::from_utf8_lossy(&o.stderr)
-                        .lines()
-                        .last()
-                        .unwrap_or("?")
-                ),
-                Err(e) => format!("could not run: {e}"),
+        Pending::Remove { repo, path, branch } => match retire(&repo, &path).await {
+            Ok(()) => {
+                let gh = std::env::var("AGENT_FLEET_GH").unwrap_or_else(|_| "gh".into());
+                removed_line(fleet, &gh, &repo, &path, branch.as_deref()).await
             }
+            Err(e) => e,
+        },
+    }
+}
+
+/// Removes the worktree at `path` of the checkout `repo`: the repo's `.agent-fleet/hook retire`,
+/// else `git worktree remove` (which refuses uncommitted or untracked files). `Err` is the line
+/// to show.
+pub async fn retire(repo: &str, path: &str) -> Result<(), String> {
+    let out = match hook(repo) {
+        Some(h) => {
+            tokio::process::Command::new(h)
+                .args(["retire", path])
+                .output()
+                .await
         }
+        None => {
+            tokio::process::Command::new("git")
+                .args(["-C", repo, "worktree", "remove", path])
+                .output()
+                .await
+        }
+    };
+    match out {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!(
+            "refused: {}",
+            String::from_utf8_lossy(&o.stderr)
+                .lines()
+                .last()
+                .unwrap_or("?")
+        )),
+        Err(e) => Err(format!("could not run: {e}")),
     }
 }
 
 /// The outcome line of a removed worktree: when its branch still has an open PR, the line says
 /// so, and the root coordinator is told the PR is a coordinator item now.
-async fn removed_line(
+pub async fn removed_line(
     fleet: &impl Fleet,
     gh: &str,
     repo: &str,
@@ -2312,7 +2321,18 @@ mod tests {
             plan(w("spawn o/r#5")),
             Ok(Plan::DryRun(w("spawn o/r#5 --dry-run"), w("spawn o/r#5")))
         );
-        for read in ["help", "api schema", "task add --help", "block -h"] {
+        assert_eq!(
+            plan(w("dev clean --execute")),
+            Ok(Plan::Write(w("dev clean --execute")))
+        );
+        for read in [
+            "help",
+            "api schema",
+            "task add --help",
+            "block -h",
+            "dev clean",
+            "dev ls",
+        ] {
             assert_eq!(plan(w(read)), Ok(Plan::Read(w(read))));
         }
         assert!(plan(w("hub")).is_err() && plan(vec![]).is_err());

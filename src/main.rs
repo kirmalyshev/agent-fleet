@@ -19,6 +19,7 @@ mod tui;
 mod ui;
 mod update;
 mod watch;
+mod worktree;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -137,6 +138,13 @@ enum Cmd {
     Repo {
         #[command(subcommand)]
         cmd: RepoCmd,
+    },
+    /// Worktrees across the connected repositories (`repo add`), the checkouts the host reports
+    /// and the one you are in: `ls` lists them, `clean` retires those of your merged or closed PRs
+    /// and deletes finished local branches.
+    Dev {
+        #[command(subcommand)]
+        cmd: DevCmd,
     },
     /// The fleet on one screen, live: agents, worktrees, tasks, findings, resources, asks; `:` runs
     /// any command from it.
@@ -474,6 +482,32 @@ enum RepoCmd {
     Ls,
     /// Disconnect a repository; its checkout is left alone.
     Rm { repo: String },
+}
+
+#[derive(Subcommand)]
+enum DevCmd {
+    /// Each worktree: branch, PR, commits not in the default branch, uncommitted files, and what
+    /// `clean` would do with it.
+    Ls {
+        /// Only this `owner/repo`.
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// What clean would do (a dry run). A branch is finished when its tip is the head of one of
+    /// your merged or closed PRs, is in the default branch, or is in `origin/<branch>`; one with
+    /// an open PR or local-only commits never is. Only a finished PR retires a worktree, and
+    /// never the main checkout, a locked one, the one you are in, one an agent works in, or one
+    /// with uncommitted files. The processes left in a worktree it retires are stopped first;
+    /// a herdr pane, an agent's processes and your own keep the worktree.
+    Clean {
+        /// Only this `owner/repo`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Stop the leftover processes (TERM, then KILL after 5 s), retire the worktrees
+        /// (`.agent-fleet/hook retire`, else `git worktree remove`) and delete the branches.
+        #[arg(long)]
+        execute: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -975,6 +1009,34 @@ async fn main() -> Result<()> {
             host::run(cfg, ctx.client()?).await?;
         }
         Cmd::Tui => tui::run(&ctx).await?,
+        Cmd::Dev { cmd } => {
+            let (only, clean, execute) = match cmd {
+                DevCmd::Ls { repo } => (repo, false, false),
+                DevCmd::Clean { repo, execute } => (repo, true, *execute),
+            };
+            let s = match ctx.snapshot_state().await {
+                Ok((s, note)) => {
+                    if let Some(note) = note {
+                        eprintln!("agent-fleet: {note}");
+                    }
+                    s
+                }
+                // No hub and no replica: no fleet here, so no fleet agent to keep a worktree for.
+                Err(e) => {
+                    eprintln!("agent-fleet: no fleet state, agents unknown: {e:#}");
+                    State::default()
+                }
+            };
+            let registered = match spawn::machine_dir() {
+                Some(d) => setup::registered(&d)?,
+                None => Default::default(),
+            };
+            let cwd = std::env::current_dir()?;
+            let here = scan::repo_of(&cwd.to_string_lossy()).await.map(Into::into);
+            let host = ctx.host_name();
+            let repos = worktree::repos(registered, &s, &host, here, only.as_deref())?;
+            print!("{}", worktree::run(&ctx, &repos, &s, clean, execute).await);
+        }
         Cmd::Instances => {
             for (name, hub) in Paths::instances()? {
                 let mark = if name == ctx.cli.instance { "*" } else { " " };

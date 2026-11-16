@@ -189,7 +189,7 @@ pub struct Group {
 
 /// The terminal multiplexer and the shells of its panes are never a worktree's processes:
 /// they are the operator's own, whatever directory they sit in.
-fn is_terminal(procs: &Procs, p: &Proc) -> bool {
+pub(crate) fn is_terminal(procs: &Procs, p: &Proc) -> bool {
     p.name == "herdr"
         || procs
             .0

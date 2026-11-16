@@ -93,6 +93,28 @@ skills (`.claude/skills`, `.codex/skills`) the same way. A repository with its o
 Try a route without starting anything: `agent-fleet spawn owner/repo#123 --dry-run`. The
 keys are explained in [docs/fleet.example.toml](docs/fleet.example.toml).
 
+### Clean up worktrees
+
+```sh
+agent-fleet dev ls                        # every connected repo; --repo owner/repo for one
+agent-fleet dev clean                     # what it would retire and delete (a dry run)
+agent-fleet dev clean --execute
+```
+
+These cover the connected repositories, the checkouts the host reports, and the one you are in.
+A local branch is finished when its tip is the head of one of your merged or closed PRs, is in the
+default branch, or is in `origin/<branch>`. A branch with an open PR, or with commits nowhere else,
+is never deleted. Only a finished PR retires a worktree, and never the main checkout, the one you
+are in, a locked one, one an agent works in (by the fleet's log, the same rule as `doctor`'s
+`forgotten`), or one with uncommitted files. Processes left in a worktree it retires are stopped
+first (TERM, then KILL after 5 s); `ls` and the dry run list them, pid and command. A process an
+agent program runs, a herdr pane and your own shell are never stopped: one of those in a worktree
+keeps it; when the working directories of processes cannot be read (no `/proc`, no `lsof`), every
+worktree is kept. It never unlocks a worktree: a lock whose pid is gone is called stale, with its
+`git worktree unlock` command. A worktree is retired as the TUI's `x` does it:
+`.agent-fleet/hook retire <path>`, else `git worktree remove`. `gh` (`AGENT_FLEET_GH`) reads the
+PRs, one `gh pr list` per repository.
+
 ## Quick start
 
 On one machine, with herdr running:
@@ -343,6 +365,7 @@ From `agent-fleet --help`; every command has its own `--help`.
 | `instances` | The agent-fleet instances on this machine and the hub each one uses |
 | `init` | Write this machine's fleet.toml and brief.md into the user config dir (`AGENT_FLEET_CONFIG_DIR` overrides it): commented templates with a profile for each agent program on PATH and one default rule. Never overwrites an existing file. Lists the user-level Claude and Codex skills that drive terminals (herdr, tmux, cmux) |
 | `repo` | Connect a repository to the fleet on this machine: `add` records its checkout in the machine's fleet.toml, `ls` lists, `rm` disconnects. The host picks changes up without a restart |
+| `dev` | Worktrees across the connected repositories (`repo add`), the checkouts the host reports and the one you are in: `ls` lists them, `clean` retires those of your merged or closed PRs and deletes finished local branches |
 | `tui` | The fleet on one screen, live: agents, worktrees, tasks, findings, resources, asks; `:` runs any command from it |
 | `task` | Tasks: `add` claims (exclusive), `done` finishes, `rm` cancels or releases |
 | `dep` | Dependencies between tasks: <task> is blocked by <on> |
