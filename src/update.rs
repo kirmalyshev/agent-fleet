@@ -24,7 +24,7 @@ const CLONE: &str = env!("CARGO_MANIFEST_DIR");
 pub const RESTART_STATUS: i32 = 75;
 /// A request this old when the host first sees it is ignored: a host down at the time does not
 /// rebuild by surprise later.
-const REQUEST_MAX_AGE: chrono::Duration = chrono::Duration::minutes(15);
+pub(crate) const REQUEST_MAX_AGE: chrono::Duration = chrono::Duration::minutes(15);
 /// How long `self-update` waits for every host to run its new commit.
 const WAIT: Duration = Duration::from_secs(20 * 60);
 
@@ -45,7 +45,7 @@ pub enum Outcome {
 /// credential prompt or compiler silences the host for good.
 const PULL: Duration = Duration::from_secs(120);
 const GIT: Duration = Duration::from_secs(60);
-const BUILD: Duration = Duration::from_secs(30 * 60);
+pub(crate) const BUILD: Duration = Duration::from_secs(30 * 60);
 /// A `.agent-fleet-update-<pid>` untouched this long (more than `BUILD`) is assumed to be the
 /// leftover of a killed update, not another host's build in progress.
 const LEFTOVER: Duration = Duration::from_secs(45 * 60);
@@ -55,7 +55,7 @@ const LEFTOVER: Duration = Duration::from_secs(45 * 60);
 /// starts must still be fresh for the new process.
 const DRAIN_MAX: Duration = Duration::from_secs(10 * 60);
 /// How long an update waits for another update in its clone (a build may take `BUILD`).
-const LOCK_WAIT: Duration = Duration::from_secs(35 * 60);
+pub(crate) const LOCK_WAIT: Duration = Duration::from_secs(35 * 60);
 /// How often a host looks whether it is behind `origin/main`.
 const CHECK_EVERY: Duration = Duration::from_secs(5 * 60);
 /// How often a finished update looks for the work in flight to end.
@@ -481,7 +481,12 @@ async fn tick<I: Io>(io: &I, c: &Ctx<'_>, seen: &mut Seen) {
         let (commit, error, restart) = match done {
             Ok(Outcome::Current(c)) => (Some(c), None, false),
             Ok(Outcome::Replaced(c)) => (Some(c), None, true),
-            Err(err) => (None, Some(tail(&format!("{err:#}"))), false),
+            // The commit it still runs: a failure leaves it as it was.
+            Err(err) => (
+                c.running.map(String::from),
+                Some(tail(&format!("{err:#}"))),
+                false,
+            ),
         };
         let result = UpdateResult {
             host: c.me.to_string(),
@@ -1386,6 +1391,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_update_answers_with_the_commit_the_host_still_runs() {
+        let (_t, _origin, clone, exe) = fixture();
+        std::fs::write(clone.join("f"), "dirty").unwrap();
+        let exe = Ok(exe);
+        let io = Fake::default();
+        *io.pending.borrow_mut() = ids(&["r1"]);
+        tick(
+            &io,
+            &ctx(&clone, &exe, Some("abc1234")),
+            &mut Seen::default(),
+        )
+        .await;
+        let r = &io.results.borrow()[0];
+        assert!(!r.ok);
+        assert_eq!(r.commit.as_deref(), Some("abc1234"));
+    }
+
+    #[tokio::test]
     async fn a_refused_update_never_exits() {
         let (_t, _origin, clone, exe) = fixture();
         std::fs::write(clone.join("f"), "dirty").unwrap();
@@ -1477,6 +1500,7 @@ mod tests {
                     agents: 0,
                     commit: commit.map(String::from),
                     ts,
+                    started: None,
                 },
             );
         }
@@ -1549,6 +1573,13 @@ mod tests {
         waited(s, &["a", "b"], Duration::from_secs(5))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_reports_a_failure_that_names_the_commit_the_host_runs_as_refused() {
+        let s = state_with(&[("a", Some("abc"))], &[("a", false, Some("abc"))]);
+        let e = waited(s, &["a"], Duration::from_secs(5)).await.unwrap_err();
+        assert!(format!("{e}").contains("refused"), "{e}");
     }
 
     #[tokio::test]

@@ -310,7 +310,7 @@ how many worktrees may hold any of a set of resources at once.
 | `role` | an agent's declared lead is down, the lead's level is not above its own, or a second root coordinator is up |
 | `quota` | a program's quota is exhausted, or a window ≥ 90% used resets in the future |
 | `stalled` | an agent idle or blocked for 15 min after it last worked |
-| `update` | a host's latest self-update (within the last 2 hours) that it answered `ok:false`, or that a live host (`host.health` in the last 3 min) has not answered 40 min after it was asked (an answer comes after the build, up to 30 min); a later success clears it. Subject `host:<host>`, with who asked and the error |
+| `update` | a host's latest self-update that it answered `ok:false` (for 2 hours, and for as long as the host's `host.health` still names the commit the failure reports: nothing asks it again until `origin/main` moves; the hub keeps such an update past its usual day), or that a live host (`host.health` in the last 3 min) has not answered 75 min after it was asked (the wait for another update's lock, 35 min, plus a build, 30, plus git). A request already older than 15 min when the host process started was ignored by it, not left unanswered. A later success clears it. Subject `host:<host>`, with who asked and the error |
 | `build` | hosts that sent `host.health` in the last 10 min report different commits (or one reports none); each such host, with the others' commits |
 
 `hung` and `stalled` are also pushed, not only read: the host writes one `msg.sent` per episode
@@ -638,7 +638,7 @@ or with uncommitted changes to tracked files, runs `git pull --ff-only`, and, un
 pulled head is the commit it already runs, runs `cargo install --locked --path <clone> --root
 <tmp>` (the `cargo` beside its own binary, else the one on `PATH`) with `<tmp>` in its binary's
 directory, and renames the build over its binary — never overwriting it in place, which kills
-a running binary on macOS. It answers `update.result` (ok, the commit it will run, or the
+a running binary on macOS. It answers `update.result` (ok, the commit it will run, or on failure the commit it still runs, and the
 error), then exits with status 75 so its supervisor (systemd `Restart=on-failure` or launchd
 `KeepAlive`) starts the new binary. The CLI waits (20 min) until each host that sent
 `host.health` in the last 3 min has refused, or reports in `host.health` the commit it named,

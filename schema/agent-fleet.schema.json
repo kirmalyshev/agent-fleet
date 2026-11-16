@@ -1227,7 +1227,7 @@
           "description": "One host's answer to the `update.requested` named by `re`.",
           "properties": {
             "commit": {
-              "description": "The commit the host runs once restarted (the one it runs now when nothing changed).",
+              "description": "The commit the host runs once restarted (the one it runs now when nothing changed); on\nfailure, the one it still runs.",
               "type": [
                 "string",
                 "null"
@@ -2289,6 +2289,14 @@
               "minimum": 0,
               "type": "integer"
             },
+            "started": {
+              "description": "When the host process started: that report's time less its `uptime_s`.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "ts": {
               "format": "date-time",
               "type": "string"
@@ -3097,7 +3105,7 @@
               "type": "object"
             },
             "since": {
-              "description": "The request's `ts`; the update is pruned `UPDATE_KEPT` after it.",
+              "description": "The request's `ts`; the update is pruned `UPDATE_KEPT` after it, unless a host still runs\nthe commit its failed answer reports.",
               "format": "date-time",
               "type": "string"
             }
@@ -3114,7 +3122,7 @@
           "description": "One host's answer to the `update.requested` named by `re`.",
           "properties": {
             "commit": {
-              "description": "The commit the host runs once restarted (the one it runs now when nothing changed).",
+              "description": "The commit the host runs once restarted (the one it runs now when nothing changed); on\nfailure, the one it still runs.",
               "type": [
                 "string",
                 "null"
