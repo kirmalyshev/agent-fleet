@@ -186,7 +186,7 @@ pub async fn update(clone: &Path, exe: &Path, running: Option<&str>) -> Result<O
     // Built beside the binary, so the rename is atomic. Overwriting it in place kills the running
     // process on macOS (code signing).
     let root = dir.join(format!(".agent-fleet-update-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    clean(&root);
     // A supervised daemon's PATH may lack cargo; `cargo install` puts binaries next to it.
     let cargo = Some(dir.join("cargo"))
         .filter(|c| c.exists())
@@ -225,9 +225,18 @@ pub async fn update(clone: &Path, exe: &Path, running: Option<&str>) -> Result<O
         std::fs::rename(root.join("bin/agent-fleet"), exe)
             .with_context(|| format!("move the build to {}", exe.display()))
     });
-    let _ = std::fs::remove_dir_all(&root);
+    clean(&root);
     done?;
     Ok(Outcome::Replaced(head))
+}
+
+/// Removes a build directory; a leftover is logged, `sweep` retries it later.
+fn clean(root: &Path) {
+    if let Err(e) = std::fs::remove_dir_all(root)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("agent-fleet host: update: remove {}: {e}", root.display());
+    }
 }
 
 /// The running binary's path. Linux names a binary replaced under it `<path> (deleted)`.
@@ -335,6 +344,11 @@ async fn tick<I: Io>(io: &I, c: &Ctx<'_>, seen: &mut HashSet<String>) {
                 seen.remove(&id);
             }
             continue;
+        }
+        if !written {
+            eprintln!(
+                "agent-fleet host: update.result for {id} not written; the restarted host answers it"
+            );
         }
         // A spawn or handoff cut off by the exit would be run again from scratch.
         io.drain();
