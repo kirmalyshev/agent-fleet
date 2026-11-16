@@ -224,11 +224,15 @@ fn restart_in_place(exe: &Path) -> ! {
     std::process::exit(crate::update::RESTART_STATUS)
 }
 
-/// Calls `changed` once when the file at `path` is replaced: a host's self-update renames a new
+/// Calls `changed` once when the file at `path` is no longer the one with identity `start`: a host's self-update renames a new
 /// binary over the installed one, and a hub still running the old one would stay on the old code
 /// (and the old protocol). A file that is briefly missing is not a change.
-async fn follow_binary(path: PathBuf, poll: Duration, changed: impl FnOnce()) {
-    let start = file_id(&path);
+async fn follow_binary(
+    path: PathBuf,
+    start: Option<(u64, u64)>,
+    poll: Duration,
+    changed: impl FnOnce(),
+) {
     loop {
         tokio::time::sleep(poll).await;
         let now = file_id(&path);
@@ -247,6 +251,9 @@ pub async fn serve(listen: &[SocketAddr], db: &Path, hub_file: &Path, token: Str
     if let Some(a) = listen.iter().find(|a| a.ip().is_unspecified()) {
         bail!("refusing to listen on {a}: bind a specific address (default 127.0.0.1)");
     }
+    // Taken before the log loads, which can take a while: a replacement meanwhile is noticed.
+    let exe = crate::update::this_exe();
+    let started_as = exe.as_ref().ok().and_then(|e| file_id(e));
     let hub = Hub::new(Store::open(db)?)?;
     // With a loopback address to fall back on, an address that will not bind yet (a Tailscale IP
     // before Tailscale is up, 3 Nov) is retried in the background instead of taking the hub down.
@@ -285,10 +292,10 @@ pub async fn serve(listen: &[SocketAddr], db: &Path, hub_file: &Path, token: Str
     std::fs::write(hub_file, format!("http://{}\n", hub_file_addr(&bound)?))?;
     let shared: Shared = Arc::new(Mutex::new(hub));
     let app = router_shared(shared.clone(), token);
-    match crate::update::this_exe() {
+    match exe {
         Ok(exe) => {
             let at = exe.clone();
-            tokio::spawn(follow_binary(exe, BINARY_POLL, move || {
+            tokio::spawn(follow_binary(exe, started_as, BINARY_POLL, move || {
                 // Between requests: one that writes twice (an answer) is not cut in half.
                 let _held = shared.lock().unwrap_or_else(|e| e.into_inner());
                 eprintln!("agent-fleet hub: binary replaced; starting the new one");
@@ -544,6 +551,7 @@ mod tests {
         let flag = changed.clone();
         let task = tokio::spawn(follow_binary(
             exe.clone(),
+            file_id(&exe),
             Duration::from_millis(10),
             move || flag.store(true, Ordering::SeqCst),
         ));

@@ -681,7 +681,9 @@ The update is hardened:
   under a temporary name and renamed into place, so a failed copy leaves the previous rollback
   copy whole); one generation, replaced by each update. If it cannot be kept the update fails
   before the rename.
-  To roll back, rename it over the binary and restart the host.
+  To roll back, rename it over the binary and restart the host. The hub on that machine follows
+  the rename onto the old binary too, and an old binary refuses a log that holds event types it
+  does not know: roll the hub back only while the log holds none.
 - **Leftovers.** At start a host removes `.agent-fleet-update-<pid>` directories from its
   binary's directory that are older than 45 minutes and whose process is gone (a killed update
   leaves one; a live pid is another host's build in progress).
