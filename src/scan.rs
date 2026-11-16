@@ -582,7 +582,7 @@ pub const STRAY_LEADER_MIN: chrono::Duration = chrono::Duration::minutes(2);
 /// `xcodebuild`, `maestro`, `simctl`, `idb`, `xctest`, the WDA runner, `log stream`, or a
 /// `java` running maestro — the CLI's real name, since it runs as `java -classpath
 /// …/.maestro/lib/… maestro.cli.AppKt`.
-fn device_tool(p: &Proc) -> bool {
+pub(crate) fn device_tool(p: &Proc) -> bool {
     matches!(
         p.name.as_str(),
         "xcodebuild" | "maestro" | "simctl" | "idb" | "xctest"

@@ -15,6 +15,7 @@ mod store;
 mod stuck;
 mod tui;
 mod ui;
+mod watch;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
