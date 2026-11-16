@@ -257,6 +257,8 @@ enum Cmd {
     },
     /// Ring an agent's doorbell: `[agent-fleet <from>→<to>] TYPE ref: text (event <id>)`.
     Tell {
+        /// An agent that is up (full id or short name), or `coordinator`: the root coordinator,
+        /// whoever holds the role when the message is delivered.
         agent: String,
         #[arg(value_name = "TYPE")]
         kind: String,
@@ -677,19 +679,7 @@ impl Ctx {
         if name.starts_with("agent:") {
             return Ok(name.to_string());
         }
-        let s = self.state().await?;
-        let found: Vec<&String> = s.agents.keys().filter(|a| short(a) == name).collect();
-        match found.as_slice() {
-            [one] => Ok((*one).clone()),
-            [] => bail!("no agent named {name} is up (see `agent-fleet ps`)"),
-            many => bail!(
-                "{name} is ambiguous: {}",
-                many.iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        }
+        up_named(&self.state().await?, name)
     }
 
     /// `me`, a full `agent:` id, or the short name of an agent that is up. A role can be
@@ -1406,7 +1396,7 @@ async fn main() -> Result<()> {
                 ("SCOPE", scope.as_deref().unwrap_or("")),
                 ("HOST", d.host.as_str()),
                 ("LEVEL", &d.level.to_string()),
-                ("LEAD", lead.as_str()),
+                ("LEAD", &spawn::lead_name(&state, &lead)),
                 ("HANDOFF", ""),
             ] {
                 vals.insert(k.into(), v.to_string());
@@ -1518,6 +1508,7 @@ async fn main() -> Result<()> {
                 None => String::new(),
             };
             let req = spawn::handoff_request(
+                &state,
                 &cfg,
                 &cfg_dir,
                 &sp,
@@ -1543,7 +1534,7 @@ async fn main() -> Result<()> {
             reference,
             text,
         } => {
-            let to = ctx.resolve_agent(agent).await?;
+            let to = tell_to(&ctx.state().await?, agent)?;
             let body = MsgSent {
                 to,
                 kind: kind.clone(),
@@ -1559,6 +1550,42 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The up agent whose short name is `name`.
+fn up_named(s: &State, name: &str) -> Result<String> {
+    let found: Vec<&String> = s.agents.keys().filter(|a| short(a) == name).collect();
+    match found.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => bail!("no agent named {name} is up (see `agent-fleet ps`)"),
+        many => bail!(
+            "{name} is ambiguous: {}",
+            many.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// The `msg.sent.to` of `tell <agent>`: `coordinator` while an up agent holds the role, else an
+/// up agent. A message to anyone else would sit undelivered, so it is refused here instead.
+fn tell_to(s: &State, agent: &str) -> Result<String> {
+    if agent == COORDINATOR {
+        if s.coordinator().is_none() {
+            bail!(
+                "nobody holds the coordinator role: no agent that is up declared root-coordinator (`agent-fleet role me root-coordinator`)"
+            );
+        }
+        return Ok(COORDINATOR.into());
+    }
+    if !agent.starts_with("agent:") {
+        return up_named(s, agent);
+    }
+    if !s.agents.contains_key(agent) {
+        bail!("{agent} is not up; nothing would deliver the message (see `agent-fleet ps`)");
+    }
+    Ok(agent.into())
 }
 
 /// One tell to the root coordinator per PR while it is unanswered; the result is a detail suffix.
@@ -1608,6 +1635,45 @@ mod tests {
         assert_eq!(parse_repo("foo=2").unwrap(), (None, PathBuf::from("foo=2")));
         // `/p=2`: the left side starts with '/', so it is a path.
         assert_eq!(parse_repo("/p=2").unwrap(), (None, PathBuf::from("/p=2")));
+    }
+
+    #[test]
+    fn tell_refuses_a_dead_agent_and_an_unheld_coordinator_role() {
+        let mut s = State::default();
+        let up = |s: &mut State, id: &str| {
+            s.agents.insert(
+                id.into(),
+                state::Agent {
+                    host: "h".into(),
+                    kind: None,
+                    pane: None,
+                    state: AgentState::Idle,
+                    since: Utc::now(),
+                    worked: None,
+                    finished: None,
+                    usage: None,
+                },
+            );
+        };
+        let err = |r: Result<String>| r.unwrap_err().to_string();
+        assert!(err(tell_to(&s, "agent:h/s/w9:p1")).contains("is not up"));
+        assert!(err(tell_to(&s, "w9:p1")).contains("no agent named"));
+        assert!(err(tell_to(&s, COORDINATOR)).contains("nobody holds the coordinator role"));
+        up(&mut s, "agent:h/s/w1:p1");
+        assert_eq!(tell_to(&s, "agent:h/s/w1:p1").unwrap(), "agent:h/s/w1:p1");
+        assert_eq!(tell_to(&s, "w1:p1").unwrap(), "agent:h/s/w1:p1");
+        s.roles.insert(
+            "agent:h/s/w1:p1".into(),
+            state::Role {
+                level: Level::RootCoordinator,
+                lead: None,
+                domain: None,
+                by: "agent:h/s/w1:p1".into(),
+                since: Utc::now(),
+            },
+        );
+        // The role name stays in the message, so delivery follows the role to its holder.
+        assert_eq!(tell_to(&s, COORDINATOR).unwrap(), COORDINATOR);
     }
 
     #[test]

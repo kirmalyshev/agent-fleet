@@ -92,7 +92,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | blocker | `blocker.raised` | what, owner?, unblocks_when?, pid?, started? (`pid`: a process on the raiser's host it waits on, `started` when that process started) | task | agent, host |
 | | `blocker.resolved` | note? (the raiser's host writes one once the blocker's `pid` is gone or started at another time) | re = the raise | agent, host |
 | question | `ask.raised` | question, options[], recommendation?, context? | task | agent |
-| comms | `msg.sent` | to, kind, ref, text | | agent, host |
+| comms | `msg.sent` | to (an agent id, or `coordinator`), kind, ref, text | | agent, host |
 | | `ask.answered` | answer, approve?, approves?, msg — **human only**, via `POST /board/answer` | re = the ask | human |
 | | `msg.delivered` | to, observed, rung?, attempts? | re = the send | host |
 | | `handoff` | to, next, done?, evidence[], learned? | task | agent |
@@ -137,7 +137,8 @@ data itself, not the scan, so the views can say how stale the numbers are.
 - **Strict on write.** `POST /events` accepts only known types at `v: 1`, with no unknown fields
   in the envelope or in `data`, with the envelope fields the type needs, at most 64 KiB, and from
   an allowed actor kind, and with every recipient (`msg.sent.to`, `handoff.to`,
-  `task.assigned.agent`, `agent.role.agent`, `agent.role.lead`) a full agent id. A malformed or oversized event is `400`; a forbidden actor (any `human`,
+  `task.assigned.agent`, `agent.role.agent`, `agent.role.lead`) a full agent id — or, for
+  `msg.sent.to` only, the role name `coordinator`. A malformed or oversized event is `400`; a forbidden actor (any `human`,
   any `hub`, or a kind not in the table) is `403`. The board's `POST /board/answer`
   (`{ask, answer, approve?}`) is `400` for an unknown ask or an empty answer, `403` for an ask
   outside the Inbox, and `409` for one already answered. Clients apply the same rules before sending,
@@ -207,8 +208,13 @@ blocked_by, handoffs), open `blockers` and `asks` (with their context link) keye
 
 ## Doorbells
 
-`agent-fleet tell <agent> <TYPE> <ref> <text>` writes `msg.sent`. The host agent of the recipient's
-machine types it into the agent as
+`agent-fleet tell <agent> <TYPE> <ref> <text>` writes `msg.sent`. `<agent>` is an agent that is
+up — a full id or its short name — or `coordinator`; anything else (an agent or pane that is
+gone, `coordinator` while no agent that is up holds the role) is refused with a non-zero exit
+and nothing is written. `coordinator` stays in the event: the host resolves it at each delivery
+attempt to the up agent holding the `root-coordinator` role (of several, the latest declared),
+so a message already queued follows a coordinator that restarts in another pane or hands over.
+The host agent of the recipient's machine types it into the agent as
 
 ```
 [agent-fleet <from>→<to>] <TYPE> <ref>: <text> (event <id>)
@@ -608,7 +614,8 @@ exhausted — while a 100% window's reset is still ahead or the `exhausted` read
 old — passes to its `fallback`, unless `--profile` named it: an explicit profile is started as
 named or refused. Every step lands in `why`. The brief renders in one pass over the template: tokens
 NAME, KIND (the profile name), PROGRAM (the kind), SLUG, ISSUE, TITLE, BRANCH, SCOPE, HOST,
-LEVEL, LEAD, HANDOFF (empty unless a handoff), the `[vars]` and `--set KEY=VALUE`; a value is
+LEVEL, LEAD (`coordinator` when the lead is the root coordinator, else the lead's agent id),
+HANDOFF (empty unless a handoff), the `[vars]` and `--set KEY=VALUE`; a value is
 never re-expanded and a placeholder with no value refuses the spawn. `--dry-run` prints the
 decision and the brief and writes nothing; otherwise `spawn.requested` is written and the CLI
 follows the hub until `spawn.result` arrives (10 min, `--no-wait` skips the wait).

@@ -712,6 +712,7 @@
               "type": "string"
             },
             "to": {
+              "description": "A full agent id, or `coordinator`: whichever up agent holds the root-coordinator role\nwhen the message is delivered.",
               "type": "string"
             }
           },

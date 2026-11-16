@@ -623,6 +623,8 @@ pub struct AskAnswered {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MsgSent {
+    /// A full agent id, or `coordinator`: whichever up agent holds the root-coordinator role
+    /// when the message is delivered.
     pub to: String,
     /// What the recipient should do, e.g. `REVIEW`, `FYI`, `UNBLOCKED`.
     pub kind: String,
@@ -980,6 +982,9 @@ impl Envelope<Known> {
     }
 }
 
+/// The role name a `msg.sent` may address instead of an agent id: the root coordinator.
+pub const COORDINATOR: &str = "coordinator";
+
 /// `agent:<host>/<session>/<name>`, each part non-empty.
 pub fn is_agent_id(id: &str) -> bool {
     id.strip_prefix("agent:")
@@ -1066,6 +1071,7 @@ fn parse(raw: &Value, human_channel: bool) -> Result<Envelope<Known>, Reject> {
         ));
     }
     let recipients: Vec<&String> = match &e.body {
+        Known::MsgSent(m) if m.to == COORDINATOR => vec![],
         Known::MsgSent(m) => vec![&m.to],
         Known::Handoff(h) => vec![&h.to],
         Known::TaskAssigned(a) => vec![&a.agent],
@@ -1163,6 +1169,10 @@ mod tests {
         assert!(
             tell("agent:h/s/w1:p2").is_ok(),
             "an unnamed agent is named by its pane"
+        );
+        assert!(
+            tell(COORDINATOR).is_ok(),
+            "the root coordinator's role name"
         );
     }
 

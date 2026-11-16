@@ -7,9 +7,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::event::{
-    AgentState, Body, Event, Known, Level, ProcessHung, QuotaWindow, ResourceHold, ResourceLimit,
-    SpawnRequested, SpawnResult, StuckCause, TYPE_VERSION, TaskState, UpdateResult, WorktreeProcs,
-    WorktreeState,
+    AgentState, Body, COORDINATOR, Event, Known, Level, ProcessHung, QuotaWindow, ResourceHold,
+    ResourceLimit, SpawnRequested, SpawnResult, StuckCause, TYPE_VERSION, TaskState, UpdateResult,
+    WorktreeProcs, WorktreeState,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -438,6 +438,24 @@ impl State {
             .filter(|(_, r)| r.lead.as_deref() == Some(id))
             .map(|(k, _)| k)
             .collect()
+    }
+
+    /// The up agent holding the root-coordinator role; of several, the latest declared, so a
+    /// handover is followed even before the old holder drops its role.
+    pub fn coordinator(&self) -> Option<&str> {
+        self.roles
+            .iter()
+            .filter(|(id, r)| r.level == Level::RootCoordinator && self.agents.contains_key(*id))
+            .max_by_key(|(_, r)| r.since)
+            .map(|(id, _)| id.as_str())
+    }
+
+    /// The agent a `msg.sent` to `to` goes to now: `coordinator` is the role's current holder.
+    pub fn recipient<'a>(&'a self, to: &'a str) -> Option<&'a str> {
+        match to {
+            COORDINATOR => self.coordinator(),
+            _ => Some(to),
+        }
     }
 
     /// The latest `spawn.requested` for `agent`, if the fleet spawned it.
@@ -1618,6 +1636,72 @@ mod tests {
 
         s.apply(&role(None, ActorKind::Agent));
         assert!(s.roles.is_empty());
+    }
+
+    #[test]
+    fn a_message_to_coordinator_follows_the_role_to_its_current_holder() {
+        let t0 = Utc::now();
+        let at = |mins, body| {
+            let mut e = ev(ActorKind::Host, body).into_event();
+            e.ts = t0 + chrono::Duration::minutes(mins);
+            e
+        };
+        let up = |name: &str| {
+            Known::AgentUp(AgentUp {
+                agent: format!("agent:h/s/{name}"),
+                host: "h".into(),
+                kind: None,
+                state: AgentState::Idle,
+                pane: None,
+            })
+        };
+        let root = |name: &str| {
+            Known::AgentRole(AgentRole {
+                agent: format!("agent:h/s/{name}"),
+                level: Some(Level::RootCoordinator),
+                lead: None,
+                domain: None,
+            })
+        };
+        let down = |name: &str| {
+            Known::AgentDown(AgentDown {
+                agent: format!("agent:h/s/{name}"),
+                reason: None,
+            })
+        };
+        let sent = Known::MsgSent(MsgSent {
+            to: COORDINATOR.into(),
+            kind: "DONE".into(),
+            reference: "x".into(),
+            text: "t".into(),
+        });
+        let mut s = State::default();
+        s.apply(&at(0, sent));
+        assert_eq!(s.recipient(COORDINATOR), None, "nobody holds the role yet");
+        s.apply(&at(1, root("w1:p1")));
+        assert_eq!(
+            s.coordinator(),
+            None,
+            "a holder that is not up is no holder"
+        );
+        s.apply(&at(2, up("w1:p1")));
+        assert_eq!(s.recipient(COORDINATOR), Some("agent:h/s/w1:p1"));
+        // A handover: the new holder wins while the old one is still up with its role.
+        s.apply(&at(3, up("w2:p1")));
+        s.apply(&at(4, root("w2:p1")));
+        assert_eq!(s.recipient(COORDINATOR), Some("agent:h/s/w2:p1"));
+        // The new holder gone: the old one, still up and still declared, holds it again.
+        s.apply(&at(5, down("w2:p1")));
+        assert_eq!(s.recipient(COORDINATOR), Some("agent:h/s/w1:p1"));
+        // A restart in another pane: the old pane is gone, the role is declared again.
+        s.apply(&at(6, down("w1:p1")));
+        assert_eq!(s.recipient(COORDINATOR), None);
+        s.apply(&at(7, up("w3:p1")));
+        s.apply(&at(8, root("w3:p1")));
+        assert_eq!(s.recipient(COORDINATOR), Some("agent:h/s/w3:p1"));
+        // The queued message still names the role, not a pane.
+        assert_eq!(s.msgs.values().next().unwrap().to, COORDINATOR);
+        assert_eq!(s.recipient("agent:h/s/b"), Some("agent:h/s/b"));
     }
 
     #[test]
