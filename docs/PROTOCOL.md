@@ -103,7 +103,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `proc.hung` | host, pid, pids[]?, agent?, command?, started?, evidence?, since?, checked? — the topmost hung process an agent started and the hung ones under it (the watch tick, every 2 min); no `evidence` clears the report; folded only from the host actor it names (`host:<host>`) | | host |
 | | `agent.stuck` | agent, cause?, detail, until? — no `cause` clears the record | | host |
 | | `agent.signal` | agent, program, signal, detail? — `prompt`/`turn_end` clear the agent's stored signal | | agent |
-| update | `update.requested` | (empty) — every host pulls, rebuilds and restarts | | agent, host |
+| update | `update.requested` | host? — every host (or only `host`) pulls, rebuilds and restarts; written by `agent-fleet self-update` as `host:<this machine>`, and by a host's own timer for itself | | host |
 | | `update.result` | host, ok, commit?, error? — folded only from the host actor it names, first answer per host | re = the request | host |
 
 `ask.answered` closes an `ask.raised` from the board's Inbox. The hub writes it together with the
@@ -641,7 +641,40 @@ a running binary on macOS. It answers `update.result` (ok, the commit it will ru
 error), then exits with status 75 so its supervisor (systemd `Restart=on-failure` or launchd
 `KeepAlive`) starts the new binary. The CLI waits (20 min) until each host that sent
 `host.health` in the last 3 min has refused, or reports in `host.health` the commit it named,
-and prints each one's commit. The hub is not restarted: a change to the protocol needs the hub
+and prints each one's commit. Only a `host` actor may write `update.requested` (the CLI writes it
+as `host:<this machine>`): it makes every host rebuild and restart.
+
+**Automatic trigger.** Every 5 minutes a host fetches `origin/main` of its clone. When the commit
+its binary was built from is an ancestor of `origin/main` and not equal to it, it writes
+`update.requested` with `host` set to itself, so no other host runs it; it runs like any other
+request. It asks once per `origin/main` commit: a build that failed is not asked for again until
+`origin/main` moves. It asks nothing while a request for this host waits, while an update holds
+the clone's lock, or when its commit is not an ancestor of `origin/main` (a build from
+elsewhere) or unknown.
+
+The update is hardened:
+
+- **Work in flight.** A spawn execution or handoff running when the build finishes would be cut
+  off by the exit and run again from scratch. The host answers `update.result`, then stops
+  handing out guards for new spawns and handoffs (a request that arrives later is run by the
+  new process), waits until the running ones end, then exits. It waits at most 20 minutes, then
+  exits anyway, so a hung one cannot keep the old binary running. If the answer could not be
+  written, the host still restarts: the new process finds the request unanswered and answers it.
+- **Time limits.** `git pull` 2 min, other git 1 min, `cargo install` 30 min; the process group
+  is killed on a timeout and the update answers with the error. No command reads stdin, and git
+  never prompts (`GIT_TERMINAL_PROMPT=0`, ssh `BatchMode`; set for every command it runs).
+- **One at a time.** An `flock` in the clone's git dir, taken before the checks and held through
+  pull and build: a second update in the same clone (two hosts on one machine) waits for the
+  first (up to 35 minutes), then runs; it is never raced, and a wait that times out answers with
+  an error. The timer's fetch does not wait: it skips its turn.
+- **Rollback.** The previous binary is kept as `<binary>.prev` (a hard link, else a copy); one
+  generation, replaced by each update. If it cannot be kept the update fails before the rename.
+  To roll back, rename it over the binary and restart the host.
+- **Leftovers.** At start a host removes `.agent-fleet-update-<pid>` directories from its
+  binary's directory that are older than 45 minutes and whose process is gone (a killed update
+  leaves one; a live pid is another host's build in progress).
+
+The hub is not restarted: a change to the protocol needs the hub
 restarted by hand first, or it refuses what the new hosts write.
 
 ## The operator's screen

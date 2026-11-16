@@ -96,6 +96,9 @@ pub struct Update {
     pub by: String,
     /// The request's `ts`; the update is pruned `UPDATE_KEPT` after it.
     pub since: DateTime<Utc>,
+    /// The one host it asks, or every host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     /// Each host's answer, by host name.
     pub results: BTreeMap<String, UpdateResult>,
 }
@@ -889,12 +892,13 @@ impl State {
                     s.answered = Some(ts);
                 }
             }
-            Known::UpdateRequested(_) => {
+            Known::UpdateRequested(d) => {
                 self.updates.insert(
                     e.id.clone(),
                     Update {
                         by: e.actor.id.clone(),
                         since: ts,
+                        host: d.host.clone(),
                         results: BTreeMap::new(),
                     },
                 );
@@ -2066,8 +2070,30 @@ mod tests {
     }
 
     #[test]
+    fn an_update_request_remembers_the_one_host_it_asks() {
+        let mut s = State::default();
+        let ask = |host: Option<&str>| {
+            ev(
+                ActorKind::Host,
+                Known::UpdateRequested(UpdateRequested {
+                    host: host.map(String::from),
+                }),
+            )
+            .into_event()
+        };
+        let (all, one) = (ask(None), ask(Some("h")));
+        s.apply(&all);
+        s.apply(&one);
+        assert_eq!(s.updates[&all.id].host, None);
+        assert_eq!(s.updates[&one.id].host.as_deref(), Some("h"));
+    }
+
+    #[test]
     fn each_host_answers_its_own_update_once_and_the_request_is_pruned_after_a_day() {
-        let req = by("agent:h/s/a", Known::UpdateRequested(UpdateRequested {}));
+        let req = by(
+            "agent:h/s/a",
+            Known::UpdateRequested(UpdateRequested::default()),
+        );
         let id = req.id.clone();
         let mut s = State::default();
         s.apply(&req.into_event());

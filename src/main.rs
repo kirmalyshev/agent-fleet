@@ -828,7 +828,6 @@ async fn main() -> Result<()> {
         }
         Cmd::Ps => print!("{}", ui::ps(&ctx.state().await?, now)),
         Cmd::SelfUpdate => {
-            let me = ctx.me().await?;
             let s = ctx.client()?.state().await?;
             // Up = a `host.health` in the last 3 minutes; they report every minute.
             let hosts: Vec<String> = s
@@ -840,8 +839,13 @@ async fn main() -> Result<()> {
             if hosts.is_empty() {
                 bail!("no host has reported in the last 3 minutes");
             }
-            let body = Known::UpdateRequested(UpdateRequested {});
-            let id = ctx.write(Envelope::new(me, &ctx.cli.project, body)).await?;
+            let body = Known::UpdateRequested(UpdateRequested::default());
+            // Only a host's actor may ask: the request makes every host rebuild and restart.
+            let by = Actor {
+                kind: ActorKind::Host,
+                id: format!("host:{}", ctx.host_name()),
+            };
+            let id = ctx.write(Envelope::new(by, &ctx.cli.project, body)).await?;
             update::wait(&ctx.client()?, &id, &hosts).await?;
         }
         Cmd::Stats { since, json } => {

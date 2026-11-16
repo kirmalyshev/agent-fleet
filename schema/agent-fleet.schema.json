@@ -1210,7 +1210,16 @@
         },
         "UpdateRequested": {
           "additionalProperties": false,
-          "description": "`agent-fleet self-update` asks every host to pull its clone's `main`, rebuild and restart.",
+          "description": "`agent-fleet self-update` asks every host to pull its clone's `main`, rebuild and restart;\na host's own timer asks only itself, with `host`.",
+          "properties": {
+            "host": {
+              "description": "Only this host runs it. Absent: every host.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
           "type": "object"
         },
         "UpdateResult": {
@@ -3072,6 +3081,13 @@
             "by": {
               "description": "Who asked (the request's actor id).",
               "type": "string"
+            },
+            "host": {
+              "description": "The one host it asks, or every host.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "results": {
               "additionalProperties": {
