@@ -342,7 +342,7 @@ pub fn parse_stat(s: &str) -> Option<(u32, u64, u64, u64, u32)> {
 }
 
 /// `/proc/stat`'s `btime` line: the epoch second the machine booted.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub fn parse_btime(s: &str) -> Option<i64> {
     s.lines()
         .find_map(|l| l.strip_prefix("btime ")?.trim().parse().ok())
