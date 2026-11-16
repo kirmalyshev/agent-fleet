@@ -310,6 +310,7 @@ how many worktrees may hold any of a set of resources at once.
 | `role` | an agent's declared lead is down, the lead's level is not above its own, or a second root coordinator is up |
 | `quota` | a program's quota is exhausted, or a window ≥ 90% used resets in the future |
 | `stalled` | an agent idle or blocked for 15 min after it last worked |
+| `update` | a host's latest self-update (within the last 2 hours) that it answered `ok:false`, or that a live host (`host.health` in the last 3 min) has not answered 40 min after it was asked (an answer comes after the build, up to 30 min); a later success clears it. Subject `host:<host>`, with who asked and the error |
 | `build` | hosts that sent `host.health` in the last 10 min report different commits (or one reports none); each such host, with the others' commits |
 
 `hung` and `stalled` are also pushed, not only read: the host writes one `msg.sent` per episode
@@ -641,8 +642,10 @@ a running binary on macOS. It answers `update.result` (ok, the commit it will ru
 error), then exits with status 75 so its supervisor (systemd `Restart=on-failure` or launchd
 `KeepAlive`) starts the new binary. The CLI waits (20 min) until each host that sent
 `host.health` in the last 3 min has refused, or reports in `host.health` the commit it named,
-and prints each one's commit. Only a `host` actor may write `update.requested` (the CLI writes it
-as `host:<this machine>`): it makes every host rebuild and restart.
+and prints each one's commit. `update.requested` makes every host rebuild and restart. Its writers list names `host` only, and
+the CLI writes it as `host:<this machine>`, but that is a schema rule, **not access control**:
+the hub has one shared token and an actor names itself, so anyone holding the token can still
+write it, as any other event. Treat the token as the right to restart the fleet.
 
 **Automatic trigger.** Every 5 minutes a host fetches `origin/main` of its clone. When the commit
 its binary was built from is an ancestor of `origin/main` and not equal to it, it writes
@@ -657,18 +660,23 @@ The update is hardened:
 - **Work in flight.** A spawn execution or handoff running when the build finishes would be cut
   off by the exit and run again from scratch. The host answers `update.result`, then stops
   handing out guards for new spawns and handoffs (a request that arrives later is run by the
-  new process), waits until the running ones end, then exits. It waits at most 20 minutes, then
-  exits anyway, so a hung one cannot keep the old binary running. If the answer could not be
+  new process), waits until the running ones end, then exits. It waits at most 10 minutes (under the
+  15 at which a spawn request is answered `expired`, so one that arrived as the drain began is
+  still fresh for the new process), then tells the root coordinator what was cut off and exits
+  anyway, so a hung one cannot keep the old binary running. If the answer could not be
   written, the host still restarts: the new process finds the request unanswered and answers it.
 - **Time limits.** `git pull` 2 min, other git 1 min, `cargo install` 30 min; the process group
   is killed on a timeout and the update answers with the error. No command reads stdin, and git
-  never prompts (`GIT_TERMINAL_PROMPT=0`, ssh `BatchMode`; set for every command it runs).
+  never prompts (`GIT_TERMINAL_PROMPT=0` for every command it runs; ssh `BatchMode` for git, unless
+  `GIT_SSH_COMMAND`, `GIT_SSH` or the clone's `core.sshCommand` is set).
 - **One at a time.** An `flock` in the clone's git dir, taken before the checks and held through
   pull and build: a second update in the same clone (two hosts on one machine) waits for the
   first (up to 35 minutes), then runs; it is never raced, and a wait that times out answers with
   an error. The timer's fetch does not wait: it skips its turn.
-- **Rollback.** The previous binary is kept as `<binary>.prev` (a hard link, else a copy); one
-  generation, replaced by each update. If it cannot be kept the update fails before the rename.
+- **Rollback.** The previous binary is kept as `<binary>.prev` (a hard link, else a copy, made
+  under a temporary name and renamed into place, so a failed copy leaves the previous rollback
+  copy whole); one generation, replaced by each update. If it cannot be kept the update fails
+  before the rename.
   To roll back, rename it over the binary and restart the host.
 - **Leftovers.** At start a host removes `.agent-fleet-update-<pid>` directories from its
   binary's directory that are older than 45 minutes and whose process is gone (a killed update

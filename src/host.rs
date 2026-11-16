@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -125,18 +125,23 @@ pub(crate) struct Host {
     seen: Notify,
     started: Instant,
     n: Counters,
-    /// Spawn executions and handoffs in flight; a self-update restart waits for zero.
-    busy: AtomicUsize,
+    /// Spawn executions and handoffs in flight, by id and what they are; a self-update restart
+    /// waits for none.
+    busy: Mutex<Vec<(u64, String)>>,
+    busy_ids: AtomicU64,
     /// A self-update restart is waiting: no new spawn or handoff gets a guard.
     draining: AtomicBool,
 }
 
 /// Held while the host does work a restart would cut short.
-pub(crate) struct Busy<'a>(&'a AtomicUsize);
+pub(crate) struct Busy<'a> {
+    work: &'a Mutex<Vec<(u64, String)>>,
+    id: u64,
+}
 
 impl Drop for Busy<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.work.lock().unwrap().retain(|(i, _)| *i != self.id);
     }
 }
 
@@ -227,22 +232,37 @@ impl Host {
             seen: Notify::new(),
             started: Instant::now(),
             n: Counters::default(),
-            busy: AtomicUsize::new(0),
+            busy: Mutex::default(),
+            busy_ids: AtomicU64::new(0),
             draining: AtomicBool::new(false),
         }
     }
 
-    /// A guard for work a restart would cut short, or `None` once a restart is waiting: the
-    /// counter is raised before the flag is read, so work either holds the guard the restart
-    /// waits for or never starts.
-    pub(crate) fn busy_guard(&self) -> Option<Busy<'_>> {
-        self.busy.fetch_add(1, Ordering::SeqCst);
-        let guard = Busy(&self.busy);
+    /// A guard for work a restart would cut short (`what` names it), or `None` once a restart is
+    /// waiting: the work is registered before the flag is read, so it either holds the guard the
+    /// restart waits for or never starts.
+    pub(crate) fn busy_guard(&self, what: impl Into<String>) -> Option<Busy<'_>> {
+        let id = self.busy_ids.fetch_add(1, Ordering::SeqCst);
+        self.busy.lock().unwrap().push((id, what.into()));
+        let guard = Busy {
+            work: &self.busy,
+            id,
+        };
         (!self.is_draining()).then_some(guard)
     }
 
     pub(crate) fn is_busy(&self) -> bool {
-        self.busy.load(Ordering::SeqCst) > 0
+        !self.busy.lock().unwrap().is_empty()
+    }
+
+    /// What is in flight.
+    pub(crate) fn busy_work(&self) -> Vec<String> {
+        self.busy
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, w)| w.clone())
+            .collect()
     }
 
     pub(crate) fn drain(&self) {
