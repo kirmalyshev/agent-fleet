@@ -29,6 +29,7 @@ fn health(n: usize) -> Envelope<Known> {
             agents: 0,
             stats: None,
             commit: None,
+            behind_since: None,
         }),
     )
 }

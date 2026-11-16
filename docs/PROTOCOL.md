@@ -72,7 +72,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | presence | `agent.up` | agent, host, kind?, state, pane? | | host |
 | | `agent.state` | agent, state (`idle` `working` `blocked` `done` `unknown`) | | host |
 | | `agent.down` | agent, reason? | | host |
-| | `host.health` | host, disk_free, disk_total, agents, stats?, commit? (the commit its binary was built from; every minute) | | host |
+| | `host.health` | host, disk_free, disk_total, agents, stats?, commit? (the commit its binary was built from), behind_since? (since when its 5-minute fetch has found `origin/main` ahead of that commit; every minute) | | host |
 | | `agent.usage` | agent, rss_kb?, cpu_pct?, procs?, cwd? (each scan) | | host |
 | | `agent.role` | agent, level? (`root-coordinator` `domain-lead` `implementation-lead` `implementer`; absent `level` removes the role), lead?, domain? | | agent, host |
 | machine | `worktree.state` | host, path, repo, branch?, head, unpushed, dirty, dirty_submodules? (of dirty, moved submodule pointers), files[] (only what still differs from the default branch), last_commit, in_main?, herdr? (a linked worktree under herdr's worktree directory: `[worktrees] directory` in its config, default `~/.herdr/worktrees`) (on change) | | host |
@@ -326,7 +326,7 @@ how many worktrees may hold any of a set of resources at once.
 | `quota` | a program's quota is exhausted, or a window ≥ 90% used resets in the future |
 | `stalled` | an agent idle or blocked for 15 min after it last worked |
 | `update` | a host's latest self-update that it answered `ok:false` (for 2 hours, and for as long as the host's `host.health` still names the commit the failure reports: nothing asks it again until `origin/main` moves; the hub keeps, past its usual day, the update a host answered last if that answer failed on its current commit; a host that has not sent `host.health` for a day is gone, not failing), or that a live host (`host.health` in the last 3 min) has not answered 75 min after it was asked (the wait for another update's lock, 35 min, plus a build, 30, plus git). A request already older than 15 min when the host process started was ignored by it, not left unanswered. A later success clears it. Subject `host:<host>`, with who asked and the error |
-| `build` | hosts that sent `host.health` in the last 10 min report different commits (or one reports none); each such host, with the others' commits |
+| `build` | hosts that sent `host.health` in the last 10 min report different commits (or one reports none); each such host, with the others' commits. When they all agree: each one whose `behind_since` is 15 min old or more (the fleet is on a commit `origin/main` has left; its self-update did not take), with how long |
 
 `hung` and `stalled` are also pushed, not only read: the host writes one `msg.sent` per episode
 — `HUNG` or `STALLED`, ref the agent's name, the finding's own detail for text — to the agent's
@@ -655,15 +655,17 @@ request that failed does not block a retry.
 
 A host runs the binary `cargo install --path <clone>` built from its own clone. The build embeds
 the clone's commit (`build.rs`, `git rev-parse HEAD`) and the clone's path (`CARGO_MANIFEST_DIR`);
-`host.health` reports the commit, `agent-fleet ps` shows it, and `doctor` reports `build` when
-live hosts disagree.
+`host.health` reports the commit, `agent-fleet ps` shows it, `agent-fleet --version` prints it
+after the crate version, and `doctor` reports `build` when live hosts disagree, or agree on a
+commit that has been behind `origin/main` for 15 min.
 
 `agent-fleet self-update` writes `update.requested`. Each host that sees it within 15 min and
 has not answered it yet, in the clone its binary was built from: refuses a clone not on `main`
 or with uncommitted changes to tracked files, runs `git pull --ff-only`, and, unless the
 pulled head is the commit it already runs, runs `cargo install --locked --path <clone> --root
 <tmp>` (the `cargo` beside its own binary, else the one on `PATH`) with `<tmp>` in its binary's
-directory, and renames the build over its binary — never overwriting it in place, which kills
+directory, runs the build's `--version` and refuses one that does not name the pulled head
+(the old binary stays, the answer is not ok), and renames the build over its binary — never overwriting it in place, which kills
 a running binary on macOS. It answers `update.result` (ok, the commit it will run, or on failure the commit it still runs, and the
 error), then exits with status 75 so its supervisor (systemd `Restart=on-failure` or launchd
 `KeepAlive`) starts the new binary. The CLI waits (20 min) until each host that sent
@@ -679,7 +681,8 @@ its binary was built from is an ancestor of `origin/main` and not equal to it, i
 request. It asks once per `origin/main` commit: a build that failed is not asked for again until
 `origin/main` moves. It asks nothing while a request for this host waits, while an update holds
 the clone's lock, or when its commit is not an ancestor of `origin/main` (a build from
-elsewhere) or unknown.
+elsewhere) or unknown. From the first fetch that finds it behind until one finds it is not, its
+`host.health` carries `behind_since`; a failed fetch or a held lock leaves it as it was.
 
 The update is hardened:
 

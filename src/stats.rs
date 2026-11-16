@@ -250,6 +250,7 @@ mod tests {
                 ..Default::default()
             }),
             commit: None,
+            behind_since: None,
         })
     }
 

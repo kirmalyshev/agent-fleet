@@ -34,7 +34,7 @@ use store::Store;
 
 /// One event log for a fleet of coding agents: presence, tasks, blockers, asks and doorbells.
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version = env!("AGENT_FLEET_VERSION"), about)]
 struct Cli {
     /// Which fleet: one instance per project or product, each with its own hub, log, token,
     /// spool and replica.
