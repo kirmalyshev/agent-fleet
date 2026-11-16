@@ -187,10 +187,13 @@ fn closes(v: &Value, repo: &str) -> (Vec<u64>, bool) {
         .into_iter()
         .flatten()
     {
-        match (
-            i["number"].as_u64(),
-            i["repository"]["nameWithOwner"].as_str(),
-        ) {
+        // `gh` gives `repository: {name, owner: {login}}`, not `nameWithOwner`.
+        let r = &i["repository"];
+        let at = match (r["owner"]["login"].as_str(), r["name"].as_str()) {
+            (Some(o), Some(n)) => Some(format!("{o}/{n}")),
+            _ => None,
+        };
+        match (i["number"].as_u64(), at) {
             (Some(n), Some(r)) if r.eq_ignore_ascii_case(repo) => here.push(n),
             _ => foreign = true,
         }
@@ -498,10 +501,14 @@ mod tests {
 
     #[test]
     fn closing_refs_are_matched_on_repo_and_number() {
-        let v: Value = serde_json::json!({"closingIssuesReferences": [
-            {"number": 5, "repository": {"nameWithOwner": "o/r"}},
-            {"number": 5, "repository": {"nameWithOwner": "x/y"}},
-            {"number": 7}]});
+        // The shape `gh pr list --json closingIssuesReferences` prints (ids and names anonymised).
+        let v: Value = serde_json::from_str(
+            r#"{"closingIssuesReferences":[
+              {"id":"I_a","number":5,"repository":{"id":"R_a","name":"r","owner":{"id":"U_a","login":"o"}},"url":"https://github.com/o/r/issues/5"},
+              {"id":"I_b","number":5,"repository":{"id":"R_b","name":"y","owner":{"id":"U_b","login":"x"}},"url":"https://github.com/x/y/issues/5"},
+              {"number":7}]}"#,
+        )
+        .unwrap();
         assert_eq!(closes(&v, "o/r"), (vec![5], true));
         assert_eq!(closes(&serde_json::json!({}), "o/r"), (vec![], false));
     }
@@ -545,8 +552,8 @@ mod tests {
             format!(
                 r#"#!/bin/sh
 case "$1 $2 $6" in
-  "pr list open") echo '[{{"number":1,"headRefName":"s-1","isDraft":false,"updatedAt":"2026-11-01T00:00:00Z","closingIssuesReferences":[{{"number":5,"repository":{{"nameWithOwner":"o/r"}}}}],"files":[{{"path":"src/a.rs"}}]}},{{"number":2,"headRefName":"s-2","isDraft":false,"updatedAt":"2026-11-01T00:00:00Z","closingIssuesReferences":[{{"number":6,"repository":{{"nameWithOwner":"o/r"}}}}],"files":[{{"path":"src/b.rs"}}]}}]' ;;
-  "pr list merged") echo '[{{"number":9,"closingIssuesReferences":[{{"number":5,"repository":{{"nameWithOwner":"o/r"}}}}]}}]' ;;
+  "pr list open") echo '[{{"number":1,"headRefName":"s-1","isDraft":false,"updatedAt":"2026-11-01T00:00:00Z","closingIssuesReferences":[{{"id":"I_x","number":5,"repository":{{"id":"R_x","name":"r","owner":{{"id":"U_x","login":"o"}}}},"url":"https://github.com/o/r/issues/5"}}],"files":[{{"path":"src/a.rs"}}]}},{{"number":2,"headRefName":"s-2","isDraft":false,"updatedAt":"2026-11-01T00:00:00Z","closingIssuesReferences":[{{"id":"I_y","number":6,"repository":{{"id":"R_x","name":"r","owner":{{"id":"U_x","login":"o"}}}},"url":"https://github.com/o/r/issues/6"}}],"files":[{{"path":"src/b.rs"}}]}}]' ;;
+  "pr list merged") echo '[{{"number":9,"closingIssuesReferences":[{{"id":"I_x","number":5,"repository":{{"id":"R_x","name":"r","owner":{{"id":"U_x","login":"o"}}}},"url":"https://github.com/o/r/issues/5"}}]}}]' ;;
   "issue list all") echo '[{{"number":5,"state":"CLOSED"}},{{"number":6,"state":"OPEN"}}]' ;;
   "pr close"*) echo "$@" >> {log:?} ;;
   *) echo "unexpected: $@" >&2; exit 1 ;;
