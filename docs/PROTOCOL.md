@@ -13,7 +13,7 @@ Three rules carry the design:
    (`msg.delivered`). A lost doorbell is visible as sent and not delivered, and it is retried.
 3. **Humans are authenticated, agents do not speak for them.** An event whose actor is a human
    may only enter through a human-only channel. The one channel is the board's answer route,
-   `POST /board/answer`, behind the hub token; `POST /events` refuses `actor.kind = human` outright.
+   `POST /board/answer`, behind the shared hub token; `POST /events` refuses `actor.kind = human` outright.
 
 ## Topology
 
@@ -153,8 +153,23 @@ data itself, not the scan, so the views can say how stale the numbers are.
 - **A readable log.** The hub refuses to start on a log holding events it cannot fold: that
   means the binary and the log drifted apart, and a skipped `task.assigned` would let a task be
   granted twice.
-- **Bearer token.** Every endpoint needs `Authorization: Bearer <token>`. The hub creates a
-  random token file (mode 0600) on first start; clients read the same file.
+- **Bearer token.** Every endpoint needs `Authorization: Bearer <token>`; a missing or unknown
+  token is `401`. The hub creates a random shared token file (mode 0600) on first start;
+  clients read the same file.
+- **The token binds the actor.** `agent-fleet mint-token <scope> --out <file>`, run where the
+  hub runs, writes a new token to `<file>` (mode 0600) and appends `<scope> <token>` to the
+  hub's token table, `hub-tokens`. The hub reads the table when it starts. A `host:<name>`
+  token may post as `host:<name>` and as agents `agent:<name>/…`; an `agent:<name>` token only
+  as agents `agent:<name>/…`. The shared token may post as any actor, except a host that has a
+  `host:` token of its own. Any other actor is `403`, checked after the duplicate check, so a
+  replay is still acknowledged. Every valid token reads; only the shared token answers the board.
+  Upgrading changes nothing until the operator mints tokens: no table, the shared token keeps
+  every right it had. Migrate one host at a time: mint `host:<name>`, copy the file to that
+  host, run its `agent-fleet host --token-file <file>` (the flag, not `AGENT_FLEET_TOKEN_FILE`,
+  which its agents would inherit), restart the hub. From then on only that file posts as that
+  host. To take the shared token away from a host's agents, mint `agent:<name>` and make it
+  that host's `token` file. A token file guards against other hosts, not against a process of the
+  same Unix user on the same machine, which can read it.
 
 ## Tolerant on read
 
@@ -729,7 +744,8 @@ machine need two `--listen` ports. A host agent serves one instance and one herd
 
 Everything of an instance lives in one data directory: `AGENT_FLEET_HOME`, or the platform data
 directory (`directories` crate) for the default instance and `instances/<name>` under it for
-the others: `hub.db`, `replica.db`, `spool.jsonl`, `spool.rejected.jsonl`, `token`, `hub` (the
+the others: `hub.db`, `replica.db`, `spool.jsonl`, `spool.rejected.jsonl`, `token`,
+`hub-tokens` (the hub's scoped tokens), `hub` (the
 hub's URL), and the lock files `spool.lock` and `spool.flush`. `AGENT_FLEET_TOKEN_FILE` and `agent-fleet hub --db` move
 the token and the hub database elsewhere.
 

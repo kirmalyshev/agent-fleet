@@ -76,6 +76,15 @@ enum Cmd {
         #[arg(long)]
         db: Option<PathBuf>,
     },
+    /// Mint a token that may post only as `host:<name>` (and its agents) or `agent:<name>` (the
+    /// agents on that host), into the hub's token table. Run it where the hub runs.
+    MintToken {
+        /// `host:<name>` or `agent:<name>`.
+        scope: String,
+        /// A new file (mode 0600) to write the token to; copy it to that host.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Run the host agent for one herdr session: presence, disk, replica, doorbell delivery,
     /// and spawn requests for this host.
     Host {
@@ -787,8 +796,16 @@ async fn main() -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| ctx.paths.token());
             let token = client::read_or_create_token(&token_file)?;
+            let tokens = hub::Tokens::load(token, &ctx.paths.hub_tokens())?;
             let db = db.clone().unwrap_or_else(|| ctx.paths.hub_db());
-            hub::serve(listen, &db, &ctx.paths.hub_file(), token).await?;
+            hub::serve(listen, &db, &ctx.paths.hub_file(), tokens).await?;
+        }
+        Cmd::MintToken { scope, out } => {
+            hub::mint(&ctx.paths.hub_tokens(), scope, out)?;
+            eprintln!(
+                "wrote a {scope} token to {}; restart the hub to accept it",
+                out.display()
+            );
         }
         Cmd::Host {
             herdr_socket,
