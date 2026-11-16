@@ -1,6 +1,6 @@
 //! `state = fold(events)`. Pure: no I/O, no clock.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
@@ -922,16 +922,22 @@ impl State {
             }
         }
         // A failure is kept while its host still runs the commit it failed on: nothing will ask
-        // that host again until `origin/main` moves, and `doctor` reports it until then.
-        let hosts = &self.hosts;
-        self.updates.retain(|_, u| {
-            e.ts - u.since <= UPDATE_KEPT
-                || u.results.iter().any(|(h, r)| {
-                    !r.ok
-                        && r.commit.is_some()
-                        && hosts.get(h).is_some_and(|x| x.commit == r.commit)
-                })
-        });
+        // that host again until `origin/main` moves, and `doctor` reports it until then. Only the
+        // newest such update per host: `doctor` reads no other.
+        let mut newest: BTreeMap<&str, (DateTime<Utc>, &str)> = BTreeMap::new();
+        for (id, u) in &self.updates {
+            for (h, r) in &u.results {
+                let on_it = !r.ok
+                    && r.commit.is_some()
+                    && self.hosts.get(h).is_some_and(|x| x.commit == r.commit);
+                if on_it && newest.get(h.as_str()).is_none_or(|(s, _)| u.since > *s) {
+                    newest.insert(h, (u.since, id));
+                }
+            }
+        }
+        let keep: HashSet<String> = newest.values().map(|(_, id)| id.to_string()).collect();
+        self.updates
+            .retain(|id, u| e.ts - u.since <= UPDATE_KEPT || keep.contains(id));
         self.answers
             .retain(|_, a| e.ts - a.acked.unwrap_or(a.at) <= ANSWER_KEPT);
         // The reducer has no clock: a spawn is pruned once a later event's `ts` is more than
@@ -2211,6 +2217,55 @@ mod tests {
         // It moved on: pruned.
         s.apply(&health("bbb", UPDATE_KEPT.num_seconds() + 120));
         assert!(s.updates.is_empty(), "history once it runs another commit");
+    }
+
+    #[test]
+    fn only_the_newest_failed_update_per_host_outlives_the_day() {
+        let mut s = State::default();
+        let health = |plus: i64| {
+            let mut e = ev(
+                ActorKind::Host,
+                Known::HostHealth(HostHealth {
+                    host: "h".into(),
+                    disk_free: 1,
+                    disk_total: 2,
+                    agents: 0,
+                    commit: Some("aaa".into()),
+                    stats: None,
+                }),
+            );
+            e.ts += chrono::Duration::seconds(plus);
+            e.into_event()
+        };
+        s.apply(&health(1));
+        let mut ids = Vec::new();
+        for hour in [0, 2] {
+            let mut req = by("host:h", Known::UpdateRequested(UpdateRequested::default()));
+            req.ts += chrono::Duration::hours(hour);
+            ids.push(req.id.clone());
+            s.apply(&req.into_event());
+            let mut fail = ev(
+                ActorKind::Host,
+                Known::UpdateResult(UpdateResult {
+                    host: "h".into(),
+                    ok: false,
+                    commit: Some("aaa".into()),
+                    error: None,
+                }),
+            )
+            .re(&ids[ids.len() - 1]);
+            fail.ts += chrono::Duration::hours(hour) + chrono::Duration::seconds(1);
+            s.apply(&fail.into_event());
+        }
+        // 23 h after the first: both fit the day.
+        s.apply(&health(23 * 3600));
+        assert_eq!(s.updates.len(), 2);
+        // 25 h after the first: past the day and not the newest, so gone; the second stays.
+        s.apply(&health(25 * 3600));
+        assert_eq!(s.updates.keys().collect::<Vec<_>>(), [&ids[1]]);
+        // 30 h after the first, 28 h after the second: kept as the newest failure on aaa.
+        s.apply(&health(30 * 3600));
+        assert_eq!(s.updates.keys().collect::<Vec<_>>(), [&ids[1]]);
     }
 
     #[test]
