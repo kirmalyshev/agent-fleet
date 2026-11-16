@@ -33,6 +33,13 @@ impl Store {
         Self::init(conn)
     }
 
+    /// Opens an existing log for reading only: no file is created, no table touched.
+    pub fn open_readonly(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("open {} read-only", path.display()))?;
+        Ok(Self { conn })
+    }
+
     #[cfg(test)]
     pub fn memory() -> Result<Self> {
         Self::init(Connection::open_in_memory()?)
