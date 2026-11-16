@@ -125,6 +125,7 @@ impl Watch {
             .filter(|(_, then)| at - *then <= Duration::from_std(EVERY * 2).unwrap_or(MIN_AGE))
         else {
             (self.prev, self.fresh) = (Some((now, at)), true);
+            self.idle.clear();
             return Vec::new();
         };
         self.fresh = false;
@@ -238,6 +239,8 @@ impl Tick<'_> {
         let p = &self.now.0[&pid];
         let old = p.started.is_some_and(|s| self.at - s >= MIN_AGE);
         let key = (pid, p.started);
+        // Walked: a streak it does not renew this tick ends (a wait or a listen breaks it).
+        self.visited.insert(key);
         let push = |t: &mut Self, verdict| {
             t.out.push(Classified {
                 pid,
@@ -255,16 +258,20 @@ impl Tick<'_> {
             }
             return true;
         }
-        // ponytail: "mcp" in the argv marks an MCP server started through a shell; a task
-        // whose argv merely names mcp is skipped too. A listener is a server it keeps.
-        let mcp = p
-            .args
-            .as_deref()
-            .is_some_and(|a| a.to_lowercase().contains("mcp"));
-        if mcp || self.seen.listening.contains(&pid) {
+        // ponytail: "mcp" in the program or its first words marks an MCP server started through
+        // a shell (`npx -y some-mcp`); a task named so is skipped too. Skipped, not busy: its
+        // parent can still be hung. A listener is a server it keeps, and keeps its parent busy.
+        let mcp = p.args.as_deref().is_some_and(|a| {
+            a.split_whitespace()
+                .take(4)
+                .any(|w| w.to_lowercase().contains("mcp"))
+        });
+        if mcp {
+            return false;
+        }
+        if self.seen.listening.contains(&pid) {
             return true;
         }
-        self.visited.insert(key);
         let mut busy = false;
         for c in self.kids(pid).to_vec() {
             busy |= self.visit(c, agent);
@@ -277,7 +284,9 @@ impl Tick<'_> {
             push(self, Verdict::Working);
             return true;
         }
-        let streak = self.streaks.get(&key).copied().unwrap_or(0) + 1;
+        // A tick that cannot see output proves nothing: the streak holds, it does not grow.
+        let was = self.streaks.get(&key).copied().unwrap_or(0);
+        let streak = was + u32::from(self.seen.output_at.is_some());
         self.next.insert(key, streak);
         let verdict = match &self.seen.output_at {
             Some(_) if streak >= HUNG_TICKS => Verdict::Hung(Evidence {
@@ -383,7 +392,6 @@ fn agent_in(s: &State, host: &str, cwd: &str) -> Option<String> {
         .map(|(_, id)| id.clone())
 }
 
-/// `lsof` with `args`, its stdout when it ran (it exits 1 when it lists nothing).
 /// How long one `lsof` or `simctl` call may take before the tick gives up on it.
 const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
@@ -421,12 +429,12 @@ async fn run(cmd: &str, args: &[&str]) -> Option<String> {
 /// Listening processes, and when each of `pids`' stdout/stderr files last changed. `None`
 /// when `lsof` gives no answer: then nothing is proved hung.
 async fn machine(pids: &[u32]) -> Option<(HashSet<u32>, HashMap<u32, DateTime<Utc>>)> {
-    let listening = parse_lsof_pids(&run("lsof", &["-nP", "-iTCP", "-sTCP:LISTEN", "-Fp"]).await?);
+    let listening = parse_lsof_pids(&run("lsof", &["-wnP", "-iTCP", "-sTCP:LISTEN", "-Fp"]).await?);
     if pids.is_empty() {
         return Some((listening, HashMap::new()));
     }
     let csv: Vec<String> = pids.iter().map(u32::to_string).collect();
-    let args = ["-nP", "-a", "-d", "1,2", "-Fpftn", "-p", &csv.join(",")];
+    let args = ["-wnP", "-a", "-d", "1,2", "-Fpftn", "-p", &csv.join(",")];
     let files = parse_lsof_files(&run("lsof", &args).await?);
     let output_at = files
         .into_iter()
@@ -448,6 +456,9 @@ async fn machine(pids: &[u32]) -> Option<(HashSet<u32>, HashMap<u32, DateTime<Ut
 
 /// The simulators booted on this host; empty off macOS or when `simctl` gives no answer.
 async fn booted() -> Vec<String> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
     let Some(out) = run("xcrun", &["simctl", "list", "devices", "booted"]).await else {
         return Vec::new();
     };
@@ -479,8 +490,12 @@ pub fn to_clear(
             let still = v
                 .iter()
                 .any(|c| c.pid == h.pid && matches!(c.verdict, Verdict::Idle | Verdict::Hung(_)));
+            // Walked and found working or waiting; absent from the walk (reparented) proves nothing.
             let seen = h.agent.as_ref().is_some_and(|a| walked.contains(a));
-            (h.started.is_some() && p.started != h.started) || covered || (seen && !still)
+            let works = v.iter().any(|c| {
+                c.pid == h.pid && matches!(c.verdict, Verdict::Working | Verdict::Waiting { .. })
+            });
+            (h.started.is_some() && p.started != h.started) || covered || (seen && works && !still)
         })
         .map(|(k, _)| k.clone())
         .collect()
@@ -617,7 +632,8 @@ async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {
         let p = &procs.0[top];
         let known = s.hung.get(&key).filter(|k| k.started == p.started);
         let since = known.and_then(|k| k.since).unwrap_or(now);
-        if known.is_none_or(|k| &k.pids != pids) {
+        // Every tick it is confirmed: `checked` keeps it kill proof.
+        {
             let ok = host
                 .publish(host.presence(Known::ProcessHung(ProcessHung {
                     host: me.clone(),
@@ -628,6 +644,7 @@ async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {
                     started: p.started,
                     evidence: Some(evidence.clone()),
                     since: Some(since),
+                    checked: Some(now),
                 })))
                 .await;
             // Its kill line only works once the report is in the log.
@@ -664,6 +681,7 @@ async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {
             started: None,
             evidence: None,
             since: None,
+            checked: None,
         })))
         .await;
     }
@@ -1075,6 +1093,7 @@ mod tests {
                 started: None,
                 evidence: Some("0% CPU".into()),
                 since: None,
+                checked: None,
             },
         );
         assert_eq!(
@@ -1158,6 +1177,7 @@ mod tests {
             started,
             evidence: Some("0% CPU".into()),
             since: Some(at(-2)),
+            checked: None,
         }
     }
 
@@ -1196,6 +1216,10 @@ mod tests {
             "works again"
         );
         assert!(
+            clear(&s, &[], &procs, &[], &walked).is_empty(),
+            "out of the walked tree (reparented) is not working"
+        );
+        assert!(
             clear(&s, &[], &procs, &[], &HashSet::new()).is_empty(),
             "its tree was not walked"
         );
@@ -1216,6 +1240,29 @@ mod tests {
             vec!["h:30"],
             "covered by its parent's report"
         );
+    }
+
+    #[test]
+    fn a_tick_without_lsof_neither_proves_nor_grows_a_streak() {
+        let mut w = Watch::default();
+        let blind = Seen {
+            output_at: None,
+            ..seen()
+        };
+        w.step(wedged(0), at(0), &seen());
+        assert_eq!(
+            verdict(&w.step(wedged(0), at(2), &blind), 30),
+            Some(&Verdict::Idle)
+        );
+        assert_eq!(
+            verdict(&w.step(wedged(0), at(4), &seen()), 30),
+            Some(&Verdict::Idle),
+            "one seen idle tick is not two"
+        );
+        assert!(matches!(
+            verdict(&w.step(wedged(0), at(6), &seen()), 30),
+            Some(Verdict::Hung(_))
+        ));
     }
 
     #[test]

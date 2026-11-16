@@ -975,7 +975,13 @@ async fn main() -> Result<()> {
             let t = kill::table()?;
             let me = std::process::id();
             let host = ctx.host_name();
-            let state = ctx.state().await.ok();
+            let state = ctx
+                .state()
+                .await
+                .inspect_err(|e| {
+                    eprintln!("agent-fleet kill: no state, so no orphan or hung proof: {e:#}")
+                })
+                .ok();
             let orphans = state
                 .as_ref()
                 .map_or_else(Default::default, |s| doctor::killable(s, now, &host));
@@ -992,7 +998,7 @@ async fn main() -> Result<()> {
             // A hung report holds for the process that hung, not a later one with its pid.
             let hung = state
                 .as_ref()
-                .map_or_else(Default::default, |s| doctor::hung_pids(s, &host));
+                .map_or_else(Default::default, |s| doctor::hung_pids(s, &host, now));
             let live = (!hung.is_empty())
                 .then(scan::Procs::read)
                 .unwrap_or_default();

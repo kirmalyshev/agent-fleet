@@ -702,6 +702,14 @@
                 "null"
               ]
             },
+            "checked": {
+              "description": "When the host last confirmed it hung; it re-reports every tick it does.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "command": {
               "type": [
                 "string",
@@ -2286,6 +2294,14 @@
           "properties": {
             "agent": {
               "description": "The agent that started it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "checked": {
+              "description": "When the host last confirmed it hung; it re-reports every tick it does.",
+              "format": "date-time",
               "type": [
                 "string",
                 "null"

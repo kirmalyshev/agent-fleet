@@ -34,6 +34,8 @@ pub const SPAWN_UNANSWERED: Duration = Duration::minutes(5);
 pub const STALLED: Duration = Duration::minutes(crate::spawn::STALL_MIN as i64);
 /// A failed spawn stays a finding this long.
 pub const SPAWN_FAILED: Duration = Duration::hours(1);
+/// A `proc.hung` report confirmed this recently is kill proof: three watch ticks.
+pub const HUNG_FRESH: Duration = Duration::minutes(6);
 /// Files every branch touches; sharing them is not duplicate work.
 const SHARED_BY_ALL: &[&str] = &[
     "bun.lock",
@@ -301,11 +303,16 @@ pub fn killable(
 }
 
 /// Pids on `host` a `proc.hung` report names, with when it was first found hung: a live
-/// process with that pid that started later is not the one that hung.
-pub fn hung_pids(s: &State, host: &str) -> std::collections::BTreeMap<u32, DateTime<Utc>> {
+/// process with that pid that started later is not the one that hung. Only a report the host
+/// confirmed within `HUNG_FRESH` counts: one nobody re-checks proves nothing for `kill`.
+pub fn hung_pids(
+    s: &State,
+    host: &str,
+    now: DateTime<Utc>,
+) -> std::collections::BTreeMap<u32, DateTime<Utc>> {
     s.hung
         .values()
-        .filter(|h| h.host == host)
+        .filter(|h| h.host == host && h.checked.is_some_and(|c| now - c <= HUNG_FRESH))
         .flat_map(|h| {
             let since = h.since.unwrap_or(DateTime::<Utc>::MIN_UTC);
             std::iter::once(h.pid)
@@ -955,6 +962,7 @@ mod tests {
                 started: Some(now - Duration::minutes(20)),
                 evidence: Some("0% CPU, output not a file".into()),
                 since: Some(now - Duration::minutes(4)),
+                checked: Some(now - Duration::minutes(1)),
             },
         );
         let f = findings(&s, now);
@@ -967,10 +975,14 @@ mod tests {
             "{}",
             f[0].detail
         );
-        let k = hung_pids(&s, "h");
+        let k = hung_pids(&s, "h", now);
         assert_eq!(k.keys().copied().collect::<Vec<_>>(), vec![30, 31]);
         assert_eq!(k[&31], now - Duration::minutes(4));
-        assert!(hung_pids(&s, "other").is_empty());
+        assert!(hung_pids(&s, "other", now).is_empty());
+        assert!(
+            hung_pids(&s, "h", now + HUNG_FRESH).is_empty(),
+            "a report nobody re-checked is no proof"
+        );
         assert!(
             killable(&s, now, "h").is_empty(),
             "a hung report is no orphan proof"

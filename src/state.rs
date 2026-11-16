@@ -826,7 +826,12 @@ impl State {
             Known::ProcessHung(d) => {
                 let key = format!("{}:{}", d.host, d.pid);
                 if d.evidence.is_some() {
-                    let since = self.hung.get(&key).and_then(|h| h.since);
+                    // A reused pid's report starts its own episode.
+                    let since = self
+                        .hung
+                        .get(&key)
+                        .filter(|h| h.started == d.started)
+                        .and_then(|h| h.since);
                     self.hung.insert(
                         key,
                         ProcessHung {
@@ -1164,6 +1169,7 @@ mod tests {
                     started: None,
                     evidence: evidence.map(str::to_string),
                     since: None,
+                    checked: None,
                 }),
             )
             .into_event()

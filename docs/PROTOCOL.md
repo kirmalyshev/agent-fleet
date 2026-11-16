@@ -100,7 +100,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `spawn.result` | agent, ok, pane?, worktree?, error? | re = the request | host |
 | | `agent.unmanaged` | host, pid, program?, cwd?, since? — no `program` clears the report | | host |
 | | `proc.orphaned` | host, pid, cwd?, why?, since? — no `why` clears the report | | host |
-| | `proc.hung` | host, pid, pids[]?, agent?, command?, started?, evidence?, since? — the topmost hung process an agent started and the hung ones under it (the watch tick, every 2 min); no `evidence` clears the report | | host |
+| | `proc.hung` | host, pid, pids[]?, agent?, command?, started?, evidence?, since?, checked? — the topmost hung process an agent started and the hung ones under it (the watch tick, every 2 min); no `evidence` clears the report | | host |
 | | `agent.stuck` | agent, cause?, detail, until? — no `cause` clears the record | | host |
 | | `agent.signal` | agent, program, signal, detail? — `prompt`/`turn_end` clear the agent's stored signal | | agent |
 
@@ -444,7 +444,8 @@ It kills the caller's own processes (its agent's tree) and orphans `doctor` prov
 a deleted worktree or a `forgotten` linked worktree (never a repository's main checkout) (on
 Linux, still in that directory). It also kills the pids of a `proc.hung` report on the caller's
 host, also inside another agent's tree, when the live process started before the report's
-`since` (a later one with that pid is not the one that hung). TERM, then KILL after `--grace`
+`since` (a later one with that pid is not the one that hung) and the report was `checked` in
+the last 6 minutes (one nobody re-checks proves nothing). TERM, then KILL after `--grace`
 seconds. Each refusal is logged as `kill.refused`.
 
 `agent-fleet hook bash` is a PreToolUse hook for Claude Code (tool `Bash`) and Devin CLI (tool
@@ -503,7 +504,7 @@ Every 2 minutes the host classifies every process an agent started: everything u
 shells its agent program runs (an agent's own process, its pane shell and its other direct
 children — MCP servers — are never classified), plus the proved orphans, each claimed by the
 agent whose worktree it runs in. A process under 2 minutes old or with no start time is not
-classified, nor is one with a listening TCP socket (a server it keeps) or `mcp` in its argv (an
+classified, nor is one with a listening TCP socket (a server it keeps) or `mcp` in the first words of its argv (an
 MCP server started through a shell), or anything under them. Each gets one state:
 
 - `working`: over 1% CPU over the interval, its stdout/stderr file changed, a child started
@@ -512,15 +513,16 @@ MCP server started through a shell), or anything under them. Each gets one state
 - `waiting`: in a watched lock's queue (`<lock>.waiting/`), with the lock and since when;
   nothing under it is classified;
 - `hung`: none of the above for 2 ticks in a row. Output on a pipe or terminal is not seen, so
-  it does not count as work. When `lsof` gives no answer (an error, a timeout), nothing is hung;
+  it does not count as work. When `lsof` gives no answer (an error, a timeout), nothing is hung and the tick does not count;
   a tick after a gap of more than two intervals (the machine slept) only re-reads the table;
 - `orphan`: a `proc.orphaned` proof holds.
 
 The topmost hung process of a chain is reported as `proc.hung` with every hung pid under it,
 its command, start, and evidence (CPU, the output file's last change, the deepest descendant's
-command, the lock it holds). The report clears when its pid is gone or is now another process,
-when a parent's report covers it, or when its agent's tree was walked and found it neither idle
-nor hung; a tree the tick could not read leaves it standing. A `hung` or `orphan` process, and a
+command, the lock it holds), re-sent every tick that confirms it with `checked`. The report
+clears when its pid is gone or is now another process, when a parent's report covers it, or
+when its agent's tree was walked and found it working or waiting; a tree the tick could not
+read, or a process that left the tree, leaves it standing. A `hung` or `orphan` process, and a
 `waiting` one past 30 minutes, are told once per episode — a `msg.sent` of kind `HUNG`,
 `ORPHAN` or `WAITING` with `ref` `<host>:<pid>` — to the agent that started it, its lead and
 the root coordinator; a hung tell waits until its report is in the log. An orphan proved by a

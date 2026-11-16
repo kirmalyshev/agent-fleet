@@ -659,6 +659,9 @@ pub struct ProcessHung {
     /// When it was first found hung.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<DateTime<Utc>>,
+    /// When the host last confirmed it hung; it re-reports every tick it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked: Option<DateTime<Utc>>,
 }
 
 /// A process on the writer's host doctor proved an orphan: reparented to init with its
