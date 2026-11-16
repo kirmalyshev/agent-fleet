@@ -164,7 +164,8 @@ fn inside(dir: &str, root: &str) -> bool {
     dir == root || dir.strip_prefix(root).is_some_and(|r| r.starts_with('/'))
 }
 
-/// Where the fleet assigned agents to work (their spawn worktrees), never where the caller or its pane stands now: a caller that `cd`s
+/// Where the fleet assigned agents to work (their spawn worktrees, or where their host first saw a
+/// hand-started one), never where the caller or its pane stands now: a caller that `cd`s
 /// into another agent's worktree gains nothing.
 #[derive(Debug, Default, PartialEq)]
 pub struct Homes {

@@ -1013,8 +1013,9 @@ async fn main() -> Result<()> {
                         .is_some_and(|t| t <= *since)
                 })
             };
-            // The caller's worktree is the one the fleet assigned at spawn (`spawn.result`), never
-            // its pane's live cwd, which follows a `cd`; no record fails closed.
+            // The caller's worktree is the one the fleet assigned at spawn (`spawn.result`), or, for
+            // a hand-started agent, where its host first saw it; never its pane's live cwd, which
+            // follows a `cd`. No record fails closed.
             let homes = match (&state, ctx.me().await) {
                 (Some(s), Ok(a)) => {
                     let trees: Vec<_> = s
