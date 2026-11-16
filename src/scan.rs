@@ -579,13 +579,19 @@ pub const STRAY_MIN: chrono::Duration = chrono::Duration::hours(2);
 pub const STRAY_LEADER_MIN: chrono::Duration = chrono::Duration::minutes(2);
 
 /// `true` when the process is a device or test tool a dead session can leave behind:
-/// `xcodebuild`, `maestro`, `simctl`, `idb`, the WDA runner, or `log stream`.
+/// `xcodebuild`, `maestro`, `simctl`, `idb`, `xctest`, the WDA runner, `log stream`, or a
+/// `java` running maestro — the CLI's real name, since it runs as `java -classpath
+/// …/.maestro/lib/… maestro.cli.AppKt`.
 fn device_tool(p: &Proc) -> bool {
     matches!(
         p.name.as_str(),
         "xcodebuild" | "maestro" | "simctl" | "idb" | "xctest"
     ) || p.name.starts_with("WebDriverAgentRunner")
         || (p.name == "log" && p.args.as_deref().is_some_and(|a| a.contains("log stream")))
+        || (p.name == "java"
+            && p.args
+                .as_deref()
+                .is_some_and(|a| a.contains("maestro.cli.AppKt") || a.contains("/.maestro/lib/")))
 }
 
 /// A cheap prefilter: reparented to init and tool-shaped — worth collecting device lists for.
@@ -950,18 +956,40 @@ mod tests {
             (555, 1, 555, "zsh"),
             (666, 1, 555, "maestro"),
         ]);
-        t.0.get_mut(&65813).unwrap().args = Some("java -jar maestro.jar test flow.yaml".into());
+        {
+            let j = t.0.get_mut(&65813).unwrap();
+            j.args = Some(
+                "java -classpath /u/.maestro/lib/maestro-cli.jar maestro.cli.AppKt test flow.yaml"
+                    .into(),
+            );
+            j.started = Some(now - chrono::Duration::minutes(9));
+        }
         t.0.get_mut(&666).unwrap().started = Some(now - chrono::Duration::minutes(30));
         let live: HashSet<String> = HashSet::new();
+        // Maestro runs as `java`: its args name it, and the dead leader proves it.
+        assert_eq!(
+            stray(&t, 65813, Some(&live), now),
+            Some("group leader dead")
+        );
+        // A plain java in the same dead group is nobody's device tool.
+        t.0.insert(
+            65814,
+            tool(65814, 1, 45872, "java", "java -jar something.jar", 9),
+        );
+        assert_eq!(
+            stray(&t, 65814, Some(&live), now),
+            None,
+            "java is a tool only when maestro's args say so"
+        );
         let s = |pid, min, table: &Procs| {
             let p = tool(pid, 1, 45872, "xcodebuild", "xcodebuild test", min);
             let mut t = Procs(table.0.clone());
             t.0.insert(pid, p);
             stray(&t, pid, Some(&live), now)
         };
-        assert_eq!(s(1, 9, &t), Some("group leader dead"));
+        assert_eq!(s(70001, 9, &t), Some("group leader dead"));
         // Each condition on its own is no proof.
-        assert_eq!(s(1, 1, &t), None, "younger than the floor");
+        assert_eq!(s(70001, 1, &t), None, "younger than the floor");
         assert_eq!(
             stray(&t, 666, Some(&live), now),
             None,

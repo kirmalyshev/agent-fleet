@@ -478,7 +478,8 @@ process's directory is known on Linux only), re-sent without `program` once the 
 
 The same scan proves orphans and reports them as `proc.orphaned` (`why` says which proof
 held; no `why` clears it). A process reparented to init that is a device or test tool —
-`xcodebuild`, `maestro`, `simctl`, `idb`, `xctest`, a `WebDriverAgentRunner`, or `log stream` —
+`xcodebuild`, `maestro` (named `maestro`, or `java` whose args carry `maestro.cli.AppKt` or
+`/.maestro/lib/`), `simctl`, `idb`, `xctest`, a `WebDriverAgentRunner`, or `log stream` —
 whose process-group leader is dead (the group id names no live process) is an orphan once it
 is two minutes old — the floor only spares a script mid-`exec`; its descendants are orphans
 with it. When the leader is alive the older proof remains: two hours and a UDID that is
