@@ -449,8 +449,10 @@ a deleted worktree or a `forgotten` linked worktree (never a repository's main c
 Linux, still in that directory). It kills an orphan (parent pid 1, `systemd` or `launchd`) whose
 working directory is inside the caller's worktree, unless that path is also inside a worktree
 recorded for another agent. The caller's worktree is the one from its most recent `spawn.result`
-answered ok on this host, never one it requested for itself and never its pane's live cwd. With
-no such record the orphan is refused. It also kills the pids of a `proc.hung` report on the caller's
+answered ok on this host, never one it requested for itself and never its pane's live cwd. An
+agent no one else spawned (started by hand in a pane) has instead the worktree holding the first
+`agent.usage` cwd its own host reported for it, fixed until `agent.down`. With no such record, or a
+spawn that failed or is unanswered, the orphan is refused. It also kills the pids of a `proc.hung` report on the caller's
 host, also inside another agent's tree, when the live process started before the report's
 `since` (a later one with that pid is not the one that hung) and the report was `checked` in
 the last 6 minutes (one nobody re-checks proves nothing). TERM, then KILL after `--grace`

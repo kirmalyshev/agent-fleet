@@ -3334,6 +3334,14 @@
           "description": "Open blockers by the id of their `blocker.raised`.",
           "type": "object"
         },
+        "first_cwd": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "The cwd an agent's own host first reported for its pane (`agent.usage`), by agent id; fixed\nuntil `agent.down`, so a later `cd` does not move it. The root of an agent nobody spawned.",
+          "type": "object"
+        },
         "hosts": {
           "additionalProperties": {
             "$ref": "#/$defs/Host"

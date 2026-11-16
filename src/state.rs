@@ -18,6 +18,10 @@ pub struct State {
     pub last: Option<String>,
     pub hosts: BTreeMap<String, Host>,
     pub agents: BTreeMap<String, Agent>,
+    /// The cwd an agent's own host first reported for its pane (`agent.usage`), by agent id; fixed
+    /// until `agent.down`, so a later `cd` does not move it. The root of an agent nobody spawned.
+    #[serde(default)]
+    pub first_cwd: BTreeMap<String, String>,
     /// Declared roles by agent id; kept apart from `agents`, so a role survives `agent.down`.
     #[serde(default)]
     pub roles: BTreeMap<String, Role>,
@@ -477,6 +481,13 @@ impl State {
             }
             Known::AgentUsage(d) => {
                 if let Some(a) = self.agents.get_mut(&d.agent) {
+                    // Only the agent's own host fixes where it was first seen.
+                    if let Some(cwd) = d.cwd.clone().filter(|_| {
+                        e.actor.kind == crate::event::ActorKind::Host
+                            && e.actor.id == format!("host:{}", a.host)
+                    }) {
+                        self.first_cwd.entry(d.agent.clone()).or_insert(cwd);
+                    }
                     a.usage = Some(Usage {
                         rss_kb: d.rss_kb,
                         cpu_pct: d.cpu_pct,
@@ -575,6 +586,7 @@ impl State {
             }
             Known::AgentDown(d) => {
                 self.agents.remove(&d.agent);
+                self.first_cwd.remove(&d.agent);
                 self.stuck.remove(&d.agent);
                 self.signals.remove(&d.agent);
             }
@@ -914,8 +926,9 @@ impl State {
     /// `spawn.result`, never where the agent's pane stands now (`usage.cwd` follows a `cd`).
     /// Exact rule: among the spawns of an agent that is up (in `agents`) on `host`, drop any the
     /// agent requested for itself, and any not answered `ok` with a worktree; the one requested
-    /// LAST (`since`) gives the root. An agent re-spawned into a new worktree so moves with it,
-    /// and an agent with no such spawn, or not up, has `None`.
+    /// LAST (`since`) gives the root. An agent re-spawned into a new worktree so moves with it.
+    /// An up agent no one else spawned here (started by hand) has its `first_cwd`; one whose spawn
+    /// failed or is unanswered, or with neither, has `None`.
     ///
     /// Threat model: `kill` guards against honest-but-mistaken agents, not deliberate
     /// impersonation. The hub's one shared bearer token already lets any holder post as any
@@ -939,6 +952,11 @@ impl State {
             let slot = out.entry(agent).or_insert((s.since, None));
             if slot.1.is_none() || s.since >= slot.0 {
                 *slot = (s.since, Some(tree));
+            }
+        }
+        for (id, a) in &self.agents {
+            if let (true, Some(cwd)) = (a.host == host, self.first_cwd.get(id)) {
+                out.entry(id).or_insert((a.since, Some(cwd.clone())));
             }
         }
         out.into_iter()
@@ -1113,6 +1131,93 @@ mod tests {
         // an agent nobody spawned is absent: its root fails closed
         s.spawns.clear();
         assert!(s.assigned_worktrees("h").is_empty());
+    }
+
+    #[test]
+    fn a_hand_started_agents_root_is_where_its_host_first_saw_it() {
+        let a = "agent:h/s/a".to_string();
+        let use_at = |kind, cwd: &str| {
+            ev(
+                kind,
+                Known::AgentUsage(AgentUsage {
+                    agent: a.clone(),
+                    rss_kb: None,
+                    cpu_pct: None,
+                    procs: None,
+                    cwd: Some(cwd.into()),
+                }),
+            )
+        };
+        let mut s = State::default();
+        s.apply(
+            &ev(
+                ActorKind::Host,
+                Known::AgentUp(AgentUp {
+                    agent: a.clone(),
+                    host: "h".into(),
+                    kind: Some("claude".into()),
+                    state: AgentState::Idle,
+                    pane: None,
+                }),
+            )
+            .into_event(),
+        );
+        assert!(s.assigned_worktrees("h").is_empty(), "no record yet");
+        s.apply(&use_at(ActorKind::Agent, "/w/foreign").into_event());
+        let mut other_host = use_at(ActorKind::Host, "/w/x");
+        other_host.actor.id = "host:x".into();
+        s.apply(&other_host.into_event());
+        assert!(s.first_cwd.is_empty(), "only the agent's own host sets it");
+        s.apply(&use_at(ActorKind::Host, "/w/mine/web").into_event());
+        s.apply(&use_at(ActorKind::Host, "/w/other").into_event());
+        let mine = vec![(a.clone(), Some("/w/mine/web".to_string()))];
+        assert_eq!(
+            s.assigned_worktrees("h"),
+            mine,
+            "a later cd does not move it"
+        );
+        assert!(s.assigned_worktrees("x").is_empty());
+        // a spawned agent keeps its spawn result, and a failed spawn still fails closed
+        let req: SpawnRequested = serde_json::from_value(serde_json::json!({
+            "name": "a", "agent": a, "host": "h", "session": "s", "repo": "r",
+            "branch": "b", "profile": "p", "brief": "x", "why": "t"
+        }))
+        .unwrap();
+        let spawn = |ok| Spawn {
+            request: req.clone(),
+            by: "agent:h/s/coord".into(),
+            project: "p".into(),
+            result: Some(SpawnResult {
+                agent: a.clone(),
+                ok,
+                pane: None,
+                worktree: Some("/w/spawned".into()),
+                error: None,
+            }),
+            since: Utc::now(),
+            answered: None,
+        };
+        s.spawns.insert("e1".into(), spawn(true));
+        assert_eq!(
+            s.assigned_worktrees("h")[0].1.as_deref(),
+            Some("/w/spawned")
+        );
+        s.spawns.insert("e1".into(), spawn(false));
+        assert_eq!(s.assigned_worktrees("h")[0].1, None);
+        // the agent's own spawn request does not count: it falls back to where it was seen
+        s.spawns.get_mut("e1").unwrap().by = a.clone();
+        assert_eq!(s.assigned_worktrees("h"), mine);
+        s.apply(
+            &ev(
+                ActorKind::Host,
+                Known::AgentDown(AgentDown {
+                    agent: a.clone(),
+                    reason: None,
+                }),
+            )
+            .into_event(),
+        );
+        assert!(s.first_cwd.is_empty(), "a new lifetime starts afresh");
     }
 
     #[test]
