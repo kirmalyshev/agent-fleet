@@ -795,6 +795,7 @@ mod tests {
         busy: std::cell::Cell<bool>,
         drop_publish: std::cell::Cell<bool>,
         asked: std::cell::Cell<usize>,
+        ask_fails: std::cell::Cell<bool>,
         results: std::cell::RefCell<Vec<UpdateResult>>,
     }
 
@@ -814,6 +815,9 @@ mod tests {
         }
         async fn ask(&self) -> bool {
             self.log.borrow_mut().push("ask".into());
+            if self.ask_fails.get() {
+                return false;
+            }
             let n = self.asked.get() + 1;
             self.asked.set(n);
             self.pending.borrow_mut().push(format!("own{n}"));
@@ -1012,6 +1016,59 @@ mod tests {
             timer(&io, &ctx(&clone, &exe, running), &mut t).await;
         }
         assert!(io.log.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_timer_does_not_replace_a_diverged_build_or_one_ahead_of_origin() {
+        let (_t, origin, clone, exe) = fixture();
+        newer(&origin);
+        sh(&clone, &["commit", "-q", "--allow-empty", "-m", "local"]);
+        let local = sh(&clone, &["rev-parse", "HEAD"]);
+        let exe = Ok(exe);
+        let io = Fake::default();
+        // A real commit that is not an ancestor of origin/main: not ours to replace.
+        let mut t = Timer::default();
+        assert!(behind(&clone, Some(&local)).await.unwrap().is_none());
+        timer(&io, &ctx(&clone, &exe, Some(&local)), &mut t).await;
+        assert!(io.log.borrow().is_empty());
+        // An unknown commit is an error, not a request.
+        assert!(behind(&clone, Some(&"0".repeat(40))).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_request_that_was_not_written_is_asked_again_next_interval() {
+        let (_t, origin, clone, exe) = fixture();
+        let first = sh(&clone, &["rev-parse", "HEAD"]);
+        newer(&origin);
+        let exe = Ok(exe);
+        let io = Fake::default();
+        io.ask_fails.set(true);
+        let (mut t, c) = (Timer::default(), ctx(&clone, &exe, Some(&first)));
+        timer(&io, &c, &mut t).await;
+        io.ask_fails.set(false);
+        timer(&io, &c, &mut t).await;
+        assert_eq!(*io.log.borrow(), ["ask", "ask"]);
+        assert_eq!(t.asked_for.as_deref().map(str::len), Some(40));
+    }
+
+    #[tokio::test]
+    async fn the_timer_asks_nothing_while_an_update_holds_the_lock_or_origin_is_unreachable() {
+        let (_t, origin, clone, exe) = fixture();
+        let first = sh(&clone, &["rev-parse", "HEAD"]);
+        newer(&origin);
+        let exe = Ok(exe);
+        let io = Fake::default();
+        let c = ctx(&clone, &exe, Some(&first));
+        let held = lock(&clone).await.unwrap();
+        timer(&io, &c, &mut Timer::default()).await;
+        assert!(io.log.borrow().is_empty(), "an update is running");
+        drop(held);
+        sh(&clone, &["remote", "set-url", "origin", "/nonexistent"]);
+        timer(&io, &c, &mut Timer::default()).await;
+        assert!(
+            io.log.borrow().is_empty(),
+            "origin unreachable: logged, no request"
+        );
     }
 
     #[tokio::test]

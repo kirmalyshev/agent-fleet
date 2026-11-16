@@ -1233,6 +1233,34 @@ mod tests {
     }
 
     #[test]
+    fn an_update_request_names_its_host_on_the_wire_and_omits_it_for_all() {
+        let host = Actor {
+            kind: ActorKind::Host,
+            id: "host:h".into(),
+        };
+        let wire = |host_field: Option<&str>| {
+            serde_json::to_value(Envelope::new(
+                host.clone(),
+                "p",
+                Known::UpdateRequested(UpdateRequested {
+                    host: host_field.map(String::from),
+                }),
+            ))
+            .unwrap()
+        };
+        let one = wire(Some("h"));
+        assert_eq!(one["data"]["host"], "h");
+        assert!(matches!(
+            parse_strict(&one),
+            Ok(Envelope { body: Known::UpdateRequested(UpdateRequested { host: Some(h) }), .. }) if h == "h"
+        ));
+        assert!(
+            wire(None)["data"].get("host").is_none(),
+            "absent asks every host"
+        );
+    }
+
+    #[test]
     fn only_a_host_may_ask_every_host_to_update() {
         let ask = |actor: Actor| {
             let v = serde_json::to_value(Envelope::new(
