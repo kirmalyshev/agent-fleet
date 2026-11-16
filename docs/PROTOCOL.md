@@ -536,7 +536,8 @@ or `gone`. Nothing is killed automatically.
 ## Spawning
 
 The fleet starts agents itself. `<checkout>/.agent-fleet/fleet.toml` in the project says how
-(`docs/fleet.example.toml` ships one): a `session`, a `base` ref (default `origin/main`), a
+(`docs/fleet.example.toml` ships one): a `session` (absent: the herdr session the CLI runs
+in, from `HERDR_SESSION`), a `base` ref (default `origin/main`), a
 `brief` template next to the file with `@@KEY@@` placeholders, an optional `ready` script run
 inside a new worktree before the agent starts, `[vars]` for extra tokens, `[profiles]` —
 a `kind` (the `agent.start`/`agent.quota` program), `args`, `unset_env`, a `prefix` for agent
@@ -546,6 +547,10 @@ whole words against the issue's title and labels — never the `--scope` text, w
 work and never picks the worker; `label:x` matches only
 a label named x. Config errors name the line that is wrong: an unknown profile, a fallback
 cycle, two defaults, no default.
+
+A checkout with no `.agent-fleet/fleet.toml` uses the machine's own: `fleet.toml` and its brief
+in the user config directory (`~/.config/agent-fleet` on Linux, `AGENT_FLEET_CONFIG_DIR`
+overrides it). The checkout's file wins whenever it exists.
 
 `agent-fleet spawn <owner/repo>#<issue>` reads the issue with `gh issue view` (`AGENT_FLEET_GH`
 names the binary), picks the rule — `--profile`, `--host` and `--level` override it. A profile at
@@ -559,6 +564,12 @@ LEVEL, LEAD, HANDOFF (empty unless a handoff), the `[vars]` and `--set KEY=VALUE
 never re-expanded and a placeholder with no value refuses the spawn. `--dry-run` prints the
 decision and the brief and writes nothing; otherwise `spawn.requested` is written and the CLI
 follows the hub until `spawn.result` arrives (10 min, `--no-wait` skips the wait).
+
+Work with no issue: `agent-fleet spawn <owner/repo> --title "<what>"`. The rules match on the
+title, the default name is the profile's prefix plus the title's words (32 characters at most),
+ISSUE renders empty, and the task is `task:<repo name>/<name>`. The CLI creates that task and,
+once `spawn.result` is ok, assigns it to the new agent; under `--no-wait` it stays unassigned.
+Every brief also has REF (`owner/repo#N`, or `owner/repo` with no issue) and TASK (the task id).
 
 The host agent serves requests naming its host and session, against a checkout given as
 `--repo <owner/repo>=<dir>` (a bare `--repo <dir>` watches a checkout and derives the slug from

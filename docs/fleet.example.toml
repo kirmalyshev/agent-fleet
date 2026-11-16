@@ -1,4 +1,4 @@
-session = "work"                 # herdr session agents run in
+session = "work"                 # herdr session agents run in; absent = the session the CLI runs in
 base = "origin/main"             # branch point for a new worktree
 brief = "brief.md"               # template next to fleet.toml; @@KEY@@ placeholders
 ready = "scripts/worktree-ready.sh"   # optional; run inside a NEW worktree with its path as $1, before the agent starts
