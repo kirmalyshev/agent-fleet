@@ -144,6 +144,17 @@ pub fn write_new_token(path: &Path) -> Result<String> {
     Ok(hex)
 }
 
+/// Holds an flock until dropped, then unlocks it outright. Closing the file is not enough: a
+/// child that another thread forked meanwhile shares the open file and keeps the lock until it
+/// execs, so the next flush would wrongly see a replay in progress.
+pub(crate) struct Held(pub(crate) File);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let _ = flock(&self.0, FlockOperation::Unlock);
+    }
+}
+
 pub struct Client {
     base: String,
     token: String,
@@ -333,6 +344,7 @@ impl Client {
             .append(true)
             .open(self.spool.with_extension("lock"))?;
         flock(&lock, FlockOperation::LockExclusive)?;
+        let _held = Held(lock);
         f()
     }
 
@@ -406,6 +418,7 @@ impl Client {
             }
             Err(e) => return Err(e.into()),
         }
+        let _held = Held(flusher);
         let lines = self.locked(|| self.spool_lines())?;
         let mut out = Flushed::default();
         let mut done = 0;
@@ -651,15 +664,10 @@ mod tests {
     #[tokio::test]
     async fn spool_replays_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("hub.db");
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener); // hub down
-        let c = Client::new(
-            &format!("http://{addr}"),
-            "tok".into(),
-            dir.path().join("spool.jsonl"),
-        );
+        let spool = dir.path().join("spool.jsonl");
+        // Hub down: a port nothing listens on (binding it needs root), not a freed ephemeral
+        // port that another test could take before the hub binds it again.
+        let c = Client::new("http://127.0.0.1:1", "tok".into(), spool.clone());
 
         let (b1, b2) = (block(1), block(2));
         assert!(matches!(c.write(&b1).await.unwrap(), Sent::Spooled(_)));
@@ -683,7 +691,10 @@ mod tests {
             "task.assigned never goes to the spool"
         );
 
-        let hub = start_hub(tokio::net::TcpListener::bind(addr).await.unwrap(), &db).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hub = start_hub(listener, &dir.path().join("hub.db")).await;
+        let c = Client::new(&base, "tok".into(), spool);
         let f = c.flush_spool().await.unwrap();
         assert_eq!((f.sent, f.rejected, f.left), (2, 0, 0));
         assert_eq!(
@@ -704,6 +715,41 @@ mod tests {
             "each spooled event exactly once, in order"
         );
         assert_eq!(c.state().await.unwrap().blockers.len(), 2);
+        hub.abort();
+    }
+
+    #[tokio::test]
+    async fn a_child_forked_meanwhile_does_not_hold_the_replay_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hub = start_hub(listener, &dir.path().join("hub.db")).await;
+        let c = Client::new(&base, "tok".into(), dir.path().join("spool.jsonl"));
+        // Another thread spawning processes, as the host and the test harness do: each fork
+        // briefly shares every open file, the replay lock's included.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let forker = std::thread::spawn({
+            let stop = stop.clone();
+            move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::process::Command::new("true").status().unwrap();
+                }
+            }
+        });
+        let mut missed = 0;
+        for n in 0..300 {
+            c.spool_append(&serde_json::to_value(block(n)).unwrap())
+                .unwrap();
+            if c.flush_spool().await.unwrap().sent != 1 {
+                missed += 1;
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        forker.join().unwrap();
+        assert_eq!(
+            missed, 0,
+            "no flush may find the lock still held by a child"
+        );
         hub.abort();
     }
 

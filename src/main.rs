@@ -1590,6 +1590,25 @@ async fn tell_root(ctx: &Ctx, s: &state::State, key: &str, text: &str) -> String
     }
 }
 
+/// Writes an executable test script. A child process writes it, never this one: a write
+/// descriptor here would be shared by any child another test thread forks meanwhile, and
+/// running the script then fails with "Text file busy" (a rename would not help: same inode).
+#[cfg(test)]
+fn write_script(path: &std::path::Path, body: &str) {
+    let ok = std::process::Command::new("sh")
+        .args([
+            "-c",
+            "printf %s \"$1\" > \"$2\" && chmod 755 \"$2\"",
+            "sh",
+            body,
+        ])
+        .arg(path)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "write {}", path.display());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

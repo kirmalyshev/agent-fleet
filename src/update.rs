@@ -256,7 +256,7 @@ async fn git_in(clone: &Path, args: &[&str], limit: Duration) -> Result<String> 
 /// One update at a time per clone: the lock lives in the clone's git dir, so two hosts of one
 /// machine never race on `git pull` or both build. An update waits for it (`wait`), the timer's
 /// fetch does not. The file is only held, never read: dropping it releases the lock.
-struct Lock(#[allow(dead_code)] std::fs::File);
+struct Lock(#[allow(dead_code)] crate::client::Held);
 
 /// Takes the lock at once or fails.
 async fn lock(clone: &Path) -> Result<Lock> {
@@ -277,7 +277,7 @@ async fn lock_for(clone: &Path, wait: Duration) -> Result<Lock> {
     let deadline = tokio::time::Instant::now() + wait;
     loop {
         match flock(&f, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => return Ok(Lock(f)),
+            Ok(()) => return Ok(Lock(crate::client::Held(f))),
             Err(e) if e == rustix::io::Errno::WOULDBLOCK => {
                 if tokio::time::Instant::now() >= deadline {
                     bail!("another update is running in {}", clone.display());
@@ -874,7 +874,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
     fn sh(dir: &Path, args: &[&str]) -> String {
@@ -931,8 +930,7 @@ chmod +x "$root/bin/agent-fleet"
         let bin = t.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let cargo = bin.join("cargo");
-        std::fs::write(&cargo, format!("#!/bin/sh\n{cargo_body}")).unwrap();
-        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::write_script(&cargo, &format!("#!/bin/sh\n{cargo_body}"));
         let exe = bin.join("agent-fleet");
         std::fs::write(&exe, "old").unwrap();
         (t, origin, clone, exe)
@@ -1880,10 +1878,7 @@ chmod +x "$root/bin/agent-fleet"
     async fn a_replaced_binary_must_run_and_exit_zero_to_be_followed() {
         let (_t, _origin, _clone, exe) = fixture();
         let bin = exe.with_file_name("probe");
-        let put = |body: &str| {
-            std::fs::write(&bin, body).unwrap();
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        };
+        let put = |body: &str| crate::write_script(&bin, body);
         put("#!/bin/sh\necho 'agent-fleet 0.1.0 abc1234'\n");
         assert_eq!(
             binary_says(&bin).await.unwrap(),

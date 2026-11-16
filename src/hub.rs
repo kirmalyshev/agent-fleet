@@ -942,14 +942,12 @@ mod tests {
     }
 
     fn script(f: &Follow, says: &str, code: i32, sleep: u32) {
-        use std::os::unix::fs::PermissionsExt;
         let body = format!(
             "#!/bin/sh\ncase \"$1\" in --version) echo 'agent-fleet 0.1.0 {says}'; exit 0;; esac\n\
              echo \"$@\" > {}\nsleep {sleep}\necho boom >&2\nexit {code}\n",
             f.argv.display()
         );
-        std::fs::write(&f.exe, body).unwrap();
-        std::fs::set_permissions(&f.exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::write_script(&f.exe, &body);
     }
 
     #[tokio::test]
