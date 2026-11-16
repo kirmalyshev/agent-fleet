@@ -121,6 +121,17 @@ fn files(v: &[&String]) -> String {
     }
 }
 
+/// `agent` worked, or a later spawn of it succeeded, after its spawn requested at `since`.
+fn spawned_since(s: &State, agent: &str, since: DateTime<Utc>) -> bool {
+    s.agents
+        .get(agent)
+        .and_then(|a| a.worked)
+        .is_some_and(|w| w > since)
+        || s.spawns.values().any(|o| {
+            o.request.agent == agent && o.since > since && o.result.as_ref().is_some_and(|r| r.ok)
+        })
+}
+
 /// The intentional hold on an agent's open task: an open blocker, else an unfinished dep.
 /// `None` when no open task of its is held.
 pub fn held(s: &State, id: &str) -> Option<String> {
@@ -693,7 +704,12 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
             ));
         }
     }
-    for k in s.refused_kills.iter().filter(|k| now - k.ts < REFUSED) {
+    // A refusal because the pid was already gone refused nothing.
+    for k in s
+        .refused_kills
+        .iter()
+        .filter(|k| now - k.ts < REFUSED && !k.reason.ends_with(crate::kill::GONE))
+    {
         out.push(finding(
             "refused",
             &k.by,
@@ -754,7 +770,11 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
                     ago(now, sp.since)
                 ),
             )),
-            Some(r) if !r.ok && sp.answered.is_some_and(|t| now - t < SPAWN_FAILED) => {
+            Some(r)
+                if !r.ok
+                    && sp.answered.is_some_and(|t| now - t < SPAWN_FAILED)
+                    && !spawned_since(s, &sp.request.agent, sp.since) =>
+            {
                 out.push(finding(
                     "spawn",
                     &r.agent,
@@ -1814,6 +1834,8 @@ mod tests {
                 what: "waits for the perf run".into(),
                 owner: None,
                 unblocks_when: None,
+                pid: None,
+                started: None,
                 by: "agent:h/s/x".into(),
                 since: h(1),
             },
@@ -1869,5 +1891,79 @@ mod tests {
             !f.iter()
                 .any(|x| x.kind == "stalled" && x.subject == "agent:h/s/q")
         );
+    }
+
+    #[test]
+    fn a_refusal_of_a_gone_pid_is_no_finding() {
+        let now = Utc::now();
+        let mut s = State::default();
+        for (pid, reason) in [
+            (7, format!("pid 7: {}", crate::kill::GONE)),
+            (8, "pid 8 (node) is not yours".to_string()),
+        ] {
+            s.refused_kills.push(crate::state::RefusedKill {
+                by: "agent:h/s/a".into(),
+                host: "h".into(),
+                pid,
+                name: "node".into(),
+                reason,
+                ts: now,
+            });
+        }
+        let f = findings(&s, now);
+        assert_eq!(f.len(), 1, "{f:#?}");
+        assert!(
+            f[0].kind == "refused" && f[0].detail.contains("pid 8"),
+            "{f:#?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_spawn_clears_once_the_agent_works_or_a_later_spawn_succeeds() {
+        let now = Utc::now();
+        let id = "agent:h/s/a";
+        let spawn = |ok, since: DateTime<Utc>| crate::state::Spawn {
+            request: serde_json::from_value(serde_json::json!({
+                "name": "a", "agent": id, "host": "h", "session": "s", "repo": "r",
+                "branch": "b", "profile": "p", "brief": "x", "why": "t"
+            }))
+            .unwrap(),
+            by: "x".into(),
+            project: "p".into(),
+            result: Some(crate::event::SpawnResult {
+                agent: id.into(),
+                ok,
+                pane: None,
+                worktree: None,
+                error: (!ok).then(|| "no pane".into()),
+            }),
+            since,
+            answered: Some(since),
+        };
+        let failed = now - Duration::minutes(10);
+        let mut s = State::default();
+        s.spawns.insert("e1".into(), spawn(false, failed));
+        assert_eq!(kinds(&findings(&s, now)), [("spawn", id)], "still failed");
+        let mut a = agent(AgentState::Working, now, "/w/a", 0, 0);
+        a.worked = Some(failed - Duration::minutes(1));
+        s.agents.insert(id.into(), a.clone());
+        assert_eq!(
+            kinds(&findings(&s, now)),
+            [("spawn", id)],
+            "worked before it"
+        );
+        a.worked = Some(now);
+        s.agents.insert(id.into(), a);
+        assert_eq!(kinds(&findings(&s, now)), [], "it works now");
+        s.agents.clear();
+        s.spawns
+            .insert("e0".into(), spawn(true, failed - Duration::minutes(1)));
+        assert_eq!(
+            kinds(&findings(&s, now)),
+            [("spawn", id)],
+            "an older ok spawn"
+        );
+        s.spawns.insert("e2".into(), spawn(true, now));
+        assert_eq!(kinds(&findings(&s, now)), [], "a later spawn succeeded");
     }
 }

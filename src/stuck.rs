@@ -1430,6 +1430,8 @@ mod tests {
                 what: "ships with the next release".into(),
                 owner: None,
                 unblocks_when: None,
+                pid: None,
+                started: None,
                 by: "agent:h/s/x".into(),
                 since: now,
             },

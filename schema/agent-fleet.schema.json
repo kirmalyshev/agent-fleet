@@ -411,6 +411,23 @@
                 "null"
               ]
             },
+            "pid": {
+              "description": "A process on the raiser's host the block waits on (a lock holder). That host resolves\nthe blocker once the pid is gone or no longer started at `started`.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "started": {
+              "description": "When `pid` started, read when the blocker was raised: a reused pid started later.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "unblocks_when": {
               "type": [
                 "string",
@@ -2208,9 +2225,25 @@
                 "null"
               ]
             },
+            "pid": {
+              "description": "The process it waits on, on the raiser's host, and when that process started.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "since": {
               "format": "date-time",
               "type": "string"
+            },
+            "started": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "task": {
               "type": [
