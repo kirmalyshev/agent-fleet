@@ -131,23 +131,8 @@ impl Watch {
             return Vec::new();
         };
         self.fresh = false;
-        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-        for (&pid, p) in &now.0 {
-            children.entry(p.ppid).or_default().push(pid);
-        }
-        let mut t = Tick {
-            now: &now,
-            before: &before,
-            then,
-            at,
-            ms: (at - then).num_milliseconds().max(1) as u64,
-            seen,
-            children,
-            streaks: &self.idle,
-            next: HashMap::new(),
-            visited: HashSet::new(),
-            out: Vec::new(),
-        };
+        let ms = (at - then).num_milliseconds().max(1) as u64;
+        let mut t = Tick::new(&now, &before, then, at, ms, seen, &self.idle);
         for (agent, apid) in &seen.agents {
             for &shell in t.kids(*apid).to_vec().iter() {
                 if SHELLS.contains(&now.0[&shell].name.as_str()) {
@@ -201,7 +186,37 @@ struct Tick<'a> {
     out: Vec<Classified>,
 }
 
-impl Tick<'_> {
+impl<'a> Tick<'a> {
+    /// `ms` is the CPU sample (`before` to `now`); `then` is how far back output and new
+    /// children count as work.
+    fn new(
+        now: &'a Procs,
+        before: &'a Procs,
+        then: DateTime<Utc>,
+        at: DateTime<Utc>,
+        ms: u64,
+        seen: &'a Seen,
+        streaks: &'a HashMap<(u32, Option<DateTime<Utc>>), u32>,
+    ) -> Self {
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (&pid, p) in &now.0 {
+            children.entry(p.ppid).or_default().push(pid);
+        }
+        Tick {
+            now,
+            before,
+            then,
+            at,
+            ms,
+            seen,
+            children,
+            streaks,
+            next: HashMap::new(),
+            visited: HashSet::new(),
+            out: Vec::new(),
+        }
+    }
+
     fn kids(&self, pid: u32) -> &[u32] {
         self.children.get(&pid).map_or(&[], Vec::as_slice)
     }
@@ -224,15 +239,22 @@ impl Tick<'_> {
         self.seen.output_at.as_ref()?.get(&pid).copied()
     }
 
-    /// Working on its own: a device tool other than `simctl bootstatus`, over 1% CPU, its
-    /// output file changed, or a child started since the last tick.
-    fn works(&self, pid: u32) -> bool {
+    /// Why `pid` is working on its own, if it is: a device tool other than `simctl bootstatus`,
+    /// over 1% CPU, its output file changed, or a child started since the last tick.
+    fn works(&self, pid: u32) -> Option<String> {
         let p = &self.now.0[&pid];
         let bootstatus = p.args.as_deref().is_some_and(|a| a.contains("bootstatus"));
-        (crate::scan::device_tool(p) && !bootstatus)
-            || self.used(pid).saturating_mul(100) > self.ms
-            || self.wrote(pid).is_some_and(|t| t > self.then)
-            || self.kids(pid).iter().any(|&c| self.fresh(c))
+        let used = self.used(pid);
+        if crate::scan::device_tool(p) && !bootstatus {
+            Some("is a device tool".into())
+        } else if used.saturating_mul(100) > self.ms {
+            Some(format!("used {used} ms of CPU in {} ms", self.ms))
+        } else if let Some(t) = self.wrote(pid).filter(|t| *t > self.then) {
+            Some(format!("wrote output at {}", t.format("%H:%M:%S")))
+        } else {
+            let c = self.kids(pid).iter().find(|&&c| self.fresh(c))?;
+            Some(format!("started child {c}"))
+        }
     }
 
     /// Mark `pid`'s subtree walked without classifying it.
@@ -274,14 +296,9 @@ impl Tick<'_> {
             }
             return true;
         }
-        // ponytail: "mcp" in a non-flag argv word marks an MCP server started through a shell
-        // (`npx -y some-mcp`, `docker run … github-mcp-server`); a task naming mcp is skipped
-        // too. Skipped, not busy: its parent can still be hung. A listener is a server it
-        // keeps, and keeps its parent busy. A skipped subtree's streaks end.
-        let mcp = p.args.as_deref().is_some_and(|a| {
-            a.split_whitespace()
-                .any(|w| !w.starts_with('-') && w.to_lowercase().contains("mcp"))
-        });
+        // An MCP server is skipped, not busy: its parent can still be hung. A listener is a
+        // server it keeps, and keeps its parent busy. A skipped subtree's streaks end.
+        let mcp = is_mcp(p);
         if mcp || self.seen.listening.contains(&pid) {
             self.skip(pid);
             return !mcp;
@@ -290,7 +307,7 @@ impl Tick<'_> {
         for c in self.kids(pid).to_vec() {
             busy |= self.visit(c, agent);
         }
-        busy |= self.works(pid);
+        busy |= self.works(pid).is_some();
         if !old {
             return busy;
         }
@@ -316,6 +333,15 @@ impl Tick<'_> {
         push(self, verdict);
         false
     }
+}
+
+/// ponytail: "mcp" in a non-flag argv word marks an MCP server started through a shell
+/// (`npx -y some-mcp`, `docker run … github-mcp-server`); a task naming mcp counts too.
+fn is_mcp(p: &Proc) -> bool {
+    p.args.as_deref().is_some_and(|a| {
+        a.split_whitespace()
+            .any(|w| !w.starts_with('-') && w.to_lowercase().contains("mcp"))
+    })
 }
 
 // ---------- the host's tick ----------
@@ -475,6 +501,122 @@ async fn machine(pids: &[u32]) -> Option<(Tcp, HashMap<u32, DateTime<Utc>>)> {
         })
         .collect();
     Some((tcp, output_at))
+}
+
+// ---------- `kill`'s own check of a hung report ----------
+
+/// How long `kill` samples the CPU of a process a hung report names. The watch's line is 1% CPU;
+/// over 5 s that is 50 ms, several clock ticks on Linux and centiseconds on macOS, so one tick
+/// of noise does not decide it, and 5 s is still short to wait for at a prompt. Output files and
+/// start times look back over the whole hung window, not just the sample.
+pub const CONFIRM: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What `kill` reads off the machine to check a hung report itself: a report is only a claim,
+/// and any process that can read the host's token file can post one.
+#[derive(Debug)]
+pub struct Sample {
+    pub before: Procs,
+    pub now: Procs,
+    /// Milliseconds from `before` to `now`.
+    pub ms: u64,
+    pub at: DateTime<Utc>,
+    /// Listeners and connections, the output files of the sampled trees, and the lock waiters.
+    pub seen: Seen,
+}
+
+impl Sample {
+    /// Two process tables `CONFIRM` apart, then the watch's `lsof` reads over `pids`' trees.
+    pub async fn take(pids: &[u32], waiting: HashMap<u32, (String, DateTime<Utc>)>) -> Self {
+        let before = Procs::read();
+        let start = std::time::Instant::now();
+        tokio::time::sleep(CONFIRM).await;
+        let now = Procs::read();
+        let ms = start.elapsed().as_millis().max(1) as u64;
+        let trees: Vec<u32> = pids.iter().flat_map(|&p| now.tree(p)).collect();
+        let mut seen = Seen {
+            waiting,
+            ..Seen::default()
+        };
+        if let Some(((listening, connected), output_at)) = machine(&trees).await {
+            (seen.listening, seen.connected) = (listening, connected);
+            seen.output_at = Some(output_at);
+        }
+        Sample {
+            before,
+            now,
+            ms,
+            at: Utc::now(),
+            seen,
+        }
+    }
+
+    /// Why this sample contradicts a report that `pid` has hung since `since`, if it does. By
+    /// the watch's own rules: `pid` is still the process that hung, and one the watch reports
+    /// at all (not an MCP server, not the agent's own child); nothing in its tree works
+    /// (`Tick::works`), waits on a fleet lock, listens, or started or wrote output within the
+    /// hung window (the watch would not have reported it); and nothing in `command`, the tool
+    /// shell an agent runs it in (`None`: no agent above it), holds a TCP connection (a pipeline
+    /// is one network wait). No `lsof` answer shows nothing idle.
+    pub fn contradicts(
+        &self,
+        pid: u32,
+        since: DateTime<Utc>,
+        command: Option<u32>,
+    ) -> Option<String> {
+        let Some(p) = self.now.0.get(&pid) else {
+            return Some(format!("pid {pid} is gone"));
+        };
+        if p.started.is_none_or(|s| s > since) {
+            return Some(format!(
+                "pid {pid} ({}) started after the report: it is not the process that hung",
+                p.name
+            ));
+        }
+        if command == Some(pid) || is_mcp(p) {
+            return Some(format!(
+                "pid {pid} ({}) is an agent's own child or an MCP server, which the watch never reports",
+                p.name
+            ));
+        }
+        if self.seen.output_at.is_none() {
+            return Some("lsof gave no answer, so nothing shows it idle".into());
+        }
+        let then = self.at - Duration::from_std(EVERY * HUNG_TICKS).unwrap_or(MIN_AGE);
+        let none = HashMap::new();
+        let t = Tick::new(
+            &self.now,
+            &self.before,
+            then,
+            self.at,
+            self.ms,
+            &self.seen,
+            &none,
+        );
+        let busy = |q: u32| {
+            if let Some((on, _)) = self.seen.waiting.get(&q) {
+                Some(format!("waits on the {on} lock"))
+            } else if self.seen.listening.contains(&q) {
+                Some("listens on a TCP port".into())
+            } else if let Some(s) = self.now.0[&q].started.filter(|s| *s > then) {
+                Some(format!("started {} ago", crate::ui::ago(self.at, s)))
+            } else {
+                t.works(q)
+            }
+        };
+        let name = |q: u32| self.now.0.get(&q).map_or("?", |x| x.name.as_str());
+        self.now
+            .tree(command.unwrap_or(pid))
+            .into_iter()
+            .find(|q| self.seen.connected.contains(q))
+            .map(|q| (q, "holds a TCP connection".to_string()))
+            .or_else(|| {
+                self.now
+                    .tree(pid)
+                    .into_iter()
+                    .find_map(|q| busy(q).map(|why| (q, why)))
+            })
+            .map(|(q, why)| format!("pid {q} ({}) {why}", name(q)))
+    }
 }
 
 /// The simulators booted on this host; empty off macOS or when `simctl` gives no answer.
@@ -1538,6 +1680,157 @@ mod tests {
         );
         let tcp = "p5\nTST=LISTEN\nTQR=0\nTST=ESTABLISHED\np7\nTST=ESTABLISHED\np9\nf3\n";
         assert_eq!(parse_lsof_tcp(tcp), ([5, 9].into(), [5, 7].into()));
+    }
+
+    /// `kill`'s 5 s sample at t0: e2e.sh (30) → java (31), and `tail` (40) in the same tool
+    /// shell, all 20 min old, output last written 10 min ago; java used `cpu` ms in the sample.
+    fn sampled(cpu: u64) -> Sample {
+        let t = |c| {
+            tree(&[
+                (30, SHELL, "bash", "bash scripts/e2e.sh", 900, 20),
+                (31, 30, "java", "java -jar driver.jar", 4000 + c, 20),
+                (40, SHELL, "tail", "tail -2", 0, 20),
+            ])
+        };
+        Sample {
+            before: t(0),
+            now: t(cpu),
+            ms: 5000,
+            at: t0(),
+            seen: Seen {
+                output_at: Some([(30, at(-10))].into()),
+                ..Seen::default()
+            },
+        }
+    }
+
+    #[test]
+    fn kill_confirms_a_hung_report_only_on_an_idle_process() {
+        let since = at(-5);
+        assert_eq!(sampled(0).contradicts(30, since, Some(SHELL)), None, "idle");
+        assert_eq!(
+            sampled(0).contradicts(31, since, Some(SHELL)),
+            None,
+            "idle child"
+        );
+        assert_eq!(
+            sampled(50).contradicts(30, since, Some(SHELL)),
+            None,
+            "1% is not over 1%"
+        );
+        let mut s = sampled(0);
+        s.seen.connected.insert(99);
+        assert_eq!(
+            s.contradicts(30, since, Some(SHELL)),
+            None,
+            "another command's connection"
+        );
+        let mut s = sampled(0);
+        s.seen.connected.insert(40);
+        assert_eq!(
+            s.contradicts(30, since, None),
+            None,
+            "no tool shell: only its own tree"
+        );
+
+        let with = |f: &dyn Fn(&mut Sample)| {
+            let mut s = sampled(0);
+            f(&mut s);
+            s
+        };
+        let cases: Vec<(Sample, u32, DateTime<Utc>, &str)> = vec![
+            (
+                sampled(200),
+                30,
+                since,
+                "pid 31 (java) used 200 ms of CPU in 5000 ms",
+            ),
+            (
+                with(&|s| {
+                    s.seen.connected.insert(31);
+                }),
+                30,
+                since,
+                "pid 31 (java) holds a TCP connection",
+            ),
+            (
+                with(&|s| {
+                    s.seen.connected.insert(40);
+                }),
+                30,
+                since,
+                "pid 40 (tail) holds a TCP connection",
+            ),
+            (
+                with(&|s| {
+                    s.seen.listening.insert(30);
+                }),
+                30,
+                since,
+                "pid 30 (bash) listens on a TCP port",
+            ),
+            (
+                with(&|s| {
+                    s.seen.waiting.insert(31, ("sim".into(), at(-1)));
+                }),
+                30,
+                since,
+                "pid 31 (java) waits on the sim lock",
+            ),
+            (
+                with(&|s| {
+                    s.seen.output_at = Some([(30, t0() - Duration::seconds(30))].into());
+                }),
+                30,
+                since,
+                "pid 30 (bash) wrote output at 06:59:30",
+            ),
+            (
+                with(&|s| {
+                    for t in [&mut s.before, &mut s.now] {
+                        let mut p = t.0[&31].clone();
+                        (p.ppid, p.name, p.started) = (31, "sleep".into(), Some(at(-1)));
+                        t.0.insert(32, p);
+                    }
+                }),
+                30,
+                since,
+                "pid 32 (sleep) started 1m ago",
+            ),
+            (
+                sampled(0),
+                30,
+                at(-30),
+                "pid 30 (bash) started after the report: it is not the process that hung",
+            ),
+            (sampled(0), 77, since, "pid 77 is gone"),
+            (
+                sampled(0),
+                SHELL,
+                since,
+                "pid 20 (zsh) is an agent's own child or an MCP server, which the watch never reports",
+            ),
+            (
+                with(&|s| {
+                    s.now.0.get_mut(&31).unwrap().args = Some("npx -y some-mcp".into());
+                }),
+                31,
+                since,
+                "pid 31 (java) is an agent's own child or an MCP server, which the watch never reports",
+            ),
+            (
+                with(&|s| s.seen.output_at = None),
+                30,
+                since,
+                "lsof gave no answer, so nothing shows it idle",
+            ),
+        ];
+        for (s, pid, since, want) in cases {
+            assert_eq!(
+                s.contradicts(pid, since, Some(SHELL)).as_deref(),
+                Some(want)
+            );
+        }
     }
 
     #[test]

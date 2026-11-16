@@ -169,7 +169,10 @@ data itself, not the scan, so the views can say how stale the numbers are.
   which its agents would inherit), restart the hub. From then on only that file posts as that
   host. To take the shared token away from a host's agents, mint `agent:<name>` and make it
   that host's `token` file. A token file guards against other hosts, not against a process of the
-  same Unix user on the same machine, which can read it.
+  same Unix user on the same machine, which can read it. Such a process (an agent) can post a
+  `proc.hung` as its own host, but that alone kills nothing: `agent-fleet kill` checks every
+  hung report against the live process itself (see "Killing processes"), so a forged report
+  cannot kill a process that is not idle.
 
 ## Tolerant on read
 
@@ -458,7 +461,8 @@ refuses, killing nothing, when any pid is:
 - a terminal multiplexer (`herdr`), a pane's shell, an agent (`claude`, `devin`, `codex`, or what
   a pane's shell runs), an `agent-fleet` daemon, or an ancestor of any of them;
 - the caller's own ancestor (its shell, its script's parent, its agent);
-- inside another agent's process tree, unless a `proc.hung` report names it (below).
+- inside another agent's process tree, unless a `proc.hung` report names it and `kill`'s own
+  look at the process agrees (below).
 
 It kills the caller's own processes (its agent's tree) and orphans `doctor` proved: processes in
 a deleted worktree or a `forgotten` linked worktree (never a repository's main checkout) (on
@@ -474,8 +478,29 @@ record, a record that is a main checkout, or a spawn that failed or is unanswere
 refused. It also kills the pids of a `proc.hung` report on the caller's
 host, also inside another agent's tree, when the live process started before the report's
 `since` (a later one with that pid is not the one that hung) and the report was `checked` in
-the last 6 minutes (one nobody re-checks proves nothing). TERM, then KILL after `--grace`
-seconds. Each refusal is logged as `kill.refused`.
+the last 6 minutes (one nobody re-checks proves nothing), and only when `kill`'s own look at the
+live process agrees. A report is a claim: any process that can read the host's token file can
+post one. So, for each named pid a report covers, `kill` reads the process table twice 5 s
+apart, then runs the watch tick's `lsof` reads once, and refuses unless, by the watch's own
+rules:
+
+- the pid is still there and started before the report's `since`;
+- it is a process the watch classifies at all: not an agent's direct child (its tool shell or
+  an MCP server) and not an MCP server started through a shell;
+- nothing in its tree used over 1% CPU in the 5 s, is a device tool, started a child, waits in
+  a watched lock's queue (as the log has it), or has a listening TCP socket;
+- nothing in its tree started, and its output file did not change, in the last 4 minutes (the
+  watch reports a hang only after 2 idle 2-minute ticks);
+- nothing in its command (the shell its agent runs it in, so all of a pipeline) holds an
+  established TCP connection;
+- `lsof` answered.
+
+Five seconds makes the 1% line 50 ms of CPU, several clock ticks on Linux and macOS, and is
+short enough to wait for; the 4-minute look-back covers output and child processes that come and
+go between samples. The refusal names the reason (`the hung report is not confirmed: pid N
+(java) used 200 ms of CPU in 5000 ms`). The same check applies to every hung report, inside
+another agent's tree or not. TERM, then KILL after `--grace` seconds. Each refusal is logged as
+`kill.refused`.
 
 `agent-fleet hook bash` is a PreToolUse hook for Claude Code (tool `Bash`) and Devin CLI (tool
 `exec`, which also reads hooks from `.claude/settings.json`) that refuses (exit 2) a shell command
