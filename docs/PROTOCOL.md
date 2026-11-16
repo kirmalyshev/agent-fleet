@@ -485,6 +485,14 @@ daemon` or `claude daemon`, and everything under such a process; the
 process's directory is known on Linux only), re-sent without `program` once the process is gone;
 `agent-fleet doctor` shows them as `unmanaged` findings.
 
+`doctor` also reads GitHub, not the log, for `orphan-pr` findings: with `[orphan_pr] repos` set in
+fleet.toml, an open PR whose head branch is no live agent's worktree branch and that has had no
+update for `days` (default 3) is named with its age, the issues it closes and their state. A
+newer merged PR that closes one of the same issues supersedes it: `doctor --apply` closes it
+with a comment and keeps the branch. A draft, or a PR touching a `guarded` path, is never
+closed; `--apply` tells the root coordinator once per PR instead. Closing is `doctor --apply`
+only; the watch loop does not run it.
+
 The same scan proves orphans and reports them as `proc.orphaned` (`why` says which proof
 held; no `why` clears it). A process reparented to init that is a device or test tool —
 `xcodebuild`, `maestro` (named `maestro`, or `java` whose args carry `maestro.cli.AppKt` or

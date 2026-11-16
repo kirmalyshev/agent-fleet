@@ -40,3 +40,8 @@ match = ["research", "design", "audit", "label:design"]
 profile = "opus"
 [[rules]]
 profile = "devin"
+
+[orphan_pr]                      # doctor: open PRs no live agent owns (off while `repos` is empty)
+repos = ["owner/repo"]
+days = 3                         # quiet this long before a PR is an orphan (default 3)
+guarded = ["AGENTS.md", "docs/"] # a PR touching these is reported, never closed (`dir/` = prefix)
