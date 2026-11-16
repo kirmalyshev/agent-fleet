@@ -99,6 +99,7 @@ keys are explained in [docs/fleet.example.toml](docs/fleet.example.toml).
 agent-fleet dev ls                        # every connected repo; --repo owner/repo for one
 agent-fleet dev clean                     # what it would retire and delete (a dry run)
 agent-fleet dev clean --execute
+agent-fleet dev prune                     # free the slots of deleted worktrees
 ```
 
 These cover the connected repositories, the checkouts the host reports, and the one you are in.
@@ -111,7 +112,9 @@ first (TERM, then KILL after 5 s); `ls` and the dry run list them, pid and comma
 agent program runs, a herdr pane and your own shell are never stopped: one of those in a worktree
 keeps it; when the working directories of processes cannot be read (no `/proc`, no `lsof`), every
 worktree is kept. It never unlocks a worktree: a lock whose pid is gone is called stale, with its
-`git worktree unlock` command. A worktree is retired as the TUI's `x` does it:
+`git worktree unlock` command. `ls` also shows each worktree's dev slot, ports and running
+services, and `clean` runs `dev down --release` for a worktree before it retires it. A worktree is
+retired as the TUI's `x` does it:
 `.agent-fleet/hook retire <path>`, else `git worktree remove`. `gh` (`AGENT_FLEET_GH`) reads the
 PRs, one `gh pr list` per repository.
 

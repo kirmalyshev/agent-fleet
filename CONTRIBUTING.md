@@ -43,7 +43,8 @@ use a raw `kill`; without the time limit only a human can stop them.
 [Clean up worktrees](README.md#clean-up-worktrees)). `./dev ls` lists the worktrees of this
 repository and of the others connected on your machine (`--repo kirmalyshev/agent-fleet` for this
 one only): branch, PR, commits not in `origin/main`, uncommitted files, and what `clean` would do.
-`./dev clean` shows which worktrees of merged or closed PRs it would remove, the processes it would
+`./dev clean` shows which worktrees of merged or closed PRs it would remove (after their `dev down
+--release`), the processes it would
 stop there, and which finished local branches it would delete; `--execute` does it. It needs `gh`
 for PR states.
 

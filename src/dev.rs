@@ -61,8 +61,11 @@ pub enum Cmd {
     Url,
     /// Slot, id, ports, env and services as JSON.
     Info,
-    /// Each worktree: branch, PR, commits not in the default branch, uncommitted files, and what
-    /// `clean` would do with it.
+    /// Drop the slots of deleted worktrees whose services no longer run, with their state and
+    /// logs. A deleted worktree whose services still run keeps its slot.
+    Prune,
+    /// Each worktree: branch, PR, commits not in the default branch, uncommitted files, its slot,
+    /// ports and running services, and what `clean` would do with it.
     Ls {
         /// Only this `owner/repo`.
         #[arg(long)]
@@ -785,19 +788,165 @@ impl Worktree {
     }
 }
 
-pub async fn run(cmd: &Cmd) -> Result<()> {
+/// This user's slot registry (`<data dir>/dev`) and the shared claims directory.
+fn dirs() -> Result<(PathBuf, PathBuf)> {
     let dir = client::Paths::from_env(client::DEFAULT_INSTANCE)?
         .dir
         .join("dev");
     fs::create_dir_all(&dir)?;
     let shared = std::env::var_os("AGENT_FLEET_DEV_SHARED").map_or(SHARED.into(), PathBuf::from);
+    Ok((dir, shared))
+}
+
+/// The keys `root` may be registered under: as given, and with its symlinks resolved (what
+/// `git rev-parse --show-toplevel` gives `dev up`).
+fn keys(root: &Path) -> Vec<String> {
+    let mut out = vec![root.display().to_string()];
+    if let Ok(r) = fs::canonicalize(root) {
+        out.push(r.display().to_string());
+    }
+    out
+}
+
+/// The services of the state dir `state` still running as started.
+fn running_in(state: &Path, procs: &Procs) -> Vec<String> {
+    let rec: Recorded = read_json(&state.join("state.json")).unwrap_or_default();
+    rec.running
+        .iter()
+        .filter(|(_, r)| ours(r, procs))
+        .map(|(n, _)| n.clone())
+        .collect()
+}
+
+/// `dev ls`'s line for the worktree at `root` (`main`: the main checkout, slot 0): its slot,
+/// ports and running services. `None` when it has no slot.
+pub fn line(root: &Path, main: bool, procs: &Procs) -> Option<String> {
+    line_in(&dirs().ok()?.0, root, main, procs)
+}
+
+fn line_in(dir: &Path, root: &Path, main: bool, procs: &Procs) -> Option<String> {
+    let config = fs::read_to_string(root.join(CONFIG)).ok();
+    let (key, slot) = if main {
+        (root.display().to_string(), config.as_ref().map(|_| 0)?)
+    } else {
+        let slots: BTreeMap<String, u32> = read_json(&dir.join("slots.json")).ok()?;
+        keys(root)
+            .into_iter()
+            .find_map(|k| slots.get(&k).map(|s| (k, *s)))?
+    };
+    let id = id_of(Path::new(&key));
+    let mut out = format!("slot {slot} ({id})");
+    let cfg = config.as_deref().map(parse);
+    match cfg.map(|c| c.and_then(|c| Vars::new(&c, slot, &id, root))) {
+        Some(Ok(v)) if !v.ports.is_empty() => {
+            let ports: Vec<String> = v.ports.iter().map(|(n, p)| format!("{n} {p}")).collect();
+            out += &format!(", ports {}", ports.join(", "));
+        }
+        Some(Err(e)) => out += &format!(", {CONFIG}: {e:#}"),
+        _ => {}
+    }
+    let running = running_in(&dir.join(format!("{slot}-{id}")), procs);
+    out += &match running.is_empty() {
+        true => ", nothing running".to_string(),
+        false => format!(", running {}", running.join(", ")),
+    };
+    Some(out)
+}
+
+/// `dev down --release` for the worktree at `root`, from anywhere: stops its services, drops its
+/// state and logs, frees its slot. `None` when it holds no slot.
+pub fn release(root: &Path) -> Result<Option<String>> {
+    let (dir, shared) = dirs()?;
+    release_in(
+        &Registry {
+            dir: &dir,
+            shared: &shared,
+        },
+        root,
+    )
+}
+
+fn release_in(reg: &Registry, root: &Path) -> Result<Option<String>> {
+    let slots: BTreeMap<String, u32> = read_json(&reg.dir.join("slots.json"))?;
+    let Some((key, slot)) = keys(root)
+        .into_iter()
+        .find_map(|k| slots.get(&k).map(|s| (k, *s)))
+    else {
+        return Ok(None);
+    };
+    let state = reg.dir.join(format!("{slot}-{}", id_of(Path::new(&key))));
+    let mut stopped = Vec::new();
+    if state.is_dir() {
+        let _l = lock(&state.join("lock"))?;
+        let rec: Recorded = read_json(&state.join("state.json"))?;
+        let procs = Procs::read();
+        for (name, r) in &rec.running {
+            if ours(r, &procs) {
+                stop(r.pid);
+                stopped.push(name.clone());
+            }
+        }
+    }
+    match fs::remove_dir_all(&state) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("remove {}", state.display()));
+        }
+        _ => {}
+    }
+    reg.release(&key)?;
+    let stopped = match stopped.is_empty() {
+        true => String::new(),
+        false => format!(", stopped {}", stopped.join(", ")),
+    };
+    Ok(Some(format!("released slot {slot}{stopped}")))
+}
+
+/// `dev prune`: frees the slot, state and logs of each registered worktree that is gone from
+/// disk and runs no service any more; one line per slot it looked at.
+fn prune(reg: &Registry) -> Result<Vec<String>> {
+    let slots: BTreeMap<String, u32> = read_json(&reg.dir.join("slots.json"))?;
+    let procs = Procs::read();
+    let mut out = Vec::new();
+    for (root, slot) in slots {
+        if Path::new(&root).exists() {
+            continue;
+        }
+        let state = reg.dir.join(format!("{slot}-{}", id_of(Path::new(&root))));
+        let running = running_in(&state, &procs);
+        if !running.is_empty() {
+            out.push(format!(
+                "kept slot {slot} of {root} (deleted): {} still running; agent-fleet dev down \
+                 cannot reach it, stop them by hand",
+                running.join(", ")
+            ));
+            continue;
+        }
+        release_in(reg, Path::new(&root))?;
+        out.push(format!("dropped slot {slot} of {root} (deleted)"));
+    }
+    Ok(out)
+}
+
+pub async fn run(cmd: &Cmd) -> Result<()> {
+    let (dir, shared) = dirs()?;
     let reg = Registry {
         dir: &dir,
         shared: &shared,
     };
+    if let Cmd::Prune = cmd {
+        let lines = prune(&reg)?;
+        if lines.is_empty() {
+            println!("nothing to prune");
+        }
+        for l in lines {
+            println!("{l}");
+        }
+        return Ok(());
+    }
     let w = Worktree::open(&reg)?;
     match cmd {
         Cmd::Ls { .. } | Cmd::Clean { .. } => unreachable!("main runs ls and clean"),
+        Cmd::Prune => unreachable!("handled above"),
         Cmd::Up { services } => {
             let names = pick(services, &w.cfg)?;
             w.infra().await?;
@@ -1104,5 +1253,125 @@ env = { PORT = "{port.web}", API = "{port.api}" }
     #[test]
     fn ids_are_short_and_safe() {
         assert_eq!(id_of(Path::new("/w/C-99.x")), "c_99_x");
+    }
+    /// A registry in temp dirs, and a service group recorded in `slot`'s state for `root`.
+    fn served(reg: &Registry, root: &str, slot: u32, service: Option<u32>) {
+        let state = reg.dir.join(format!("{slot}-{}", id_of(Path::new(root))));
+        fs::create_dir_all(&state).unwrap();
+        let mut rec = Recorded::default();
+        if let Some(pid) = service {
+            let started = Procs::read().0.get(&pid).and_then(|p| p.started);
+            rec.running.insert(
+                "app".into(),
+                Run {
+                    pid: pid as i32,
+                    started,
+                    env: BTreeMap::new(),
+                },
+            );
+        }
+        write_json(&state.join("state.json"), &rec).unwrap();
+    }
+
+    /// A service's process group, reaped as it dies (as `dev up` does), so `stop` sees it go.
+    fn group() -> u32 {
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        std::thread::spawn(move || child.wait());
+        pid
+    }
+
+    #[test]
+    fn prune_drops_deleted_worktrees_whose_services_stopped_and_keeps_the_rest() {
+        let (data, shared, live) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        fs::set_permissions(shared.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let reg = Registry {
+            dir: data.path(),
+            shared: shared.path(),
+        };
+        let live = live.path().display().to_string();
+        let gone = data.path().join("gone").display().to_string();
+        let busy = data.path().join("busy").display().to_string();
+        let pid = group();
+        for (root, service) in [(&live, None), (&gone, None), (&busy, Some(pid))] {
+            let slot = reg.claim(root, 5).unwrap();
+            served(&reg, root, slot, service);
+        }
+        let lines = prune(&reg).unwrap();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("dropped slot 2 of ") && l.contains("gone"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("kept slot 3") && l.contains("app still"))
+        );
+        let slots: BTreeMap<String, u32> = read_json(&data.path().join("slots.json")).unwrap();
+        let mut kept = vec![&busy, &live];
+        kept.sort();
+        assert_eq!(slots.keys().collect::<Vec<_>>(), kept);
+        assert!(
+            !data.path().join("2-gone").exists(),
+            "its state and logs go too"
+        );
+        // Once its service is down, the deleted worktree's slot goes as well.
+        assert_eq!(
+            release_in(&reg, Path::new(&busy)).unwrap().unwrap(),
+            "released slot 3, stopped app"
+        );
+        assert!(prune(&reg).unwrap().is_empty());
+    }
+
+    #[test]
+    fn release_stops_a_worktrees_services_and_frees_its_slot_from_anywhere() {
+        let (data, shared, root) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
+        fs::set_permissions(shared.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let reg = Registry {
+            dir: data.path(),
+            shared: shared.path(),
+        };
+        let r = root.path().display().to_string();
+        let pid = group();
+        let slot = reg.claim(&r, 5).unwrap();
+        served(&reg, &r, slot, Some(pid));
+        fs::create_dir_all(root.path().join(".agent-fleet")).unwrap();
+        fs::write(
+            root.path().join(CONFIG),
+            "[slots]\nstep = 10\nports = { api = 21000 }\n[services.app]\nrun = \"x\"\n",
+        )
+        .unwrap();
+        let line = line_in(data.path(), root.path(), false, &Procs::read()).unwrap();
+        assert!(line.ends_with(", ports api 21010, running app"), "{line}");
+        assert_eq!(
+            release_in(&reg, root.path()).unwrap().unwrap(),
+            "released slot 1, stopped app"
+        );
+        assert!(!alive(pid as i32));
+        assert_eq!(
+            line_in(data.path(), root.path(), false, &Procs::read()),
+            None
+        );
+        assert_eq!(
+            release_in(&reg, root.path()).unwrap(),
+            None,
+            "no slot: nothing to do"
+        );
+        let main = line_in(data.path(), root.path(), true, &Procs::read()).unwrap();
+        assert!(main.starts_with("slot 0 (") && main.contains("api 21000, nothing running"));
     }
 }
