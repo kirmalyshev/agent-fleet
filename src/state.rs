@@ -97,7 +97,8 @@ pub struct Host {
 pub struct Update {
     /// Who asked (the request's actor id).
     pub by: String,
-    /// The request's `ts`; the update is pruned `UPDATE_KEPT` after it.
+    /// The request's `ts`; the update is pruned `UPDATE_KEPT` after it, unless a host still runs
+    /// the commit its failed answer reports.
     pub since: DateTime<Utc>,
     /// The one host it asks, or every host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -920,7 +921,17 @@ impl State {
                 }
             }
         }
-        self.updates.retain(|_, u| e.ts - u.since <= UPDATE_KEPT);
+        // A failure is kept while its host still runs the commit it failed on: nothing will ask
+        // that host again until `origin/main` moves, and `doctor` reports it until then.
+        let hosts = &self.hosts;
+        self.updates.retain(|_, u| {
+            e.ts - u.since <= UPDATE_KEPT
+                || u.results.iter().any(|(h, r)| {
+                    !r.ok
+                        && r.commit.is_some()
+                        && hosts.get(h).is_some_and(|x| x.commit == r.commit)
+                })
+        });
         self.answers
             .retain(|_, a| e.ts - a.acked.unwrap_or(a.at) <= ANSWER_KEPT);
         // The reducer has no clock: a spawn is pruned once a later event's `ts` is more than
@@ -2158,6 +2169,48 @@ mod tests {
         late.ts += UPDATE_KEPT + chrono::Duration::seconds(1);
         s.apply(&late.into_event());
         assert!(s.updates.is_empty(), "pruned a day after the request");
+    }
+
+    #[test]
+    fn a_failed_update_outlives_the_day_while_its_host_runs_the_commit_it_failed_on() {
+        let mut s = State::default();
+        let health = |commit: &str, plus: i64| {
+            let mut e = ev(
+                ActorKind::Host,
+                Known::HostHealth(HostHealth {
+                    host: "h".into(),
+                    disk_free: 1,
+                    disk_total: 2,
+                    agents: 0,
+                    commit: Some(commit.into()),
+                    stats: None,
+                }),
+            );
+            e.ts += chrono::Duration::seconds(plus);
+            e.into_event()
+        };
+        let req = by("host:h", Known::UpdateRequested(UpdateRequested::default()));
+        let id = req.id.clone();
+        s.apply(&req.into_event());
+        s.apply(&health("aaa", 1));
+        let mut fail = ev(
+            ActorKind::Host,
+            Known::UpdateResult(UpdateResult {
+                host: "h".into(),
+                ok: false,
+                commit: Some("aaa".into()),
+                error: Some("boom".into()),
+            }),
+        )
+        .re(&id);
+        fail.ts += chrono::Duration::seconds(2);
+        s.apply(&fail.into_event());
+        // A day and a bit later the host still runs aaa: kept.
+        s.apply(&health("aaa", UPDATE_KEPT.num_seconds() + 60));
+        assert_eq!(s.updates.len(), 1, "kept while on aaa");
+        // It moved on: pruned.
+        s.apply(&health("bbb", UPDATE_KEPT.num_seconds() + 120));
+        assert!(s.updates.is_empty(), "history once it runs another commit");
     }
 
     #[test]

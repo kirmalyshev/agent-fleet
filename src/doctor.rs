@@ -529,9 +529,10 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
         for u in &by_since {
             // A request already stale when the host started was ignored by it, not left
             // unanswered.
-            let ignored = h
-                .started
-                .is_some_and(|st| st - u.since >= crate::update::REQUEST_MAX_AGE);
+            // A minute of slack: the host first looks a few seconds after it starts.
+            let ignored = h.started.is_some_and(|st| {
+                st - u.since >= crate::update::REQUEST_MAX_AGE + Duration::minutes(1)
+            });
             let concerns = u.results.contains_key(host)
                 || (up
                     && !ignored
@@ -1064,11 +1065,15 @@ mod tests {
         s.updates.insert("r".into(), up(80, vec![]));
         assert_eq!(findings(&s, now).len(), 1);
         // Exactly the request limit at host start: ignored; a minute less: not.
-        s.hosts.get_mut("mac").unwrap().started = Some(now - Duration::minutes(65));
+        s.hosts.get_mut("mac").unwrap().started = Some(now - Duration::minutes(64));
         s.updates.insert("r".into(), up(80, vec![]));
-        assert!(findings(&s, now).is_empty(), "stale (15 min) at start");
-        s.hosts.get_mut("mac").unwrap().started = Some(now - Duration::minutes(66));
-        assert_eq!(findings(&s, now).len(), 1, "14 min old at start: fresh");
+        assert!(findings(&s, now).is_empty(), "stale (16 min) at start");
+        s.hosts.get_mut("mac").unwrap().started = Some(now - Duration::minutes(65));
+        assert_eq!(
+            findings(&s, now).len(),
+            1,
+            "15 min old at start: within the slack"
+        );
         // A stale request that the host did answer still reports its result.
         s.hosts.get_mut("mac").unwrap().started = Some(now - Duration::minutes(65));
         s.updates

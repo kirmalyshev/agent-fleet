@@ -794,7 +794,8 @@ pub struct UpdateRequested {
 pub struct UpdateResult {
     pub host: String,
     pub ok: bool,
-    /// The commit the host runs once restarted (the one it runs now when nothing changed).
+    /// The commit the host runs once restarted (the one it runs now when nothing changed); on
+    /// failure, the one it still runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
