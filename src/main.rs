@@ -20,6 +20,7 @@ mod tui;
 mod ui;
 mod update;
 mod watch;
+mod worktree;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -139,8 +140,9 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RepoCmd,
     },
-    /// Per-worktree dev environments from the repository's `.agent-fleet/dev.toml`: each worktree
-    /// gets a slot with its own ports and values, runs its own services, and shares the infra.
+    /// Per-worktree dev environments from the repository's `.agent-fleet/dev.toml` (`up`, `down`,
+    /// `status` …: each worktree gets a slot with its own ports and values, runs its own services,
+    /// and shares the infra), and the worktrees of the connected repositories (`ls`, `clean`).
     Dev {
         #[command(subcommand)]
         cmd: dev::Cmd,
@@ -918,7 +920,9 @@ async fn main() -> Result<()> {
     if let Cmd::Init | Cmd::Repo { .. } = &cli.cmd {
         return machine_config(&cli.cmd);
     }
-    if let Cmd::Dev { cmd } = &cli.cmd {
+    if let Cmd::Dev { cmd } = &cli.cmd
+        && !matches!(cmd, dev::Cmd::Ls { .. } | dev::Cmd::Clean { .. })
+    {
         return dev::run(cmd).await;
     }
     let ctx = Ctx {
@@ -927,7 +931,7 @@ async fn main() -> Result<()> {
     };
     let now = Utc::now();
     match &ctx.cli.cmd {
-        Cmd::Api { .. } | Cmd::Init | Cmd::Repo { .. } | Cmd::Dev { .. } => unreachable!(),
+        Cmd::Api { .. } | Cmd::Init | Cmd::Repo { .. } => unreachable!(),
         Cmd::Hub { listen, db, check } => {
             if *check {
                 let db = db.clone().unwrap_or_else(|| ctx.paths.hub_db());
@@ -985,6 +989,35 @@ async fn main() -> Result<()> {
             host::run(cfg, ctx.client()?).await?;
         }
         Cmd::Tui => tui::run(&ctx).await?,
+        Cmd::Dev { cmd } => {
+            let (only, clean, execute) = match cmd {
+                dev::Cmd::Ls { repo } => (repo, false, false),
+                dev::Cmd::Clean { repo, execute } => (repo, true, *execute),
+                _ => unreachable!("dev::run runs the rest"),
+            };
+            let s = match ctx.snapshot_state().await {
+                Ok((s, note)) => {
+                    if let Some(note) = note {
+                        eprintln!("agent-fleet: {note}");
+                    }
+                    s
+                }
+                // No hub and no replica: no fleet here, so no fleet agent to keep a worktree for.
+                Err(e) => {
+                    eprintln!("agent-fleet: no fleet state, agents unknown: {e:#}");
+                    State::default()
+                }
+            };
+            let registered = match spawn::machine_dir() {
+                Some(d) => setup::registered(&d)?,
+                None => Default::default(),
+            };
+            let cwd = std::env::current_dir()?;
+            let here = scan::repo_of(&cwd.to_string_lossy()).await.map(Into::into);
+            let host = ctx.host_name();
+            let repos = worktree::repos(registered, &s, &host, here, only.as_deref())?;
+            print!("{}", worktree::run(&ctx, &repos, &s, clean, execute).await);
+        }
         Cmd::Instances => {
             for (name, hub) in Paths::instances()? {
                 let mark = if name == ctx.cli.instance { "*" } else { " " };

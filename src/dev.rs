@@ -61,6 +61,28 @@ pub enum Cmd {
     Url,
     /// Slot, id, ports, env and services as JSON.
     Info,
+    /// Each worktree: branch, PR, commits not in the default branch, uncommitted files, and what
+    /// `clean` would do with it.
+    Ls {
+        /// Only this `owner/repo`.
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// What clean would do (a dry run). A branch is finished when its tip is the head of one of
+    /// your merged or closed PRs, is in the default branch, or is in `origin/<branch>`; one with
+    /// an open PR or local-only commits never is. Only a finished PR retires a worktree, and
+    /// never the main checkout, a locked one, the one you are in, one an agent works in, or one
+    /// with uncommitted files. The processes left in a worktree it retires are stopped first;
+    /// a herdr pane, an agent's processes and your own keep the worktree.
+    Clean {
+        /// Only this `owner/repo`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Stop the leftover processes (TERM, then KILL after 5 s), retire the worktrees
+        /// (`.agent-fleet/hook retire`, else `git worktree remove`) and delete the branches.
+        #[arg(long)]
+        execute: bool,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -775,6 +797,7 @@ pub async fn run(cmd: &Cmd) -> Result<()> {
     };
     let w = Worktree::open(&reg)?;
     match cmd {
+        Cmd::Ls { .. } | Cmd::Clean { .. } => unreachable!("main runs ls and clean"),
         Cmd::Up { services } => {
             let names = pick(services, &w.cfg)?;
             w.infra().await?;
