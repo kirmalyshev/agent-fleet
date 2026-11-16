@@ -71,8 +71,8 @@ agent-fleet init
 codex, devin), one default rule, and a comment on every key. It never overwrites a file. It also
 lists your Claude and Codex skills that drive terminals (herdr, tmux, cmux): in a fleet, agents
 talk through `agent-fleet tell` and `spawn`, so check that those skills do not tell them to type
-into each other's panes. Edit
-them, then start the hub and the host as in the quick start below.
+into each other's panes. Edit the two files, then start the hub and the host as in the quick
+start below.
 
 ## Connect a repository
 

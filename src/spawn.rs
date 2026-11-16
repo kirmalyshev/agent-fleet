@@ -2288,7 +2288,19 @@ profile = "devin"
     }
 
     fn host_at(dir: &Path, sock: PathBuf, stuck_act: bool) -> Arc<Host> {
-        let cfg = Config {
+        host_of(dir, host_cfg(dir, sock, stuck_act))
+    }
+
+    fn host_of(dir: &Path, cfg: Config) -> Arc<Host> {
+        Arc::new(Host::new(
+            cfg,
+            Client::new("http://127.0.0.1:1", "t".into(), dir.join("spool.jsonl")),
+            Store::open(&dir.join("replica.db")).unwrap(),
+        ))
+    }
+
+    fn host_cfg(dir: &Path, sock: PathBuf, stuck_act: bool) -> Config {
+        Config {
             host: "h".into(),
             session: "s".into(),
             herdr_socket: sock,
@@ -2300,12 +2312,7 @@ profile = "devin"
             locks: Vec::new(),
             stall_min: 15,
             stuck_act,
-        };
-        Arc::new(Host::new(
-            cfg,
-            Client::new("http://127.0.0.1:1", "t".into(), dir.join("spool.jsonl")),
-            Store::open(&dir.join("replica.db")).unwrap(),
-        ))
+        }
     }
 
     /// The fleet.toml the host resolves profiles from — the request only names the profile.
@@ -2462,6 +2469,68 @@ profile = "devin"
             r.ok && r.pane.as_deref() == Some("w:1")
                 && r.worktree.as_deref() == Some(wt.to_str().unwrap())
         );
+    }
+
+    #[tokio::test]
+    async fn a_repo_connected_after_the_host_started_is_spawned_into() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        let git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&co)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(st.success());
+        };
+        git(&["remote", "add", "origin", "https://github.com/o/r"]);
+        let wt = co.join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let machine = dir.path().join("cfg");
+        crate::setup::init(&machine, &["claude"]).unwrap();
+        let stub = Arc::new(Stub::default());
+        stub.script.lock().unwrap().insert(
+            "worktree.create".into(),
+            vec![created(wt.to_str().unwrap())],
+        );
+        let sock = dir.path().join("herdr.sock");
+        tokio::spawn(stub.clone().serve(UnixListener::bind(&sock).unwrap()));
+        // No `--repo` flag: the host knows only the machine's config dir.
+        let mut cfg = host_cfg(dir.path(), sock, false);
+        cfg.checkouts.clear();
+        cfg.config_dir = Some(machine.clone());
+        let host = host_of(dir.path(), cfg);
+        let results = || -> Vec<SpawnResult> {
+            host.replica
+                .lock()
+                .unwrap()
+                .all()
+                .unwrap()
+                .iter()
+                .filter_map(|e| match &e.body {
+                    Body::Known(Known::SpawnResult(r)) => Some(r.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        execute(&host, "req1", &spawn_of(req(None)), &State::default()).await;
+        let r = &results()[0];
+        assert!(
+            !r.ok && r.error.as_deref().unwrap().contains("repo add o/r"),
+            "{r:?}"
+        );
+        assert!(stub.calls().is_empty());
+
+        crate::setup::add(&machine, "o/r", &co).unwrap();
+        execute(&host, "req2", &spawn_of(req(None)), &State::default()).await;
+        let r = &results()[1];
+        assert!(r.ok, "{r:?}");
+        assert_eq!(r.worktree.as_deref(), Some(wt.to_str().unwrap()));
+        assert_eq!(stub.calls()[0], "worktree.create");
+        let cwd = &stub.calls.lock().unwrap()[0].1;
+        assert!(cwd.to_string().contains(co.to_str().unwrap()), "{cwd}");
     }
 
     #[tokio::test]
