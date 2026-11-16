@@ -1,7 +1,9 @@
-//! `agent-fleet tui`: the fleet on one screen, live, with the few actions an operator takes. Every
-//! write goes through the same commands as the CLI; local actions (kill, remove) ask first.
+//! `agent-fleet tui`: the fleet on one screen, live, with the actions an operator takes. Every
+//! write goes through the same commands as the CLI, and every action asks first. The command
+//! line (`:`) runs the CLI itself, this binary with the screen's own flags, in the background.
 
 use std::path::Path;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -24,6 +26,10 @@ pub trait Fleet {
     async fn snapshot(&self) -> Result<(State, Option<String>)>;
     async fn task(&self, task: &str, body: Known) -> Result<String>;
     async fn tell(&self, agent: &str, text: &str) -> Result<String>;
+    /// Answers an Inbox ask, as the board does.
+    async fn answer(&self, ask: &str, text: &str, approve: bool) -> Result<String>;
+    /// The CLI as a command line: this binary and the flags the screen runs under.
+    fn cli(&self) -> Vec<String>;
     fn instance(&self) -> &str;
     fn hub(&self) -> String;
     fn host(&self) -> String;
@@ -40,14 +46,16 @@ enum Tab {
     Tasks,
     Findings,
     Resources,
+    Asks,
 }
 
-const TABS: [(Tab, &str); 5] = [
+const TABS: [(Tab, &str); 6] = [
     (Tab::Agents, "1 Agents"),
     (Tab::Worktrees, "2 Worktrees"),
     (Tab::Tasks, "3 Tasks"),
     (Tab::Findings, "4 Findings"),
     (Tab::Resources, "5 Resources"),
+    (Tab::Asks, "6 Asks"),
 ];
 
 /// An action waiting for `y`.
@@ -59,24 +67,61 @@ enum Pending {
         branch: Option<String>,
     },
     Task(String, Box<Known>, &'static str),
+    /// A CLI command, run in the background.
+    Run(Vec<String>),
+    Answer {
+        ask: String,
+        text: String,
+        approve: bool,
+    },
+}
+
+/// What a line of text is typed for.
+#[derive(Clone)]
+enum Input {
+    Tell(String),
+    Command,
+    Answer { ask: String, approve: bool },
+}
+
+/// A command's whole output, and for a spawn's dry run the spawn `y` starts.
+#[derive(Clone)]
+struct Output {
+    title: String,
+    text: String,
+    then: Option<Vec<String>>,
 }
 
 enum Mode {
     Normal,
     Confirm(String, Pending),
-    Tell { agent: String, buf: String },
+    Input(Input, String),
+    Output(Output, u16),
     Help,
+}
+
+/// A finished background command.
+struct Done {
+    args: Vec<String>,
+    ok: bool,
+    out: String,
+    then: Option<Vec<String>>,
 }
 
 struct App {
     tab: Tab,
-    tables: [TableState; 5],
+    tables: [TableState; 6],
     state: State,
     found: Vec<Finding>,
     warn: Option<String>,
     note: Option<(String, Instant)>,
     mode: Mode,
     loaded: Option<Instant>,
+    /// The commands still running, as typed.
+    jobs: Vec<String>,
+    last: Option<Output>,
+    tx: mpsc::Sender<Done>,
+    rx: mpsc::Receiver<Done>,
 }
 
 /// The home directory as `~`, also inside `<host>:<path>` keys.
@@ -124,6 +169,24 @@ fn mb(kb: u64) -> String {
 }
 
 impl App {
+    fn new() -> App {
+        let (tx, rx) = mpsc::channel();
+        App {
+            tab: Tab::Agents,
+            tables: Default::default(),
+            state: State::default(),
+            found: Vec::new(),
+            warn: None,
+            note: None,
+            mode: Mode::Normal,
+            loaded: None,
+            jobs: Vec::new(),
+            last: None,
+            tx,
+            rx,
+        }
+    }
+
     fn at(&self) -> usize {
         self.tables[self.tab as usize].selected().unwrap_or(0)
     }
@@ -137,6 +200,7 @@ impl App {
             Tab::Resources => {
                 self.state.resources.len() + self.state.limits.len() + self.state.quotas.len()
             }
+            Tab::Asks => self.state.inbox().len(),
         }
     }
 
@@ -184,17 +248,11 @@ pub async fn run(fleet: &impl Fleet) -> Result<()> {
 }
 
 async fn main_loop(term: &mut DefaultTerminal, fleet: &impl Fleet) -> Result<()> {
-    let mut app = App {
-        tab: Tab::Agents,
-        tables: Default::default(),
-        state: State::default(),
-        found: Vec::new(),
-        warn: None,
-        note: None,
-        mode: Mode::Normal,
-        loaded: None,
-    };
+    let mut app = App::new();
     loop {
+        while let Ok(done) = app.rx.try_recv() {
+            finished(&mut app, done);
+        }
         if app.loaded.is_none_or(|t| t.elapsed() >= REFRESH) {
             match fleet.snapshot().await {
                 Ok((s, warn)) => {
@@ -234,31 +292,46 @@ async fn main_loop(term: &mut DefaultTerminal, fleet: &impl Fleet) -> Result<()>
         }
         match std::mem::replace(&mut app.mode, Mode::Normal) {
             Mode::Help => {}
+            Mode::Confirm(_, Pending::Run(args)) if k.code == KeyCode::Char('y') => {
+                start(&mut app, fleet, args, None)
+            }
             Mode::Confirm(_, pending) if k.code == KeyCode::Char('y') => {
                 let msg = act(fleet, pending).await;
                 app.say(msg);
                 app.loaded = None;
             }
             Mode::Confirm(..) => app.say("cancelled"),
-            Mode::Tell { agent, mut buf } => match k.code {
+            Mode::Output(out, scroll) => match k.code {
+                KeyCode::Char('y') if out.then.is_some() => {
+                    if let Some(l) = &mut app.last {
+                        l.then = None;
+                    }
+                    start(&mut app, fleet, out.then.unwrap_or_default(), None);
+                }
+                KeyCode::Down | KeyCode::Char('j') => app.mode = Mode::Output(out, scroll + 1),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.mode = Mode::Output(out, scroll.saturating_sub(1))
+                }
+                KeyCode::PageDown => app.mode = Mode::Output(out, scroll + 10),
+                KeyCode::PageUp => app.mode = Mode::Output(out, scroll.saturating_sub(10)),
+                _ => {}
+            },
+            Mode::Input(what, mut buf) => match k.code {
                 KeyCode::Esc => app.say("cancelled"),
-                KeyCode::Enter if !buf.trim().is_empty() => {
-                    let msg = match fleet.tell(&agent, buf.trim()).await {
-                        Ok(id) => format!("rang {}: {id}", short(&agent)),
-                        Err(e) => format!("tell failed: {e:#}"),
-                    };
-                    app.say(msg);
-                    app.loaded = None;
+                KeyCode::Enter if !buf.trim().is_empty() => entered(&mut app, fleet, what, buf),
+                KeyCode::Tab if matches!(what, Input::Command) => {
+                    complete(&mut app, &mut buf);
+                    app.mode = Mode::Input(what, buf);
                 }
                 KeyCode::Backspace => {
                     buf.pop();
-                    app.mode = Mode::Tell { agent, buf };
+                    app.mode = Mode::Input(what, buf);
                 }
                 KeyCode::Char(c) => {
                     buf.push(c);
-                    app.mode = Mode::Tell { agent, buf };
+                    app.mode = Mode::Input(what, buf);
                 }
-                _ => app.mode = Mode::Tell { agent, buf },
+                _ => app.mode = Mode::Input(what, buf),
             },
             Mode::Normal => {
                 if !key(&mut app, k.code, fleet).await {
@@ -268,6 +341,220 @@ async fn main_loop(term: &mut DefaultTerminal, fleet: &impl Fleet) -> Result<()>
         }
     }
 }
+
+/// A typed line: a message to send, a command to run, an answer to give. Each asks first.
+fn entered(app: &mut App, fleet: &impl Fleet, what: Input, buf: String) {
+    let text = buf.trim().to_string();
+    match what {
+        Input::Tell(agent) => {
+            let args = ["tell", &agent, "NOTE", "tui", &text].map(str::to_string);
+            app.mode = Mode::Confirm(
+                format!("tell {}: {text}?", short(&agent)),
+                Pending::Run(args.to_vec()),
+            );
+        }
+        Input::Answer { ask, approve } => {
+            let verb = if approve { "approve" } else { "answer" };
+            app.mode = Mode::Confirm(
+                format!("{verb} {}: {text}?", short(&ask)),
+                Pending::Answer { ask, text, approve },
+            );
+        }
+        Input::Command => match words(&text).and_then(plan) {
+            Err(e) => app.say(e),
+            Ok(Plan::Read(args)) => start(app, fleet, args, None),
+            Ok(Plan::DryRun(dry, real)) => start(app, fleet, dry, Some(real)),
+            Ok(Plan::Write(args)) => {
+                app.mode = Mode::Confirm(format!("run agent-fleet {text}?"), Pending::Run(args))
+            }
+        },
+    }
+}
+
+/// How the command line runs a command.
+#[derive(Debug, PartialEq)]
+enum Plan {
+    /// It only reads: run it now.
+    Read(Vec<String>),
+    /// It writes: ask first.
+    Write(Vec<String>),
+    /// A spawn: its dry run first, then the spawn on `y`.
+    DryRun(Vec<String>, Vec<String>),
+}
+
+fn plan(args: Vec<String>) -> Result<Plan, String> {
+    let w = |i: usize| args.get(i).map_or("", String::as_str);
+    let has = |f: &str| args.iter().any(|a| a == f);
+    Ok(match w(0) {
+        "" => return Err("type a command, e.g. task add <task> --title <title>".into()),
+        "hub" | "host" | "tui" | "hook" | "mint-token" | "bench" => {
+            return Err(format!("{} runs outside the screen", w(0)));
+        }
+        "spawn" if !has("--dry-run") => {
+            let mut dry = args.clone();
+            dry.push("--dry-run".into());
+            Plan::DryRun(dry, args)
+        }
+        "ps" | "stats" | "proc" | "instances" | "state" | "ui" | "spawn" => Plan::Read(args),
+        "doctor" if !has("--apply") => Plan::Read(args),
+        "task" if matches!(w(1), "ls" | "show") => Plan::Read(args),
+        "repo" if w(1) == "ls" => Plan::Read(args),
+        "role" if args.len() == 2 => Plan::Read(args),
+        _ => Plan::Write(args),
+    })
+}
+
+/// Shell-like words: whitespace splits, single or double quotes keep spaces.
+fn words(s: &str) -> Result<Vec<String>, String> {
+    let (mut out, mut cur, mut quote) = (Vec::new(), None::<String>, None);
+    for c in s.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => cur.get_or_insert_default().push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                cur.get_or_insert_default();
+            }
+            None if c.is_whitespace() => out.extend(cur.take()),
+            None => cur.get_or_insert_default().push(c),
+        }
+    }
+    if quote.is_some() {
+        return Err("a quote is not closed".into());
+    }
+    out.extend(cur);
+    Ok(out)
+}
+
+/// Runs the CLI in the background; `finished` takes the result.
+fn start(app: &mut App, fleet: &impl Fleet, args: Vec<String>, then: Option<Vec<String>>) {
+    let argv = fleet.cli();
+    let tx = app.tx.clone();
+    app.jobs.push(args.join(" "));
+    app.say(format!("running {}", args.join(" ")));
+    std::thread::spawn(move || {
+        let out = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .output();
+        let (ok, out) = match out {
+            Ok(o) => (
+                o.status.success(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+            ),
+            Err(e) => (false, format!("could not run {}: {e}", argv[0])),
+        };
+        let _ = tx.send(Done {
+            args,
+            ok,
+            out,
+            then,
+        });
+    });
+}
+
+/// A background command ended: its last line is the outcome; a failure, a longer output or a
+/// dry run opens the whole output (`o` opens it again).
+fn finished(app: &mut App, d: Done) {
+    let cmd = d.args.join(" ");
+    if let Some(i) = app.jobs.iter().position(|j| *j == cmd) {
+        app.jobs.remove(i);
+    }
+    app.loaded = None;
+    let last = d.out.lines().rev().find(|l| !l.trim().is_empty());
+    let last = last.unwrap_or(if d.ok { "done" } else { "failed" });
+    let verb: Vec<&str> = d.args.iter().take(2).map(String::as_str).collect();
+    app.say(format!("{}: {last}", verb.join(" ")));
+    let out = Output {
+        title: format!("agent-fleet {cmd}{}", if d.ok { "" } else { " (failed)" }),
+        text: d.out.clone(),
+        then: d.then.filter(|_| d.ok),
+    };
+    let open = !d.ok || d.out.trim().lines().count() > 1 || out.then.is_some();
+    app.last = Some(out.clone());
+    if open && matches!(app.mode, Mode::Normal) {
+        app.mode = Mode::Output(out, 0);
+    }
+}
+
+/// Completes the last word of the command line from the commands, the agents that are up, tasks,
+/// blockers, levels and the profiles of fleet.toml. Several matches: the common part, and the
+/// matches in the note line.
+fn complete(app: &mut App, buf: &mut String) {
+    let word = buf.rsplit(' ').next().unwrap_or("").to_string();
+    let mut all: Vec<String> = if buf.contains(' ') {
+        let s = &app.state;
+        let profiles: Vec<String> = crate::spawn::find()
+            .map(|(c, _)| c.profiles.into_keys().collect())
+            .unwrap_or_default();
+        (s.agents.keys().map(|a| short(a).to_string()))
+            .chain([crate::event::COORDINATOR.to_string()])
+            .chain(s.tasks.keys().cloned())
+            .chain(s.blockers.keys().cloned())
+            .chain(s.limits.values().map(|l| l.name.clone()))
+            .chain(
+                [
+                    "root-coordinator",
+                    "domain-lead",
+                    "implementation-lead",
+                    "implementer",
+                ]
+                .map(str::to_string),
+            )
+            .chain(profiles)
+            .collect()
+    } else {
+        COMMANDS.map(str::to_string).to_vec()
+    };
+    all.retain(|c| c.starts_with(&word));
+    all.sort();
+    all.dedup();
+    let Some(first) = all.first() else {
+        return app.say("no match");
+    };
+    let common = all.iter().fold(first.clone(), |acc, c| {
+        acc.chars()
+            .zip(c.chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(a, _)| a)
+            .collect()
+    });
+    buf.truncate(buf.len() - word.len());
+    buf.push_str(&common);
+    if all.len() == 1 {
+        buf.push(' ');
+    } else {
+        app.say(all.iter().take(12).cloned().collect::<Vec<_>>().join("  "));
+    }
+}
+
+const COMMANDS: [&str; 20] = [
+    "task",
+    "dep",
+    "block",
+    "unblock",
+    "ask",
+    "role",
+    "spawn",
+    "handoff",
+    "tell",
+    "kill",
+    "resource",
+    "self-update",
+    "doctor",
+    "stats",
+    "ui",
+    "ps",
+    "proc",
+    "repo",
+    "init",
+    "instances",
+];
 
 /// Handles a key in the normal mode. `false` quits.
 async fn key(app: &mut App, code: KeyCode, fleet: &impl Fleet) -> bool {
@@ -285,7 +572,7 @@ async fn key(app: &mut App, code: KeyCode, fleet: &impl Fleet) -> bool {
         KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
             app.tab = TABS[(app.tab as usize + TABS.len() - 1) % TABS.len()].0
         }
-        KeyCode::Char(c @ '1'..='5') => app.tab = TABS[(c as u8 - b'1') as usize].0,
+        KeyCode::Char(c @ '1'..='6') => app.tab = TABS[(c as u8 - b'1') as usize].0,
         KeyCode::Enter if app.tab == Tab::Findings => jump(app),
         KeyCode::Char(c) => action(app, c, fleet).await,
         _ => {}
@@ -325,11 +612,97 @@ async fn action(app: &mut App, c: char, fleet: &impl Fleet) {
     match (app.tab, c) {
         (Tab::Agents, 't') => {
             if let Some(agent) = app.state.agents.keys().nth(at) {
-                app.mode = Mode::Tell {
-                    agent: agent.clone(),
-                    buf: String::new(),
-                };
+                app.mode = Mode::Input(Input::Tell(agent.clone()), String::new());
             }
+        }
+        (Tab::Agents, 'R' | 'H') => {
+            if let Some(agent) = app.state.agents.keys().nth(at) {
+                let a = short(agent);
+                command(
+                    app,
+                    &if c == 'R' {
+                        format!("role {a} ")
+                    } else {
+                        format!("handoff {a} --to ")
+                    },
+                );
+            }
+        }
+        (Tab::Tasks, 'n') => command(app, "task add "),
+        (Tab::Tasks, 'a' | 'b' | 'B' | 'p' | 'P') => {
+            let Some((task, t)) = app.state.tasks.iter().nth(at) else {
+                return;
+            };
+            let blocker = app
+                .state
+                .blockers
+                .iter()
+                .find(|(_, b)| b.task.as_deref() == Some(task))
+                .map(|(id, _)| id.as_str());
+            let line = match c {
+                'a' => format!("task add {task} --to "),
+                'b' => format!("block {task} "),
+                'p' => format!("dep add {task} "),
+                'P' => match t.blocked_by.iter().next() {
+                    Some(on) => format!("dep rm {task} {on}"),
+                    None => return app.say("it waits for no task"),
+                },
+                _ => match blocker {
+                    Some(b) => format!("unblock {b} --note "),
+                    None => return app.say("no blocker on it"),
+                },
+            };
+            command(app, &line);
+        }
+        (Tab::Findings, 'K') => {
+            let Some(f) = app.found.get(at) else {
+                return;
+            };
+            let pids = pids_of(f);
+            if pids.is_empty() || !matches!(f.kind, "hung" | "orphan") {
+                return app.say("only a hung or orphaned process finding names pids to kill");
+            }
+            let host = f.subject.split_once(':').map_or("", |(h, _)| h);
+            if host != fleet.host() {
+                return app.say(format!("those run on {host}; kill them there"));
+            }
+            let mut args = vec!["kill".to_string()];
+            args.extend(pids.iter().map(u32::to_string));
+            app.mode = Mode::Confirm(
+                format!(
+                    "agent-fleet {}? (it checks again and may refuse)",
+                    args.join(" ")
+                ),
+                Pending::Run(args),
+            );
+        }
+        (Tab::Resources, 'L') => command(app, "resource limit "),
+        (Tab::Resources, 'U') => {
+            let rule = app
+                .at()
+                .checked_sub(app.state.resources.len())
+                .and_then(|i| app.state.limits.values().nth(i));
+            let Some(l) = rule else {
+                return app.say("pick a rule row");
+            };
+            let args = ["resource", "unlimit", &l.name, "--host", &l.host].map(str::to_string);
+            app.mode = Mode::Confirm(
+                format!("remove the rule {} on {}?", l.name, l.host),
+                Pending::Run(args.to_vec()),
+            );
+        }
+        (Tab::Asks, 'a' | 'A') => {
+            let Some(item) = app.state.inbox().into_iter().nth(at) else {
+                return;
+            };
+            if item.answer.is_some() {
+                return app.say("already answered");
+            }
+            let what = Input::Answer {
+                ask: item.id,
+                approve: c == 'A',
+            };
+            app.mode = Mode::Input(what, String::new());
         }
         (Tab::Agents, 'f') => {
             let Some((id, a)) = app.state.agents.iter().nth(at) else {
@@ -423,8 +796,28 @@ async fn action(app: &mut App, c: char, fleet: &impl Fleet) {
                 },
             );
         }
+        (_, ':') => command(app, ""),
+        (_, 'S') => command(app, "spawn "),
+        (_, 'c') => command(app, "tell coordinator NOTE tui "),
+        (_, 'o') => match app.last.clone() {
+            Some(out) => app.mode = Mode::Output(out, 0),
+            None => app.say("no command has run yet"),
+        },
         _ => {}
     }
+}
+
+/// Opens the command line with `line` typed.
+fn command(app: &mut App, line: &str) {
+    app.note = None;
+    app.mode = Mode::Input(Input::Command, line.to_string());
+}
+
+/// The pids a hung or orphan finding says to kill (`… kill 12 34`).
+fn pids_of(f: &Finding) -> Vec<u32> {
+    f.detail.rsplit_once("kill ").map_or(vec![], |(_, t)| {
+        t.split_whitespace().map_while(|w| w.parse().ok()).collect()
+    })
 }
 
 /// `<repo>/.agent-fleet/hook`, when the repository ships one: it knows the stack, databases and
@@ -441,6 +834,11 @@ async fn act(fleet: &impl Fleet, pending: Pending) -> String {
         Pending::Task(task, body, verb) => match fleet.task(&task, *body).await {
             Ok(id) => format!("{verb}: {id}"),
             Err(e) => format!("{verb} failed: {e:#}"),
+        },
+        Pending::Run(_) => unreachable!("runs in the background"),
+        Pending::Answer { ask, text, approve } => match fleet.answer(&ask, &text, approve).await {
+            Ok(id) => format!("answered {}: {id}", short(&ask)),
+            Err(e) => format!("answer failed: {e:#}"),
         },
         Pending::Kill(pids, dir) => {
             let mut out = Vec::new();
@@ -638,6 +1036,7 @@ fn draw(f: &mut Frame, app: &App, fleet: &impl Fleet, now: DateTime<Utc>) {
         Tab::Tasks => tasks(app, now),
         Tab::Findings => found(app),
         Tab::Resources => resources(app, now),
+        Tab::Asks => asks(app, now),
     };
     let rows: Vec<Row> = rows
         .into_iter()
@@ -670,12 +1069,31 @@ fn draw(f: &mut Frame, app: &App, fleet: &impl Fleet, now: DateTime<Utc>) {
             format!("{q}  y yes · any other key no"),
             Style::new().fg(Color::Yellow).bold(),
         ),
-        (Mode::Tell { agent, buf }, _) => Line::from(vec![
-            Span::styled(format!("tell {}: ", short(agent)), Style::new().bold()),
-            Span::raw(buf.clone()),
-            Span::styled("█", Style::new().fg(DIM)),
-            Span::styled("   Enter send · Esc cancel", Style::new().fg(DIM)),
-        ]),
+        (Mode::Input(what, buf), _) => {
+            let (prompt, hint) = match what {
+                Input::Tell(agent) => (format!("tell {}: ", short(agent)), "Enter send"),
+                Input::Command => (":".to_string(), "Tab complete · Enter run"),
+                Input::Answer { ask, approve } => (
+                    format!(
+                        "{} {}: ",
+                        if *approve { "approve" } else { "answer" },
+                        short(ask)
+                    ),
+                    "Enter send",
+                ),
+            };
+            let note = app.note.as_ref().filter(|_| matches!(what, Input::Command));
+            Line::from(vec![
+                Span::styled(prompt, Style::new().bold()),
+                Span::raw(buf.clone()),
+                Span::styled("█", Style::new().fg(DIM)),
+                Span::styled(format!("   {hint} · Esc cancel   "), Style::new().fg(DIM)),
+                Span::styled(
+                    note.map(|(n, _)| n.clone()).unwrap_or_default(),
+                    Style::new().fg(Color::Cyan),
+                ),
+            ])
+        }
         (_, tab) => {
             let note = app
                 .note
@@ -683,17 +1101,26 @@ fn draw(f: &mut Frame, app: &App, fleet: &impl Fleet, now: DateTime<Utc>) {
                 .filter(|(_, t)| t.elapsed() < Duration::from_secs(6))
                 .map(|(n, _)| format!("{n}   "))
                 .unwrap_or_default();
+            let jobs = if app.jobs.is_empty() {
+                String::new()
+            } else {
+                format!("running: {}   ", app.jobs.join(" · "))
+            };
             let own = match tab {
-                Tab::Agents => "t Tell · f Focus · ",
+                Tab::Agents => "t Tell · f Focus · R Role · H Handoff · ",
                 Tab::Worktrees => "x Remove · K Kill · ",
-                Tab::Tasks => "d Done · u Release · x Cancel · ",
-                Tab::Findings => "Enter Go to · ",
-                Tab::Resources => "",
+                Tab::Tasks => {
+                    "n New · a Assign · d Done · u Release · x Cancel · b Block · B Unblock · p/P Dep · "
+                }
+                Tab::Findings => "Enter Go to · K Kill · ",
+                Tab::Resources => "L Limit · U Unlimit · ",
+                Tab::Asks => "a Answer · A Approve · ",
             };
             Line::from(vec![
+                Span::styled(jobs, Style::new().fg(Color::Yellow)),
                 Span::styled(note, Style::new().fg(Color::Cyan)),
                 Span::raw(format!(
-                    "↑↓/jk Move · ←→/1-5 Tab · {own}r Refresh · ? Help · q Quit"
+                    "{own}: Command · S Spawn · c Coordinator · o Output · ? Help · q Quit"
                 )),
             ])
         }
@@ -703,8 +1130,10 @@ fn draw(f: &mut Frame, app: &App, fleet: &impl Fleet, now: DateTime<Utc>) {
         foot,
     );
 
-    if matches!(app.mode, Mode::Help) {
-        help(f);
+    match &app.mode {
+        Mode::Help => help(f),
+        Mode::Output(out, scroll) => output(f, out, *scroll),
+        _ => {}
     }
 }
 
@@ -1015,13 +1444,26 @@ fn found(app: &App) -> View<'_> {
         })
         .collect();
     let about = app.found.get(app.at()).map_or(vec![], |f| {
-        vec![
+        let mut l = vec![
             Line::styled(
                 format!("{} · {}", f.kind, home(&f.subject)),
                 Style::new().bold(),
             ),
             Line::raw(f.detail.clone()),
-        ]
+        ];
+        // What `agent-fleet proc` says of each pid the finding names.
+        let host = f.subject.split_once(':').map_or("", |(h, _)| h);
+        for pid in pids_of(f) {
+            let (verdict, why) = crate::watch::verdict_of(&app.state, host, pid, Utc::now());
+            l.push(Line::styled(
+                format!(
+                    "proc {pid}: {verdict}{}",
+                    why.map(|w| format!(": {w}")).unwrap_or_default()
+                ),
+                Style::new().fg(DIM),
+            ));
+        }
+        l
     });
     (
         vec!["KIND", "SUBJECT", "DETAIL"],
@@ -1200,6 +1642,66 @@ fn resources(app: &App, now: DateTime<Utc>) -> View<'_> {
     )
 }
 
+fn asks(app: &App, now: DateTime<Utc>) -> View<'_> {
+    let inbox = app.state.inbox();
+    let rows = inbox
+        .iter()
+        .map(|i| {
+            let (state, color) = match &i.answer {
+                None => ("open", Color::Yellow),
+                Some(a) if a.acked.is_some() => ("seen", DIM),
+                Some(_) => ("answered", Color::Green),
+            };
+            Row::new(vec![
+                Cell::from(state).fg(color),
+                Cell::from(short(&i.ask.by).to_string()),
+                Cell::from(i.level.short()),
+                Cell::from(ago(now, i.ask.since)),
+                Cell::from(i.ask.question.clone()),
+            ])
+        })
+        .collect();
+    let about = inbox.into_iter().nth(app.at()).map_or(vec![], |i| {
+        let mut l = vec![Line::from(vec![
+            Span::styled(i.ask.question.clone(), Style::new().bold()),
+            Span::raw(format!(
+                "  {} · {}",
+                i.ask.by,
+                i.ask.task.as_deref().unwrap_or("no task")
+            )),
+        ])];
+        for (n, o) in i.ask.options.iter().enumerate() {
+            l.push(Line::raw(format!("  {}. {o}", n + 1)));
+        }
+        if let Some(r) = &i.ask.recommendation {
+            l.push(Line::raw(format!("recommends: {r}")));
+        }
+        if let Some(c) = &i.ask.context {
+            l.push(Line::raw(c.clone()).fg(DIM));
+        }
+        if let Some(a) = &i.answer {
+            let how = if a.approve { "approved" } else { "answered" };
+            l.push(Line::styled(
+                format!("{how} {} ago: {}", ago(now, a.at), a.answer),
+                Style::new().fg(Color::Green),
+            ));
+        }
+        l
+    });
+    (
+        vec!["STATE", "BY", "LEVEL", "FOR", "QUESTION"],
+        vec![
+            Constraint::Length(9),
+            Constraint::Length(16),
+            Constraint::Length(9),
+            Constraint::Length(7),
+            Constraint::Min(20),
+        ],
+        rows,
+        about,
+    )
+}
+
 fn finding_lines<'a>(app: &'a App, subject: &str) -> Vec<Line<'a>> {
     app.findings_for(subject)
         .into_iter()
@@ -1217,18 +1719,27 @@ fn help(f: &mut Frame) {
         Line::styled("agent-fleet tui", Style::new().bold()),
         Line::raw(""),
         Line::raw("↑↓ / j k      move            PgUp PgDn   ten rows"),
-        Line::raw("← → / 1-5     tabs            r           refresh now (it refreshes every 2 s)"),
+        Line::raw("← → / 1-6     tabs            r           refresh now (it refreshes every 2 s)"),
         Line::raw(""),
-        Line::raw("Agents        t  ring the agent's doorbell (agent-fleet tell)"),
-        Line::raw("              f  focus its herdr pane (same host and session)"),
         Line::raw(
-            "Worktrees     x  remove a worktree no agent works in (the repo's .agent-fleet/hook retire,",
+            "Agents        t tell · f focus its herdr pane · R role · H handoff --to <profile>",
         ),
-        Line::raw("                 else git worktree remove, which refuses unsaved work)"),
-        Line::raw("              K  kill the processes left in it (TERM; only those still there)"),
-        Line::raw("Tasks         d  done · u release · x cancel"),
-        Line::raw("Findings      Enter  go to the agent, worktree or resource"),
-        Line::raw("Resources     locks the hosts read: holder, queue, capacity rules"),
+        Line::raw("Worktrees     x remove one no agent works in (.agent-fleet/hook retire, else"),
+        Line::raw("                git worktree remove) · K kill the processes left in it"),
+        Line::raw("Tasks         n new (task add) · a assign · d done · u release · x cancel"),
+        Line::raw("              b block · B unblock · p dep add · P dep rm"),
+        Line::raw("Findings      Enter go to its subject · K kill a hung or orphaned process"),
+        Line::raw("Resources     L add a capacity rule · U remove the selected rule"),
+        Line::raw("Asks          the board's Inbox: a answer · A approve"),
+        Line::raw(""),
+        Line::raw(":             any CLI command, run as `agent-fleet <command>` (Tab completes):"),
+        Line::raw(
+            "              task, dep, block, unblock, role, spawn, handoff, tell, kill, resource,",
+        ),
+        Line::raw("              self-update, doctor --apply, stats, ui, proc <pid>, ps …"),
+        Line::raw(
+            "S spawn (its dry run first) · c tell the coordinator · o the last command's output",
+        ),
         Line::raw(""),
         Line::raw("Every action asks first. Findings are `agent-fleet doctor`'s."),
         Line::raw(""),
@@ -1250,10 +1761,35 @@ fn help(f: &mut Frame) {
     );
 }
 
+/// A command's whole output over the screen; for a dry run, `y` starts the spawn.
+fn output(f: &mut Frame, out: &Output, scroll: u16) {
+    let area = f.area().inner(ratatui::layout::Margin::new(2, 1));
+    let keys = if out.then.is_some() {
+        " y spawn · ↑↓ scroll · any other key cancels "
+    } else {
+        " ↑↓ scroll · any other key closes "
+    };
+    let block = ratatui::widgets::Block::bordered()
+        .title(Line::styled(
+            format!(" {} ", out.title),
+            Style::new().bold(),
+        ))
+        .title_bottom(Line::styled(keys, Style::new().fg(Color::Yellow)));
+    f.render_widget(ratatui::widgets::Clear, area);
+    f.render_widget(
+        Paragraph::new(out.text.clone())
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        area,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::Agent;
+    use clap::Parser;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -1281,6 +1817,19 @@ mod tests {
         async fn tell(&self, a: &str, t: &str) -> Result<String> {
             self.0.lock().unwrap().push((a.into(), t.into()));
             Ok(String::new())
+        }
+        async fn answer(&self, ask: &str, t: &str, approve: bool) -> Result<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((ask.into(), format!("{t} {approve}")));
+            Ok("e1".into())
+        }
+        fn cli(&self) -> Vec<String> {
+            // Prints the command line it was given, as the CLI's outcome line.
+            ["sh", "-c", "echo \"$@\"", "agent-fleet"]
+                .map(str::to_string)
+                .to_vec()
         }
         fn instance(&self) -> &str {
             "i"
@@ -1348,6 +1897,12 @@ mod tests {
         async fn tell(&self, _: &str, _: &str) -> Result<String> {
             unreachable!()
         }
+        async fn answer(&self, _: &str, _: &str, _: bool) -> Result<String> {
+            unreachable!()
+        }
+        fn cli(&self) -> Vec<String> {
+            unreachable!()
+        }
         fn instance(&self) -> &str {
             "demo"
         }
@@ -1377,14 +1932,10 @@ mod tests {
             },
         );
         let app = App {
-            tab: Tab::Agents,
-            tables: Default::default(),
             found: findings(&state, now),
             state,
             warn: Some("hub unreachable; local replica".into()),
-            note: None,
-            mode: Mode::Normal,
-            loaded: None,
+            ..App::new()
         };
         let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
         term.draw(|f| draw(f, &app, &Stub, now)).unwrap();
@@ -1460,17 +2011,14 @@ mod tests {
         .map(ev)
         .collect();
         let state = State::fold(&events);
-        let mut tables: [TableState; 5] = Default::default();
+        let mut tables: [TableState; 6] = Default::default();
         tables[Tab::Resources as usize].select(Some(1));
         let mut app = App {
             tab: Tab::Resources,
             tables,
             found: findings(&state, now),
             state,
-            warn: None,
-            note: None,
-            mode: Mode::Normal,
-            loaded: None,
+            ..App::new()
         };
         let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
         let local = |t: DateTime<Utc>| t.with_timezone(&chrono::Local);
@@ -1516,5 +2064,323 @@ mod tests {
         term.draw(|f| draw(f, &app, &Stub, now)).unwrap();
         let screen = rows(&term).join("\n");
         assert!(screen.contains(&format!("expired at {}", crate::ui::at(now, old))));
+    }
+
+    /// A fleet: a lead agent up, a task with a blocker and a dependency, a lead's open ask, a
+    /// capacity rule and a hung process on this host.
+    fn fleet_state() -> State {
+        use crate::event::{
+            Actor, ActorKind, AgentRole, AskRaised, BlockerRaised, Dep, Envelope, Level,
+            ProcessHung, ResourceLimit, TaskCreated,
+        };
+        let lead = "agent:h/s/lead";
+        let by = Actor {
+            kind: ActorKind::Agent,
+            id: lead.into(),
+        };
+        let ev = |body, task: Option<&str>| {
+            let e = Envelope::new(by.clone(), "p", body);
+            match task {
+                Some(t) => e.task(t),
+                None => e,
+            }
+            .into_event()
+        };
+        let t = Some("task:p/1");
+        let created = |title: &str| {
+            Known::TaskCreated(TaskCreated {
+                title: title.into(),
+                url: None,
+            })
+        };
+        let mut s = State::fold(&[
+            ev(created("first"), Some("task:p/0")),
+            ev(created("second"), t),
+            ev(
+                Known::DepAdded(Dep {
+                    on: "task:p/0".into(),
+                }),
+                t,
+            ),
+            ev(
+                Known::BlockerRaised(BlockerRaised {
+                    what: "CI".into(),
+                    owner: None,
+                    unblocks_when: None,
+                    pid: None,
+                    started: None,
+                }),
+                t,
+            ),
+            ev(
+                Known::AgentRole(AgentRole {
+                    agent: lead.into(),
+                    level: Some(Level::RootCoordinator),
+                    lead: None,
+                    domain: None,
+                }),
+                None,
+            ),
+            ev(
+                Known::AskRaised(AskRaised {
+                    question: "ship it?".into(),
+                    options: vec!["yes".into(), "no".into()],
+                    recommendation: Some("yes".into()),
+                    context: None,
+                }),
+                t,
+            ),
+            ev(
+                Known::ResourceLimit(ResourceLimit {
+                    host: "h".into(),
+                    name: "native".into(),
+                    resources: vec!["sim".into()],
+                    max: 1,
+                    until: None,
+                }),
+                None,
+            ),
+        ]);
+        s.agents.insert(
+            lead.into(),
+            Agent {
+                host: "h".into(),
+                kind: None,
+                pane: None,
+                state: AgentState::Working,
+                since: Utc::now(),
+                worked: None,
+                finished: None,
+                usage: None,
+            },
+        );
+        s.hung.insert(
+            "h:30".into(),
+            ProcessHung {
+                host: "h".into(),
+                pid: 30,
+                pids: vec![30, 31],
+                agent: Some(lead.into()),
+                command: Some("sleep 999".into()),
+                started: None,
+                evidence: Some("no output".into()),
+                since: Some(Utc::now()),
+                checked: Some(Utc::now()),
+            },
+        );
+        s
+    }
+
+    /// The command line an action left: typed (plus what the operator would add), or waiting
+    /// for `y`.
+    fn line(app: &App, rest: &str) -> Vec<String> {
+        match &app.mode {
+            Mode::Input(Input::Command, buf) => words(&format!("{buf}{rest}")).unwrap(),
+            Mode::Confirm(_, Pending::Run(args)) => args.clone(),
+            _ => panic!("no command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn every_action_builds_a_command_the_cli_parses() {
+        let fleet = Told(Default::default());
+        let mut app = App {
+            state: fleet_state(),
+            ..App::new()
+        };
+        app.found = findings(&app.state, Utc::now());
+        let hung = app.found.iter().position(|f| f.subject == "h:30").unwrap();
+        app.tables[Tab::Findings as usize].select(Some(hung));
+        let blocker = app.state.blockers.keys().next().unwrap().clone();
+        let cases = [
+            (
+                Tab::Agents,
+                'R',
+                "implementer --lead coordinator",
+                "role lead implementer --lead coordinator".to_string(),
+            ),
+            (Tab::Agents, 'H', "codex", "handoff lead --to codex".into()),
+            (
+                Tab::Tasks,
+                'n',
+                "task:p/2 --title 'two words'",
+                "task add task:p/2 --title two words".into(),
+            ),
+            (
+                Tab::Tasks,
+                'a',
+                "lead",
+                "task add task:p/0 --to lead".into(),
+            ),
+            (
+                Tab::Tasks,
+                'b',
+                "'waits on CI'",
+                "block task:p/0 waits on CI".into(),
+            ),
+            (Tab::Findings, 'K', "", "kill 30 31".into()),
+            (
+                Tab::Resources,
+                'L',
+                "sims sim --max 2",
+                "resource limit sims sim --max 2".into(),
+            ),
+            (
+                Tab::Resources,
+                'U',
+                "",
+                "resource unlimit native --host h".into(),
+            ),
+            (Tab::Asks, ':', "self-update", "self-update".into()),
+            (Tab::Agents, 'S', "o/r#5", "spawn o/r#5".into()),
+            (
+                Tab::Agents,
+                'c',
+                "hello",
+                "tell coordinator NOTE tui hello".into(),
+            ),
+        ];
+        for (tab, key, rest, want) in cases {
+            app.tab = tab;
+            action(&mut app, key, &fleet).await;
+            let args = line(&app, rest);
+            assert_eq!(args.join(" "), want, "{key}");
+            let argv = std::iter::once("agent-fleet".to_string()).chain(args);
+            assert!(crate::Cli::try_parse_from(argv).is_ok(), "{want}");
+            app.mode = Mode::Normal;
+        }
+        // The second task waits for the first and has the blocker.
+        app.tab = Tab::Tasks;
+        app.tables[Tab::Tasks as usize].select(Some(1));
+        for (key, rest, want) in [
+            ('B', "fixed", format!("unblock {blocker} --note fixed")),
+            ('p', "task:p/9", "dep add task:p/1 task:p/9".into()),
+            ('P', "", "dep rm task:p/1 task:p/0".into()),
+        ] {
+            action(&mut app, key, &fleet).await;
+            let args = line(&app, rest);
+            assert_eq!(args.join(" "), want);
+            let argv = std::iter::once("agent-fleet".to_string()).chain(args);
+            assert!(crate::Cli::try_parse_from(argv).is_ok(), "{want}");
+            app.mode = Mode::Normal;
+        }
+        // tell: typed, then the CLI's own `tell` waits for `y`.
+        app.tab = Tab::Agents;
+        action(&mut app, 't', &fleet).await;
+        let Mode::Input(what, _) = std::mem::replace(&mut app.mode, Mode::Normal) else {
+            panic!("no input")
+        };
+        entered(&mut app, &fleet, what, "look at #3".into());
+        assert_eq!(
+            line(&app, "").join(" "),
+            "tell agent:h/s/lead NOTE tui look at #3"
+        );
+        // An ask: approved through the board's endpoint after `y`.
+        app.tab = Tab::Asks;
+        action(&mut app, 'A', &fleet).await;
+        let Mode::Input(what, _) = std::mem::replace(&mut app.mode, Mode::Normal) else {
+            panic!("no input")
+        };
+        entered(&mut app, &fleet, what, "yes".into());
+        let Mode::Confirm(_, pending) = std::mem::replace(&mut app.mode, Mode::Normal) else {
+            panic!("no confirm")
+        };
+        assert!(act(&fleet, pending).await.starts_with("answered "));
+        let ask = app.state.asks.keys().next().unwrap().clone();
+        assert_eq!(fleet.0.lock().unwrap()[0], (ask, "yes true".to_string()));
+    }
+
+    #[test]
+    fn the_command_line_reads_at_once_asks_before_a_write_and_dry_runs_a_spawn() {
+        let w = |s: &str| words(s).unwrap();
+        assert_eq!(w(r#"block t "a b" 'c d'"#), ["block", "t", "a b", "c d"]);
+        assert!(words("block t \"open").is_err());
+        assert_eq!(plan(w("doctor")), Ok(Plan::Read(w("doctor"))));
+        assert_eq!(
+            plan(w("doctor --apply")),
+            Ok(Plan::Write(w("doctor --apply")))
+        );
+        assert_eq!(plan(w("role lead")), Ok(Plan::Read(w("role lead"))));
+        assert_eq!(
+            plan(w("role lead --clear")),
+            Ok(Plan::Write(w("role lead --clear")))
+        );
+        assert_eq!(
+            plan(w("spawn o/r#5")),
+            Ok(Plan::DryRun(w("spawn o/r#5 --dry-run"), w("spawn o/r#5")))
+        );
+        assert!(plan(w("hub")).is_err() && plan(vec![]).is_err());
+    }
+
+    #[test]
+    fn a_command_runs_in_the_background_and_its_last_line_is_the_outcome() {
+        let fleet = Told(Default::default());
+        let mut app = App::new();
+        start(&mut app, &fleet, w2("task ls"), None);
+        assert_eq!(app.jobs, ["task ls"]);
+        let done = app.rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        finished(&mut app, done);
+        assert!(app.jobs.is_empty() && matches!(app.mode, Mode::Normal));
+        assert_eq!(app.note.as_ref().unwrap().0, "task ls: task ls");
+        // A dry run opens its output with the spawn behind `y`; a failure opens its output.
+        start(
+            &mut app,
+            &fleet,
+            w2("spawn o/r#5 --dry-run"),
+            Some(w2("spawn o/r#5")),
+        );
+        let done = app.rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        finished(&mut app, done);
+        assert!(matches!(&app.mode, Mode::Output(o, 0) if o.then == Some(w2("spawn o/r#5"))));
+        app.mode = Mode::Normal;
+        finished(
+            &mut app,
+            Done {
+                args: w2("kill 30"),
+                ok: false,
+                out: "agent-fleet kill: REFUSED not yours\nError: killed nothing\n".into(),
+                then: None,
+            },
+        );
+        assert!(matches!(&app.mode, Mode::Output(o, _) if o.text.contains("REFUSED")));
+    }
+
+    fn w2(s: &str) -> Vec<String> {
+        words(s).unwrap()
+    }
+
+    #[test]
+    fn the_asks_tab_shows_the_inbox_and_a_finding_its_processes() {
+        let mut app = App {
+            tab: Tab::Asks,
+            state: fleet_state(),
+            ..App::new()
+        };
+        app.found = findings(&app.state, Utc::now());
+        let mut term = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        let screen = |term: &Terminal<TestBackend>| -> String {
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+        term.draw(|f| draw(f, &app, &Stub, Utc::now())).unwrap();
+        for want in [
+            "6 Asks",
+            "open",
+            "ship it?",
+            "1. yes",
+            "recommends: yes",
+            "A Approve",
+        ] {
+            assert!(screen(&term).contains(want), "missing {want:?}");
+        }
+        app.tab = Tab::Findings;
+        let hung = app.found.iter().position(|f| f.subject == "h:30").unwrap();
+        app.tables[Tab::Findings as usize].select(Some(hung));
+        term.draw(|f| draw(f, &app, &Stub, Utc::now())).unwrap();
+        assert!(screen(&term).contains("proc 31: hung: no output"));
     }
 }

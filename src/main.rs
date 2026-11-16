@@ -138,7 +138,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RepoCmd,
     },
-    /// The fleet on one screen, live: agents, worktrees, tasks, findings, and the actions on them.
+    /// The fleet on one screen, live: agents, worktrees, tasks, findings, resources, asks; `:` runs
+    /// any command from it.
     Tui,
     /// Tasks: `add` claims (exclusive), `done` finishes, `rm` cancels or releases.
     Task {
@@ -348,6 +349,44 @@ impl tui::Fleet for Ctx {
             Known::MsgSent(body),
         ))
         .await
+    }
+
+    async fn answer(&self, ask: &str, text: &str, approve: bool) -> Result<String> {
+        self.client()?.answer(ask, text, approve).await
+    }
+
+    fn cli(&self) -> Vec<String> {
+        // After a self-update the running binary's file is replaced: run the new one.
+        let exe = std::env::current_exe().map_or_else(
+            |_| "agent-fleet".to_string(),
+            |p| {
+                p.to_string_lossy()
+                    .trim_end_matches(" (deleted)")
+                    .to_string()
+            },
+        );
+        let c = &self.cli;
+        let mut v = vec![
+            exe,
+            "--instance".into(),
+            c.instance.clone(),
+            "--project".into(),
+            c.project.clone(),
+        ];
+        for (flag, val) in [
+            ("--hub", c.hub.clone()),
+            (
+                "--token-file",
+                c.token_file.as_ref().map(|p| p.display().to_string()),
+            ),
+            ("--as", c.me.clone()),
+            ("--host-name", c.host_name.clone()),
+        ] {
+            if let Some(val) = val {
+                v.extend([flag.to_string(), val]);
+            }
+        }
+        v
     }
 
     fn instance(&self) -> &str {

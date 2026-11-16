@@ -268,25 +268,32 @@ Other levels are `domain-lead`, `implementation-lead` and `implementer`, each wi
 
 `agent-fleet tui` shows the whole fleet on one screen and refreshes every 2 s. The top lines
 count agents, tasks, worktrees, findings and undelivered messages; below them, in red, up to
-three hung or orphaned processes, duplicate work or capacity breaches. Pick a tab with `1`–`5` or `←`/`→`, move with `↑`/`↓` or `j`/`k`, and read the selected
-row's details in the bottom panel. The footer lists the keys of the current tab; `?` shows them
-all, `q` quits.
+three hung or orphaned processes, duplicate work or capacity breaches. Pick a tab with `1`–`6` or
+`←`/`→`, move with `↑`/`↓` or `j`/`k`, and read the selected row's details in the bottom panel.
+The footer lists the keys of the current tab; `?` shows them all, `q` quits.
 
 ![The Agents tab: state, role, CPU, memory, task and branch of each agent](docs/images/tui-agents.png)
 
 | Tab | Shows | Keys |
 |---|---|---|
-| 1 Agents | State, time in it, role, CPU, memory, task, branch | `t` send a message (`tell`), `f` focus its herdr pane |
+| 1 Agents | State, time in it, role, CPU, memory, task, branch | `t` send a message (`tell`), `f` focus its herdr pane, `R` set or clear its role, `H` hand it off (`handoff --to`) |
 | 2 Worktrees | Branch, agent, unpushed commits, uncommitted files, what runs in it | `x` remove a worktree no agent works in, `K` kill the processes left in it |
-| 3 Tasks | State, time in it, owner, open blockers, title | `d` done, `u` release, `x` cancel |
-| 4 Findings | What `doctor` found: hung, orphaned, stuck or blocked work | `Enter` go to the agent, worktree or resource |
-| 5 Resources | Locks the hosts report, who holds and who waits, capacity rules, quotas | |
+| 3 Tasks | State, time in it, owner, open blockers, title | `n` new (`task add`), `a` assign, `d` done, `u` release, `x` cancel, `b` block, `B` unblock, `p` / `P` add / remove a dependency |
+| 4 Findings | What `doctor` found: hung, orphaned, stuck or blocked work, and what `proc` says of each process | `Enter` go to the agent, worktree or resource, `K` kill a hung or orphaned process (`kill`, with its own checks) |
+| 5 Resources | Locks the hosts report, who holds and who waits, capacity rules, quotas | `L` add a capacity rule, `U` remove the selected one |
+| 6 Asks | The board's Inbox: questions from leads and the coordinator, open first, with their options | `a` answer, `A` approve |
+| Everywhere | | `:` run any CLI command (Tab completes), `S` spawn, `c` tell the coordinator, `o` the last command's output |
 
-Every action asks before it runs, and writes the same events as the CLI.
+`:` runs the CLI itself, with the screen's flags, so every action writes the same events as the
+CLI, with the same checks and refusals. A command that only reads (`stats`, `doctor`, `proc`,
+`ui` …) runs at once; every other asks first, and `spawn` shows its dry run first. The keys fill
+the command line from the selected row, for you to finish and run.
+
+![The Asks tab: a lead's open question with its options and recommendation](docs/images/tui-asks.png)
 
 ![The Worktrees tab: unpushed and uncommitted work per worktree](docs/images/tui-worktrees.png)
 
-![The Findings tab: a held blocker and a hung process](docs/images/tui-findings.png)
+![The Findings tab: a hung process, its kill command and what proc says of each pid](docs/images/tui-findings.png)
 
 ![The help screen](docs/images/tui-help.png)
 
@@ -336,7 +343,7 @@ From `agent-fleet --help`; every command has its own `--help`.
 | `instances` | The agent-fleet instances on this machine and the hub each one uses |
 | `init` | Write this machine's fleet.toml and brief.md into the user config dir (`AGENT_FLEET_CONFIG_DIR` overrides it): commented templates with a profile for each agent program on PATH and one default rule. Never overwrites an existing file. Lists the user-level Claude and Codex skills that drive terminals (herdr, tmux, cmux) |
 | `repo` | Connect a repository to the fleet on this machine: `add` records its checkout in the machine's fleet.toml, `ls` lists, `rm` disconnects. The host picks changes up without a restart |
-| `tui` | The fleet on one screen, live: agents, worktrees, tasks, findings, and the actions on them |
+| `tui` | The fleet on one screen, live: agents, worktrees, tasks, findings, resources, asks; `:` runs any command from it |
 | `task` | Tasks: `add` claims (exclusive), `done` finishes, `rm` cancels or releases |
 | `dep` | Dependencies between tasks: <task> is blocked by <on> |
 | `block` | Raise a blocker on a task. Prints the blocker id |
