@@ -923,6 +923,18 @@ env = { PORT = "{port.web}", API = "{port.api}" }
         assert_eq!(c.services["api"].timeout, 120);
         assert_eq!(c.services["web"].timeout, 60);
         assert_eq!(c.infra.unwrap().health.len(), 1);
+        // docs/DEV.md's minimal file and its `${VAR}` advice.
+        let m = parse(
+            "[slots]\nports = { api = 8990 }\n[services.api]\nrun = \"serve --port ${PORT}\"\n\
+             env = { PORT = \"{port.api}\" }\n",
+        )
+        .unwrap();
+        let v = Vars::new(&m, 2, "x", Path::new("/r")).unwrap();
+        assert_eq!(
+            render(&m.services["api"].run, &v).unwrap(),
+            "serve --port ${PORT}"
+        );
+        assert_eq!(render(&m.services["api"].env["PORT"], &v).unwrap(), "9010");
     }
 
     #[test]

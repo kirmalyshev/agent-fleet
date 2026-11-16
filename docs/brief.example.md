@@ -12,4 +12,8 @@ Rules:
 - Stuck on something you cannot resolve: `agent-fleet block @@TASK@@ "<what>"`. A decision only
   the operator can make: `agent-fleet ask @@TASK@@ "<question>"`.
 - Make the smallest change that fully solves the task, and run the repository's checks.
+- If the repository has `.agent-fleet/dev.toml`, run its services with `agent-fleet dev up`
+  in your worktree, on your own ports, and stop them with `agent-fleet dev down` when done.
+  To write or change that file, follow
+  https://github.com/kirmalyshev/agent-fleet/blob/main/docs/DEV.md.
 - Commit on `@@BRANCH@@`, push it, and open a pull request. Never push to the default branch.

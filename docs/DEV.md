@@ -71,6 +71,59 @@ A port counts as taken when something accepts a connection on `127.0.0.1:<port>`
 bound. The ports a service's own templates name are checked before it starts, except the ones a
 running service of the same worktree also names.
 
+## For agents: writing a `dev.toml`
+
+Write the file at `.agent-fleet/dev.toml` in the repository root and commit it. Every worktree
+then has it.
+
+1. Find how the repository starts each service now: its README, `Makefile`, `package.json`,
+   `docker-compose.yml`, `Procfile`, or its own `./dev`. Copy the commands as they are.
+2. Give every port a service listens on a name and a base under `[slots] ports`. Use the
+   port the repository uses today as the base, so the main checkout (slot 0) keeps it. Then
+   replace each hard-coded port in `run`, `env`, `health` and `url` with `{port.<name>}`. A
+   hard-coded port makes two worktrees collide.
+3. Give every value that two worktrees must not share a template: a database name
+   (`app_{id}`), a cache index (`{slot}`), a temp directory (`/tmp/app-{id}`). Put values
+   every service needs in `[env]`, and values for one service in its own `env`.
+4. Put containers and other things every worktree shares under `[infra]`, never in a
+   service: `down` never stops infra. Give `[infra]` a `health` check, so `up` skips it when
+   it already runs.
+5. Give each service a `health`: a URL that answers 2xx when the service is ready, or a
+   command that exits 0. Without one, `up` cannot tell a crash from a start.
+6. Keep `max * step` small enough that every port stays at or below 65535, and make `step`
+   larger than the number of ports, so slots do not overlap.
+
+Minimal file:
+
+```toml
+[slots]
+ports = { api = 8990 }
+
+[services.api]
+run = "make serve PORT={port.api}"
+health = "http://127.0.0.1:{port.api}/health"
+url = "http://localhost:{port.api}"
+```
+
+Check it in a linked worktree, never only in the main checkout:
+
+```sh
+agent-fleet dev info          # loads the file: errors name the line or the key; claims the slot
+agent-fleet dev up --all      # starts everything on this worktree's ports and waits for health
+agent-fleet dev status
+agent-fleet dev down
+```
+
+The loader rejects:
+
+- A key it does not know, such as a misspelt `helth`. The error names the line.
+- `{port.x}` when `ports` has no `x`. The error names the key that uses it.
+- A port past 65535 at slot `max`.
+- A service named `all`, or a name with characters other than letters, digits, `-` and `_`.
+
+A shell's `${VAR}` is left as is, so `run = "serve --port ${PORT}"` with
+`env = { PORT = "{port.api}" }` works.
+
 ## Slots
 
 - The main checkout is slot 0. A linked worktree claims the lowest free slot ≥ 1 on first use
