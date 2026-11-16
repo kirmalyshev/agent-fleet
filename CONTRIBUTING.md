@@ -26,6 +26,15 @@ cargo test
 
 Try a change against a throwaway fleet, never against one you depend on: a temporary
 `AGENT_FLEET_HOME`, an `--instance` of its own and a free port, as in the README's quick start.
+Start its daemons with a time limit, so they stop by themselves:
+
+```sh
+export AGENT_FLEET_HOME=$(mktemp -d) AGENT_FLEET_INSTANCE=try
+timeout 30m agent-fleet hub --listen 127.0.0.1:7799 &
+```
+
+`agent-fleet kill` refuses every `agent-fleet` process, throwaway ones too, and an agent must not
+use a raw `kill`; without the time limit only a human can stop them.
 
 ## Code map
 
