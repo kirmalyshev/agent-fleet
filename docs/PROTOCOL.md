@@ -565,6 +565,12 @@ never re-expanded and a placeholder with no value refuses the spawn. `--dry-run`
 decision and the brief and writes nothing; otherwise `spawn.requested` is written and the CLI
 follows the hub until `spawn.result` arrives (10 min, `--no-wait` skips the wait).
 
+Work with no issue: `agent-fleet spawn <owner/repo> --title "<what>"`. The rules match on the
+title, the default name is the profile's prefix plus the title's words (32 characters at most),
+ISSUE renders empty, and the task is `task:<repo name>/<name>`. The CLI creates that task and,
+once `spawn.result` is ok, assigns it to the new agent; under `--no-wait` it stays unassigned.
+Every brief also has REF (`owner/repo#N`, or `owner/repo` with no issue) and TASK (the task id).
+
 The host agent serves requests naming its host and session, against a checkout given as
 `--repo <owner/repo>=<dir>` (a bare `--repo <dir>` watches a checkout and derives the slug from
 its `origin` remote). A request names the `profile`; the host reads `kind`, `args`, `unset_env`,

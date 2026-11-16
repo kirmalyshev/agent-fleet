@@ -279,7 +279,6 @@ pub fn find() -> Result<(FleetConfig, PathBuf)> {
 pub struct Issue {
     /// `owner/repo`: a profile's cap counts only this repo's agents.
     pub repo: String,
-    pub number: u64,
     pub title: String,
     pub labels: Vec<String>,
 }
@@ -309,7 +308,6 @@ pub async fn gh_issue(repo: &str, n: u64) -> Result<Issue> {
     let v: Value = serde_json::from_slice(&out.stdout).context("gh issue view: bad JSON")?;
     Ok(Issue {
         repo: repo.to_string(),
-        number: n,
         title: v["title"].as_str().unwrap_or_default().to_string(),
         labels: v["labels"]
             .as_array()
@@ -321,17 +319,37 @@ pub async fn gh_issue(repo: &str, n: u64) -> Result<Issue> {
 }
 
 /// `<owner/repo>#<issue>`.
-pub fn parse_target(s: &str) -> Result<(String, u64)> {
-    let Some((repo, n)) = s.rsplit_once('#') else {
-        bail!("not <owner/repo>#<issue>: {s}")
+pub fn parse_target(s: &str) -> Result<(String, Option<u64>)> {
+    let (repo, n) = match s.rsplit_once('#') {
+        Some((repo, n)) => (repo, Some(n)),
+        None => (s, None),
     };
     if repo.split('/').count() != 2 || repo.split('/').any(str::is_empty) {
-        bail!("not <owner/repo>#<issue>: {s}");
+        bail!("not <owner/repo>#<issue> or <owner/repo>: {s}");
     }
-    let n: u64 = n
-        .parse()
-        .with_context(|| format!("not an issue number: {n}"))?;
+    let n = n
+        .map(|n| {
+            n.parse::<u64>()
+                .with_context(|| format!("not an issue number: {n}"))
+        })
+        .transpose()?;
     Ok((repo.to_string(), n))
+}
+
+/// An agent-name tail from a title: lowercase words joined by `-`, at most `max` characters.
+pub fn title_slug(title: &str, max: usize) -> String {
+    let mut out = String::new();
+    for c in title.chars() {
+        if out.len() >= max {
+            break;
+        }
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_end_matches('-').to_string()
 }
 
 /// `owner/repo` from a git remote URL, or `None` when it isn't a GitHub remote.
@@ -1776,6 +1794,19 @@ pub async fn spawn_loop(host: Arc<Host>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_target_with_no_issue_parses_and_a_title_makes_a_name() {
+        assert_eq!(parse_target("o/r#12").unwrap(), ("o/r".into(), Some(12)));
+        assert_eq!(parse_target("o/r").unwrap(), ("o/r".into(), None));
+        assert!(parse_target("o/r#x").is_err());
+        assert!(parse_target("just-a-name").is_err());
+        assert_eq!(
+            title_slug("Directory: sort NEW options!", 30),
+            "directory-sort-new-options"
+        );
+        assert_eq!(title_slug("Directory: sort new options", 10), "directory");
+    }
     use crate::client::Client;
     use crate::host::Config;
     use crate::store::Store;
@@ -1840,7 +1871,6 @@ profile = "devin"
     fn issue(title: &str, labels: &[&str]) -> Issue {
         Issue {
             repo: "o/r".into(),
-            number: 7,
             title: title.into(),
             labels: labels.iter().map(|l| l.to_string()).collect(),
         }
