@@ -552,7 +552,9 @@ pub(crate) async fn watch_loop(host: Arc<Host>) {
     let mut tick = tokio::time::interval(EVERY);
     // A stalled tick must not fire the next ones back to back: streaks count real intervals.
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_prs: Option<std::time::Instant> = None;
+    // The first look waits a full interval: at start the replica may not have caught up, and a
+    // live agent missing from it would look like an orphan's owner gone.
+    let mut last_prs = Some(std::time::Instant::now());
     loop {
         tick.tick().await;
         if let Err(err) = once(&host, &mut w).await {
@@ -560,8 +562,11 @@ pub(crate) async fn watch_loop(host: Arc<Host>) {
         }
         if last_prs.is_none_or(|t| t.elapsed() >= ORPHAN_PR_EVERY) {
             last_prs = Some(std::time::Instant::now());
-            if let Err(err) = orphan_prs(&host).await {
-                eprintln!("agent-fleet host: orphan PRs: {err:#}");
+            // A hung `gh` must not stop the loop that finds hung processes.
+            match tokio::time::timeout(ORPHAN_PR_TIMEOUT, orphan_prs(&host)).await {
+                Ok(Err(err)) => eprintln!("agent-fleet host: orphan PRs: {err:#}"),
+                Err(_) => eprintln!("agent-fleet host: orphan PRs: timed out"),
+                Ok(Ok(())) => {}
             }
         }
     }
@@ -570,11 +575,13 @@ pub(crate) async fn watch_loop(host: Arc<Host>) {
 /// How often the watch loop looks at GitHub for PRs no live agent owns.
 const ORPHAN_PR_EVERY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+const ORPHAN_PR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// `doctor --apply` for `orphan-pr`, when fleet.toml turns it on (`[orphan_pr] apply = true`, off by
 /// default): close what a merged PR supersedes, tell the root coordinator of the rest.
 async fn orphan_prs(host: &Arc<Host>) -> anyhow::Result<()> {
-    let Some(cfg) = crate::orphanpr::config(std::path::Path::new("."))?
-        .filter(|c| c.apply && !c.repos.is_empty())
+    let Some(cfg) =
+        crate::orphanpr::watch_enabled(crate::orphanpr::config(std::path::Path::new("."))?)
     else {
         return Ok(());
     };

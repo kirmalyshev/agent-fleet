@@ -520,17 +520,26 @@ async fn removed_line(
     branch: Option<&str>,
 ) -> String {
     let mut line = format!("removed {}", home(path));
-    if let Some(b) = branch
-        && let Some((_, note)) = crate::orphanpr::retire_note(gh, repo, b).await
-    {
-        line += &format!("; {note}");
-        if let Some(root) = fleet
-            .snapshot()
-            .await
-            .ok()
-            .and_then(|(s, _)| crate::orphanpr::root_of(&s))
-        {
-            let _ = fleet.tell(&root, &format!("{b} retired: {note}")).await;
+    let Some(b) = branch else {
+        return line;
+    };
+    match crate::orphanpr::retire_note(gh, repo, b).await {
+        Ok(None) => {}
+        Err(e) => line += &format!("; PR check failed: {e:#}"),
+        Ok(Some((_, note))) => {
+            line += &format!("; {note}");
+            let root = fleet
+                .snapshot()
+                .await
+                .map(|(s, _)| crate::orphanpr::root_of(&s));
+            line += &match root {
+                Ok(Some(root)) => match fleet.tell(&root, &format!("{b} retired: {note}")).await {
+                    Ok(_) => " (coordinator told)".to_string(),
+                    Err(e) => format!(" (tell failed: {e:#})"),
+                },
+                Ok(None) => " (no root coordinator to tell)".into(),
+                Err(e) => format!(" (tell failed: {e:#})"),
+            };
         }
     }
     line
@@ -1311,6 +1320,7 @@ mod tests {
         let line = removed_line(&fleet, gh, repo, "/w/s-1", Some("s-1")).await;
         assert!(line.starts_with("removed "), "{line}");
         assert!(line.contains("o/r#7 is still open"), "{line}");
+        assert!(line.ends_with("(coordinator told)"), "{line}");
         let told = fleet.0.lock().unwrap().clone();
         assert_eq!(told.len(), 1);
         assert_eq!(told[0].0, "agent:h/s/root");

@@ -475,28 +475,43 @@ pub fn slug_of(url: &str) -> Option<String> {
 }
 
 /// The note a retire adds to its outcome line when the branch it retired still has an open PR:
-/// `(PR number, line)`. `None` when there is none, or it cannot be told.
-pub async fn retire_note(bin: &str, repo: &str, branch: &str) -> Option<(u64, String)> {
+/// `(PR number, line)`. `Ok(None)` when it has none; an error when that could not be found out.
+pub async fn retire_note(bin: &str, repo: &str, branch: &str) -> Result<Option<(u64, String)>> {
     let url = tokio::process::Command::new("git")
         .args(["-C", repo, "remote", "get-url", "origin"])
         .output()
         .await
-        .ok()
-        .filter(|o| o.status.success())?;
-    let slug = slug_of(&String::from_utf8_lossy(&url.stdout))?;
+        .context("run git remote get-url")?;
+    if !url.status.success() {
+        bail!("{repo} has no origin remote");
+    }
+    let slug =
+        slug_of(&String::from_utf8_lossy(&url.stdout)).context("origin is not owner/repo")?;
     let v = gh(
         bin,
         &[
             "pr", "list", "-R", &slug, "--head", branch, "--state", "open", "--json", "number",
         ],
     )
-    .await
-    .ok()?;
-    let n = v.as_array()?.first()?["number"].as_u64()?;
-    Some((
+    .await?;
+    let Some(n) = v
+        .as_array()
+        .context("gh pr list: not a list")?
+        .first()
+        .map(|p| p["number"].as_u64().context("gh pr list: no number"))
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
         n,
         format!("PR {slug}#{n} is still open: a coordinator item now"),
-    ))
+    )))
+}
+
+/// The config the watch loop acts on: only a fleet.toml that sets `apply` and names repos.
+pub fn watch_enabled(cfg: Option<Config>) -> Option<Config> {
+    cfg.filter(|c| c.apply && !c.repos.is_empty())
 }
 
 /// The root coordinator's agent id.
@@ -655,6 +670,58 @@ mod tests {
         assert_eq!(slug_of("r"), None);
     }
 
+    #[test]
+    fn the_watch_acts_only_on_apply_with_repos() {
+        let on = || Config {
+            repos: vec!["o/r".into()],
+            apply: true,
+            ..Config::default()
+        };
+        assert!(watch_enabled(None).is_none());
+        assert!(watch_enabled(Some(Config::default())).is_none());
+        assert!(
+            watch_enabled(Some(Config {
+                apply: false,
+                ..on()
+            }))
+            .is_none()
+        );
+        assert!(
+            watch_enabled(Some(Config {
+                repos: vec![],
+                ..on()
+            }))
+            .is_none()
+        );
+        assert!(watch_enabled(Some(on())).is_some());
+    }
+
+    #[test]
+    fn a_pending_tell_blocks_a_re_tell_even_past_a_week() {
+        let mut s = with_root();
+        s.msgs.insert(
+            "m".into(),
+            crate::state::Msg {
+                from: "x".into(),
+                to: "agent:h/s/root".into(),
+                kind: "orphan-pr".into(),
+                reference: "o/r#2".into(),
+                text: "t".into(),
+                since: now(),
+            },
+        );
+        let old = [told("o/r#2", now() - Duration::days(9))];
+        assert!(
+            acts(
+                vec![orphan(2, Action::Report("a draft waits for a person"))],
+                &s,
+                &old,
+                now()
+            )
+            .is_empty()
+        );
+    }
+
     fn orphan(n: u64, action: Action) -> Orphan {
         Orphan {
             repo: "o/r".into(),
@@ -748,11 +815,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let (gh, repo) = (bin.to_str().unwrap(), repo.to_str().unwrap());
-        let (n, line) = retire_note(gh, repo, "s-1").await.unwrap();
+        let (n, line) = retire_note(gh, repo, "s-1").await.unwrap().unwrap();
         assert_eq!(n, 7);
         assert!(line.contains("o/r#7 is still open"), "{line}");
-        assert!(retire_note(gh, repo, "s-2").await.is_none());
-        assert!(retire_note("/nonexistent/gh", repo, "s-1").await.is_none());
+        assert!(retire_note(gh, repo, "s-2").await.unwrap().is_none());
+        assert!(retire_note("/nonexistent/gh", repo, "s-1").await.is_err());
+        assert!(retire_note(gh, "/nonexistent", "s-1").await.is_err());
     }
 
     #[test]
