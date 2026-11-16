@@ -224,23 +224,107 @@ fn restart_in_place(exe: &Path) -> ! {
     std::process::exit(crate::update::RESTART_STATUS)
 }
 
-/// Calls `changed` once when the file at `path` is no longer the one with identity `start`: a host's self-update renames a new
-/// binary over the installed one, and a hub still running the old one would stay on the old code
-/// (and the old protocol). A file that is briefly missing is not a change.
-async fn follow_binary(
+/// Watches a file's identity. A replacement counts once the same new identity is seen on two
+/// polls in a row: a copy still being written (`cargo install` over a running binary, a hand
+/// `cp`) changes it more than once.
+struct Settle {
+    start: Option<(u64, u64)>,
+    pending: Option<(u64, u64)>,
+}
+
+#[derive(Debug, PartialEq)]
+enum Seen {
+    Quiet,
+    Settling,
+    /// A new file that has stayed the same for two polls.
+    Replaced((u64, u64)),
+}
+
+impl Settle {
+    fn new(start: Option<(u64, u64)>) -> Self {
+        Settle {
+            start,
+            pending: None,
+        }
+    }
+
+    /// `now`: the file's identity this poll; none when it is briefly missing.
+    fn step(&mut self, now: Option<(u64, u64)>) -> Seen {
+        match now {
+            Some(id) if Some(id) != self.start => {
+                if self.pending == Some(id) {
+                    Seen::Replaced(id)
+                } else {
+                    self.pending = Some(id);
+                    Seen::Settling
+                }
+            }
+            _ => {
+                self.pending = None;
+                Seen::Quiet
+            }
+        }
+    }
+}
+
+/// Calls `changed` once when the file at `path` has been replaced by one that `verify` accepts
+/// (a host's self-update renames a new binary over the installed one, and a hub still running the
+/// old one would stay on the old code and protocol). Settled but refused (a binary that does not
+/// run, a rollback): the hub keeps running, says why once, and looks again only when the file is
+/// replaced again. A file that is briefly missing is not a change.
+async fn follow_binary<V, Fut>(
     path: PathBuf,
     start: Option<(u64, u64)>,
     poll: Duration,
+    verify: V,
     changed: impl FnOnce(),
-) {
+) where
+    V: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let mut settle = Settle::new(start);
+    let mut refused: Option<(u64, u64)> = None;
     loop {
         tokio::time::sleep(poll).await;
-        let now = file_id(&path);
-        if now.is_some() && now != start {
-            changed();
-            return;
+        let Seen::Replaced(id) = settle.step(file_id(&path)) else {
+            continue;
+        };
+        if refused == Some(id) {
+            continue;
+        }
+        match verify().await {
+            Ok(()) => {
+                changed();
+                return;
+            }
+            Err(why) => {
+                eprintln!(
+                    "agent-fleet hub: {} was replaced but is not followed: {why}",
+                    path.display()
+                );
+                refused = Some(id);
+            }
         }
     }
+}
+
+/// The real check: the new binary runs, and is not an older commit than this one.
+async fn followable(exe: &Path) -> Result<(), String> {
+    let says = crate::update::binary_says(exe)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    if crate::update::is_rollback(
+        Path::new(crate::update::CLONE),
+        crate::update::COMMIT,
+        &says,
+    )
+    .await
+    {
+        return Err(format!(
+            "it is an older build ({says}); restart the hub by hand to run it"
+        ));
+    }
+    Ok(())
 }
 
 /// Serves the hub on every address in `listen`. Once bound, writes one URL to `hub_file`, where
@@ -295,12 +379,22 @@ pub async fn serve(listen: &[SocketAddr], db: &Path, hub_file: &Path, token: Str
     match exe {
         Ok(exe) => {
             let at = exe.clone();
-            tokio::spawn(follow_binary(exe, started_as, BINARY_POLL, move || {
-                // Between requests: one that writes twice (an answer) is not cut in half.
-                let _held = shared.lock().unwrap_or_else(|e| e.into_inner());
-                eprintln!("agent-fleet hub: binary replaced; starting the new one");
-                restart_in_place(&at)
-            }));
+            let check = exe.clone();
+            tokio::spawn(follow_binary(
+                exe,
+                started_as,
+                BINARY_POLL,
+                move || {
+                    let exe = check.clone();
+                    async move { followable(&exe).await }
+                },
+                move || {
+                    // Between requests: one that writes twice (an answer) is not cut in half.
+                    let _held = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    eprintln!("agent-fleet hub: binary replaced; starting the new one");
+                    restart_in_place(&at)
+                },
+            ));
         }
         Err(e) => eprintln!("agent-fleet hub: cannot follow its binary: {e:#}"),
     }
@@ -530,6 +624,78 @@ async fn stream(AxState(hub): AxState<Shared>, Query(q): Query<Cursor>) -> Respo
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_replacement_counts_only_once_the_same_new_file_stays_for_two_polls() {
+        let (old, a, b) = (Some((1, 1)), Some((1, 2)), Some((1, 3)));
+        let mut w = Settle::new(old);
+        assert_eq!(w.step(old), Seen::Quiet);
+        assert_eq!(w.step(a), Seen::Settling, "first sight of a new file");
+        assert_eq!(
+            w.step(b),
+            Seen::Settling,
+            "it changed again: still being written"
+        );
+        assert_eq!(w.step(b), Seen::Replaced((1, 3)));
+        // Missing or back to the old one in between: start over.
+        let mut w = Settle::new(old);
+        assert_eq!(w.step(a), Seen::Settling);
+        assert_eq!(w.step(None), Seen::Quiet);
+        assert_eq!(w.step(a), Seen::Settling);
+        assert_eq!(w.step(old), Seen::Quiet);
+        assert_eq!(w.step(a), Seen::Settling);
+    }
+
+    #[tokio::test]
+    async fn a_replacement_that_is_refused_is_kept_out_once_and_a_later_good_one_is_followed() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("agent-fleet");
+        std::fs::write(&exe, "old").unwrap();
+        std::fs::hard_link(&exe, dir.path().join("held")).unwrap();
+        let (changed, asked) = (
+            std::sync::Arc::new(AtomicBool::new(false)),
+            std::sync::Arc::new(AtomicUsize::new(0)),
+        );
+        let (flag, count) = (changed.clone(), asked.clone());
+        let task = tokio::spawn(follow_binary(
+            exe.clone(),
+            file_id(&exe),
+            Duration::from_millis(10),
+            move || {
+                let n = count.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        Err("half written".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            move || flag.store(true, Ordering::SeqCst),
+        ));
+        let put = |name: &str, body: &str| {
+            let new = dir.path().join(name);
+            std::fs::write(&new, body).unwrap();
+            std::fs::rename(&new, &exe).unwrap();
+        };
+        put(".a", "a");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!changed.load(Ordering::SeqCst), "refused: keeps running");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "asked once, not every poll"
+        );
+        std::fs::hard_link(&exe, dir.path().join("held-a")).unwrap();
+        put(".b", "b");
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("followed the next one")
+            .unwrap();
+        assert!(changed.load(Ordering::SeqCst));
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn the_hub_restarts_as_the_same_command() {
         let c = restart_command(Path::new("/opt/agent-fleet"));
         assert_eq!(c.get_program(), "/opt/agent-fleet");
@@ -553,6 +719,7 @@ mod tests {
             exe.clone(),
             file_id(&exe),
             Duration::from_millis(10),
+            || async { Ok(()) },
             move || flag.store(true, Ordering::SeqCst),
         ));
         tokio::time::sleep(Duration::from_millis(60)).await;
