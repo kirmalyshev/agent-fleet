@@ -865,7 +865,7 @@ the screen's `--instance`, `--hub`, `--token-file`, `--as`, `--project` and `--h
 background. So each action writes the same events, with the same checks and refusals, as the
 command typed in a shell. Tab completes commands, agents, tasks, blockers, levels and the
 profiles of fleet.toml. A command that only reads (`stats`, `doctor`, `proc`, `ps`, `ui`, `task
-ls|show`, `role <agent>`, `api schema`, `help`, `worktree` without `--execute`
+ls|show`, `role <agent>`, `api schema`, `help`, `dev ls|clean` without `--execute`
 and any `--help`) runs at once; any other asks first. `spawn` runs its `--dry-run` first
 and spawns on `y`, following until `spawn.result` as the CLI does. A failure, or an output longer
 than one line, opens over the screen; `o` opens the last one again. The services (`hub`, `host`)
@@ -884,7 +884,7 @@ simulators a worktree holds, and how its stack stops. If its main checkout has a
 `.agent-fleet/hook`, removing a worktree runs `.agent-fleet/hook retire <path>` instead of
 `git worktree remove`; the hook does the repository's own teardown and exits non-zero to refuse.
 
-**Cleaning worktrees.** `agent-fleet worktree ls|clean [--execute] [--repo owner/repo]` reads the
+**Cleaning worktrees.** `agent-fleet dev ls|clean [--execute] [--repo owner/repo]` reads the
 worktrees and local branches of the machine's `[repos]`, of the main checkouts the host reports
 in `worktree.state`, and of the checkout it runs in. A branch is finished when its tip is the head
 of one of your merged or closed PRs (`pr`), is in the default branch (`in main`), or is in
@@ -900,8 +900,8 @@ are stopped before it goes: TERM, then KILL after 5 s, each re-read just before 
 pid reused by another process (another start time or cwd) is never hit. `ls` and the dry run list
 them, pid and command. A herdr pane, anything under an agent program (`claude`, `codex`, `devin`)
 and the caller and its ancestors are never stopped; one of them in the worktree keeps it. Without
-a hub or replica, no agent is known. `:worktree` runs at once from the screen unless it has
-`--execute`.
+a hub or replica, no agent is known. `:dev ls` and `:dev clean` run at once from the screen unless they
+have `--execute`.
 
 ## The board
 

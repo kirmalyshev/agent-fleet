@@ -1,4 +1,4 @@
-//! `agent-fleet worktree clean` over two connected throwaway repositories and a fake `gh`.
+//! `agent-fleet dev clean` over two connected throwaway repositories and a fake `gh`.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -172,13 +172,13 @@ fn clean_retires_finished_work_in_every_connected_repo_and_keeps_the_rest() {
         ok(out, &format!("agent-fleet {args:?}"))
     };
 
-    let ls = fleet(&["worktree", "ls"]);
+    let ls = fleet(&["dev", "ls"]);
     assert!(ls.contains("owner/a") && ls.contains("owner/b"), "{ls}");
     assert!(ls.contains("#2 open"), "{ls}");
-    let dry = fleet(&["worktree", "clean"]);
+    let dry = fleet(&["dev", "clean"]);
     assert!(dry.contains("dry run"), "{dry}");
     assert!(t.join("merged").exists(), "a dry run removes nothing");
-    let only_b = fleet(&["worktree", "clean", "--repo", "owner/b"]);
+    let only_b = fleet(&["dev", "clean", "--repo", "owner/b"]);
     assert!(!only_b.contains("owner/a"), "{only_b}");
 
     // Only Linux reads a process's cwd; elsewhere no leftover is seen.
@@ -186,11 +186,12 @@ fn clean_retires_finished_work_in_every_connected_repo_and_keeps_the_rest() {
     if linux {
         assert!(dry.contains(&format!("stop {sleeper} sleep 60")), "{dry}");
     }
-    let out = fleet(&["worktree", "clean", "--execute"]);
+    let out = fleet(&["dev", "clean", "--execute"]);
     if linux {
         assert!(out.contains(&format!("stopped {sleeper} TERM")), "{out}");
         let alive = Command::new("kill")
             .args(["-0", &sleeper])
+            .stderr(std::process::Stdio::null())
             .status()
             .unwrap();
         assert!(!alive.success(), "{sleeper} still runs");

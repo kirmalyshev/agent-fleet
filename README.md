@@ -96,9 +96,9 @@ keys are explained in [docs/fleet.example.toml](docs/fleet.example.toml).
 ### Clean up worktrees
 
 ```sh
-agent-fleet worktree ls                   # every connected repo; --repo owner/repo for one
-agent-fleet worktree clean                # what it would retire and delete (a dry run)
-agent-fleet worktree clean --execute
+agent-fleet dev ls                        # every connected repo; --repo owner/repo for one
+agent-fleet dev clean                     # what it would retire and delete (a dry run)
+agent-fleet dev clean --execute
 ```
 
 These cover the connected repositories, the checkouts the host reports, and the one you are in.
@@ -364,7 +364,7 @@ From `agent-fleet --help`; every command has its own `--help`.
 | `instances` | The agent-fleet instances on this machine and the hub each one uses |
 | `init` | Write this machine's fleet.toml and brief.md into the user config dir (`AGENT_FLEET_CONFIG_DIR` overrides it): commented templates with a profile for each agent program on PATH and one default rule. Never overwrites an existing file. Lists the user-level Claude and Codex skills that drive terminals (herdr, tmux, cmux) |
 | `repo` | Connect a repository to the fleet on this machine: `add` records its checkout in the machine's fleet.toml, `ls` lists, `rm` disconnects. The host picks changes up without a restart |
-| `worktree` | The worktrees and local branches of every connected repository (`repo add`), the checkouts the host reports and the one you are in: `ls` lists them, `clean` retires the worktrees of your merged or closed PRs and deletes finished local branches |
+| `dev` | Worktrees across the connected repositories (`repo add`), the checkouts the host reports and the one you are in: `ls` lists them, `clean` retires those of your merged or closed PRs and deletes finished local branches |
 | `tui` | The fleet on one screen, live: agents, worktrees, tasks, findings, resources, asks; `:` runs any command from it |
 | `task` | Tasks: `add` claims (exclusive), `done` finishes, `rm` cancels or releases |
 | `dep` | Dependencies between tasks: <task> is blocked by <on> |

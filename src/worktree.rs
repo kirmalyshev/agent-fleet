@@ -1,4 +1,4 @@
-//! `worktree ls` and `worktree clean`: the worktrees and local branches of every repository
+//! `dev ls` and `dev clean`: the worktrees and local branches of every repository
 //! connected on this machine, and which of them are finished.
 //!
 //! A local branch is stale when its tip is safe somewhere else: it is the head of one of your
@@ -411,7 +411,7 @@ fn scan(slug: &str, dir: &Path, s: &State, host: &str, here: &Path, procs: &Proc
     })
 }
 
-/// `worktree ls` (`clean` false) or `worktree clean [--execute]`, over `repos`; the report.
+/// `dev ls` (`clean` false) or `dev clean [--execute]`, over `repos`; the report.
 pub async fn run(
     fleet: &impl Fleet,
     repos: &[(String, PathBuf)],
@@ -521,7 +521,7 @@ pub async fn run(
         }
     }
     if clean && !execute {
-        out += "dry run; agent-fleet worktree clean --execute to do it\n";
+        out += "dry run; agent-fleet dev clean --execute to do it\n";
     }
     out
 }

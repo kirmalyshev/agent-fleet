@@ -402,7 +402,7 @@ fn plan(args: Vec<String>) -> Result<Plan, String> {
         "doctor" if !has("--apply") => Plan::Read(args),
         "task" if matches!(w(1), "ls" | "show") => Plan::Read(args),
         "repo" if w(1) == "ls" => Plan::Read(args),
-        "worktree" if !has("--execute") => Plan::Read(args),
+        "dev" if matches!(w(1), "ls" | "clean") && !has("--execute") => Plan::Read(args),
         "role" if args.len() == 2 => Plan::Read(args),
         _ => Plan::Write(args),
     })
@@ -2322,15 +2322,16 @@ mod tests {
             Ok(Plan::DryRun(w("spawn o/r#5 --dry-run"), w("spawn o/r#5")))
         );
         assert_eq!(
-            plan(w("worktree clean --execute")),
-            Ok(Plan::Write(w("worktree clean --execute")))
+            plan(w("dev clean --execute")),
+            Ok(Plan::Write(w("dev clean --execute")))
         );
         for read in [
             "help",
             "api schema",
             "task add --help",
             "block -h",
-            "worktree clean",
+            "dev clean",
+            "dev ls",
         ] {
             assert_eq!(plan(w(read)), Ok(Plan::Read(w(read))));
         }

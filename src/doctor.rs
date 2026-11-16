@@ -98,7 +98,7 @@ fn containing<'a>(s: &'a State, host: &str, dir: &str) -> Option<(&'a String, &'
 }
 
 /// Worktree key → the live agents that work in it: their cwd is in it, or they were spawned into
-/// it (`State::assigned_worktrees`). Neither `forgotten` nor `worktree clean` touches these.
+/// it (`State::assigned_worktrees`). Neither `forgotten` nor `dev clean` touches these.
 pub fn workers(s: &State) -> BTreeMap<String, Vec<String>> {
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut add = |key: String, id: &str| {
