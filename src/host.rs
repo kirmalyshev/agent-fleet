@@ -606,6 +606,7 @@ impl Host {
                         disk_total: s.f_blocks * s.f_frsize,
                         agents,
                         stats: Some(self.stats()),
+                        commit: crate::update::COMMIT.map(str::to_string),
                     })))
                     .await;
                 }
@@ -1206,6 +1207,7 @@ pub async fn run(cfg: Config, client: Client) -> Result<()> {
         r = tokio::spawn(host.clone().lock_loop()) => bail!("lock reads stopped: {r:?}"),
         r = tokio::spawn(crate::watch::watch_loop(host.clone())) => bail!("the watch tick stopped: {r:?}"),
         r = tokio::spawn(crate::spawn::spawn_loop(host.clone())) => bail!("spawning stopped: {r:?}"),
+        r = tokio::spawn(crate::update::update_loop(host.clone())) => bail!("self-update stopped: {r:?}"),
     }
 }
 

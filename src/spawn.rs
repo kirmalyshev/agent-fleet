@@ -742,7 +742,7 @@ struct Done {
     worktree: String,
 }
 
-async fn git(dir: &Path, args: &[&str]) -> Result<String> {
+pub(crate) async fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = tokio::process::Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -1246,7 +1246,7 @@ async fn close_replaced(host: &Host, old: &str) {
 }
 
 /// The last 4 KiB of `s`, on a char boundary: herdr or script spew stays a one-line finding.
-fn tail(s: &str) -> String {
+pub(crate) fn tail(s: &str) -> String {
     let mut i = s.len().saturating_sub(4096);
     while i < s.len() && !s.is_char_boundary(i) {
         i += 1;

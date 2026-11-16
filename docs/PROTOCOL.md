@@ -72,7 +72,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | presence | `agent.up` | agent, host, kind?, state, pane? | | host |
 | | `agent.state` | agent, state (`idle` `working` `blocked` `done` `unknown`) | | host |
 | | `agent.down` | agent, reason? | | host |
-| | `host.health` | host, disk_free, disk_total, agents, stats? (every minute) | | host |
+| | `host.health` | host, disk_free, disk_total, agents, stats?, commit? (the commit its binary was built from; every minute) | | host |
 | | `agent.usage` | agent, rss_kb?, cpu_pct?, procs?, cwd? (each scan) | | host |
 | | `agent.role` | agent, level? (`root-coordinator` `domain-lead` `implementation-lead` `implementer`; absent `level` removes the role), lead?, domain? | | agent, host |
 | machine | `worktree.state` | host, path, repo, branch?, head, unpushed, dirty, files[] (only what still differs from the default branch), last_commit, in_main? (on change) | | host |
@@ -103,6 +103,8 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `proc.hung` | host, pid, pids[]?, agent?, command?, started?, evidence?, since?, checked? — the topmost hung process an agent started and the hung ones under it (the watch tick, every 2 min); no `evidence` clears the report; folded only from the host actor it names (`host:<host>`) | | host |
 | | `agent.stuck` | agent, cause?, detail, until? — no `cause` clears the record | | host |
 | | `agent.signal` | agent, program, signal, detail? — `prompt`/`turn_end` clear the agent's stored signal | | agent |
+| update | `update.requested` | (empty) — every host pulls, rebuilds and restarts | | agent, host |
+| | `update.result` | host, ok, commit?, error? — folded only from the host actor it names, first answer per host | re = the request | host |
 
 `ask.answered` closes an `ask.raised` from the board's Inbox. The hub writes it together with the
 `msg.sent` (kind `ANSWER`, or `APPROVED` when `approve` is true; `ref` = the ask) that rings the
@@ -181,7 +183,8 @@ ULID that arrives late is still returned after the cursor, so a follower never m
 `GET /state` returns `hosts`, `agents` (state + since), `roles` (level, lead, domain, by, since)
 keyed by agent id, `spawns` (the request, who asked, the result) keyed by `spawn.requested` id
 — kept for 24 h after its answer (or its request, when unanswered), and never while the agent
-is still up — `quotas` (windows, plan, exhausted, read_at, exhausted_since — when the reports
+is still up — `updates` (who asked, each host's `update.result`) keyed by `update.requested` id,
+kept for 24 h — `quotas` (windows, plan, exhausted, read_at, exhausted_since — when the reports
 first showed the account out) keyed by `<host>:<kind>`,
 `tasks` (state + since, owner, lead,
 blocked_by, handoffs), open `blockers` and `asks` (with their context link) keyed by their raising event id, undelivered
@@ -307,6 +310,7 @@ how many worktrees may hold any of a set of resources at once.
 | `role` | an agent's declared lead is down, the lead's level is not above its own, or a second root coordinator is up |
 | `quota` | a program's quota is exhausted, or a window ≥ 90% used resets in the future |
 | `stalled` | an agent idle or blocked for 15 min after it last worked |
+| `build` | hosts that sent `host.health` in the last 10 min report different commits (or one reports none); each such host, with the others' commits |
 
 `hung` and `stalled` are also pushed, not only read: the host writes one `msg.sent` per episode
 — `HUNG` or `STALLED`, ref the agent's name, the finding's own detail for text — to the agent's
@@ -606,6 +610,26 @@ Any other never-started agent (`handoff_min` minutes since its successful spawn
 without reaching `working`) is a tell to the lead, never a handoff. An agent
 that worked, is `working` or `done`, or whose task closed is never handed off; a replacement
 request that failed does not block a retry.
+
+## Self-update
+
+A host runs the binary `cargo install --path <clone>` built from its own clone. The build embeds
+the clone's commit (`build.rs`, `git rev-parse HEAD`) and the clone's path (`CARGO_MANIFEST_DIR`);
+`host.health` reports the commit, `agent-fleet ps` shows it, and `doctor` reports `build` when
+live hosts disagree.
+
+`agent-fleet self-update` writes `update.requested`. Each host that sees it within 15 min and
+has not answered it yet, in the clone its binary was built from: refuses a clone not on `main`
+or with uncommitted changes to tracked files, runs `git pull --ff-only`, and, unless the
+pulled head is the commit it already runs, runs `cargo install --locked --path <clone> --root
+<tmp>` (the `cargo` beside its own binary, else the one on `PATH`) with `<tmp>` in its binary's
+directory, and renames the build over its binary — never overwriting it in place, which kills
+a running binary on macOS. It answers `update.result` (ok, the commit it will run, or the
+error), then exits with status 75 so its supervisor (systemd `Restart=on-failure` or launchd
+`KeepAlive`) starts the new binary. The CLI waits (20 min) until each host that sent
+`host.health` in the last 3 min has refused, or reports in `host.health` the commit it named,
+and prints each one's commit. The hub is not restarted: a change to the protocol needs the hub
+restarted by hand first, or it refuses what the new hosts write.
 
 ## The operator's screen
 

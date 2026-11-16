@@ -362,10 +362,11 @@ pub fn board(s: &State, now: DateTime<Utc>) -> String {
         let gb = |b: u64| b as f64 / 1e9;
         let _ = writeln!(
             out,
-            "{h}  disk {:.1}/{:.1} GB free  agents {}  ({} ago)",
+            "{h}  disk {:.1}/{:.1} GB free  agents {}  commit {}  ({} ago)",
             gb(x.disk_free),
             gb(x.disk_total),
             x.agents,
+            crate::update::short(x.commit.as_deref()),
             ago(now, x.ts)
         );
     }

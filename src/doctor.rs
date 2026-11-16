@@ -8,6 +8,7 @@ use serde::Serialize;
 use crate::event::{AgentState, Level};
 use crate::state::{Agent, Hold, State, Worktree};
 use crate::ui::{ago, at, dur, hold};
+use crate::update::short;
 
 /// Idle, done or blocked this long: the agent is stale.
 pub const STALE: Duration = Duration::hours(2);
@@ -36,6 +37,8 @@ pub const STALLED: Duration = Duration::minutes(crate::spawn::STALL_MIN as i64);
 pub const SPAWN_FAILED: Duration = Duration::hours(1);
 /// A `proc.hung` report confirmed this recently is kill proof: three watch ticks.
 pub const HUNG_FRESH: Duration = Duration::minutes(6);
+/// A host whose `host.health` is older than this is not compared for `build`.
+pub const HOST_LIVE: Duration = Duration::minutes(10);
 /// Files every branch touches; sharing them is not duplicate work.
 const SHARED_BY_ALL: &[&str] = &[
     "bun.lock",
@@ -49,7 +52,7 @@ const SHARED_BY_ALL: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Finding {
     /// `stale`, `hung`, `heavy`, `duplicate`, `forgotten`, `unpushed`, `orphan`, `breach`,
-    /// `queued`, `refused`, `role`, `quota`, `spawn`, `unmanaged`, `stalled`.
+    /// `queued`, `refused`, `role`, `quota`, `spawn`, `unmanaged`, `stalled`, `build`.
     pub kind: &'static str,
     /// The agent id or `<host>:<path>` it is about.
     pub subject: String,
@@ -697,6 +700,31 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
             _ => {}
         }
     }
+    // Hosts that reported lately but run different builds: one of them missed an update.
+    let live: Vec<(&String, Option<&str>)> = s
+        .hosts
+        .iter()
+        .filter(|(_, h)| now - h.ts < HOST_LIVE)
+        .map(|(n, h)| (n, h.commit.as_deref()))
+        .collect();
+    if live.iter().any(|(_, c)| *c != live[0].1) {
+        for (name, commit) in &live {
+            let others: Vec<String> = live
+                .iter()
+                .filter(|(n, _)| n != name)
+                .map(|(n, c)| format!("{n} {}", short(*c)))
+                .collect();
+            out.push(finding(
+                "build",
+                *name,
+                format!(
+                    "runs {}; {} (agent-fleet self-update)",
+                    short(*commit),
+                    others.join(", ")
+                ),
+            ));
+        }
+    }
     for (key, r) in &s.resources {
         for w in r.waiting.iter().filter(|w| now - w.since >= QUEUED) {
             let behind = r
@@ -906,6 +934,40 @@ mod tests {
         let (mut s, now) = leftover_state(false);
         s.worktrees.values_mut().for_each(|w| w.since = now);
         assert!(findings(&s, now).is_empty(), "inside the grace");
+    }
+
+    #[test]
+    fn hosts_running_different_builds_are_a_finding() {
+        let now = Utc::now();
+        let mut s = State::default();
+        let host = |s: &mut State, name: &str, commit: Option<&str>, age: i64| {
+            let h = crate::state::Host {
+                disk_free: 1,
+                disk_total: 1,
+                agents: 0,
+                commit: commit.map(str::to_string),
+                ts: now - Duration::minutes(age),
+            };
+            s.hosts.insert(name.into(), h);
+        };
+        host(&mut s, "a", Some("1111111aaaa"), 0);
+        host(&mut s, "b", Some("1111111aaaa"), 1);
+        host(&mut s, "gone", Some("0000000"), 60);
+        assert!(
+            findings(&s, now).is_empty(),
+            "a long-silent host is not compared"
+        );
+        host(&mut s, "c", None, 0);
+        let f = findings(&s, now);
+        assert_eq!(
+            kinds(&f),
+            vec![("build", "a"), ("build", "b"), ("build", "c")],
+            "{f:#?}"
+        );
+        assert_eq!(
+            f[2].detail,
+            "runs unknown; a 1111111, b 1111111 (agent-fleet self-update)"
+        );
     }
 
     #[test]

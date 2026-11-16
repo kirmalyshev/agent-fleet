@@ -270,6 +270,10 @@ pub enum Known {
     AgentStuck(AgentStuck),
     #[serde(rename = "agent.signal")]
     AgentSignal(AgentSignal),
+    #[serde(rename = "update.requested")]
+    UpdateRequested(UpdateRequested),
+    #[serde(rename = "update.result")]
+    UpdateResult(UpdateResult),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -311,6 +315,9 @@ pub struct HostHealth {
     pub agents: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<HostStats>,
+    /// The commit the host's binary was built from; absent when built outside a git checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
 }
 
 /// The host agent's own vitals. Counters run from the host's start, so a drop in `uptime_s`
@@ -771,6 +778,24 @@ pub struct SpawnResult {
     pub error: Option<String>,
 }
 
+/// `agent-fleet self-update` asks every host to pull its clone's `main`, rebuild and restart.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateRequested {}
+
+/// One host's answer to the `update.requested` named by `re`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateResult {
+    pub host: String,
+    pub ok: bool,
+    /// The commit the host runs once restarted (the one it runs now when nothing changed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Handoff {
@@ -824,6 +849,8 @@ impl Known {
             Self::ProcessHung(_) => "proc.hung",
             Self::AgentStuck(_) => "agent.stuck",
             Self::AgentSignal(_) => "agent.signal",
+            Self::UpdateRequested(_) => "update.requested",
+            Self::UpdateResult(_) => "update.result",
         }
     }
 
@@ -849,7 +876,7 @@ impl Known {
             | Self::ProcessOrphaned(_)
             | Self::ProcessHung(_)
             | Self::AgentStuck(_) => &[Host],
-            Self::MsgDelivered(_) | Self::SpawnResult(_) => &[Host],
+            Self::MsgDelivered(_) | Self::SpawnResult(_) | Self::UpdateResult(_) => &[Host],
             Self::AskRaised(_) | Self::Handoff(_) | Self::AgentSignal(_) => &[Agent],
             Self::AskAnswered(_) => &[Human],
             Self::MsgSent(_) => &[Agent, Host, Human],
@@ -879,6 +906,7 @@ impl Known {
                 | Self::AskAnswered(_)
                 | Self::MsgDelivered(_)
                 | Self::SpawnResult(_)
+                | Self::UpdateResult(_)
         )
     }
 }
