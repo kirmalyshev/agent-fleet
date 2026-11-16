@@ -72,7 +72,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | presence | `agent.up` | agent, host, kind?, state, pane? | | host |
 | | `agent.state` | agent, state (`idle` `working` `blocked` `done` `unknown`) | | host |
 | | `agent.down` | agent, reason? | | host |
-| | `host.health` | host, disk_free, disk_total, agents, stats? (every minute) | | host |
+| | `host.health` | host, disk_free, disk_total, agents, stats?, commit? (the commit its binary was built from; every minute) | | host |
 | | `agent.usage` | agent, rss_kb?, cpu_pct?, procs?, cwd? (each scan) | | host |
 | | `agent.role` | agent, level? (`root-coordinator` `domain-lead` `implementation-lead` `implementer`; absent `level` removes the role), lead?, domain? | | agent, host |
 | machine | `worktree.state` | host, path, repo, branch?, head, unpushed, dirty, dirty_submodules? (of dirty, moved submodule pointers), files[] (only what still differs from the default branch), last_commit, in_main?, herdr? (a linked worktree under herdr's worktree directory: `[worktrees] directory` in its config, default `~/.herdr/worktrees`) (on change) | | host |
@@ -103,6 +103,8 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `proc.hung` | host, pid, pids[]?, agent?, command?, started?, evidence?, since?, checked? — the topmost hung process an agent started and the hung ones under it (the watch tick, every 2 min); no `evidence` clears the report; folded only from the host actor it names (`host:<host>`) | | host |
 | | `agent.stuck` | agent, cause?, detail, until? — no `cause` clears the record | | host |
 | | `agent.signal` | agent, program, signal, detail? — `prompt`/`turn_end` clear the agent's stored signal | | agent |
+| update | `update.requested` | host? — every host (or only `host`) pulls, rebuilds and restarts; written by `agent-fleet self-update` as `host:<this machine>`, and by a host's own timer for itself | | host |
+| | `update.result` | host, ok, commit?, error? — folded only from the host actor it names, first answer per host | re = the request | host |
 
 `ask.answered` closes an `ask.raised` from the board's Inbox. The hub writes it together with the
 `msg.sent` (kind `ANSWER`, or `APPROVED` when `approve` is true; `ref` = the ask) that rings the
@@ -181,7 +183,8 @@ ULID that arrives late is still returned after the cursor, so a follower never m
 `GET /state` returns `hosts`, `agents` (state + since), `roles` (level, lead, domain, by, since)
 keyed by agent id, `spawns` (the request, who asked, the result) keyed by `spawn.requested` id
 — kept for 24 h after its answer (or its request, when unanswered), and never while the agent
-is still up — `quotas` (windows, plan, exhausted, read_at, exhausted_since — when the reports
+is still up — `updates` (who asked, each host's `update.result`) keyed by `update.requested` id,
+kept for 24 h — `quotas` (windows, plan, exhausted, read_at, exhausted_since — when the reports
 first showed the account out) keyed by `<host>:<kind>`,
 `tasks` (state + since, owner, lead,
 blocked_by, handoffs), open `blockers` and `asks` (with their context link) keyed by their raising event id, undelivered
@@ -307,6 +310,7 @@ how many worktrees may hold any of a set of resources at once.
 | `role` | an agent's declared lead is down, the lead's level is not above its own, or a second root coordinator is up |
 | `quota` | a program's quota is exhausted, or a window ≥ 90% used resets in the future |
 | `stalled` | an agent idle or blocked for 15 min after it last worked |
+| `build` | hosts that sent `host.health` in the last 10 min report different commits (or one reports none); each such host, with the others' commits |
 
 `hung` and `stalled` are also pushed, not only read: the host writes one `msg.sent` per episode
 — `HUNG` or `STALLED`, ref the agent's name, the finding's own detail for text — to the agent's
@@ -445,8 +449,10 @@ a deleted worktree or a `forgotten` linked worktree (never a repository's main c
 Linux, still in that directory). It kills an orphan (parent pid 1, `systemd` or `launchd`) whose
 working directory is inside the caller's worktree, unless that path is also inside a worktree
 recorded for another agent. The caller's worktree is the one from its most recent `spawn.result`
-answered ok on this host, never one it requested for itself and never its pane's live cwd. With
-no such record the orphan is refused. It also kills the pids of a `proc.hung` report on the caller's
+answered ok on this host, never one it requested for itself and never its pane's live cwd. An
+agent no one else spawned (started by hand in a pane) has instead the worktree holding the first
+`agent.usage` cwd its own host reported for it, fixed until `agent.down`. With no such record, or a
+spawn that failed or is unanswered, the orphan is refused. It also kills the pids of a `proc.hung` report on the caller's
 host, also inside another agent's tree, when the live process started before the report's
 `since` (a later one with that pid is not the one that hung) and the report was `checked` in
 the last 6 minutes (one nobody re-checks proves nothing). TERM, then KILL after `--grace`
@@ -484,6 +490,17 @@ first argument; a `daemon` inside a `-p` prompt is no daemon), as in `codex app-
 daemon` or `claude daemon`, and everything under such a process; the
 process's directory is known on Linux only), re-sent without `program` once the process is gone;
 `agent-fleet doctor` shows them as `unmanaged` findings.
+
+`doctor` also reads GitHub, not the log, for `orphan-pr` findings: with `[orphan_pr] repos` set in
+fleet.toml, an open PR whose head branch is no live agent's worktree branch and that has had no
+update for `days` (default 3) is named with its age, the issues it closes and their state. `doctor --apply` closes it, with a comment and the branch kept, only when every issue it closes is closed or closed by a newer
+merged PR in the same repo; anything else is reported. A draft, or a PR touching a `guarded` path, is never
+closed; `--apply` tells the root coordinator of each orphan it does not close, again on a later run once the earlier
+tell is delivered; a tell still pending is not repeated. The default `guarded` is
+`AGENTS.md`, `CLAUDE.md`, `README.md`, `docs/`, `schema/`; setting it replaces that list. A PR whose
+file list hits `gh`'s cap of 100 counts as guarded. Nothing is closed while a live agent's
+branch is unknown; a repo or row `gh` cannot read is an `orphan-pr` error line, and so is a
+fleet.toml `doctor` cannot read (no fleet.toml, or no checkout, means the check is off). Closing is `doctor --apply` only; the watch loop does not run it.
 
 The same scan proves orphans and reports them as `proc.orphaned` (`why` says which proof
 held; no `why` clears it). A process reparented to init that is a device or test tool —
@@ -606,6 +623,59 @@ Any other never-started agent (`handoff_min` minutes since its successful spawn
 without reaching `working`) is a tell to the lead, never a handoff. An agent
 that worked, is `working` or `done`, or whose task closed is never handed off; a replacement
 request that failed does not block a retry.
+
+## Self-update
+
+A host runs the binary `cargo install --path <clone>` built from its own clone. The build embeds
+the clone's commit (`build.rs`, `git rev-parse HEAD`) and the clone's path (`CARGO_MANIFEST_DIR`);
+`host.health` reports the commit, `agent-fleet ps` shows it, and `doctor` reports `build` when
+live hosts disagree.
+
+`agent-fleet self-update` writes `update.requested`. Each host that sees it within 15 min and
+has not answered it yet, in the clone its binary was built from: refuses a clone not on `main`
+or with uncommitted changes to tracked files, runs `git pull --ff-only`, and, unless the
+pulled head is the commit it already runs, runs `cargo install --locked --path <clone> --root
+<tmp>` (the `cargo` beside its own binary, else the one on `PATH`) with `<tmp>` in its binary's
+directory, and renames the build over its binary — never overwriting it in place, which kills
+a running binary on macOS. It answers `update.result` (ok, the commit it will run, or the
+error), then exits with status 75 so its supervisor (systemd `Restart=on-failure` or launchd
+`KeepAlive`) starts the new binary. The CLI waits (20 min) until each host that sent
+`host.health` in the last 3 min has refused, or reports in `host.health` the commit it named,
+and prints each one's commit. Only a `host` actor may write `update.requested` (the CLI writes it
+as `host:<this machine>`): it makes every host rebuild and restart.
+
+**Automatic trigger.** Every 5 minutes a host fetches `origin/main` of its clone. When the commit
+its binary was built from is an ancestor of `origin/main` and not equal to it, it writes
+`update.requested` with `host` set to itself, so no other host runs it; it runs like any other
+request. It asks once per `origin/main` commit: a build that failed is not asked for again until
+`origin/main` moves. It asks nothing while a request for this host waits, while an update holds
+the clone's lock, or when its commit is not an ancestor of `origin/main` (a build from
+elsewhere) or unknown.
+
+The update is hardened:
+
+- **Work in flight.** A spawn execution or handoff running when the build finishes would be cut
+  off by the exit and run again from scratch. The host answers `update.result`, then stops
+  handing out guards for new spawns and handoffs (a request that arrives later is run by the
+  new process), waits until the running ones end, then exits. It waits at most 20 minutes, then
+  exits anyway, so a hung one cannot keep the old binary running. If the answer could not be
+  written, the host still restarts: the new process finds the request unanswered and answers it.
+- **Time limits.** `git pull` 2 min, other git 1 min, `cargo install` 30 min; the process group
+  is killed on a timeout and the update answers with the error. No command reads stdin, and git
+  never prompts (`GIT_TERMINAL_PROMPT=0`, ssh `BatchMode`; set for every command it runs).
+- **One at a time.** An `flock` in the clone's git dir, taken before the checks and held through
+  pull and build: a second update in the same clone (two hosts on one machine) waits for the
+  first (up to 35 minutes), then runs; it is never raced, and a wait that times out answers with
+  an error. The timer's fetch does not wait: it skips its turn.
+- **Rollback.** The previous binary is kept as `<binary>.prev` (a hard link, else a copy); one
+  generation, replaced by each update. If it cannot be kept the update fails before the rename.
+  To roll back, rename it over the binary and restart the host.
+- **Leftovers.** At start a host removes `.agent-fleet-update-<pid>` directories from its
+  binary's directory that are older than 45 minutes and whose process is gone (a killed update
+  leaves one; a live pid is another host's build in progress).
+
+The hub is not restarted: a change to the protocol needs the hub
+restarted by hand first, or it refuses what the new hosts write.
 
 ## The operator's screen
 

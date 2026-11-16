@@ -43,6 +43,9 @@ pub struct FleetConfig {
     /// First match wins; a rule with no `match` is the default.
     #[serde(default)]
     pub rules: Vec<Rule>,
+    /// `[orphan_pr]`: which repos `doctor` looks at for PRs no live agent owns.
+    #[serde(default)]
+    pub orphan_pr: crate::orphanpr::Config,
 }
 
 fn default_session() -> String {
@@ -742,7 +745,7 @@ struct Done {
     worktree: String,
 }
 
-async fn git(dir: &Path, args: &[&str]) -> Result<String> {
+pub(crate) async fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = tokio::process::Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -1246,7 +1249,7 @@ async fn close_replaced(host: &Host, old: &str) {
 }
 
 /// The last 4 KiB of `s`, on a char boundary: herdr or script spew stays a one-line finding.
-fn tail(s: &str) -> String {
+pub(crate) fn tail(s: &str) -> String {
     let mut i = s.len().saturating_sub(4096);
     while i < s.len() && !s.is_char_boundary(i) {
         i += 1;
@@ -1256,6 +1259,9 @@ fn tail(s: &str) -> String {
 
 /// Executes one `spawn.requested` and answers it with `spawn.result`.
 pub async fn execute(host: &Host, id: &str, sp: &Spawn, state: &State) {
+    let Some(_busy) = host.busy_guard() else {
+        return; // A restart is waiting: the new process runs the request.
+    };
     let r = &sp.request;
     let mut made = Made::default();
     match run_spawn(host, r, &mut made, state).await {
@@ -1458,6 +1464,9 @@ async fn handoffs(
     done: &mut HashSet<String>,
     warned: &mut HashSet<String>,
 ) {
+    let Some(_busy) = host.busy_guard() else {
+        return;
+    };
     let prefix = agent_prefix(&host.cfg.host, &host.cfg.session);
     // A failed replacement frees the agent: dedupe counts only pending or successful ones.
     done.retain(|id| replacement_open(state, id));
@@ -1746,6 +1755,10 @@ pub async fn spawn_loop(host: Arc<Host>) {
     let mut stuck_seen = crate::stuck::Seen::default();
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
+        // A self-update restart is waiting for the work in flight: start none.
+        if host.is_draining() {
+            continue;
+        }
         let view = match host.view() {
             Ok(v) => v,
             Err(err) => {
@@ -2194,6 +2207,25 @@ profile = "devin"
             "type": "workspace_created",
             "root_pane": { "pane_id": "w:2" },
             "workspace": { "workspace_id": "ws2", "worktree": { "checkout_path": wt } } } })
+    }
+
+    #[test]
+    fn busy_guards_count_the_work_in_flight_and_drain_is_sticky() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_at(dir.path(), dir.path().join("sock"), false);
+        assert!(!host.is_busy() && !host.is_draining());
+        let (a, b) = (host.busy_guard().unwrap(), host.busy_guard().unwrap());
+        drop(a);
+        assert!(host.is_busy(), "one left");
+        drop(b);
+        assert!(!host.is_busy());
+        host.drain();
+        assert!(host.is_draining());
+        assert!(
+            host.busy_guard().is_none(),
+            "no new work once a restart waits"
+        );
+        assert!(!host.is_busy(), "the refused guard is not counted");
     }
 
     fn host_at(dir: &Path, sock: PathBuf, stuck_act: bool) -> Arc<Host> {

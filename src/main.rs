@@ -5,6 +5,7 @@ mod event;
 mod host;
 mod hub;
 mod kill;
+mod orphanpr;
 mod quota;
 mod scan;
 mod signal;
@@ -15,6 +16,7 @@ mod store;
 mod stuck;
 mod tui;
 mod ui;
+mod update;
 mod watch;
 
 use std::net::SocketAddr;
@@ -104,6 +106,9 @@ enum Cmd {
     },
     /// What every agent is doing.
     Ps,
+    /// Every host that is up pulls `main` in the clone its binary was built from, rebuilds and
+    /// restarts; prints the commit each one then runs. A dirty clone or one not on `main` refuses.
+    SelfUpdate,
     /// The agent-fleet instances on this machine and the hub each one uses.
     Instances,
     /// The fleet on one screen, live: agents, worktrees, tasks, findings, and the actions on them.
@@ -260,6 +265,10 @@ enum Cmd {
     Doctor {
         #[arg(long)]
         json: bool,
+        /// Close each `orphan-pr` a newer merged PR supersedes (comment, branch kept) and tell the
+        /// root coordinator about the others (not again while its last tell is pending).
+        #[arg(long)]
+        apply: bool,
     },
     /// Load-test a throwaway in-process hub: post latency, throughput, follower lag, 409 races.
     Bench {
@@ -818,6 +827,27 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Ps => print!("{}", ui::ps(&ctx.state().await?, now)),
+        Cmd::SelfUpdate => {
+            let s = ctx.client()?.state().await?;
+            // Up = a `host.health` in the last 3 minutes; they report every minute.
+            let hosts: Vec<String> = s
+                .hosts
+                .iter()
+                .filter(|(_, h)| now - h.ts < chrono::Duration::minutes(3))
+                .map(|(name, _)| name.clone())
+                .collect();
+            if hosts.is_empty() {
+                bail!("no host has reported in the last 3 minutes");
+            }
+            let body = Known::UpdateRequested(UpdateRequested::default());
+            // Only a host's actor may ask: the request makes every host rebuild and restart.
+            let by = Actor {
+                kind: ActorKind::Host,
+                id: format!("host:{}", ctx.host_name()),
+            };
+            let id = ctx.write(Envelope::new(by, &ctx.cli.project, body)).await?;
+            update::wait(&ctx.client()?, &id, &hosts).await?;
+        }
         Cmd::Stats { since, json } => {
             let v = ctx.client()?.stats(*since).await?;
             if *json {
@@ -837,8 +867,56 @@ async fn main() -> Result<()> {
                 detail.map(|d| format!(": {d}")).unwrap_or_default()
             );
         }
-        Cmd::Doctor { json } => {
-            let f = doctor::findings(&ctx.state().await?, now);
+        Cmd::Doctor { json, apply } => {
+            let state = ctx.state().await?;
+            let mut f = doctor::findings(&state, now);
+            let (cfg, cfg_err) = match orphanpr::config(std::path::Path::new(".")) {
+                Ok(c) => (c.unwrap_or_default(), None),
+                Err(e) => (Default::default(), Some(format!("{e:#}"))),
+            };
+            let gh = std::env::var("AGENT_FLEET_GH").unwrap_or_else(|_| "gh".into());
+            let (orphans, errs) = orphanpr::scan(&gh, &state, &cfg, now).await;
+            for o in &orphans {
+                let key = format!("{}#{}", o.repo, o.number);
+                let mut detail = o.detail.clone();
+                if *apply {
+                    detail += &match &o.action {
+                        orphanpr::Action::Close { by } => {
+                            match orphanpr::close(&gh, &o.repo, o.number, *by).await {
+                                Ok(()) => "; closed, branch kept".to_string(),
+                                Err(e) => format!("; close failed: {e:#}"),
+                            }
+                        }
+                        orphanpr::Action::Report(why) => {
+                            format!("; {why}{}", tell_root(&ctx, &state, &key, &o.detail).await)
+                        }
+                    };
+                } else {
+                    detail += &match &o.action {
+                        orphanpr::Action::Close { .. } => "; --apply closes it".to_string(),
+                        orphanpr::Action::Report(why) => format!("; {why}"),
+                    };
+                }
+                f.push(doctor::Finding {
+                    kind: "orphan-pr",
+                    subject: key,
+                    detail,
+                });
+            }
+            for (repo, e) in errs {
+                f.push(doctor::Finding {
+                    kind: "orphan-pr",
+                    subject: repo,
+                    detail: format!("could not read: {e}"),
+                });
+            }
+            if let Some(e) = cfg_err {
+                f.push(doctor::Finding {
+                    kind: "orphan-pr",
+                    subject: "fleet.toml".into(),
+                    detail: format!("orphan PRs not checked: {e}"),
+                });
+            }
             if *json {
                 println!("{}", serde_json::to_string_pretty(&f)?);
             } else {
@@ -1013,8 +1091,9 @@ async fn main() -> Result<()> {
                         .is_some_and(|t| t <= *since)
                 })
             };
-            // The caller's worktree is the one the fleet assigned at spawn (`spawn.result`), never
-            // its pane's live cwd, which follows a `cd`; no record fails closed.
+            // The caller's worktree is the one the fleet assigned at spawn (`spawn.result`), or, for
+            // a hand-started agent, where its host first saw it; never its pane's live cwd, which
+            // follows a `cd`. No record fails closed.
             let homes = match (&state, ctx.me().await) {
                 (Some(s), Ok(a)) => {
                     let trees: Vec<_> = s
@@ -1439,6 +1518,35 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One tell to the root coordinator per PR while it is unanswered; the result is a detail suffix.
+async fn tell_root(ctx: &Ctx, s: &state::State, key: &str, text: &str) -> String {
+    let Some(root) = orphanpr::root_of(s) else {
+        return " (no root coordinator to tell)".into();
+    };
+    if orphanpr::already_told(s, &root, key) {
+        return " (coordinator already told)".into();
+    }
+    let sent = async {
+        let body = MsgSent {
+            to: root,
+            kind: "orphan-pr".into(),
+            reference: key.into(),
+            text: format!("{key} has no live agent: {text}"),
+        };
+        ctx.write(Envelope::new(
+            ctx.me().await?,
+            &ctx.cli.project,
+            Known::MsgSent(body),
+        ))
+        .await
+    }
+    .await;
+    match sent {
+        Ok(_) => " (coordinator told)".into(),
+        Err(e) => format!(" (tell failed: {e:#})"),
+    }
 }
 
 #[cfg(test)]

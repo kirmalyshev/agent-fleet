@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::event::{
     AgentState, Body, Event, Known, Level, ProcessHung, QuotaWindow, ResourceHold, ResourceLimit,
-    SpawnRequested, SpawnResult, StuckCause, TYPE_VERSION, TaskState, WorktreeProcs, WorktreeState,
+    SpawnRequested, SpawnResult, StuckCause, TYPE_VERSION, TaskState, UpdateResult, WorktreeProcs,
+    WorktreeState,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -17,6 +18,10 @@ pub struct State {
     pub last: Option<String>,
     pub hosts: BTreeMap<String, Host>,
     pub agents: BTreeMap<String, Agent>,
+    /// The cwd an agent's own host first reported for its pane (`agent.usage`), by agent id; fixed
+    /// until `agent.down`, so a later `cd` does not move it. The root of an agent nobody spawned.
+    #[serde(default)]
+    pub first_cwd: BTreeMap<String, String>,
     /// Declared roles by agent id; kept apart from `agents`, so a role survives `agent.down`.
     #[serde(default)]
     pub roles: BTreeMap<String, Role>,
@@ -49,6 +54,9 @@ pub struct State {
     /// Spawn requests by their `spawn.requested` id; answered ones are kept for 24 h.
     #[serde(default)]
     pub spawns: BTreeMap<String, Spawn>,
+    /// Self-update requests by their `update.requested` id, kept for 24 h.
+    #[serde(default)]
+    pub updates: BTreeMap<String, Update>,
     /// Agent programs outside herdr on each host, keyed `<host>:<pid>`.
     #[serde(default)]
     pub unmanaged: BTreeMap<String, Unmanaged>,
@@ -75,8 +83,27 @@ pub struct Host {
     pub disk_free: u64,
     pub disk_total: u64,
     pub agents: u32,
+    /// The commit its binary was built from, as its last `host.health` said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
     pub ts: DateTime<Utc>,
 }
+
+/// An `update.requested` and each host's `update.result`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Update {
+    /// Who asked (the request's actor id).
+    pub by: String,
+    /// The request's `ts`; the update is pruned `UPDATE_KEPT` after it.
+    pub since: DateTime<Utc>,
+    /// The one host it asks, or every host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Each host's answer, by host name.
+    pub results: BTreeMap<String, UpdateResult>,
+}
+
+pub const UPDATE_KEPT: chrono::Duration = chrono::Duration::hours(24);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Agent {
@@ -457,6 +484,13 @@ impl State {
             }
             Known::AgentUsage(d) => {
                 if let Some(a) = self.agents.get_mut(&d.agent) {
+                    // Only the agent's own host fixes where it was first seen.
+                    if let Some(cwd) = d.cwd.clone().filter(|_| {
+                        e.actor.kind == crate::event::ActorKind::Host
+                            && e.actor.id == format!("host:{}", a.host)
+                    }) {
+                        self.first_cwd.entry(d.agent.clone()).or_insert(cwd);
+                    }
                     a.usage = Some(Usage {
                         rss_kb: d.rss_kb,
                         cpu_pct: d.cpu_pct,
@@ -555,6 +589,7 @@ impl State {
             }
             Known::AgentDown(d) => {
                 self.agents.remove(&d.agent);
+                self.first_cwd.remove(&d.agent);
                 self.stuck.remove(&d.agent);
                 self.signals.remove(&d.agent);
             }
@@ -637,6 +672,7 @@ impl State {
                         disk_free: d.disk_free,
                         disk_total: d.disk_total,
                         agents: d.agents,
+                        commit: d.commit.clone(),
                         ts,
                     },
                 );
@@ -856,7 +892,28 @@ impl State {
                     s.answered = Some(ts);
                 }
             }
+            Known::UpdateRequested(d) => {
+                self.updates.insert(
+                    e.id.clone(),
+                    Update {
+                        by: e.actor.id.clone(),
+                        since: ts,
+                        host: d.host.clone(),
+                        results: BTreeMap::new(),
+                    },
+                );
+            }
+            // Only the host it names may answer for it, and only once.
+            Known::UpdateResult(d) => {
+                if e.actor.id == format!("host:{}", d.host)
+                    && let Some(re) = &e.re
+                    && let Some(u) = self.updates.get_mut(re)
+                {
+                    u.results.entry(d.host.clone()).or_insert_with(|| d.clone());
+                }
+            }
         }
+        self.updates.retain(|_, u| e.ts - u.since <= UPDATE_KEPT);
         self.answers
             .retain(|_, a| e.ts - a.acked.unwrap_or(a.at) <= ANSWER_KEPT);
         // The reducer has no clock: a spawn is pruned once a later event's `ts` is more than
@@ -873,8 +930,9 @@ impl State {
     /// `spawn.result`, never where the agent's pane stands now (`usage.cwd` follows a `cd`).
     /// Exact rule: among the spawns of an agent that is up (in `agents`) on `host`, drop any the
     /// agent requested for itself, and any not answered `ok` with a worktree; the one requested
-    /// LAST (`since`) gives the root. An agent re-spawned into a new worktree so moves with it,
-    /// and an agent with no such spawn, or not up, has `None`.
+    /// LAST (`since`) gives the root. An agent re-spawned into a new worktree so moves with it.
+    /// An up agent no one else spawned here (started by hand) has its `first_cwd`; one whose spawn
+    /// failed or is unanswered, or with neither, has `None`.
     ///
     /// Threat model: `kill` guards against honest-but-mistaken agents, not deliberate
     /// impersonation. The hub's one shared bearer token already lets any holder post as any
@@ -898,6 +956,11 @@ impl State {
             let slot = out.entry(agent).or_insert((s.since, None));
             if slot.1.is_none() || s.since >= slot.0 {
                 *slot = (s.since, Some(tree));
+            }
+        }
+        for (id, a) in &self.agents {
+            if let (true, Some(cwd)) = (a.host == host, self.first_cwd.get(id)) {
+                out.entry(id).or_insert((a.since, Some(cwd.clone())));
             }
         }
         out.into_iter()
@@ -1072,6 +1135,93 @@ mod tests {
         // an agent nobody spawned is absent: its root fails closed
         s.spawns.clear();
         assert!(s.assigned_worktrees("h").is_empty());
+    }
+
+    #[test]
+    fn a_hand_started_agents_root_is_where_its_host_first_saw_it() {
+        let a = "agent:h/s/a".to_string();
+        let use_at = |kind, cwd: &str| {
+            ev(
+                kind,
+                Known::AgentUsage(AgentUsage {
+                    agent: a.clone(),
+                    rss_kb: None,
+                    cpu_pct: None,
+                    procs: None,
+                    cwd: Some(cwd.into()),
+                }),
+            )
+        };
+        let mut s = State::default();
+        s.apply(
+            &ev(
+                ActorKind::Host,
+                Known::AgentUp(AgentUp {
+                    agent: a.clone(),
+                    host: "h".into(),
+                    kind: Some("claude".into()),
+                    state: AgentState::Idle,
+                    pane: None,
+                }),
+            )
+            .into_event(),
+        );
+        assert!(s.assigned_worktrees("h").is_empty(), "no record yet");
+        s.apply(&use_at(ActorKind::Agent, "/w/foreign").into_event());
+        let mut other_host = use_at(ActorKind::Host, "/w/x");
+        other_host.actor.id = "host:x".into();
+        s.apply(&other_host.into_event());
+        assert!(s.first_cwd.is_empty(), "only the agent's own host sets it");
+        s.apply(&use_at(ActorKind::Host, "/w/mine/web").into_event());
+        s.apply(&use_at(ActorKind::Host, "/w/other").into_event());
+        let mine = vec![(a.clone(), Some("/w/mine/web".to_string()))];
+        assert_eq!(
+            s.assigned_worktrees("h"),
+            mine,
+            "a later cd does not move it"
+        );
+        assert!(s.assigned_worktrees("x").is_empty());
+        // a spawned agent keeps its spawn result, and a failed spawn still fails closed
+        let req: SpawnRequested = serde_json::from_value(serde_json::json!({
+            "name": "a", "agent": a, "host": "h", "session": "s", "repo": "r",
+            "branch": "b", "profile": "p", "brief": "x", "why": "t"
+        }))
+        .unwrap();
+        let spawn = |ok| Spawn {
+            request: req.clone(),
+            by: "agent:h/s/coord".into(),
+            project: "p".into(),
+            result: Some(SpawnResult {
+                agent: a.clone(),
+                ok,
+                pane: None,
+                worktree: Some("/w/spawned".into()),
+                error: None,
+            }),
+            since: Utc::now(),
+            answered: None,
+        };
+        s.spawns.insert("e1".into(), spawn(true));
+        assert_eq!(
+            s.assigned_worktrees("h")[0].1.as_deref(),
+            Some("/w/spawned")
+        );
+        s.spawns.insert("e1".into(), spawn(false));
+        assert_eq!(s.assigned_worktrees("h")[0].1, None);
+        // the agent's own spawn request does not count: it falls back to where it was seen
+        s.spawns.get_mut("e1").unwrap().by = a.clone();
+        assert_eq!(s.assigned_worktrees("h"), mine);
+        s.apply(
+            &ev(
+                ActorKind::Host,
+                Known::AgentDown(AgentDown {
+                    agent: a.clone(),
+                    reason: None,
+                }),
+            )
+            .into_event(),
+        );
+        assert!(s.first_cwd.is_empty(), "a new lifetime starts afresh");
     }
 
     #[test]
@@ -1895,5 +2045,96 @@ mod tests {
             })
             .collect();
         assert_eq!(State::fold(&events).tasks["task:p/1"].blocked_by.len(), 20);
+    }
+
+    fn by(id: &str, body: Known) -> Envelope<Known> {
+        let kind = if id.starts_with("host:") {
+            ActorKind::Host
+        } else {
+            ActorKind::Agent
+        };
+        let actor = Actor {
+            kind,
+            id: id.into(),
+        };
+        Envelope::new(actor, "p", body)
+    }
+
+    fn update_result(host: &str, commit: &str) -> Known {
+        Known::UpdateResult(UpdateResult {
+            host: host.into(),
+            ok: true,
+            commit: Some(commit.into()),
+            error: None,
+        })
+    }
+
+    #[test]
+    fn an_update_request_remembers_the_one_host_it_asks() {
+        let mut s = State::default();
+        let ask = |host: Option<&str>| {
+            ev(
+                ActorKind::Host,
+                Known::UpdateRequested(UpdateRequested {
+                    host: host.map(String::from),
+                }),
+            )
+            .into_event()
+        };
+        let (all, one) = (ask(None), ask(Some("h")));
+        s.apply(&all);
+        s.apply(&one);
+        assert_eq!(s.updates[&all.id].host, None);
+        assert_eq!(s.updates[&one.id].host.as_deref(), Some("h"));
+    }
+
+    #[test]
+    fn each_host_answers_its_own_update_once_and_the_request_is_pruned_after_a_day() {
+        let req = by(
+            "agent:h/s/a",
+            Known::UpdateRequested(UpdateRequested::default()),
+        );
+        let id = req.id.clone();
+        let mut s = State::default();
+        s.apply(&req.into_event());
+        assert_eq!(s.updates[&id].by, "agent:h/s/a");
+        assert!(s.updates[&id].results.is_empty());
+        // another host may not answer for h1
+        let forged = by("host:h2", update_result("h1", "bad")).re(&id);
+        s.apply(&forged.into_event());
+        assert!(s.updates[&id].results.is_empty());
+        for (actor, host, commit) in [("h1", "h1", "abc"), ("h1", "h1", "x"), ("h2", "h2", "def")] {
+            let e = by(&format!("host:{actor}"), update_result(host, commit)).re(&id);
+            s.apply(&e.into_event());
+        }
+        let got: Vec<_> = s.updates[&id]
+            .results
+            .iter()
+            .map(|(h, r)| (h.as_str(), r.commit.as_deref().unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            [("h1", "abc"), ("h2", "def")],
+            "the first answer stands"
+        );
+        let mut late = by("host:h1", update_result("h1", "x")).re("other");
+        late.ts += UPDATE_KEPT + chrono::Duration::seconds(1);
+        s.apply(&late.into_event());
+        assert!(s.updates.is_empty(), "pruned a day after the request");
+    }
+
+    #[test]
+    fn host_health_carries_the_commit() {
+        let health = Known::HostHealth(HostHealth {
+            host: "h1".into(),
+            disk_free: 1,
+            disk_total: 2,
+            agents: 0,
+            stats: None,
+            commit: Some("abc".into()),
+        });
+        let mut s = State::default();
+        s.apply(&by("host:h1", health).into_event());
+        assert_eq!(s.hosts["h1"].commit.as_deref(), Some("abc"));
     }
 }
