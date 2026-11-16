@@ -1256,7 +1256,9 @@ pub(crate) fn tail(s: &str) -> String {
 
 /// Executes one `spawn.requested` and answers it with `spawn.result`.
 pub async fn execute(host: &Host, id: &str, sp: &Spawn, state: &State) {
-    let _busy = host.busy_guard();
+    let Some(_busy) = host.busy_guard() else {
+        return; // A restart is waiting: the new process runs the request.
+    };
     let r = &sp.request;
     let mut made = Made::default();
     match run_spawn(host, r, &mut made, state).await {
@@ -1459,7 +1461,9 @@ async fn handoffs(
     done: &mut HashSet<String>,
     warned: &mut HashSet<String>,
 ) {
-    let _busy = host.busy_guard();
+    let Some(_busy) = host.busy_guard() else {
+        return;
+    };
     let prefix = agent_prefix(&host.cfg.host, &host.cfg.session);
     // A failed replacement frees the agent: dedupe counts only pending or successful ones.
     done.retain(|id| replacement_open(state, id));
@@ -2207,13 +2211,18 @@ profile = "devin"
         let dir = tempfile::tempdir().unwrap();
         let host = host_at(dir.path(), dir.path().join("sock"), false);
         assert!(!host.is_busy() && !host.is_draining());
-        let (a, b) = (host.busy_guard(), host.busy_guard());
+        let (a, b) = (host.busy_guard().unwrap(), host.busy_guard().unwrap());
         drop(a);
         assert!(host.is_busy(), "one left");
         drop(b);
         assert!(!host.is_busy());
         host.drain();
         assert!(host.is_draining());
+        assert!(
+            host.busy_guard().is_none(),
+            "no new work once a restart waits"
+        );
+        assert!(!host.is_busy(), "the refused guard is not counted");
     }
 
     fn host_at(dir: &Path, sock: PathBuf, stuck_act: bool) -> Arc<Host> {

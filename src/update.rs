@@ -46,13 +46,18 @@ pub enum Outcome {
 const PULL: Duration = Duration::from_secs(120);
 const GIT: Duration = Duration::from_secs(60);
 const BUILD: Duration = Duration::from_secs(30 * 60);
-/// A `.agent-fleet-update-<pid>` older than this is the leftover of a killed update.
-const LEFTOVER: Duration = Duration::from_secs(600);
+/// A `.agent-fleet-update-<pid>` untouched this long (more than `BUILD`) is assumed to be the
+/// leftover of a killed update, not another host's build in progress.
+const LEFTOVER: Duration = Duration::from_secs(45 * 60);
+/// How long a finished update waits for spawns and handoffs in flight (a ready script may run
+/// 15 min) before it exits anyway: a hung one must not keep the old binary running for good.
+const DRAIN_MAX: Duration = Duration::from_secs(20 * 60);
 /// How often a finished update looks for the work in flight to end.
 const DRAIN_POLL: Duration = Duration::from_secs(1);
 
 /// Runs `c` to the end, or kills its whole process group after `limit` (cargo and git start
-/// children of their own). No stdin and no git prompt: under a supervisor nobody can answer.
+/// children of their own). No stdin and no git prompt (the environment applies to cargo too):
+/// under a supervisor nobody can answer.
 async fn limited(mut c: tokio::process::Command, limit: Duration) -> Result<std::process::Output> {
     let child = c
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -93,7 +98,8 @@ async fn git_in(clone: &Path, args: &[&str], limit: Duration) -> Result<String> 
 }
 
 /// One update at a time per clone: the lock lives in the clone's git dir, so two hosts of one
-/// machine never race on `git pull` or both build.
+/// machine never race on `git pull` or both build. The second is refused, not queued. The file
+/// is only held, never read: dropping it releases the lock.
 struct Lock(#[allow(dead_code)] std::fs::File);
 
 async fn lock(clone: &Path) -> Result<Lock> {
@@ -127,12 +133,18 @@ pub fn sweep(dir: &Path, older_than: Duration) {
             .ok()
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age >= older_than);
+        let name = e.file_name().to_string_lossy().into_owned();
+        // Another host of this machine may be building in it right now.
+        let building = name
+            .strip_prefix(".agent-fleet-update-")
+            .and_then(|p| p.parse::<i32>().ok())
+            .is_some_and(|pid| unsafe { libc::kill(pid, 0) } == 0);
         if old
-            && e.file_name()
-                .to_string_lossy()
-                .starts_with(".agent-fleet-update-")
+            && !building
+            && name.starts_with(".agent-fleet-update-")
+            && let Err(err) = std::fs::remove_dir_all(e.path())
         {
-            let _ = std::fs::remove_dir_all(e.path());
+            eprintln!("agent-fleet host: sweep {}: {err}", e.path().display());
         }
     }
 }
@@ -141,9 +153,17 @@ pub fn sweep(dir: &Path, older_than: Duration) {
 /// already its head, builds it and renames the build over `exe`. The old binary stays as
 /// `<exe>.prev`: to roll back, rename it over `exe` and restart.
 pub async fn update(clone: &Path, exe: &Path, running: Option<&str>) -> Result<Outcome> {
+    // First: the checks below must hold while this update pulls.
+    let _lock = lock(clone).await?;
     let branch = git_in(clone, &["symbolic-ref", "--short", "HEAD"], GIT)
         .await
-        .with_context(|| format!("{} is not on a branch", clone.display()))?;
+        .map_err(|e| {
+            if format!("{e:#}").contains("not a symbolic ref") {
+                anyhow!("{} is not on a branch", clone.display())
+            } else {
+                e
+            }
+        })?;
     if branch != "main" {
         bail!("{} is on {branch}, not main", clone.display());
     }
@@ -157,7 +177,6 @@ pub async fn update(clone: &Path, exe: &Path, running: Option<&str>) -> Result<O
     {
         bail!("{} has uncommitted changes", clone.display());
     }
-    let _lock = lock(clone).await?;
     git_in(clone, &["pull", "--ff-only", "--quiet"], PULL).await?;
     let head = git_in(clone, &["rev-parse", "HEAD"], GIT).await?;
     if running == Some(head.as_str()) {
@@ -193,9 +212,15 @@ pub async fn update(clone: &Path, exe: &Path, running: Option<&str>) -> Result<O
             "{}.prev",
             exe.file_name().unwrap_or_default().to_string_lossy()
         ));
-        let _ = std::fs::remove_file(&prev);
-        if let Err(e) = std::fs::hard_link(exe, &prev) {
-            eprintln!("agent-fleet host: update: keeping {}: {e}", prev.display());
+        match std::fs::remove_file(&prev) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow!("remove the old {}: {e}", prev.display())),
+        }
+        // No rollback copy, no update: a link, else a copy.
+        if std::fs::hard_link(exe, &prev).is_err() {
+            std::fs::copy(exe, &prev)
+                .with_context(|| format!("keep the old binary as {}", prev.display()))?;
         }
         std::fs::rename(root.join("bin/agent-fleet"), exe)
             .with_context(|| format!("move the build to {}", exe.display()))
@@ -214,14 +239,24 @@ fn this_exe() -> Result<PathBuf> {
         .map_or(exe.clone(), PathBuf::from))
 }
 
+/// The requests `me` has not answered, still fresh enough to run.
+fn pending_for(s: &State, me: &str, now: chrono::DateTime<Utc>) -> Vec<String> {
+    s.updates
+        .iter()
+        .filter(|(_, u)| !u.results.contains_key(me) && now - u.since < REQUEST_MAX_AGE)
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
 /// What a tick needs from its host, so the tick is testable with fakes.
 trait Io {
     /// Requests not yet answered by this host, still fresh.
     fn pending(&self) -> Vec<String>;
-    async fn publish(&self, id: &str, r: UpdateResult);
+    /// Whether the answer was written.
+    async fn publish(&self, id: &str, r: UpdateResult) -> bool;
     /// Spawn or handoff work in flight that an exit would cut short.
     fn busy(&self) -> bool;
-    /// Start no new such work.
+    /// One way: no new such work starts, until the process exits.
     fn drain(&self);
     fn exit(&self, code: i32);
 }
@@ -230,26 +265,19 @@ struct HostIo(Arc<Host>);
 
 impl Io for HostIo {
     fn pending(&self) -> Vec<String> {
-        let view = match self.0.view() {
-            Ok(v) => v,
+        match self.0.view() {
+            Ok(v) => pending_for(&v.state, &self.0.cfg.host, Utc::now()),
             Err(err) => {
                 eprintln!("agent-fleet host: replica: {err}");
-                return Vec::new();
+                Vec::new()
             }
-        };
-        let me = &self.0.cfg.host;
-        view.state
-            .updates
-            .iter()
-            .filter(|(_, u)| !u.results.contains_key(me) && Utc::now() - u.since < REQUEST_MAX_AGE)
-            .map(|(id, _)| id.clone())
-            .collect()
+        }
     }
 
-    async fn publish(&self, id: &str, r: UpdateResult) {
+    async fn publish(&self, id: &str, r: UpdateResult) -> bool {
         self.0
             .publish(self.0.presence(Known::UpdateResult(r)).re(id))
-            .await;
+            .await
     }
 
     fn busy(&self) -> bool {
@@ -265,74 +293,92 @@ impl Io for HostIo {
     }
 }
 
-/// Executes each request this host has not answered, answers `update.result`, and once the
-/// binary was replaced waits for the work in flight to end, then exits with `RESTART_STATUS`.
-async fn tick<I: Io>(
-    io: &I,
-    me: &str,
-    clone: &Path,
-    exe: &Path,
-    running: Option<&str>,
-    seen: &mut HashSet<String>,
+/// What a tick runs against.
+struct Ctx<'a> {
+    me: &'a str,
+    clone: &'a Path,
+    /// This binary's path; when it cannot be told, every request is answered with the error.
+    exe: &'a Result<PathBuf>,
+    running: Option<&'a str>,
     poll: Duration,
-) {
+    drain_max: Duration,
+}
+
+/// Executes each request this host has not answered and answers `update.result`. Once the binary
+/// was replaced it stops new spawns and handoffs, waits (at most `drain_max`) for those in
+/// flight, then exits with `RESTART_STATUS`. A restart whose answer was not written is not
+/// retried by building again: the new process finds the request unanswered and answers it.
+async fn tick<I: Io>(io: &I, c: &Ctx<'_>, seen: &mut HashSet<String>) {
     for id in io.pending() {
         if !seen.insert(id.clone()) {
             continue;
         }
-        let done = update(clone, exe, running).await;
+        let done = match c.exe {
+            Ok(exe) => update(c.clone, exe, c.running).await,
+            Err(err) => Err(anyhow!("cannot tell this binary's path: {err:#}")),
+        };
         let (commit, error, restart) = match done {
             Ok(Outcome::Current(c)) => (Some(c), None, false),
             Ok(Outcome::Replaced(c)) => (Some(c), None, true),
             Err(err) => (None, Some(tail(&format!("{err:#}"))), false),
         };
         let result = UpdateResult {
-            host: me.to_string(),
+            host: c.me.to_string(),
             ok: error.is_none(),
             commit,
             error,
         };
-        io.publish(&id, result).await;
-        if restart {
-            // A spawn or handoff cut off by the exit would be run again from scratch.
-            io.drain();
-            while io.busy() {
-                tokio::time::sleep(poll).await;
+        let written = io.publish(&id, result).await;
+        if !restart {
+            if !written {
+                eprintln!("agent-fleet host: update.result for {id} not written; retrying");
+                seen.remove(&id);
             }
-            eprintln!("agent-fleet host: binary replaced; exiting for the supervisor to restart");
-            io.exit(RESTART_STATUS);
-            return;
+            continue;
         }
+        // A spawn or handoff cut off by the exit would be run again from scratch.
+        io.drain();
+        let deadline = tokio::time::Instant::now() + c.drain_max;
+        while io.busy() {
+            if tokio::time::Instant::now() >= deadline {
+                eprintln!(
+                    "agent-fleet host: spawn or handoff still running after {} min; restarting anyway",
+                    c.drain_max.as_secs() / 60
+                );
+                break;
+            }
+            tokio::time::sleep(c.poll).await;
+        }
+        eprintln!("agent-fleet host: binary replaced; exiting for the supervisor to restart");
+        io.exit(RESTART_STATUS);
+        return;
     }
 }
 
 pub async fn update_loop(host: Arc<Host>) {
     let exe = this_exe();
-    if let Ok(exe) = &exe
-        && let Some(dir) = exe.parent()
-    {
-        sweep(dir, LEFTOVER);
+    match &exe {
+        Ok(exe) => {
+            if let Some(dir) = exe.parent() {
+                sweep(dir, LEFTOVER);
+            }
+        }
+        Err(err) => eprintln!("agent-fleet host: update: {err:#}"),
     }
     let me = host.cfg.host.clone();
     let io = HostIo(host);
     let mut seen: HashSet<String> = HashSet::new();
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        match &exe {
-            Ok(exe) => {
-                tick(
-                    &io,
-                    &me,
-                    Path::new(CLONE),
-                    exe,
-                    COMMIT,
-                    &mut seen,
-                    DRAIN_POLL,
-                )
-                .await
-            }
-            Err(err) => eprintln!("agent-fleet host: update: {err:#}"),
-        }
+        let c = Ctx {
+            me: &me,
+            clone: Path::new(CLONE),
+            exe: &exe,
+            running: COMMIT,
+            poll: DRAIN_POLL,
+            drain_max: DRAIN_MAX,
+        };
+        tick(&io, &c, &mut seen).await;
     }
 }
 
@@ -357,6 +403,7 @@ where
     // host → whether it got there
     let mut done: BTreeMap<&str, bool> = BTreeMap::new();
     let mut last = None;
+    let mut last_err: Option<String> = None;
     loop {
         match fetch().await {
             Ok(s) => {
@@ -381,7 +428,13 @@ where
             Err(e) if e.downcast_ref::<Refused>().is_some() => {
                 bail!("waiting for the update results: {e:#}");
             }
-            Err(_) => {}
+            Err(e) => {
+                let e = format!("{e:#}");
+                if last_err.as_deref() != Some(e.as_str()) {
+                    eprintln!("waiting: the hub did not answer: {e}");
+                    last_err = Some(e);
+                }
+            }
         }
         if done.len() == hosts.len() {
             break;
@@ -402,8 +455,11 @@ where
                 }
             }
             bail!(
-                "not every host runs its new build after {} min",
-                limit.as_secs() / 60
+                "not every host runs its new build after {} min{}",
+                limit.as_secs() / 60,
+                last_err
+                    .map(|e| format!(" (the hub's last error: {e})"))
+                    .unwrap_or_default()
             );
         }
         tokio::time::sleep(poll).await;
@@ -584,12 +640,12 @@ mod tests {
         let mark = t.path().join("late");
         let mut c = tokio::process::Command::new("sh");
         c.arg("-c")
-            .arg(format!("(sleep 2; touch {}) & sleep 30", mark.display()));
+            .arg(format!("(sleep 1; touch {}) & sleep 30", mark.display()));
         let started = std::time::Instant::now();
         let e = limited(c, Duration::from_millis(300)).await.unwrap_err();
         assert!(format!("{e}").contains("timed out"), "{e}");
         assert!(started.elapsed() < Duration::from_secs(5));
-        tokio::time::sleep(Duration::from_millis(2200)).await;
+        tokio::time::sleep(Duration::from_millis(1300)).await;
         assert!(!mark.exists(), "the child died with the group");
         let mut c = tokio::process::Command::new("sh");
         c.arg("-c")
@@ -602,17 +658,20 @@ mod tests {
     }
 
     #[test]
-    fn sweep_removes_old_build_dirs_only() {
+    fn sweep_removes_old_build_dirs_of_dead_processes_only() {
         let t = tempfile::tempdir().unwrap();
-        std::fs::create_dir(t.path().join(".agent-fleet-update-123")).unwrap();
+        let dead = t.path().join(".agent-fleet-update-123456789");
+        let live = t
+            .path()
+            .join(format!(".agent-fleet-update-{}", std::process::id()));
+        std::fs::create_dir(&dead).unwrap();
+        std::fs::create_dir(&live).unwrap();
         std::fs::create_dir(t.path().join("keep")).unwrap();
         sweep(t.path(), Duration::from_secs(3600));
-        assert!(
-            t.path().join(".agent-fleet-update-123").exists(),
-            "too young"
-        );
+        assert!(dead.exists(), "too young");
         sweep(t.path(), Duration::ZERO);
-        assert!(!t.path().join(".agent-fleet-update-123").exists());
+        assert!(!dead.exists());
+        assert!(live.exists(), "its process is alive: a build in progress");
         assert!(t.path().join("keep").exists());
     }
 
@@ -622,6 +681,7 @@ mod tests {
         pending: std::cell::RefCell<Vec<String>>,
         log: std::cell::RefCell<Vec<String>>,
         busy: std::cell::Cell<bool>,
+        drop_publish: std::cell::Cell<bool>,
         results: std::cell::RefCell<Vec<UpdateResult>>,
     }
 
@@ -629,11 +689,12 @@ mod tests {
         fn pending(&self) -> Vec<String> {
             self.pending.borrow().clone()
         }
-        async fn publish(&self, id: &str, r: UpdateResult) {
+        async fn publish(&self, id: &str, r: UpdateResult) -> bool {
             self.log
                 .borrow_mut()
                 .push(format!("publish {id} ok={}", r.ok));
             self.results.borrow_mut().push(r);
+            !self.drop_publish.get()
         }
         fn busy(&self) -> bool {
             self.busy.get()
@@ -648,16 +709,33 @@ mod tests {
 
     const POLL: Duration = Duration::from_millis(10);
 
+    fn ctx<'a>(clone: &'a Path, exe: &'a Result<PathBuf>, running: Option<&'a str>) -> Ctx<'a> {
+        Ctx {
+            me: "h",
+            clone,
+            exe,
+            running,
+            poll: POLL,
+            drain_max: Duration::from_secs(30),
+        }
+    }
+
+    fn newer(origin: &Path) {
+        std::fs::write(origin.join("f"), "2").unwrap();
+        sh(origin, &["commit", "-qam", "two"]);
+    }
+
     #[tokio::test]
     async fn the_exit_waits_for_the_work_in_flight_and_nothing_new_starts() {
         let (_t, origin, clone, exe) = fixture();
-        std::fs::write(origin.join("f"), "2").unwrap();
-        sh(&origin, &["commit", "-qam", "two"]);
+        newer(&origin);
+        let exe = Ok(exe);
         let io = Fake::default();
         *io.pending.borrow_mut() = ids(&["r1"]);
         io.busy.set(true);
         let mut seen = HashSet::new();
-        tokio::join!(tick(&io, "h", &clone, &exe, None, &mut seen, POLL), async {
+        let c = ctx(&clone, &exe, None);
+        tokio::join!(tick(&io, &c, &mut seen), async {
             while !io.log.borrow().contains(&"drain".to_string()) {
                 tokio::time::sleep(POLL).await;
             }
@@ -673,27 +751,133 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refused_or_current_update_never_exits_and_a_request_runs_once() {
-        let (_t, _origin, clone, exe) = fixture();
-        let head = sh(&clone, &["rev-parse", "HEAD"]);
+    async fn work_that_never_ends_cannot_keep_the_old_binary_running() {
+        let (_t, origin, clone, exe) = fixture();
+        newer(&origin);
+        let exe = Ok(exe);
         let io = Fake::default();
         *io.pending.borrow_mut() = ids(&["r1"]);
+        io.busy.set(true);
+        let c = Ctx {
+            drain_max: Duration::from_millis(100),
+            ..ctx(&clone, &exe, None)
+        };
+        tick(&io, &c, &mut HashSet::new()).await;
+        assert_eq!(io.log.borrow().last().unwrap(), "exit 75");
+    }
+
+    #[tokio::test]
+    async fn a_replaced_binary_restarts_even_if_the_answer_was_not_written() {
+        let (_t, origin, clone, exe) = fixture();
+        newer(&origin);
+        let exe = Ok(exe);
+        let io = Fake::default();
+        io.drop_publish.set(true);
+        *io.pending.borrow_mut() = ids(&["r1"]);
+        tick(&io, &ctx(&clone, &exe, None), &mut HashSet::new()).await;
+        // The new process finds the request unanswered and answers it: no second build here.
+        assert_eq!(*io.log.borrow(), ["publish r1 ok=true", "drain", "exit 75"]);
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_was_not_written_is_retried_and_a_request_runs_once() {
+        let (_t, _origin, clone, exe) = fixture();
+        let head = sh(&clone, &["rev-parse", "HEAD"]);
+        let exe = Ok(exe);
+        let io = Fake::default();
+        *io.pending.borrow_mut() = ids(&["r1"]);
+        io.drop_publish.set(true);
         let mut seen = HashSet::new();
-        tick(&io, "h", &clone, &exe, Some(&head), &mut seen, POLL).await;
-        tick(&io, "h", &clone, &exe, Some(&head), &mut seen, POLL).await;
-        assert_eq!(*io.log.borrow(), ["publish r1 ok=true"], "current, once");
+        let c = ctx(&clone, &exe, Some(&head));
+        tick(&io, &c, &mut seen).await;
+        tick(&io, &c, &mut seen).await;
+        io.drop_publish.set(false);
+        tick(&io, &c, &mut seen).await;
+        tick(&io, &c, &mut seen).await;
+        assert_eq!(
+            *io.log.borrow(),
+            ["publish r1 ok=true"; 3],
+            "retried until written, then once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_update_never_exits() {
+        let (_t, _origin, clone, exe) = fixture();
         std::fs::write(clone.join("f"), "dirty").unwrap();
+        let exe = Ok(exe);
+        let io = Fake::default();
         *io.pending.borrow_mut() = ids(&["r2"]);
-        tick(&io, "h", &clone, &exe, None, &mut seen, POLL).await;
-        assert_eq!(io.log.borrow().last().unwrap(), "publish r2 ok=false");
+        tick(&io, &ctx(&clone, &exe, None), &mut HashSet::new()).await;
+        assert_eq!(*io.log.borrow(), ["publish r2 ok=false"]);
         assert!(
-            io.results.borrow()[1]
+            io.results.borrow()[0]
                 .error
                 .as_deref()
                 .unwrap()
                 .contains("uncommitted")
         );
-        assert!(!io.log.borrow().iter().any(|l| l.starts_with("exit")));
+    }
+
+    #[tokio::test]
+    async fn a_binary_whose_path_is_unknown_still_answers_the_request() {
+        let (_t, _origin, clone, _exe) = fixture();
+        let exe: Result<PathBuf> = Err(anyhow!("no /proc"));
+        let io = Fake::default();
+        *io.pending.borrow_mut() = ids(&["r1"]);
+        tick(&io, &ctx(&clone, &exe, None), &mut HashSet::new()).await;
+        assert_eq!(*io.log.borrow(), ["publish r1 ok=false"]);
+        assert!(
+            io.results.borrow()[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("no /proc")
+        );
+    }
+
+    #[test]
+    fn only_fresh_requests_this_host_has_not_answered_are_pending() {
+        let now = Utc::now();
+        let mut s = state_with(&[], &[]);
+        let fresh = |results: &[&str]| crate::state::Update {
+            by: "host:x".into(),
+            since: now,
+            results: results
+                .iter()
+                .map(|h| {
+                    (
+                        h.to_string(),
+                        UpdateResult {
+                            host: h.to_string(),
+                            ok: true,
+                            commit: None,
+                            error: None,
+                        },
+                    )
+                })
+                .collect(),
+        };
+        s.updates.clear();
+        s.updates.insert("fresh".into(), fresh(&[]));
+        s.updates.insert("mine".into(), fresh(&["h"]));
+        s.updates.insert("theirs".into(), fresh(&["other"]));
+        let mut stale = fresh(&[]);
+        stale.since = now - REQUEST_MAX_AGE - chrono::Duration::seconds(1);
+        s.updates.insert("stale".into(), stale);
+        assert_eq!(pending_for(&s, "h", now), ["fresh", "theirs"]);
+    }
+
+    #[tokio::test]
+    async fn the_second_update_keeps_the_build_before_it_as_prev() {
+        let (_t, origin, clone, exe) = fixture();
+        newer(&origin);
+        assert!(update(&clone, &exe, None).await.is_ok());
+        std::fs::write(&exe, "first").unwrap();
+        sh(&origin, &["commit", "-q", "--allow-empty", "-m", "three"]);
+        assert!(update(&clone, &exe, None).await.is_ok());
+        let prev = exe.with_file_name("agent-fleet.prev");
+        assert_eq!(std::fs::read_to_string(prev).unwrap(), "first");
     }
 
     fn state_with(hosts: &[(&str, Option<&str>)], results: &[(&str, bool, Option<&str>)]) -> State {
@@ -734,6 +918,40 @@ mod tests {
     async fn waited(s: State, hosts: &[&str], limit: Duration) -> Result<()> {
         let hosts: Vec<String> = hosts.iter().map(|h| h.to_string()).collect();
         wait_with(|| async { Ok(s.clone()) }, "r1", &hosts, POLL, limit).await
+    }
+
+    #[tokio::test]
+    async fn wait_survives_a_hub_that_fails_and_names_it_when_it_gives_up() {
+        let ok = state_with(&[("a", Some("abc"))], &[("a", true, Some("abc"))]);
+        let calls = std::cell::Cell::new(0);
+        let hosts = ids(&["a"]);
+        wait_with(
+            || {
+                calls.set(calls.get() + 1);
+                let r = if calls.get() < 3 {
+                    Err(anyhow!("hub down"))
+                } else {
+                    Ok(ok.clone())
+                };
+                async move { r }
+            },
+            "r1",
+            &hosts,
+            POLL,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let e = wait_with(
+            || async { Err(anyhow!("hub down")) },
+            "r1",
+            &hosts,
+            POLL,
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{e}").contains("hub down"), "{e}");
     }
 
     #[tokio::test]

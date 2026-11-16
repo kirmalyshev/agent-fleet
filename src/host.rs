@@ -127,7 +127,7 @@ pub(crate) struct Host {
     n: Counters,
     /// Spawn executions and handoffs in flight; a self-update restart waits for zero.
     busy: AtomicUsize,
-    /// A self-update restart is waiting: start no new spawn or handoff.
+    /// A self-update restart is waiting: no new spawn or handoff gets a guard.
     draining: AtomicBool,
 }
 
@@ -232,9 +232,13 @@ impl Host {
         }
     }
 
-    pub(crate) fn busy_guard(&self) -> Busy<'_> {
+    /// A guard for work a restart would cut short, or `None` once a restart is waiting: the
+    /// counter is raised before the flag is read, so work either holds the guard the restart
+    /// waits for or never starts.
+    pub(crate) fn busy_guard(&self) -> Option<Busy<'_>> {
         self.busy.fetch_add(1, Ordering::SeqCst);
-        Busy(&self.busy)
+        let guard = Busy(&self.busy);
+        (!self.is_draining()).then_some(guard)
     }
 
     pub(crate) fn is_busy(&self) -> bool {

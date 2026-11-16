@@ -636,17 +636,23 @@ as `host:<this machine>`): it makes every host rebuild and restart.
 The update is hardened:
 
 - **Work in flight.** A spawn execution or handoff running when the build finishes would be cut
-  off by the exit and run again from scratch. The host answers `update.result`, starts no new
-  spawn or handoff, waits until the running ones end, then exits.
+  off by the exit and run again from scratch. The host answers `update.result`, then stops
+  handing out guards for new spawns and handoffs (a request that arrives later is run by the
+  new process), waits until the running ones end, then exits. It waits at most 20 minutes, then
+  exits anyway, so a hung one cannot keep the old binary running. If the answer could not be
+  written, the host still restarts: the new process finds the request unanswered and answers it.
 - **Time limits.** `git pull` 2 min, other git 1 min, `cargo install` 30 min; the process group
-  is killed on a timeout and the update answers with the error. git never prompts
-  (`GIT_TERMINAL_PROMPT=0`, ssh `BatchMode`).
-- **One at a time.** A non-blocking `flock` in the clone's git dir around the pull and build:
-  a second update in the same clone (two hosts on one machine) is refused, not raced.
-- **Rollback.** The old binary stays hard-linked as `<binary>.prev`. To roll back, rename it over
-  the binary and restart the host.
-- **Leftovers.** At start a host removes `.agent-fleet-update-<pid>` directories older than 10
-  minutes from its binary's directory (a killed update leaves one).
+  is killed on a timeout and the update answers with the error. No command reads stdin, and git
+  never prompts (`GIT_TERMINAL_PROMPT=0`, ssh `BatchMode`; set for every command it runs).
+- **One at a time.** A non-blocking `flock` in the clone's git dir, taken before the checks and
+  held through pull and build: a second update in the same clone (two hosts on one machine) is
+  refused with an error, not raced or queued.
+- **Rollback.** The previous binary is kept as `<binary>.prev` (a hard link, else a copy); one
+  generation, replaced by each update. If it cannot be kept the update fails before the rename.
+  To roll back, rename it over the binary and restart the host.
+- **Leftovers.** At start a host removes `.agent-fleet-update-<pid>` directories from its
+  binary's directory that are older than 45 minutes and whose process is gone (a killed update
+  leaves one; a live pid is another host's build in progress).
 
 The hub is not restarted: a change to the protocol needs the hub
 restarted by hand first, or it refuses what the new hosts write.
