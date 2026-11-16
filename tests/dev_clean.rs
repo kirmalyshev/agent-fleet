@@ -117,6 +117,42 @@ fn clean_retires_finished_work_in_every_connected_repo_and_keeps_the_rest() {
         .output()
         .unwrap();
     let sleeper = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // Merged PR, a `dev up` service in its slot: `down --release`, then retired.
+    let port = loop {
+        let p = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        if (20000..65000).contains(&p) {
+            break p;
+        }
+    };
+    let served_dir = t.join("served");
+    git(
+        &a,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "served",
+            served_dir.to_str().unwrap(),
+        ],
+    );
+    std::fs::create_dir_all(served_dir.join(".agent-fleet")).unwrap();
+    std::fs::write(
+        served_dir.join(".agent-fleet/dev.toml"),
+        format!(
+            "[slots]\nmax = 3\nstep = 1\nports = {{ app = {port} }}\n\
+             [services.app]\nrun = \"exec sleep 60\"\n"
+        ),
+    )
+    .unwrap();
+    git(&served_dir, &["add", "."]);
+    git(&served_dir, &["commit", "-q", "-m", "dev.toml"]);
+    git(&served_dir, &["push", "-q", "origin", "served"]);
+    let served = git(&served_dir, &["rev-parse", "HEAD"]);
     branch(&a, "local", false, false); // local-only commit: kept
     branch(&a, "pushed", false, true); // on origin: deleted
     let b = repo(t, "b");
@@ -128,6 +164,7 @@ fn clean_retires_finished_work_in_every_connected_repo_and_keeps_the_rest() {
         pr("dirty", "MERGED", &dirty, 3),
         pr("locked", "MERGED", &locked, 4),
         pr("busy", "MERGED", &busy, 5),
+        pr("served", "MERGED", &served, 6),
     ];
     let gh = format!(
         "#!/bin/sh\ncase \"$*\" in\n*owner/a*) echo '[{}]' ;;\n*owner/b*) echo '[{}]' ;;\n\
@@ -158,12 +195,13 @@ fn clean_retires_finished_work_in_every_connected_repo_and_keeps_the_rest() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(home.join("token"), "t").unwrap();
     std::fs::write(home.join("replica.db"), "").unwrap();
-    let fleet = |args: &[&str]| {
+    let run_in = |dir: &Path, args: &[&str]| {
         let out = Command::new(env!("CARGO_BIN_EXE_agent-fleet"))
             .args(["--hub", "http://127.0.0.1:1", "--host-name", "h"])
             .args(args)
-            .current_dir(&a)
+            .current_dir(dir)
             .env("AGENT_FLEET_HOME", &home)
+            .env("AGENT_FLEET_DEV_SHARED", t.join("claims"))
             .env("AGENT_FLEET_CONFIG_DIR", &config)
             .env("AGENT_FLEET_GH", &gh_path)
             .env_remove("AGENT_FLEET_INSTANCE")
@@ -171,12 +209,22 @@ fn clean_retires_finished_work_in_every_connected_repo_and_keeps_the_rest() {
             .unwrap();
         ok(out, &format!("agent-fleet {args:?}"))
     };
+    let fleet = |args: &[&str]| run_in(&a, args);
+    run_in(&served_dir, &["dev", "up", "--app"]);
 
     let ls = fleet(&["dev", "ls"]);
     assert!(ls.contains("owner/a") && ls.contains("owner/b"), "{ls}");
     assert!(ls.contains("#2 open"), "{ls}");
+    assert!(
+        ls.contains(&format!(
+            "slot 1 (served), ports app {}, running app",
+            port + 1
+        )),
+        "{ls}"
+    );
     let dry = fleet(&["dev", "clean"]);
     assert!(dry.contains("dry run"), "{dry}");
+    assert!(dry.contains("dev down --release: slot 1 (served)"), "{dry}");
     assert!(t.join("merged").exists(), "a dry run removes nothing");
     let only_b = fleet(&["dev", "clean", "--repo", "owner/b"]);
     assert!(!only_b.contains("owner/a"), "{only_b}");
@@ -191,6 +239,9 @@ fn clean_retires_finished_work_in_every_connected_repo_and_keeps_the_rest() {
         .unwrap();
     assert!(!alive.success(), "{sleeper} still runs");
     assert!(!t.join("busy").exists(), "{out}");
+    assert!(out.contains("released slot 1, stopped app"), "{out}");
+    assert!(!served_dir.exists(), "{out}");
+    assert!(fleet(&["dev", "prune"]).contains("nothing to prune"));
     assert!(out.contains("[merged: pr]"), "{out}");
     assert!(out.contains("[closed: pr]"), "{out}");
     assert!(out.contains("delete pushed (pushed)"), "{out}");

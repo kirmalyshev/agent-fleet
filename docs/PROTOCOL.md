@@ -900,7 +900,10 @@ is in a worktree clean retires, read live (cwds from `/proc` on Linux, from one 
 pid reused by another process (another start time or cwd) is never hit. `ls` and the dry run list
 them, pid and command. A herdr pane, anything under an agent program (`claude`, `codex`, `devin`)
 and the caller and its ancestors are never stopped; one of them in the worktree keeps it. Without
-a hub or replica, no agent is known. `:dev ls` and `:dev clean` run at once from the screen unless they
+a hub or replica, no agent is known. `ls` shows each worktree's `dev` slot (`docs/DEV.md`), its
+ports and running services; `clean --execute` runs a worktree's `dev down --release` (its
+services' process groups stopped, its state and slot freed) before the leftover processes are
+stopped and it is retired. `:dev ls` and `:dev clean` run at once from the screen unless they
 have `--execute`.
 
 ## The board

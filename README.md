@@ -1,47 +1,63 @@
 # agent-fleet
 
-One event log for a fleet of coding agents. Every fact (an agent came up, a task was claimed, a
-blocker was raised, a message was delivered) is a typed event. State is a fold over the events,
-and every view is a function of the state.
+agent-fleet helps you run several AI coding agents at the same time. The agents (Claude Code,
+Codex, Devin CLI and others) run in [herdr](https://herdr.dev) terminal panes, on one machine or a
+few. With five or ten of them at work, it is hard to keep track: which agent works on which
+issue, which one has stopped and why, whether two of them do the same work, and what they left
+behind. agent-fleet keeps that record for you and acts on it:
 
-It is for people who run several AI coding agents (Claude Code, Codex, Devin CLI and others) in
-[herdr](https://herdr.dev) panes on one machine or a few. It tells you what every agent is doing,
-gives tasks one owner each, delivers messages to agents and proves they arrived, starts agents on
-GitHub issues, and finds hung, orphaned or forgotten work.
+- It starts an agent on a GitHub issue, in its own git worktree, with a brief.
+- It shows what every agent is doing: working, idle or blocked, on which task and branch.
+- It gives each task one owner, so two agents do not take the same issue.
+- It delivers messages to agents and records that they arrived.
+- It finds stuck agents, hung or orphaned processes, and forgotten worktrees, and tells you or
+  the agent that coordinates the others.
 
-One Rust binary, no runtime. Linux and macOS.
+It is for a developer who runs a fleet of coding agents on their own GitHub repositories. One
+Rust binary, no runtime. Linux and macOS.
+
+## What using it looks like
+
+Connect a repository once, then start an agent on an issue. The agent gets a worktree, a herdr
+pane, a brief and the issue as its task:
+
+```sh
+agent-fleet repo add owner/repo
+agent-fleet spawn owner/repo#123       # prints: agent:<host>/<session>/<name> is up (pane …, <worktree>)
+```
+
+Start more, then see the fleet:
+
+```sh
+agent-fleet ps                         # every agent: working, idle or blocked, and for how long
+agent-fleet tui                        # one screen: agents, worktrees, tasks, findings, questions
+agent-fleet doctor                     # what needs a look: stuck or hung agents, duplicate work,
+                                       # forgotten worktrees, unpushed commits
+```
+
+When an agent stops on something it cannot clear itself (a question, a full context, an error,
+an empty quota), agent-fleet reads its screen, names the cause and sends a message to the agent's
+lead, or to the agent you made coordinator. agent-fleet types each message into the recipient's
+prompt (a "doorbell"), for example:
+
+```
+[agent-fleet host:laptop→lead] QUESTION c-123: c-123: Keep the old API or remove it? (event …)
+```
+
+A hung or orphaned process gets the same kind of message (`HUNG`, `ORPHAN`), with the
+`agent-fleet kill` command that stops it safely. You answer agents, send them work and finish
+tasks from the CLI, the TUI or the browser board (`agent-fleet ui`):
+
+```sh
+agent-fleet tell c-123 FYI owner/repo#123 "keep the old API"
+agent-fleet task done task:repo/123
+```
+
+Agents run the same commands themselves: they claim tasks, raise blockers, ask you questions
+and message each other.
 
 **Status:** early (0.1.0). It runs a real fleet every day, but the CLI, the config and the
 protocol can still change without notice.
-
-## How it works
-
-```
-   agents ── fleet CLI ──┐                       ┌── agent-fleet host (machine A) ── herdr ── agent panes
-                         ▼                       │
-                 agent-fleet hub: event log ── SSE ────┼── agent-fleet host (machine B) ── herdr ── agent panes
-                 (SQLite) + state                │
-                                                 └── …
-```
-
-1. **Everything is an event.** An agent runs `agent-fleet task add`, `agent-fleet block` or `agent-fleet tell`. Each
-   command sends one small JSON event to the hub, for example `blocker.raised`.
-2. **The hub keeps the log.** It checks each event, appends it to a SQLite log, and folds the log
-   into one state: who is up, who owns which task, what is blocked, which messages are not yet
-   delivered. `agent-fleet ps` and `agent-fleet ui --text` print that state.
-3. **One host agent per machine (and herdr session) watches herdr.** herdr pushes a status change when an agent turns
-   idle, working or blocked. `agent-fleet host` turns each change into an event, so the hub always knows
-   what every agent is doing, with no polling.
-4. **Messages are doorbells.** `agent-fleet tell` writes a `msg.sent` event. The host agent on the
-   recipient's machine types it into that agent's prompt. When it sees the agent start working,
-   it writes `msg.delivered`. A message with no `delivered` is visibly lost, and the host retries
-   it.
-5. **Only one thing needs the hub's permission.** Claiming a task is exclusive: if someone already
-   holds it, the hub answers 409. Everything else can wait. When the hub is down, the CLI keeps
-   writes in a local spool and sends them later; replaying is safe because every event has a
-   unique id.
-6. **Every machine has a copy.** The host agent copies the whole log locally. When the hub is
-   down, reads still work from that copy.
 
 ## Prerequisites
 
@@ -73,65 +89,6 @@ lists your Claude and Codex skills that drive terminals (herdr, tmux, cmux): in 
 talk through `agent-fleet tell` and `spawn`, so check that those skills do not tell them to type
 into each other's panes. Edit the two files, then start the hub and the host as in the quick
 start below.
-
-## Connect a repository
-
-```sh
-cd <checkout of owner/repo>
-agent-fleet repo add owner/repo        # or: agent-fleet repo add owner/repo <checkout>
-agent-fleet repo ls
-agent-fleet repo rm owner/repo
-```
-
-`repo add` records the checkout in the machine's `fleet.toml` (`[repos]`). It refuses a directory
-that is not a git checkout and a checkout whose `origin` is another repository. The host re-reads
-the list at each spawn and scan, so no restart is needed. It lists the repository's own terminal-driving
-skills (`.claude/skills`, `.codex/skills`) the same way. A repository with its own
-`.agent-fleet/fleet.toml` uses that file instead of the machine's rules.
-
-`agent-fleet host --repo owner/repo=<checkout>` flags still work and merge with this list.
-Try a route without starting anything: `agent-fleet spawn owner/repo#123 --dry-run`. The
-keys are explained in [docs/fleet.example.toml](docs/fleet.example.toml).
-
-### Clean up worktrees
-
-```sh
-agent-fleet dev ls                        # every connected repo; --repo owner/repo for one
-agent-fleet dev clean                     # what it would retire and delete (a dry run)
-agent-fleet dev clean --execute
-```
-
-These cover the connected repositories, the checkouts the host reports, and the one you are in.
-A local branch is finished when its tip is the head of one of your merged or closed PRs, is in the
-default branch, or is in `origin/<branch>`. A branch with an open PR, or with commits nowhere else,
-is never deleted. Only a finished PR retires a worktree, and never the main checkout, the one you
-are in, a locked one, one an agent works in (by the fleet's log, the same rule as `doctor`'s
-`forgotten`), or one with uncommitted files. Processes left in a worktree it retires are stopped
-first (TERM, then KILL after 5 s); `ls` and the dry run list them, pid and command. A process an
-agent program runs, a herdr pane and your own shell are never stopped: one of those in a worktree
-keeps it; when the working directories of processes cannot be read (no `/proc`, no `lsof`), every
-worktree is kept. It never unlocks a worktree: a lock whose pid is gone is called stale, with its
-`git worktree unlock` command. A worktree is retired as the TUI's `x` does it:
-`.agent-fleet/hook retire <path>`, else `git worktree remove`. `gh` (`AGENT_FLEET_GH`) reads the
-PRs, one `gh pr list` per repository.
-
-## Per-worktree dev environments
-
-A repository with an `.agent-fleet/dev.toml` gets a dev environment per worktree: each worktree
-has a slot with its own ports and values, its own services, and the shared infra.
-
-```sh
-agent-fleet dev up --api --web   # infra, then the services; waits for health, prints URLs
-agent-fleet dev status           # running, healthy, env changed since start
-agent-fleet dev logs api
-agent-fleet dev down             # this worktree's services only; --release frees the slot
-agent-fleet dev db reset         # the repo's [db] command; refuses a database another worktree uses
-agent-fleet dev test unit -x     # the repo's [test.unit] with this worktree's env
-agent-fleet dev agents           # the fleet's agents here: worktree, slot, PR and its health
-agent-fleet dev prs              # your open PRs everywhere, their health and the agent on each
-```
-
-The file format, the commands and how slots are shared are in [docs/DEV.md](docs/DEV.md).
 
 ## Quick start
 
@@ -174,6 +131,68 @@ agent-fleet hub --listen 127.0.0.1:7799 &       # later commands find this hub t
 
 An agent's CLI reads its pane shell's environment, not yours: export the same two variables in
 that shell before you start the agent, or its commands go to your other fleet.
+
+## Connect a repository
+
+```sh
+cd <checkout of owner/repo>
+agent-fleet repo add owner/repo        # or: agent-fleet repo add owner/repo <checkout>
+agent-fleet repo ls
+agent-fleet repo rm owner/repo
+```
+
+`repo add` records the checkout in the machine's `fleet.toml` (`[repos]`). It refuses a directory
+that is not a git checkout and a checkout whose `origin` is another repository. The host re-reads
+the list at each spawn and scan, so no restart is needed. It lists the repository's own terminal-driving
+skills (`.claude/skills`, `.codex/skills`) the same way. A repository with its own
+`.agent-fleet/fleet.toml` uses that file instead of the machine's rules.
+
+`agent-fleet host --repo owner/repo=<checkout>` flags still work and merge with this list.
+Try a route without starting anything: `agent-fleet spawn owner/repo#123 --dry-run`. The
+keys are explained in [docs/fleet.example.toml](docs/fleet.example.toml).
+
+### Clean up worktrees
+
+```sh
+agent-fleet dev ls                        # every connected repo; --repo owner/repo for one
+agent-fleet dev clean                     # what it would retire and delete (a dry run)
+agent-fleet dev clean --execute
+agent-fleet dev prune                     # free the slots of deleted worktrees
+```
+
+These cover the connected repositories, the checkouts the host reports, and the one you are in.
+A local branch is finished when its tip is the head of one of your merged or closed PRs, is in the
+default branch, or is in `origin/<branch>`. A branch with an open PR, or with commits nowhere else,
+is never deleted. Only a finished PR retires a worktree, and never the main checkout, the one you
+are in, a locked one, one an agent works in (by the fleet's log, the same rule as `doctor`'s
+`forgotten`), or one with uncommitted files. Processes left in a worktree it retires are stopped
+first (TERM, then KILL after 5 s); `ls` and the dry run list them, pid and command. A process an
+agent program runs, a herdr pane and your own shell are never stopped: one of those in a worktree
+keeps it; when the working directories of processes cannot be read (no `/proc`, no `lsof`), every
+worktree is kept. It never unlocks a worktree: a lock whose pid is gone is called stale, with its
+`git worktree unlock` command. `ls` also shows each worktree's dev slot, ports and running
+services, and `clean` runs `dev down --release` for a worktree before it retires it. A worktree is
+retired as the TUI's `x` does it:
+`.agent-fleet/hook retire <path>`, else `git worktree remove`. `gh` (`AGENT_FLEET_GH`) reads the
+PRs, one `gh pr list` per repository.
+
+## Per-worktree dev environments
+
+A repository with an `.agent-fleet/dev.toml` gets a dev environment per worktree: each worktree
+has a slot with its own ports and values, its own services, and the shared infra.
+
+```sh
+agent-fleet dev up --api --web   # infra, then the services; waits for health, prints URLs
+agent-fleet dev status           # running, healthy, env changed since start
+agent-fleet dev logs api
+agent-fleet dev down             # this worktree's services only; --release frees the slot
+agent-fleet dev db reset         # the repo's [db] command; refuses a database another worktree uses
+agent-fleet dev test unit -x     # the repo's [test.unit] with this worktree's env
+agent-fleet dev agents           # the fleet's agents here: worktree, slot, PR and its health
+agent-fleet dev prs              # your open PRs everywhere, their health and the agent on each
+```
+
+The file format, the commands and how slots are shared are in [docs/DEV.md](docs/DEV.md).
 
 ## Run the hub and host as services
 
@@ -368,6 +387,39 @@ and one herdr session. `agent-fleet instances` lists them.
 loopback (`--listen 127.0.0.1:7710 --listen <address>:7710`); it refuses `0.0.0.0`. On each other
 machine run a host with `AGENT_FLEET_HUB=http://<address>:7710` and a token file: a copy of the
 shared token, or better a token minted for that host (see [SECURITY.md](SECURITY.md)).
+
+## How it works
+
+agent-fleet is one event log. Every fact (an agent came up, a task was claimed, a blocker was
+raised, a message was delivered) is a typed event. The state is computed from the events in order
+(a fold), and every view (`ps`, `tui`, `ui`) is read off that state.
+
+```
+   agents ── fleet CLI ──┐                       ┌── agent-fleet host (machine A) ── herdr ── agent panes
+                         ▼                       │
+                 agent-fleet hub: event log ── SSE ────┼── agent-fleet host (machine B) ── herdr ── agent panes
+                 (SQLite) + state                │
+                                                 └── …
+```
+
+1. **Everything is an event.** An agent runs `agent-fleet task add`, `agent-fleet block` or `agent-fleet tell`. Each
+   command sends one small JSON event to the hub, for example `blocker.raised`.
+2. **The hub keeps the log.** It checks each event, appends it to a SQLite log, and folds the log
+   into one state: who is up, who owns which task, what is blocked, which messages are not yet
+   delivered. `agent-fleet ps` and `agent-fleet ui --text` print that state.
+3. **One host agent per machine (and herdr session) watches herdr.** herdr pushes a status change when an agent turns
+   idle, working or blocked. `agent-fleet host` turns each change into an event, so the hub always knows
+   what every agent is doing, with no polling.
+4. **Messages are doorbells.** `agent-fleet tell` writes a `msg.sent` event. The host agent on the
+   recipient's machine types it into that agent's prompt. When it sees the agent start working,
+   it writes `msg.delivered`. A message with no `delivered` is visibly lost, and the host retries
+   it.
+5. **Only one thing needs the hub's permission.** Claiming a task is exclusive: if someone already
+   holds it, the hub answers 409. Everything else can wait. When the hub is down, the CLI keeps
+   writes in a local spool and sends them later; replaying is safe because every event has a
+   unique id.
+6. **Every machine has a copy.** The host agent copies the whole log locally. When the hub is
+   down, reads still work from that copy.
 
 ## Commands
 

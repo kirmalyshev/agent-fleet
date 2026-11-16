@@ -20,6 +20,8 @@ Run them anywhere inside the worktree.
 | `dev env` | The rendered `[env]`, one `KEY=value` per line. |
 | `dev url` | Each service's URL. |
 | `dev info` | JSON: slot, id, root, main, ports, env, services (running, pid, url, log), the recorded set. |
+| `dev prune` | Run anywhere. Frees the slot, state and logs of each worktree in your `slots.json` that is gone from disk and runs no service any more. A deleted worktree whose services still run keeps its slot, and the line names them. |
+| `dev ls`, `dev clean` | Across every connected repository: each worktree's branch, PR, slot, ports and running services, and which finished worktrees and branches `clean` retires. Before it retires a worktree, `clean --execute` runs its `dev down --release`. See the README's *Clean up worktrees*. |
 | `dev db setup\|reset\|drop` | Run the `[db]` command with the `[env]`, in the root. `reset` and `drop` refuse when another of your worktrees that still exists, or another user, uses the same database name (see [Slots](#slots)). After `drop` succeeds it stops the services and frees the slot, as `down --release`. |
 | `dev test <name> [args…]` | Run `[test.<name>]` with the `[env]` and the test's own `env`; the args go after its `run`, and its exit code is `dev test`'s. |
 | `dev agents` | The fleet's agents in the repository you are in, on this machine: state, slot, branch, the branch's open PR and its health, worktree. |
@@ -150,7 +152,8 @@ A shell's `${VAR}` is left as is, so `run = "serve --port ${PORT}"` with
 ## Slots
 
 - The main checkout is slot 0. A linked worktree claims the lowest free slot ≥ 1 on first use
-  and keeps it while it exists; `dev down --release` frees it.
+  and keeps it while it exists; `dev down --release` frees it, as does `dev clean --execute` when
+  it retires the worktree, and `dev prune` once the worktree is deleted and its services stopped.
 - Each user's claims are in `<data dir>/dev/slots.json` (worktree path → slot, for every
   repository), changed under an exclusive `flock`.
 - Users on one machine share ports, so each user also publishes the slots they hold to

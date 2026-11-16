@@ -9,11 +9,12 @@
 #   ./dev ls               this repo's worktrees: branch, PR, commits not in main,
 #                          uncommitted files, and what clean would do with it
 #   ./dev clean            what clean would retire, stop and delete (a dry run); --execute does it
+#   ./dev prune            free the slots of deleted worktrees whose services stopped
 #
 # ls and clean cover only this repository (its `origin`, so take no --repo);
 # `agent-fleet dev ls|clean` covers every connected one. docs/DEV.md has the dev.toml format.
 set -eu
-[ $# -gt 0 ] || { sed -n '2,14s/^# \{0,1\}//p' "$0"; exit 1; }
+[ $# -gt 0 ] || { sed -n '2,15s/^# \{0,1\}//p' "$0"; exit 1; }
 case $1 in ls | clean)
   origin=$(git -C "$(dirname "$0")" remote get-url origin)
   set -- "$@" --repo "$(printf %s "$origin" | sed -E 's#(\.git)?/?$##; s#.*[:/]([^/:]+/[^/:]+)$#\1#')"
