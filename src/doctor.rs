@@ -41,8 +41,8 @@ pub const SPAWN_FAILED: Duration = Duration::hours(1);
 /// after it.
 pub const UPDATE_FAILED: Duration = Duration::hours(2);
 /// Above the longest an update can take to answer: the wait for another update's lock plus a
-/// build (`update::LOCK_WAIT` + `update::BUILD`, 65 min).
-pub const UPDATE_UNANSWERED: Duration = Duration::minutes(70);
+/// build (`update::LOCK_WAIT` + `update::BUILD`, 65 min), with room for the git steps.
+pub const UPDATE_UNANSWERED: Duration = Duration::minutes(75);
 /// A `proc.hung` report confirmed this recently is kill proof: three watch ticks.
 pub const HUNG_FRESH: Duration = Duration::minutes(6);
 /// A host whose `host.health` is older than this is not compared for `build`.
@@ -905,11 +905,11 @@ mod tests {
         s.updates.clear();
         s.updates.insert("c".into(), up(3, Some("mac"), vec![]));
         assert!(findings(&s, now).is_empty(), "too soon");
-        s.updates.insert("c".into(), up(75, Some("mac"), vec![]));
+        s.updates.insert("c".into(), up(80, Some("mac"), vec![]));
         let f = findings(&s, now);
         assert!(f[0].detail.contains("not answered"), "{f:#?}");
         // Asked of another host, or an hour old: nothing.
-        s.updates.insert("c".into(), up(75, Some("other"), vec![]));
+        s.updates.insert("c".into(), up(80, Some("other"), vec![]));
         assert!(findings(&s, now).is_empty());
         s.updates.insert("c".into(), up(150, Some("mac"), vec![]));
         assert!(findings(&s, now).is_empty());
@@ -1016,6 +1016,64 @@ mod tests {
         old.results.get_mut("mac").unwrap().commit = None;
         s.updates.insert("a".into(), old);
         assert!(findings(&s, now).is_empty());
+    }
+
+    #[test]
+    fn a_later_success_clears_a_retained_failure_and_the_unanswered_limit_has_its_edges() {
+        use crate::event::UpdateResult;
+        let now = Utc::now();
+        let mut s = State::default();
+        s.hosts.insert(
+            "mac".into(),
+            crate::state::Host {
+                disk_free: 0,
+                disk_total: 0,
+                agents: 0,
+                commit: Some("aaa".into()),
+                ts: now,
+                started: Some(now - Duration::minutes(5)),
+            },
+        );
+        let result = |ok: bool, commit: &str| UpdateResult {
+            host: "mac".into(),
+            ok,
+            commit: Some(commit.into()),
+            error: None,
+        };
+        let up = |mins: i64, results: Vec<UpdateResult>| crate::state::Update {
+            by: "host:ops".into(),
+            since: now - Duration::minutes(mins),
+            host: None,
+            results: results.into_iter().map(|r| (r.host.clone(), r)).collect(),
+        };
+        s.updates
+            .insert("old".into(), up(500, vec![result(false, "aaa")]));
+        assert_eq!(findings(&s, now).len(), 1, "retained");
+        s.updates
+            .insert("new".into(), up(100, vec![result(true, "aaa")]));
+        assert!(findings(&s, now).is_empty(), "a later success clears it");
+        // Unanswered: quiet up to the limit, a finding after it. The host started after the
+        // request, so the request (newer than its start) is not the "ignored" kind.
+        s.updates.clear();
+        s.hosts.get_mut("mac").unwrap().started = Some(now - Duration::minutes(600));
+        s.updates.insert("r".into(), up(65, vec![]));
+        assert!(
+            findings(&s, now).is_empty(),
+            "65 min: a build can still be running"
+        );
+        s.updates.insert("r".into(), up(80, vec![]));
+        assert_eq!(findings(&s, now).len(), 1);
+        // Exactly the request limit at host start: ignored; a minute less: not.
+        s.hosts.get_mut("mac").unwrap().started = Some(now - Duration::minutes(65));
+        s.updates.insert("r".into(), up(80, vec![]));
+        assert!(findings(&s, now).is_empty(), "stale (15 min) at start");
+        s.hosts.get_mut("mac").unwrap().started = Some(now - Duration::minutes(66));
+        assert_eq!(findings(&s, now).len(), 1, "14 min old at start: fresh");
+        // A stale request that the host did answer still reports its result.
+        s.hosts.get_mut("mac").unwrap().started = Some(now - Duration::minutes(65));
+        s.updates
+            .insert("r".into(), up(80, vec![result(false, "aaa")]));
+        assert_eq!(findings(&s, now).len(), 1);
     }
 
     #[test]

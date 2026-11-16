@@ -1576,6 +1576,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_reports_a_failure_that_names_the_commit_the_host_runs_as_refused() {
+        let s = state_with(&[("a", Some("abc"))], &[("a", false, Some("abc"))]);
+        let e = waited(s, &["a"], Duration::from_secs(5)).await.unwrap_err();
+        assert!(format!("{e}").contains("refused"), "{e}");
+    }
+
+    #[tokio::test]
     async fn wait_fails_on_a_refusal_and_on_a_host_that_never_restarts() {
         let refused = state_with(&[("a", Some("old"))], &[("a", false, None)]);
         let e = waited(refused, &["a"], Duration::from_secs(5))
