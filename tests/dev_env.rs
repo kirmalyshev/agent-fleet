@@ -63,6 +63,11 @@ url = "http://localhost:{{port.app}}"
 }
 
 fn repo(health: &str, timeout: u32) -> Repo {
+    repo_with(health, timeout, "")
+}
+
+/// A repo whose dev.toml has `extra` after the usual service.
+fn repo_with(health: &str, timeout: u32, extra: &str) -> Repo {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let main = tmp.path().join("main");
@@ -70,7 +75,7 @@ fn repo(health: &str, timeout: u32) -> Repo {
     let base = free_port();
     fs::write(
         main.join(".agent-fleet/dev.toml"),
-        config(base, health, timeout),
+        config(base, health, timeout) + extra,
     )
     .unwrap();
     fs::write(main.join(".gitignore"), ".started\n").unwrap();
@@ -231,4 +236,79 @@ fn worktrees_get_their_own_slots_and_ports() {
     r.ok(&b, &["down"]);
     assert_eq!(r.info(&c)["services"]["app"]["running"], true);
     r.ok(&c, &["down"]);
+}
+
+#[test]
+fn test_runs_with_the_worktree_env_args_and_exit_code() {
+    let r = repo_with(
+        "true",
+        20,
+        r#"
+[test.unit]
+run = "echo T=$T W=$WHO"
+env = { T = "{slot}" }
+
+[test.fail]
+run = "exit 3"
+"#,
+    );
+    let a = r.worktree("wt-a");
+    let out = r.ok(&a, &["test", "unit", "--x", "two words"]);
+    assert_eq!(out.trim(), "T=1 W=w_wt_a_1 --x two words");
+    assert_eq!(r.dev(&a, &["test", "fail"]).status.code(), Some(3));
+    let err = r.dev(&a, &["test", "nope"]);
+    assert!(String::from_utf8_lossy(&err.stderr).contains("it has: fail, unit"));
+}
+
+#[test]
+fn db_reset_and_drop_refuse_a_name_someone_else_uses() {
+    let r = repo_with(
+        "true",
+        20,
+        r#"
+[db]
+name = "same"
+setup = "touch {root}/.db"
+reset = "echo reset {id}"
+drop = "rm {root}/.db"
+"#,
+    );
+    let a = r.worktree("wt-a");
+    r.ok(&a, &["db", "setup"]);
+    assert!(a.join(".db").exists());
+    // Alone, the name is free.
+    assert!(r.ok(&a, &["db", "reset"]).contains("reset wt_a"));
+    // A second worktree with the same name: both refuse.
+    let b = r.worktree("wt-b");
+    r.ok(&b, &["info"]);
+    let err = r.dev(&a, &["db", "reset"]);
+    assert!(!err.status.success());
+    let msg = String::from_utf8_lossy(&err.stderr);
+    assert!(
+        msg.contains("refusing to reset database same") && msg.contains("wt-b"),
+        "{msg}"
+    );
+    assert!(!r.dev(&b, &["db", "drop"]).status.success());
+    // Released, wt-b no longer counts; another user's published name does.
+    r.ok(&b, &["down", "--release"]);
+    r.ok(&a, &["db", "reset"]);
+    let other = r.home.join("shared/4000000000.dbs.json");
+    fs::write(&other, r#"["same"]"#).unwrap();
+    let msg = String::from_utf8_lossy(&r.dev(&a, &["db", "drop"]).stderr).into_owned();
+    assert!(msg.contains("uid 4000000000"), "{msg}");
+    fs::remove_file(&other).unwrap();
+    // drop runs the command, then frees the slot like `down --release`.
+    r.ok(&a, &["up", "app"]);
+    let pid = r.info(&a)["services"]["app"]["pid"].as_i64().unwrap();
+    let out = r.ok(&a, &["db", "drop"]);
+    assert!(out.contains("released slot 1"), "{out}");
+    assert!(!a.join(".db").exists());
+    assert!(!alive(pid));
+    let mine: Vec<String> = fs::read_dir(r.home.join("shared"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".dbs.json"))
+        .flat_map(|e| serde_json::from_slice::<Vec<String>>(&fs::read(e.path()).unwrap()).unwrap())
+        .collect();
+    assert!(mine.is_empty(), "{mine:?}");
 }

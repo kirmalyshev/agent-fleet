@@ -7,6 +7,7 @@ mod host;
 mod hub;
 mod kill;
 mod orphanpr;
+mod prs;
 mod quota;
 mod scan;
 mod setup;
@@ -22,6 +23,7 @@ mod update;
 mod watch;
 mod worktree;
 
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -142,7 +144,8 @@ enum Cmd {
     },
     /// Per-worktree dev environments from the repository's `.agent-fleet/dev.toml` (`up`, `down`,
     /// `status` …: each worktree gets a slot with its own ports and values, runs its own services,
-    /// and shares the infra), and the worktrees of the connected repositories (`ls`, `clean`).
+    /// and shares the infra; `db`, `test`), the worktrees of the connected repositories (`ls`,
+    /// `clean`), and the agents and PRs on them (`agents`, `prs`).
     Dev {
         #[command(subcommand)]
         cmd: dev::Cmd,
@@ -921,7 +924,10 @@ async fn main() -> Result<()> {
         return machine_config(&cli.cmd);
     }
     if let Cmd::Dev { cmd } = &cli.cmd
-        && !matches!(cmd, dev::Cmd::Ls { .. } | dev::Cmd::Clean { .. })
+        && !matches!(
+            cmd,
+            dev::Cmd::Ls { .. } | dev::Cmd::Clean { .. } | dev::Cmd::Agents | dev::Cmd::Prs
+        )
     {
         return dev::run(cmd).await;
     }
@@ -990,11 +996,6 @@ async fn main() -> Result<()> {
         }
         Cmd::Tui => tui::run(&ctx).await?,
         Cmd::Dev { cmd } => {
-            let (only, clean, execute) = match cmd {
-                dev::Cmd::Ls { repo } => (repo, false, false),
-                dev::Cmd::Clean { repo, execute } => (repo, true, *execute),
-                _ => unreachable!("dev::run runs the rest"),
-            };
             let s = match ctx.snapshot_state().await {
                 Ok((s, note)) => {
                     if let Some(note) = note {
@@ -1013,10 +1014,47 @@ async fn main() -> Result<()> {
                 None => Default::default(),
             };
             let cwd = std::env::current_dir()?;
-            let here = scan::repo_of(&cwd.to_string_lossy()).await.map(Into::into);
+            let here: Option<PathBuf> = scan::repo_of(&cwd.to_string_lossy()).await.map(Into::into);
             let host = ctx.host_name();
-            let repos = worktree::repos(registered, &s, &host, here, only.as_deref())?;
-            print!("{}", worktree::run(&ctx, &repos, &s, clean, execute).await);
+            let colour = std::io::stdout().is_terminal();
+            match cmd {
+                dev::Cmd::Ls { repo } | dev::Cmd::Clean { repo, .. } => {
+                    let (clean, execute) = match cmd {
+                        dev::Cmd::Clean { execute, .. } => (true, *execute),
+                        _ => (false, false),
+                    };
+                    let repos = worktree::repos(registered, &s, &host, here, repo.as_deref())?;
+                    print!("{}", worktree::run(&ctx, &repos, &s, clean, execute).await);
+                }
+                dev::Cmd::Agents => {
+                    let Some(repo) = here else {
+                        bail!("not in a git checkout");
+                    };
+                    let slug = spawn::slug_of(&repo).ok_or_else(|| {
+                        anyhow::anyhow!("{} has no origin remote", repo.display())
+                    })?;
+                    let prs = prs::open_prs(&slug, false).unwrap_or_else(|e| {
+                        eprintln!("agent-fleet: gh failed, PRs unknown: {e:#}");
+                        Vec::new()
+                    });
+                    let repo = repo.to_string_lossy();
+                    print!(
+                        "{}",
+                        prs::agents(&s, &host, &repo, &prs, &dev::slots()?, colour)
+                    );
+                }
+                dev::Cmd::Prs => {
+                    let repos: Vec<_> = worktree::repos(registered, &s, &host, here, None)?
+                        .into_iter()
+                        .map(|(slug, dir)| {
+                            let prs = prs::open_prs(&slug, true);
+                            (slug, dir, prs)
+                        })
+                        .collect();
+                    print!("{}", prs::prs(&s, &host, &repos, colour));
+                }
+                _ => unreachable!("dev::run runs the rest"),
+            }
         }
         Cmd::Instances => {
             for (name, hub) in Paths::instances()? {

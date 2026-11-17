@@ -25,17 +25,19 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-Try a change against a throwaway fleet, never against one you depend on: a temporary
-`AGENT_FLEET_HOME`, an `--instance` of its own and a free port, as in the README's quick start.
-Start its daemons with a time limit, so they stop by themselves:
+Try a change against a throwaway fleet, never against one you depend on. `./dev` gives each
+worktree its own, from `.agent-fleet/dev.toml` (details in [docs/DEV.md](docs/DEV.md#this-repositorys-own-devtoml)):
 
 ```sh
-export AGENT_FLEET_HOME=$(mktemp -d) AGENT_FLEET_INSTANCE=try
-timeout 30m agent-fleet hub --listen 127.0.0.1:7799 &
+./dev up hub                          # builds this checkout, starts a hub on this worktree's port
+set -a; eval "$(./dev env)"; set +a   # this shell's agent-fleet talks to it
+./dev up host                         # optional, from a herdr pane
+./dev down --release                  # stops them and deletes the throwaway data
 ```
 
 `agent-fleet kill` refuses every `agent-fleet` process, throwaway ones too, and an agent must not
-use a raw `kill`; without the time limit only a human can stop them.
+use a raw `kill`; `./dev down` is how an agent stops the daemons it started. A hub started by hand
+needs a time limit (`timeout 30m agent-fleet hub …`), or only a human can stop it.
 
 ## Worktrees
 
@@ -43,10 +45,11 @@ use a raw `kill`; without the time limit only a human can stop them.
 to this repository (see the README's [Clean up worktrees](README.md#clean-up-worktrees);
 `agent-fleet dev ls|clean` covers every connected repository). `./dev ls` lists its worktrees:
 branch, PR, commits not in `origin/main`, uncommitted files, and what `clean` would do.
+`./dev agents` and `./dev prs` show the agents in this repository and your open PRs with their
+health.
 `./dev clean` shows which worktrees of merged or closed PRs it would remove (after their `dev down
---release`), the processes it would
-stop there, and which finished local branches it would delete; `--execute` does it. It needs `gh`
-for PR states.
+--release`), the processes it would stop there, and which finished local branches it would
+delete; `--execute` does it. It needs `gh` for PR states.
 
 ## Code map
 
@@ -72,6 +75,7 @@ One crate, one binary. `docs/PROTOCOL.md` is the spec, `schema/` the generated J
 | `src/kill.rs` | `agent-fleet kill` and `hook bash`. |
 | `src/doctor.rs` | Findings read off the state. |
 | `src/worktree.rs` | `dev ls` and `dev clean`: every connected repo's worktrees and finished branches. |
+| `src/prs.rs` | `dev agents` and `dev prs`: open PRs, their health, and the agents on them. |
 | `src/orphanpr.rs` | Open PRs no live agent owns, read off `gh`. |
 | `src/update.rs` | `self-update`: the host pulls its clone, rebuilds and restarts. |
 | `src/ui.rs`, `src/board.html` | Text views and the browser board. |

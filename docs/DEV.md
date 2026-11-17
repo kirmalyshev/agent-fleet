@@ -22,6 +22,17 @@ Run them anywhere inside the worktree.
 | `dev info` | JSON: slot, id, root, main, ports, env, services (running, pid, url, log), the recorded set. |
 | `dev prune` | Run anywhere. Frees the slot, state and logs of each worktree in your `slots.json` that is gone from disk and runs no service any more. A deleted worktree whose services still run keeps its slot, and the line names them. |
 | `dev ls`, `dev clean` | Across every connected repository: each worktree's branch, PR, slot, ports and running services, and which finished worktrees and branches `clean` retires. Before it retires a worktree, `clean --execute` runs its `dev down --release`. See the README's *Clean up worktrees*. |
+| `dev db setup\|reset\|drop` | Run the `[db]` command with the `[env]`, in the root. `reset` and `drop` refuse when another of your worktrees that still exists, or another user, uses the same database name (see [Slots](#slots)). After `drop` succeeds it stops the services and frees the slot, as `down --release`. |
+| `dev test <name> [args…]` | Run `[test.<name>]` with the `[env]` and the test's own `env`; the args go after its `run`, and its exit code is `dev test`'s. |
+| `dev agents` | The fleet's agents in the repository you are in, on this machine: state, slot, branch, the branch's open PR and its health, worktree. |
+| `dev prs` | Your open PRs in every connected repository, with their health and the agents on each: those in a worktree of that branch on this machine, and the owners of open tasks whose url is the PR. |
+
+A PR's health, coloured on a terminal: `conflict` (red), else `failing` when a check failed (red),
+else `pending` while a check runs (yellow), else `unknown` until GitHub has worked out whether it
+merges (yellow; it does on the first ask), else `ok` (green). `gh` (`AGENT_FLEET_GH`) reads them,
+one `gh pr list` per repository.
+
+Name services bare when they share a name with a global flag: `dev up hub`, not `dev up --hub`.
 
 ## `.agent-fleet/dev.toml`
 
@@ -51,6 +62,17 @@ url = "http://localhost:{port.api}"      # shown by `dev url` and `dev up`
 dir = "web"
 run = "npm start"
 env = { PORT = "{port.web}" }            # on top of [env], for this service only
+
+[db]                         # for `dev db`
+name = "app_{id}"            # the database this worktree uses: what reset and drop check
+setup = "make db-create migrate"
+reset = "make db-reset"
+drop = "dropdb --if-exists app_{id}"
+
+[test.unit]                  # `dev test unit [args…]`
+dir = "server"
+run = "pytest"
+env = { CACHE_OFFSET = "{slot}" }
 ```
 
 Every value except `max`, `step` and the port bases is a template:
@@ -61,6 +83,7 @@ Every value except `max`, `step` and the port bases is a template:
 | `{id}` | A short stable name: the worktree's directory name, lowercased, other characters `_`. |
 | `{port.<name>}` | `ports.<name> + step * slot`. A name not in `ports` is an error. |
 | `{root}` | The worktree's absolute path. |
+| `{state}` | The worktree's state directory (see [Slots](#slots)): for data a throwaway service keeps; `down --release` deletes it. |
 
 Any other `{…}`, such as a shell's `${HOME}`, stays as it is. Commands run with `sh -c`, in the
 service's `dir`, with the process environment plus `[env]` plus the service's `env`. Unknown keys,
@@ -139,8 +162,30 @@ A shell's `${VAR}` is left as is, so `run = "serve --port ${PORT}"` with
   owned by root or by you, and sticky when others may write it; `dev` creates it `1777` when it is
   missing. For several users, create it once as root: `sudo install -d -m 1777
   /var/tmp/agent-fleet-dev`. `AGENT_FLEET_DEV_SHARED` names another directory.
+- A worktree that runs any `dev` command with a `[db]` records its rendered `name` in
+  `<data dir>/dev/dbs.json` (worktree path → name) and publishes the names of your worktrees that
+  still exist to `<shared dir>/<uid>.dbs.json`. `dev db reset|drop` refuses a name another entry
+  holds. `down --release` and `db drop` forget the worktree's name.
 - A worktree's state is in `<data dir>/dev/<slot>-<id>/`: `state.json` (the recorded set, and
   each running service's process group, its leader's start time and env) and `<service>.log`. Nothing is written inside
   the worktree.
 
 `<data dir>` is `AGENT_FLEET_HOME`, else the default instance's data directory.
+
+## This repository's own `dev.toml`
+
+`.agent-fleet/dev.toml` in this repository gives each worktree a throwaway fleet, so a contributor
+never tests against the fleet they run:
+
+```sh
+./dev up hub                          # builds, starts a hub on 17710 + 10 * slot, data in {state}/fleet
+set -a; eval "$(./dev env)"; set +a   # this shell's agent-fleet now talks to it
+agent-fleet ps
+./dev up host                         # optional, from a herdr pane: a host reporting to it
+./dev down --release                  # stops both and deletes the hub's data
+```
+
+`./dev env` sets `AGENT_FLEET_HUB`, `AGENT_FLEET_TOKEN_FILE` and `AGENT_FLEET_INSTANCE=dev-<id>`;
+the instance keeps the shell's spool and replica in `<data dir>/instances/dev-<id>`, away from
+your real fleet's. `down` never leaves the hub or host running, which `agent-fleet kill` refuses
+to stop.
