@@ -1253,6 +1253,25 @@ impl Host {
                 let Some(to) = view.state.recipient(&msg.to) else {
                     continue;
                 };
+                // A status report that waited out a reconnect is history: close it unrung.
+                if let Some(why) = msg.stale(chrono::Utc::now()) {
+                    let dropped = MsgDelivered {
+                        to: to.to_string(),
+                        observed: AgentState::Idle,
+                        rung: None,
+                        attempts: Some(0),
+                    };
+                    if self
+                        .publish(self.presence(Known::MsgDelivered(dropped)).re(id))
+                        .await
+                    {
+                        eprintln!(
+                            "agent-fleet host: {id} to {} dropped, not rung: {why}",
+                            msg.to
+                        );
+                    }
+                    continue;
+                }
                 let target = {
                     let panes = self.panes.lock().unwrap();
                     panes
@@ -1482,6 +1501,15 @@ mod tests {
 
     /// A host on a fake herdr, with a hub that is down: its writes go to the spool and replica.
     async fn host_on_fake(dir: &Path, status: &str) -> (Arc<Host>, Arc<FakeHerdr>, u64) {
+        host_on_fake_msg(dir, status, "FYI", 0).await
+    }
+    /// As `host_on_fake`, the one queued message being a `kind` sent `age_h` hours ago.
+    async fn host_on_fake_msg(
+        dir: &Path,
+        status: &str,
+        kind: &str,
+        age_h: i64,
+    ) -> (Arc<Host>, Arc<FakeHerdr>, u64) {
         let sock = dir.join("herdr.sock");
         let fake = Arc::new(FakeHerdr::default());
         *fake.status.lock().unwrap() = status.into();
@@ -1522,16 +1550,14 @@ mod tests {
             "p",
             Known::MsgSent(MsgSent {
                 to: "agent:h/s/a".into(),
-                kind: "FYI".into(),
+                kind: kind.into(),
                 reference: "x".into(),
                 text: "hi".into(),
             }),
         );
-        host.replica
-            .lock()
-            .unwrap()
-            .append(&msg.into_event())
-            .unwrap();
+        let mut msg = msg.into_event();
+        msg.ts -= chrono::Duration::hours(age_h);
+        host.replica.lock().unwrap().append(&msg).unwrap();
         tokio::spawn(host.clone().delivery_loop());
         host.wake.notify_one();
         (host, fake, epoch)
@@ -1590,6 +1616,25 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_status_report_that_waited_out_a_reconnect_is_dropped_not_rung() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, fake, _) = host_on_fake_msg(dir.path(), "idle", "MERGED", 20).await;
+        for _ in 0..200 {
+            if types(&host).contains(&"msg.delivered".to_string()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            fake.prompts.lock().unwrap().is_empty(),
+            "a 20 h old MERGED rang"
+        );
+        assert!(
+            types(&host).contains(&"msg.delivered".to_string()),
+            "dropped, so it leaves the undelivered list"
+        );
+    }
     #[tokio::test]
     async fn a_busy_agent_is_not_rung() {
         let dir = tempfile::tempdir().unwrap();

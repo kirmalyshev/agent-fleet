@@ -134,6 +134,12 @@ pub fn compute(rows: &[(Event, Option<i64>)], now: DateTime<Utc>, window: Durati
                 s.doorbells.sent += 1;
                 sent.insert(&e.id, e.ts);
             }
+            Known::MsgDelivered(d) if d.attempts == Some(0) => {
+                // Closed unrung (a stale status report): no ring happened to time.
+                if let Some(re) = e.re.as_deref() {
+                    sent.remove(re);
+                }
+            }
             Known::MsgDelivered(d) => {
                 let Some(at_sent) = e.re.as_deref().and_then(|re| sent.remove(re)) else {
                     continue;

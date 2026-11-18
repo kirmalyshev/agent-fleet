@@ -388,6 +388,25 @@ pub struct Msg {
     pub since: DateTime<Utc>,
 }
 
+/// A status report (`MERGED`, `DONE`, `RETIRE`, `OPEN`, `FIX`) still undelivered this long
+/// after it was sent is history: its host was away, and what it announced has long been acted on.
+pub const MSG_FRESH: chrono::Duration = chrono::Duration::hours(6);
+
+impl Msg {
+    /// Why ringing this doorbell now would be a false alarm, if it would: a status report that
+    /// waited out a host reconnect. Questions and instructions (`ASK`, `BLOCKED`, ...) never go stale.
+    pub fn stale(&self, now: DateTime<Utc>) -> Option<String> {
+        let status = ["MERGED", "DONE", "RETIRE", "OPEN", "FIX"];
+        (status.contains(&self.kind.as_str()) && now - self.since > MSG_FRESH).then(|| {
+            format!(
+                "{} sent {}h ago, before this host came back",
+                self.kind,
+                (now - self.since).num_hours()
+            )
+        })
+    }
+}
+
 impl State {
     pub fn fold<'a>(events: impl IntoIterator<Item = &'a Event>) -> Self {
         let mut s = Self::default();
@@ -2545,5 +2564,25 @@ mod tests {
         let mut s = State::default();
         s.apply(&by("host:h1", health).into_event());
         assert_eq!(s.hosts["h1"].commit.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn a_status_report_older_than_six_hours_is_stale_and_a_question_never_is() {
+        let now = Utc::now();
+        let msg = |kind: &str, ago: i64| Msg {
+            from: "agent:h/s/a".into(),
+            to: "coordinator".into(),
+            kind: kind.into(),
+            reference: "x#1".into(),
+            text: "t".into(),
+            since: now - chrono::Duration::hours(ago),
+        };
+        for k in ["MERGED", "DONE", "RETIRE", "OPEN", "FIX"] {
+            assert!(msg(k, 5).stale(now).is_none(), "{k} at 5h is still news");
+            assert!(msg(k, 7).stale(now).unwrap().contains("7h ago"), "{k}");
+        }
+        for k in ["BLOCKED", "ASK", "FYI"] {
+            assert!(msg(k, 30).stale(now).is_none(), "{k} never goes stale");
+        }
     }
 }
