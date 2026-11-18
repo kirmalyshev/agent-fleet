@@ -1272,7 +1272,7 @@ mod tests {
         let v = w.step(lone(), at(4), &seen());
         assert!(matches!(verdict(&v, 41), Some(Verdict::Hung(_))), "{v:#?}");
         let mut w = Watch::default();
-        let only = || tree(&[(40, SHELL, "tail", "tail -f x.log", 0, 20)]);
+        let only = || tree(&[(40, SHELL, "tail", "tail --follow=name x.log", 0, 20)]);
         w.step(only(), at(0), &seen());
         w.step(only(), at(2), &seen());
         let v = w.step(only(), at(4), &seen());
@@ -1280,7 +1280,7 @@ mod tests {
     }
 
     #[test]
-    fn a_wedged_sibling_beside_a_listener_stays_hung_and_follow_eq_is_spared() {
+    fn a_wedged_sibling_beside_a_listener_stays_hung() {
         let mut w = Watch::default();
         let mut sn = seen();
         sn.listening.insert(31);
@@ -1288,7 +1288,6 @@ mod tests {
             tree(&[
                 (31, SHELL, "node", "node server.js", 0, 20),
                 (32, SHELL, "sleep", "sleep 9999", 0, 20),
-                (33, SHELL, "tail", "tail --follow=name x.log", 0, 20),
             ])
         };
         w.step(t(), at(0), &sn);
