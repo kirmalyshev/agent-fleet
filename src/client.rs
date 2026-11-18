@@ -76,7 +76,12 @@ impl Paths {
 
     /// The instances on this machine, by name, with the hub each one points at.
     pub fn instances() -> Result<Vec<(String, String)>> {
-        let base = Self::base()?;
+        Ok(Self::instances_in(&Self::base()?))
+    }
+
+    /// The instances whose data dirs are under `base`.
+    pub fn instances_in(base: &Path) -> Vec<(String, String)> {
+        let base = base.to_path_buf();
         let mut out = vec![(
             DEFAULT_INSTANCE.to_string(),
             Self { dir: base.clone() }.hub_url(),
@@ -86,13 +91,16 @@ impl Paths {
                 .flatten()
                 .filter_map(|e| {
                     let name = e.file_name().to_str()?.to_string();
-                    Some((name, Self { dir: e.path() }.hub_url()))
+                    // Not a stray file (`.DS_Store`), a name `--instance` refuses, or a second
+                    // `default`: that one is `base` itself.
+                    (valid_instance_name(&name) && name != DEFAULT_INSTANCE && e.path().is_dir())
+                        .then(|| (name, Self { dir: e.path() }.hub_url()))
                 })
                 .collect();
             named.sort();
             out.extend(named);
         }
-        Ok(out)
+        out
     }
 
     /// The hub this instance uses: what `agent-fleet hub` last wrote here, or the local default.

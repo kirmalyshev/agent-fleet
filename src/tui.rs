@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use futures_util::FutureExt;
 use ratatui::crossterm::event::{self, Event as Key, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -106,6 +107,62 @@ struct Done {
     ok: bool,
     out: String,
     then: Option<Vec<String>>,
+    /// The instance it ran against, under `tui --all`.
+    on: Option<String>,
+    /// That instance's index: a dry run's spawn stays behind `y` only while it is on screen.
+    at: usize,
+}
+
+/// One instance in the strip `tui --all` draws under the title.
+struct Summary {
+    name: String,
+    text: String,
+    color: Color,
+    /// `(host, path)` of each worktree its agents work in: no instance removes one another
+    /// instance's agent works in.
+    busy: Vec<(String, String)>,
+}
+
+/// What the strip says of an instance: its counts, read off its hub or its replica, or that it has
+/// no state at all.
+fn summary(name: String, got: &Result<(State, Option<String>)>, now: DateTime<Utc>) -> Summary {
+    let (s, warn) = match got {
+        Ok(v) => v,
+        Err(_) => {
+            return Summary {
+                name,
+                text: "no state".into(),
+                color: Color::Red,
+                busy: Vec::new(),
+            };
+        }
+    };
+    let working = (s.agents.values())
+        .filter(|a| a.state == AgentState::Working)
+        .count();
+    let found = findings(s, now).len();
+    let busy = (s.agents.values())
+        .filter_map(|a| worktree_of(s, a))
+        .map(|(_, w)| (w.state.host.clone(), w.state.path.clone()))
+        .collect();
+    let counts = format!(
+        "{} agents, {working} working, {found} findings",
+        s.agents.len()
+    );
+    match warn {
+        Some(_) => Summary {
+            name,
+            text: format!("replica: {counts}"),
+            color: Color::Yellow,
+            busy,
+        },
+        None => Summary {
+            name,
+            text: counts,
+            color: if found == 0 { Color::Green } else { DIM },
+            busy,
+        },
+    }
 }
 
 struct App {
@@ -122,6 +179,10 @@ struct App {
     last: Option<Output>,
     tx: mpsc::Sender<Done>,
     rx: mpsc::Receiver<Done>,
+    /// The instance on screen: an index into the fleets the screen runs with.
+    on: usize,
+    /// Every instance, in the order of the fleets; more than one only under `tui --all`.
+    instances: Vec<Summary>,
 }
 
 /// The home directory as `~`, also inside `<host>:<path>` keys.
@@ -184,7 +245,45 @@ impl App {
             last: None,
             tx,
             rx,
+            on: 0,
+            instances: Vec::new(),
         }
+    }
+
+    /// Several instances on one screen (`tui --all`).
+    fn multi(&self) -> bool {
+        self.instances.len() > 1
+    }
+
+    /// `<instance>: ` before a prompt or an outcome under `tui --all`, so it is plain which
+    /// instance an action goes to.
+    fn label(&self, name: &str) -> String {
+        if self.multi() {
+            format!("{name}: ")
+        } else {
+            String::new()
+        }
+    }
+
+    /// Puts the next (or previous) instance on screen. Its rows replace the last one's only once
+    /// its own state is read, so no row of one instance is ever shown or acted on under another.
+    fn switch(&mut self, forward: bool) {
+        let n = self.instances.len();
+        if n < 2 {
+            return;
+        }
+        self.on = (self.on + if forward { 1 } else { n - 1 }) % n;
+        self.state = State::default();
+        self.found.clear();
+        self.warn = None;
+        self.tables = Default::default();
+        self.loaded = None;
+        // A dry run's spawn belongs to the instance it ran on.
+        if let Some(l) = &mut self.last {
+            l.then = None;
+        }
+        let name = self.instances[self.on].name.clone();
+        self.say(format!("instance {name}"));
     }
 
     fn at(&self) -> usize {
@@ -240,45 +339,52 @@ impl App {
     }
 }
 
-pub async fn run(fleet: &impl Fleet) -> Result<()> {
+/// The screen over `fleets`, one instance each, starting on `fleets[on]`. With one fleet it is
+/// the single-instance screen; with several (`tui --all`), `[` and `]` switch between them.
+pub async fn run<F: Fleet>(fleets: &[F], on: usize) -> Result<()> {
     let mut term = ratatui::init();
-    let result = main_loop(&mut term, fleet).await;
+    let result = main_loop(&mut term, fleets, on).await;
     ratatui::restore();
     result
 }
 
-async fn main_loop(term: &mut DefaultTerminal, fleet: &impl Fleet) -> Result<()> {
-    let mut app = App::new();
+async fn main_loop<F: Fleet>(term: &mut DefaultTerminal, fleets: &[F], on: usize) -> Result<()> {
+    let mut app = App {
+        on: on.min(fleets.len().saturating_sub(1)),
+        instances: (fleets.iter())
+            .map(|f| Summary {
+                name: f.instance().to_string(),
+                text: "reading".into(),
+                color: DIM,
+                busy: Vec::new(),
+            })
+            .collect(),
+        ..App::new()
+    };
+    // Each instance's read in flight. They are polled between keys, never awaited, so a hub that
+    // is slow to answer holds up neither the keys nor the other instances.
+    let mut reading: Vec<_> = fleets.iter().map(|_| None).collect();
     loop {
         while let Ok(done) = app.rx.try_recv() {
             finished(&mut app, done);
         }
         if app.loaded.is_none_or(|t| t.elapsed() >= REFRESH) {
-            match fleet.snapshot().await {
-                Ok((s, warn)) => {
-                    app.found = findings(&s, Utc::now());
-                    app.state = s;
-                    app.warn = warn;
-                }
-                Err(e) => app.warn = Some(format!("{e:#}")),
-            }
             app.loaded = Some(Instant::now());
-            for tab in TABS.map(|(t, _)| t) {
-                let saved = app.tab;
-                app.tab = tab;
-                let n = app.rows();
-                let t = &mut app.tables[tab as usize];
-                t.select(if n == 0 {
-                    None
-                } else {
-                    Some(t.selected().unwrap_or(0).min(n - 1))
-                });
-                app.tab = saved;
+            for (r, f) in reading.iter_mut().zip(fleets) {
+                if r.is_none() {
+                    *r = Some(Box::pin(f.snapshot()));
+                }
+            }
+        }
+        for (i, r) in reading.iter_mut().enumerate() {
+            if let Some(got) = r.as_mut().and_then(|r| r.now_or_never()) {
+                *r = None;
+                loaded(&mut app, i, got, Utc::now());
             }
         }
         let now = Utc::now();
-        term.draw(|f| draw(f, &app, fleet, now))?;
-        if !event::poll(Duration::from_millis(250))? {
+        term.draw(|f| draw(f, &app, fleets, now))?;
+        if !event::poll(Duration::from_millis(100))? {
             continue;
         }
         let Key::Key(k) = event::read()? else {
@@ -290,56 +396,115 @@ async fn main_loop(term: &mut DefaultTerminal, fleet: &impl Fleet) -> Result<()>
         if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
             return Ok(());
         }
-        match std::mem::replace(&mut app.mode, Mode::Normal) {
-            Mode::Help => {}
-            Mode::Confirm(_, Pending::Run(args)) if k.code == KeyCode::Char('y') => {
-                start(&mut app, fleet, args, None)
-            }
-            Mode::Confirm(_, pending) if k.code == KeyCode::Char('y') => {
-                let msg = act(fleet, pending).await;
-                app.say(msg);
-                app.loaded = None;
-            }
-            Mode::Confirm(..) => app.say("cancelled"),
-            Mode::Output(out, scroll) => match k.code {
-                KeyCode::Char('y') if out.then.is_some() => {
-                    if let Some(l) = &mut app.last {
-                        l.then = None;
-                    }
-                    start(&mut app, fleet, out.then.unwrap_or_default(), None);
-                }
-                KeyCode::Down | KeyCode::Char('j') => app.mode = Mode::Output(out, scroll + 1),
-                KeyCode::Up | KeyCode::Char('k') => {
-                    app.mode = Mode::Output(out, scroll.saturating_sub(1))
-                }
-                KeyCode::PageDown => app.mode = Mode::Output(out, scroll + 10),
-                KeyCode::PageUp => app.mode = Mode::Output(out, scroll.saturating_sub(10)),
-                _ => {}
-            },
-            Mode::Input(what, mut buf) => match k.code {
-                KeyCode::Esc => app.say("cancelled"),
-                KeyCode::Enter if !buf.trim().is_empty() => entered(&mut app, fleet, what, buf),
-                KeyCode::Tab if matches!(what, Input::Command) => {
-                    complete(&mut app, &mut buf, fleet.instance());
-                    app.mode = Mode::Input(what, buf);
-                }
-                KeyCode::Backspace => {
-                    buf.pop();
-                    app.mode = Mode::Input(what, buf);
-                }
-                KeyCode::Char(c) => {
-                    buf.push(c);
-                    app.mode = Mode::Input(what, buf);
-                }
-                _ => app.mode = Mode::Input(what, buf),
-            },
-            Mode::Normal => {
-                if !key(&mut app, k.code, fleet).await {
-                    return Ok(());
-                }
-            }
+        if !press(&mut app, fleets, k.code).await {
+            return Ok(());
         }
     }
+}
+
+/// Reads every instance's state at once and takes each in, as the screen does between keys.
+#[cfg(test)]
+async fn refresh<F: Fleet>(app: &mut App, fleets: &[F]) {
+    if app.instances.len() != fleets.len() {
+        app.instances = (fleets.iter())
+            .map(|f| {
+                summary(
+                    f.instance().to_string(),
+                    &Err(anyhow::anyhow!("")),
+                    Utc::now(),
+                )
+            })
+            .collect();
+    }
+    let got = futures_util::future::join_all(fleets.iter().map(|f| f.snapshot())).await;
+    for (i, got) in got.into_iter().enumerate() {
+        loaded(app, i, got, Utc::now());
+    }
+    app.loaded = Some(Instant::now());
+}
+
+/// One instance's state, from its hub or replica, or why there is none: its line in the strip,
+/// and the tabs when it is the one on screen. One that is down leaves the others as they are.
+fn loaded(app: &mut App, i: usize, got: Result<(State, Option<String>)>, now: DateTime<Utc>) {
+    let name = app.instances[i].name.clone();
+    app.instances[i] = summary(name, &got, now);
+    if i != app.on {
+        return;
+    }
+    match got {
+        Ok((s, warn)) => {
+            app.found = findings(&s, now);
+            app.state = s;
+            app.warn = warn;
+        }
+        Err(e) => app.warn = Some(format!("{e:#}")),
+    }
+    for tab in TABS.map(|(t, _)| t) {
+        let saved = app.tab;
+        app.tab = tab;
+        let n = app.rows();
+        let t = &mut app.tables[tab as usize];
+        t.select(if n == 0 {
+            None
+        } else {
+            Some(t.selected().unwrap_or(0).min(n - 1))
+        });
+        app.tab = saved;
+    }
+}
+
+/// Handles a key in any mode; every action goes to the instance on screen. `false` quits.
+async fn press<F: Fleet>(app: &mut App, fleets: &[F], code: KeyCode) -> bool {
+    let fleet = &fleets[app.on];
+    match std::mem::replace(&mut app.mode, Mode::Normal) {
+        Mode::Help => {}
+        Mode::Confirm(_, Pending::Run(args)) if code == KeyCode::Char('y') => {
+            start(app, fleet, args, None)
+        }
+        Mode::Confirm(_, pending) if code == KeyCode::Char('y') => {
+            let msg = act(fleet, pending).await;
+            app.say(format!("{}{msg}", app.label(fleet.instance())));
+            app.loaded = None;
+        }
+        Mode::Confirm(..) => app.say("cancelled"),
+        Mode::Output(out, scroll) => match code {
+            KeyCode::Char('y') if out.then.is_some() => {
+                if let Some(l) = &mut app.last {
+                    l.then = None;
+                }
+                start(app, fleet, out.then.unwrap_or_default(), None);
+            }
+            KeyCode::Down | KeyCode::Char('j') => app.mode = Mode::Output(out, scroll + 1),
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.mode = Mode::Output(out, scroll.saturating_sub(1))
+            }
+            KeyCode::PageDown => app.mode = Mode::Output(out, scroll + 10),
+            KeyCode::PageUp => app.mode = Mode::Output(out, scroll.saturating_sub(10)),
+            _ => {}
+        },
+        Mode::Input(what, mut buf) => match code {
+            KeyCode::Esc => app.say("cancelled"),
+            KeyCode::Enter if !buf.trim().is_empty() => entered(app, fleet, what, buf),
+            KeyCode::Tab if matches!(what, Input::Command) => {
+                complete(app, &mut buf, fleet.instance());
+                app.mode = Mode::Input(what, buf);
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+                app.mode = Mode::Input(what, buf);
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                app.mode = Mode::Input(what, buf);
+            }
+            _ => app.mode = Mode::Input(what, buf),
+        },
+        Mode::Normal if app.multi() && matches!(code, KeyCode::Char('[' | ']')) => {
+            app.switch(code == KeyCode::Char(']'))
+        }
+        Mode::Normal => return key(app, code, fleet).await,
+    }
+    true
 }
 
 /// A typed line: a message to send, a command to run, an answer to give. Each asks first.
@@ -434,8 +599,10 @@ fn words(s: &str) -> Result<Vec<String>, String> {
 fn start(app: &mut App, fleet: &impl Fleet, args: Vec<String>, then: Option<Vec<String>>) {
     let argv = fleet.cli();
     let tx = app.tx.clone();
-    app.jobs.push(args.join(" "));
-    app.say(format!("running {}", args.join(" ")));
+    let (on, at) = (app.multi().then(|| fleet.instance().to_string()), app.on);
+    let label = format!("{}{}", app.label(fleet.instance()), args.join(" "));
+    app.jobs.push(label.clone());
+    app.say(format!("running {label}"));
     std::thread::spawn(move || {
         let out = std::process::Command::new(&argv[0])
             .args(&argv[1..])
@@ -458,6 +625,8 @@ fn start(app: &mut App, fleet: &impl Fleet, args: Vec<String>, then: Option<Vec<
             ok,
             out,
             then,
+            on,
+            at,
         });
     });
 }
@@ -466,18 +635,25 @@ fn start(app: &mut App, fleet: &impl Fleet, args: Vec<String>, then: Option<Vec<
 /// dry run opens the whole output (`o` opens it again).
 fn finished(app: &mut App, d: Done) {
     let cmd = d.args.join(" ");
-    if let Some(i) = app.jobs.iter().position(|j| *j == cmd) {
+    let (label, flag) = match &d.on {
+        Some(on) => (format!("{on}: "), format!("--instance {on} ")),
+        None => Default::default(),
+    };
+    if let Some(i) = app.jobs.iter().position(|j| *j == format!("{label}{cmd}")) {
         app.jobs.remove(i);
     }
     app.loaded = None;
     let last = d.out.lines().rev().find(|l| !l.trim().is_empty());
     let last = last.unwrap_or(if d.ok { "done" } else { "failed" });
     let verb: Vec<&str> = d.args.iter().take(2).map(String::as_str).collect();
-    app.say(format!("{}: {last}", verb.join(" ")));
+    app.say(format!("{label}{}: {last}", verb.join(" ")));
     let out = Output {
-        title: format!("agent-fleet {cmd}{}", if d.ok { "" } else { " (failed)" }),
+        title: format!(
+            "agent-fleet {flag}{cmd}{}",
+            if d.ok { "" } else { " (failed)" }
+        ),
         text: d.out.clone(),
-        then: d.then.filter(|_| d.ok),
+        then: d.then.filter(|_| d.ok && d.at == app.on),
     };
     let open = !d.ok || d.out.trim().lines().count() > 1 || out.then.is_some();
     app.last = Some(out.clone());
@@ -778,11 +954,14 @@ async fn action(app: &mut App, c: char, fleet: &impl Fleet) {
             if st.path == st.repo {
                 return app.say("a main checkout is never removed");
             }
-            if app
-                .state
-                .agents
-                .values()
-                .any(|a| worktree_of(&app.state, a).is_some_and(|(k, _)| *k == key))
+            let elsewhere = (app.instances.iter())
+                .any(|i| i.busy.iter().any(|(h, p)| *h == st.host && *p == st.path));
+            if elsewhere
+                || app
+                    .state
+                    .agents
+                    .values()
+                    .any(|a| worktree_of(&app.state, a).is_some_and(|(k, _)| *k == key))
             {
                 return app.say("an agent works there");
             }
@@ -959,6 +1138,16 @@ async fn focus(fleet: &impl Fleet, id: &str, host: &str, pane: Option<&str>) -> 
     if host != fleet.host() {
         return format!("{} runs on {host}", short(id));
     }
+    // A pane id is herdr's per session: another session's agent is not this socket's pane.
+    let session = id.strip_prefix("agent:").and_then(|r| r.split('/').nth(1));
+    if let (Some(s), Ok(here)) = (session, std::env::var("HERDR_SESSION"))
+        && s != here
+    {
+        return format!(
+            "{} runs in herdr session {s}; focus it from there",
+            short(id)
+        );
+    }
     let (Some(pane), Some(sock)) = (pane, std::env::var_os("HERDR_SOCKET_PATH")) else {
         return "focus works from inside the agent's herdr session".into();
     };
@@ -969,15 +1158,17 @@ async fn focus(fleet: &impl Fleet, id: &str, host: &str, pane: Option<&str>) -> 
     }
 }
 
-fn draw(f: &mut Frame, app: &App, fleet: &impl Fleet, now: DateTime<Utc>) {
+fn draw<F: Fleet>(f: &mut Frame, app: &App, fleets: &[F], now: DateTime<Utc>) {
+    let fleet = &fleets[app.on];
     let alerts: Vec<&Finding> = app
         .found
         .iter()
         .filter(|f| matches!(f.kind, "orphan" | "hung" | "duplicate" | "breach"))
         .take(3)
         .collect();
+    let strip = strip(app, f.area().width as usize);
     let [head, alert, tabs, table, detail, foot] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(1 + strip.len() as u16),
         Constraint::Length(alerts.len() as u16 + u16::from(app.warn.is_some())),
         Constraint::Length(2),
         Constraint::Min(5),
@@ -1014,7 +1205,9 @@ fn draw(f: &mut Frame, app: &App, fleet: &impl Fleet, now: DateTime<Utc>) {
         ),
         Span::raw(format!(" · {} undelivered", s.msgs.len())),
     ]);
-    f.render_widget(Paragraph::new(summary), head);
+    let mut top = vec![summary];
+    top.extend(strip);
+    f.render_widget(Paragraph::new(top), head);
 
     let mut lines: Vec<Line> = Vec::new();
     if let Some(w) = &app.warn {
@@ -1076,9 +1269,10 @@ fn draw(f: &mut Frame, app: &App, fleet: &impl Fleet, now: DateTime<Utc>) {
     text.extend(about);
     f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), detail);
 
+    let on = app.label(fleet.instance());
     let keys = match (&app.mode, app.tab) {
         (Mode::Confirm(q, _), _) => Line::styled(
-            format!("{q}  y yes · any other key no"),
+            format!("{on}{q}  y yes · any other key no"),
             Style::new().fg(Color::Yellow).bold(),
         ),
         (Mode::Input(what, buf), _) => {
@@ -1096,7 +1290,7 @@ fn draw(f: &mut Frame, app: &App, fleet: &impl Fleet, now: DateTime<Utc>) {
             };
             let note = app.note.as_ref().filter(|_| matches!(what, Input::Command));
             Line::from(vec![
-                Span::styled(prompt, Style::new().bold()),
+                Span::styled(format!("{on}{prompt}"), Style::new().bold()),
                 Span::raw(buf.clone()),
                 Span::styled("█", Style::new().fg(DIM)),
                 Span::styled(format!("   {hint} · Esc cancel   "), Style::new().fg(DIM)),
@@ -1128,11 +1322,12 @@ fn draw(f: &mut Frame, app: &App, fleet: &impl Fleet, now: DateTime<Utc>) {
                 Tab::Resources => "L Limit · U Unlimit · ",
                 Tab::Asks => "a Answer · A Approve · ",
             };
+            let switch = if app.multi() { "[ ] Instance · " } else { "" };
             Line::from(vec![
                 Span::styled(jobs, Style::new().fg(Color::Yellow)),
                 Span::styled(note, Style::new().fg(Color::Cyan)),
                 Span::raw(format!(
-                    "{own}: Command · S Spawn · c Coordinator · o Output · ? Help · q Quit"
+                    "{own}: Command · S Spawn · c Coordinator · o Output · {switch}? Help · q Quit"
                 )),
             ])
         }
@@ -1147,6 +1342,33 @@ fn draw(f: &mut Frame, app: &App, fleet: &impl Fleet, now: DateTime<Utc>) {
         Mode::Output(out, scroll) => output(f, out, *scroll),
         _ => {}
     }
+}
+
+/// Under `tui --all`, every instance with its counts or why it has none, the one on screen
+/// reversed; as many lines as `width` needs, so none is cut off. Empty for one instance.
+fn strip(app: &App, width: usize) -> Vec<Line<'_>> {
+    if !app.multi() {
+        return Vec::new();
+    }
+    let mut lines = vec![Line::from(Span::styled("[ ] ", Style::new().fg(DIM)))];
+    for (i, sum) in app.instances.iter().enumerate() {
+        let style = if i == app.on {
+            Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::new().bold()
+        };
+        let entry = [
+            Span::styled(format!(" {} ", sum.name), style),
+            Span::styled(format!(" {}   ", sum.text), Style::new().fg(sum.color)),
+        ];
+        let w: usize = entry.iter().map(Span::width).sum();
+        let last = lines.last_mut().expect("one line at least");
+        if last.width() + w > width && last.width() > 4 {
+            lines.push(Line::from(Span::raw("    ")));
+        }
+        lines.last_mut().expect("one line at least").extend(entry);
+    }
+    lines
 }
 
 type View<'a> = (
@@ -1732,6 +1954,7 @@ fn help(f: &mut Frame) {
         Line::raw(""),
         Line::raw("↑↓ / j k      move            PgUp PgDn   ten rows"),
         Line::raw("← → / 1-6     tabs            r           refresh now (it refreshes every 2 s)"),
+        Line::raw("[ ]           the previous or next instance (tui --all); actions go to it"),
         Line::raw(""),
         Line::raw(
             "Agents        t tell · f focus its herdr pane · R role · H handoff --to <profile>",
@@ -1950,7 +2173,8 @@ mod tests {
             ..App::new()
         };
         let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
-        term.draw(|f| draw(f, &app, &Stub, now)).unwrap();
+        term.draw(|f| draw(f, &app, std::slice::from_ref(&Stub), now))
+            .unwrap();
         let screen: String = term
             .backend()
             .buffer()
@@ -2049,7 +2273,8 @@ mod tests {
                 .map(|r| r.iter().map(|c| c.symbol()).collect())
                 .collect()
         };
-        term.draw(|f| draw(f, &app, &Stub, now)).unwrap();
+        term.draw(|f| draw(f, &app, std::slice::from_ref(&Stub), now))
+            .unwrap();
         let screen = rows(&term);
         let find = |name: &str| screen.iter().find(|r| r.contains(name)).unwrap();
         assert!(
@@ -2062,7 +2287,8 @@ mod tests {
         let detail = screen.join("\n");
         assert!(detail.contains(&format!("until {}", crate::ui::at(now, far))));
         app.tables[Tab::Resources as usize].select(Some(2));
-        term.draw(|f| draw(f, &app, &Stub, now)).unwrap();
+        term.draw(|f| draw(f, &app, std::slice::from_ref(&Stub), now))
+            .unwrap();
         let screen = rows(&term).join("\n");
         for want in [
             "at most 1 of sim".to_string(),
@@ -2073,7 +2299,8 @@ mod tests {
             assert!(screen.contains(&want), "missing {want:?}");
         }
         app.tables[Tab::Resources as usize].select(Some(3));
-        term.draw(|f| draw(f, &app, &Stub, now)).unwrap();
+        term.draw(|f| draw(f, &app, std::slice::from_ref(&Stub), now))
+            .unwrap();
         let screen = rows(&term).join("\n");
         assert!(screen.contains(&format!("expired at {}", crate::ui::at(now, old))));
     }
@@ -2366,6 +2593,8 @@ mod tests {
                 ok: false,
                 out: "agent-fleet kill: REFUSED not yours\nError: killed nothing\n".into(),
                 then: None,
+                on: None,
+                at: 0,
             },
         );
         assert!(matches!(&app.mode, Mode::Output(o, _) if o.text.contains("REFUSED")));
@@ -2373,6 +2602,301 @@ mod tests {
 
     fn w2(s: &str) -> Vec<String> {
         words(s).unwrap()
+    }
+
+    /// One instance of `tui --all`: its state (none: its hub down with no replica), a warning
+    /// when it is read off a replica, and the task writes it receives.
+    struct Inst {
+        name: &'static str,
+        state: Option<State>,
+        warn: Option<&'static str>,
+        did: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Inst {
+        fn new(name: &'static str, state: Option<State>, warn: Option<&'static str>) -> Inst {
+            Inst {
+                name,
+                state,
+                warn,
+                did: Default::default(),
+            }
+        }
+    }
+
+    impl Fleet for Inst {
+        async fn snapshot(&self) -> Result<(State, Option<String>)> {
+            match &self.state {
+                Some(s) => Ok((s.clone(), self.warn.map(str::to_string))),
+                None => Err(anyhow::anyhow!("{}: connection refused", self.name)),
+            }
+        }
+        async fn task(&self, task: &str, _: Known) -> Result<String> {
+            self.did.lock().unwrap().push(task.to_string());
+            Ok("e1".into())
+        }
+        async fn tell(&self, _: &str, _: &str) -> Result<String> {
+            unreachable!()
+        }
+        async fn answer(&self, _: &str, _: &str, _: bool) -> Result<String> {
+            unreachable!()
+        }
+        fn cli(&self) -> Vec<String> {
+            // Prints the command line it was given: the instance flag, then the command.
+            [
+                "sh",
+                "-c",
+                "echo \"$@\"",
+                "agent-fleet",
+                "--instance",
+                self.name,
+            ]
+            .map(str::to_string)
+            .to_vec()
+        }
+        fn instance(&self) -> &str {
+            self.name
+        }
+        fn hub(&self) -> String {
+            format!("http://{}", self.name)
+        }
+        fn host(&self) -> String {
+            "h".into()
+        }
+    }
+
+    fn one_agent() -> State {
+        let mut s = State::default();
+        s.agents.insert(
+            "agent:h/s/builder".into(),
+            Agent {
+                host: "h".into(),
+                kind: None,
+                pane: None,
+                state: AgentState::Working,
+                since: Utc::now(),
+                worked: None,
+                finished: None,
+                usage: None,
+            },
+        );
+        s
+    }
+
+    fn screen<F: Fleet>(app: &App, fleets: &[F]) -> String {
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        term.draw(|f| draw(f, app, fleets, Utc::now())).unwrap();
+        let w = term.backend().buffer().area.width as usize;
+        let cells: Vec<&str> = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        cells.chunks(w).map(|l| l.concat() + "\n").collect()
+    }
+
+    #[tokio::test]
+    async fn all_instances_each_show_their_own_state_and_a_down_hub_breaks_none() {
+        let fleets = [
+            Inst::new("alpha", Some(one_agent()), None),
+            Inst::new("beta", None, None),
+            Inst::new(
+                "gamma",
+                Some(fleet_state()),
+                Some("hub unreachable; local replica"),
+            ),
+        ];
+        let mut app = App::new();
+        refresh(&mut app, &fleets).await;
+        // The one on screen is live; every instance has its line, the down one says so.
+        assert!(app.state.agents.contains_key("agent:h/s/builder") && app.warn.is_none());
+        let text: Vec<(&str, &str)> = (app.instances.iter())
+            .map(|s| (s.name.as_str(), s.text.as_str()))
+            .collect();
+        assert_eq!(text[0], ("alpha", "1 agents, 1 working, 0 findings"));
+        assert_eq!(text[1], ("beta", "no state"));
+        assert!(text[2].1.starts_with("replica: "), "{text:?}");
+        let shown = screen(&app, &fleets);
+        assert!(
+            shown.contains("agent-fleet alpha · http://alpha"),
+            "{shown}"
+        );
+        assert!(shown.contains(" beta  no state"), "{shown}");
+        assert!(shown.contains("[ ] Instance"), "{shown}");
+
+        // To the down one: its error, and none of alpha's rows under its name.
+        assert!(press(&mut app, &fleets, KeyCode::Char(']')).await);
+        refresh(&mut app, &fleets).await;
+        assert_eq!(app.on, 1);
+        assert!(app.state.agents.is_empty());
+        assert_eq!(app.warn.as_deref(), Some("beta: connection refused"));
+        let shown = screen(&app, &fleets);
+        assert!(
+            shown.contains("agent-fleet beta") && !shown.contains("builder"),
+            "{shown}"
+        );
+        assert!(shown.contains("beta: connection refused"), "{shown}");
+
+        // On to the replica one, and `[` back; alpha is still live meanwhile.
+        press(&mut app, &fleets, KeyCode::Char(']')).await;
+        refresh(&mut app, &fleets).await;
+        assert_eq!(app.warn.as_deref(), Some("hub unreachable; local replica"));
+        assert!(app.state.tasks.contains_key("task:p/1"));
+        assert!(!app.found.is_empty());
+        // Back to the down one: none of gamma's rows or findings (and so none of its pids to kill).
+        press(&mut app, &fleets, KeyCode::Char('[')).await;
+        refresh(&mut app, &fleets).await;
+        assert!(app.found.is_empty() && app.state.tasks.is_empty());
+        press(&mut app, &fleets, KeyCode::Char('[')).await;
+        refresh(&mut app, &fleets).await;
+        assert_eq!(app.on, 0);
+        assert!(app.state.agents.contains_key("agent:h/s/builder"));
+
+        // One instance: no strip, and `[`/`]` do nothing, as before `--all`.
+        let one = [Inst::new("alpha", Some(one_agent()), None)];
+        let mut app = App::new();
+        refresh(&mut app, &one).await;
+        press(&mut app, &one, KeyCode::Char(']')).await;
+        assert_eq!(app.on, 0);
+        let shown = screen(&app, &one);
+        assert!(
+            !shown.contains("[ ]") && !shown.contains("no state"),
+            "{shown}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_action_goes_to_the_instance_on_screen() {
+        let fleets = [
+            Inst::new("alpha", Some(fleet_state()), None),
+            Inst::new("beta", Some(fleet_state()), None),
+        ];
+        let mut app = App::new();
+        refresh(&mut app, &fleets).await;
+        press(&mut app, &fleets, KeyCode::Char(']')).await;
+        refresh(&mut app, &fleets).await;
+
+        // A key action: `d` on the first task, `y`. The prompt names the instance.
+        app.tab = Tab::Tasks;
+        press(&mut app, &fleets, KeyCode::Char('d')).await;
+        assert!(screen(&app, &fleets).contains("beta: mark done task:p/0?"));
+        press(&mut app, &fleets, KeyCode::Char('y')).await;
+        assert!(fleets[0].did.lock().unwrap().is_empty());
+        assert_eq!(*fleets[1].did.lock().unwrap(), ["task:p/0"]);
+        assert!(
+            app.note
+                .as_ref()
+                .unwrap()
+                .0
+                .starts_with("beta: mark done: ")
+        );
+
+        // A typed command runs the CLI with beta's own flags.
+        press(&mut app, &fleets, KeyCode::Char(':')).await;
+        for c in "task done 1".chars() {
+            press(&mut app, &fleets, KeyCode::Char(c)).await;
+        }
+        press(&mut app, &fleets, KeyCode::Enter).await;
+        assert!(screen(&app, &fleets).contains("beta: run agent-fleet task done 1?"));
+        press(&mut app, &fleets, KeyCode::Char('y')).await;
+        assert_eq!(app.jobs, ["beta: task done 1"]);
+        let done = app.rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        finished(&mut app, done);
+        assert!(app.jobs.is_empty());
+        let title = &app.last.as_ref().unwrap().title;
+        assert_eq!(title, "agent-fleet --instance beta task done 1");
+        assert_eq!(
+            app.note.as_ref().unwrap().0,
+            "beta: task done: --instance beta task done 1"
+        );
+
+        // A spawn's dry run on beta that ends after a switch to alpha: its spawn is not behind `y`
+        // there, neither when it ends nor through `o`.
+        press(&mut app, &fleets, KeyCode::Char(':')).await;
+        for c in "spawn o/r#5".chars() {
+            press(&mut app, &fleets, KeyCode::Char(c)).await;
+        }
+        press(&mut app, &fleets, KeyCode::Enter).await;
+        assert_eq!(app.jobs, ["beta: spawn o/r#5 --dry-run"]);
+        press(&mut app, &fleets, KeyCode::Char('[')).await;
+        let done = app.rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        finished(&mut app, done);
+        assert!(app.last.as_ref().unwrap().then.is_none());
+        press(&mut app, &fleets, KeyCode::Char('o')).await;
+        press(&mut app, &fleets, KeyCode::Char('y')).await;
+        assert!(app.jobs.is_empty());
+        // One that ran before the switch loses its spawn on the switch.
+        app.last = Some(Output {
+            title: String::new(),
+            text: String::new(),
+            then: Some(w2("spawn o/r#5")),
+        });
+        press(&mut app, &fleets, KeyCode::Char(']')).await;
+        assert!(app.last.as_ref().unwrap().then.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_instance_removes_a_worktree_another_instances_agent_works_in() {
+        let wt: crate::state::Worktree = serde_json::from_value(serde_json::json!({
+            "state": {
+                "host": "h", "path": "/w/x", "repo": "/w/repo", "head": "abc",
+                "unpushed": 0, "dirty": 0, "files": [], "last_commit": Utc::now(),
+            },
+            "since": Utc::now(),
+        }))
+        .unwrap();
+        let mut alpha = State::default();
+        alpha
+            .worktrees
+            .insert(worktree_key("h", "/w/x"), wt.clone());
+        let mut beta = one_agent();
+        beta.worktrees.insert(worktree_key("h", "/w/x"), wt);
+        beta.agents.values_mut().for_each(|a| {
+            a.usage = Some(crate::state::Usage {
+                rss_kb: None,
+                cpu_pct: None,
+                procs: None,
+                cwd: Some("/w/x/src".into()),
+                ts: Utc::now(),
+            })
+        });
+        let fleets = [
+            Inst::new("alpha", Some(alpha), None),
+            Inst::new("beta", Some(beta), None),
+        ];
+        let mut app = App {
+            tab: Tab::Worktrees,
+            ..App::new()
+        };
+        refresh(&mut app, &fleets).await;
+        press(&mut app, &fleets, KeyCode::Char('x')).await;
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.note.as_ref().unwrap().0, "an agent works there");
+    }
+
+    #[tokio::test]
+    async fn the_strip_wraps_so_every_instance_is_named() {
+        let names = [
+            "instance-one",
+            "instance-two",
+            "instance-three",
+            "instance-four",
+            "five",
+        ];
+        let fleets = names.map(|n| Inst::new(n, Some(one_agent()), None));
+        let mut app = App::new();
+        refresh(&mut app, &fleets).await;
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| draw(f, &app, &fleets, Utc::now())).unwrap();
+        let shown: String = (term.backend().buffer().content().iter())
+            .map(|c| c.symbol())
+            .collect();
+        for n in names {
+            assert!(shown.contains(&format!(" {n}  1 agents")), "{n}: {shown}");
+        }
+        assert!(strip(&app, 120).len() > 1);
     }
 
     #[test]
@@ -2392,7 +2916,8 @@ mod tests {
                 .map(|c| c.symbol())
                 .collect()
         };
-        term.draw(|f| draw(f, &app, &Stub, Utc::now())).unwrap();
+        term.draw(|f| draw(f, &app, std::slice::from_ref(&Stub), Utc::now()))
+            .unwrap();
         for want in [
             "6 Asks",
             "open",
@@ -2406,7 +2931,8 @@ mod tests {
         app.tab = Tab::Findings;
         let hung = app.found.iter().position(|f| f.subject == "h:30").unwrap();
         app.tables[Tab::Findings as usize].select(Some(hung));
-        term.draw(|f| draw(f, &app, &Stub, Utc::now())).unwrap();
+        term.draw(|f| draw(f, &app, std::slice::from_ref(&Stub), Utc::now()))
+            .unwrap();
         assert!(screen(&term).contains("proc 31: hung: no output"));
     }
 }
