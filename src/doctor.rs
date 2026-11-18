@@ -14,6 +14,8 @@ use crate::update::short;
 pub const STALE: Duration = Duration::hours(2);
 /// Working this long with no CPU and no change in its worktree: the agent may be hung.
 pub const HUNG: Duration = Duration::minutes(30);
+/// `HUNG` for an agent no `proc.hung` names: its own stall, or one the watch cannot see into.
+pub const HUNG_UNPROVEN: Duration = Duration::minutes(90);
 pub const HUNG_CPU_PCT: u32 = 2;
 pub const HEAVY_RSS_KB: u64 = 4 * 1024 * 1024;
 pub const HEAVY_CPU_PCT: u32 = 200;
@@ -284,15 +286,17 @@ pub fn stalled(a: &Agent, now: DateTime<Utc>, min: Duration) -> Option<String> {
     .then(|| format!("idle for {}m since it worked", idle_for.num_minutes()))
 }
 
-/// `hung`: `working` for HUNG at under HUNG_CPU_PCT, its worktree unchanged as long, and a
-/// process of its own the host's watch proved hung. A pane tree that samples 0% CPU while a
-/// command waits under load is not proof: the watch judges each process, so without its
-/// `proc.hung` for this agent the agent is not hung (idle is `stalled`'s and `stale`'s).
+/// `hung`: `working` and under HUNG_CPU_PCT, its worktree unchanged, for HUNG when the host's watch
+/// proved a process of the agent hung (`proc.hung`), else for HUNG_UNPROVEN. A pane tree that
+/// samples 0% CPU while a command waits under load proves nothing alone (s-c844, 18 Nov: 38 min,
+/// `bun run check` queued under load 68), so the bare reading needs three times as long; the
+/// watch's report is what makes 30 minutes enough.
 pub fn hung(s: &State, id: &str, a: &Agent, now: DateTime<Utc>) -> Option<String> {
-    eprintln!("DBG id={id} hung={:?}", s.hung.keys().collect::<Vec<_>>());
-    if !hung_pids_of(s, id, now) {
-        return None;
-    }
+    let need = if hung_pids_of(s, id, now) {
+        HUNG
+    } else {
+        HUNG_UNPROVEN
+    };
     // a worktree waiting on a resource is a legitimate wait, not a hang
     if resource_wait(s, a).is_some() {
         return None;
@@ -300,9 +304,9 @@ pub fn hung(s: &State, id: &str, a: &Agent, now: DateTime<Utc>) -> Option<String
     let u = a.usage.as_ref()?;
     let wt = worktree_of(s, a);
     if a.state != AgentState::Working
-        || now - a.since < HUNG
+        || now - a.since < need
         || !u.cpu_pct.is_some_and(|c| c < HUNG_CPU_PCT)
-        || !wt.is_none_or(|(_, w)| now - w.since >= HUNG)
+        || !wt.is_none_or(|(_, w)| now - w.since >= need)
     {
         return None;
     }
@@ -1703,6 +1707,35 @@ mod tests {
         let f = findings(&s, now);
         let k = kinds(&f);
         assert!(k.contains(&("hung", "agent:h/s/mac")), "{k:?}");
+    }
+
+    #[test]
+    fn an_agent_at_zero_cpu_is_hung_only_when_proven_or_for_three_times_as_long() {
+        let now = Utc::now();
+        let at = |since: Duration, proven: bool| {
+            let mut s = State::default();
+            s.agents.insert(
+                "agent:h/s/q".into(),
+                agent(AgentState::Working, now - since, "/w/a", 0, 1024),
+            );
+            if proven {
+                proc_hung(&mut s, "agent:h/s/q", 77, now);
+            }
+            kinds(&findings(&s, now)).contains(&("hung", "agent:h/s/q"))
+        };
+        assert!(
+            !at(Duration::minutes(40), false),
+            "s-c844: 40 min queued, unproven"
+        );
+        assert!(at(Duration::minutes(40), true), "proven hung at 40 min");
+        assert!(
+            at(Duration::minutes(100), false),
+            "100 min of nothing is hung"
+        );
+        assert!(
+            !at(Duration::minutes(20), true),
+            "proven but not yet long enough"
+        );
     }
 
     #[test]
