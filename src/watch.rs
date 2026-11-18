@@ -22,9 +22,6 @@ pub const HUNG_TICKS: u32 = 2;
 /// A wait this long is reported: nothing waits more than 30 min.
 pub const WAIT_MAX: Duration = Duration::minutes(30);
 
-/// Commands that only read a pipe: idle without their producer, never hung by themselves.
-const FILTERS: &[&str] = &["tail", "head", "grep", "cat", "tee", "sed", "awk", "jq"];
-
 /// The shells an agent runs its commands in; their subtrees are what the agent started.
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
 
@@ -147,15 +144,22 @@ impl Watch {
                     }
                     // A pipeline's members are siblings: the reader is not hung while its
                     // producer works, so one busy member makes the whole command busy.
-                    let start = t.out.len();
-                    let mut busy = false;
+                    let mut ranges = Vec::new();
                     for c in t.kids(shell).to_vec() {
-                        busy |= t.visit(c, agent);
+                        let begin = t.out.len();
+                        let b = t.visit(c, agent);
+                        ranges.push((begin, t.out.len(), b));
                     }
+                    let busy = ranges.iter().any(|r| r.2);
+                    let start = ranges.first().map_or(t.out.len(), |r| r.0);
                     if busy {
-                        t.revive(start);
+                        // Only members that did no work themselves: a busy member's own
+                        // subtree stays judged per process.
+                        for &(a, z, _) in ranges.iter().filter(|r| !r.2) {
+                            t.revive(a, z);
+                        }
                     } else {
-                        t.spare_filters(start);
+                        t.spare_followers(start);
                     }
                 }
             }
@@ -276,10 +280,10 @@ impl<'a> Tick<'a> {
         }
     }
 
-    /// The command is busy: what `visit` classified from `start` on as idle or hung is a
-    /// member waiting on a working sibling, and its streak ends.
-    fn revive(&mut self, start: usize) {
-        for c in &mut self.out[start..] {
+    /// The command is busy: what `visit` classified in `out[a..z]` (an idle member's subtree)
+    /// as idle or hung is waiting on a working sibling, and its streak ends.
+    fn revive(&mut self, a: usize, z: usize) {
+        for c in &mut self.out[a..z] {
             if matches!(c.verdict, Verdict::Idle | Verdict::Hung(_)) {
                 c.verdict = Verdict::Working;
                 let p = &self.now.0[&c.pid];
@@ -288,15 +292,28 @@ impl<'a> Tick<'a> {
         }
     }
 
-    /// A command whose only hung members are pure filters is not hung: they wait on a
-    /// producer that is gone or not ours to judge.
-    fn spare_filters(&mut self, start: usize) {
-        let filter = |t: &Self, c: &Classified| FILTERS.contains(&t.now.0[&c.pid].name.as_str());
+    /// A command whose only hung members are `tail -f` followers is not hung: a follower
+    /// waits for more of another process's log by design. Any other lone filter blocked on a
+    /// pipe nobody writes is a real hang and is reported.
+    fn spare_followers(&mut self, start: usize) {
+        let follower = |t: &Self, c: &Classified| {
+            let p = &t.now.0[&c.pid];
+            p.name == "tail"
+                && p.args.as_deref().is_some_and(|a| {
+                    a.split_whitespace().any(|w| {
+                        w.starts_with('-') && !w.starts_with("--") && w.contains(['f', 'F'])
+                            || w == "--follow"
+                    })
+                })
+        };
         let hung = |c: &Classified| matches!(c.verdict, Verdict::Hung(_));
-        let out = &self.out[start..];
-        if out.iter().filter(|c| hung(c)).all(|c| filter(self, c)) {
+        if self.out[start..]
+            .iter()
+            .filter(|c| hung(c))
+            .all(|c| follower(self, c))
+        {
             for c in &mut self.out[start..] {
-                if matches!(c.verdict, Verdict::Hung(_)) {
+                if hung(c) {
                     c.verdict = Verdict::Idle;
                 }
             }
@@ -1234,13 +1251,41 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_pure_filter_is_never_hung() {
+    fn a_lone_tail_follower_is_not_hung_but_a_lone_head_is() {
         let mut w = Watch::default();
-        let lone = || tree(&[(40, SHELL, "tail", "tail -8", 0, 20)]);
+        let lone = || {
+            tree(&[
+                (40, SHELL, "tail", "tail -f x.log", 0, 20),
+                (41, SHELL, "head", "head -3", 0, 20),
+            ])
+        };
         w.step(lone(), at(0), &seen());
         w.step(lone(), at(2), &seen());
         let v = w.step(lone(), at(4), &seen());
+        assert!(matches!(verdict(&v, 41), Some(Verdict::Hung(_))), "{v:#?}");
+        let mut w = Watch::default();
+        let only = || tree(&[(40, SHELL, "tail", "tail -f x.log", 0, 20)]);
+        w.step(only(), at(0), &seen());
+        w.step(only(), at(2), &seen());
+        let v = w.step(only(), at(4), &seen());
         assert!(!matches!(verdict(&v, 40), Some(Verdict::Hung(_))), "{v:#?}");
+    }
+
+    #[test]
+    fn a_wedged_grandchild_beside_a_working_sibling_stays_hung() {
+        let mut w = Watch::default();
+        let t = |cpu| {
+            tree(&[
+                (30, SHELL, "bash", "bash dev.sh", 0, 20),
+                (31, 30, "java", "java Main", cpu, 20),
+                (32, 30, "sleep", "sleep 9999", 0, 20),
+            ])
+        };
+        w.step(t(0), at(0), &seen());
+        w.step(t(60_000), at(2), &seen());
+        let v = w.step(t(120_000), at(4), &seen());
+        assert_eq!(verdict(&v, 31), Some(&Verdict::Working));
+        assert!(matches!(verdict(&v, 32), Some(Verdict::Hung(_))), "{v:#?}");
     }
 
     #[test]
