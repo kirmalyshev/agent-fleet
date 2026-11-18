@@ -97,6 +97,11 @@ pub fn command_of(t: &Table, pid: u32) -> Option<u32> {
         .find(|&p| parent(t, p).is_some_and(|a| is_agent(t, a)))
 }
 
+/// Why no caller may ever signal `pid`: an agent, a pane, a multiplexer or daemon, or anything
+/// above one. What the watch reports hung must pass this, or its own `kill` line is refused.
+pub fn never_killable(t: &Table, pid: u32) -> Option<String> {
+    protected(t, 0, pid)
+}
 /// Why `pid` must never be signalled by `me`, if it must not.
 fn protected(t: &Table, me: u32, pid: u32) -> Option<String> {
     let what = |p: u32| -> Option<&'static str> {
