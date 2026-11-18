@@ -241,9 +241,9 @@ impl FleetConfig {
 }
 
 /// `dir/.agent-fleet/fleet.toml`, and the directory it lives in (the brief template sits there).
-/// A checkout with no fleet.toml of its own uses the machine's: `<user config dir>/agent-fleet`.
-pub fn load(dir: &Path) -> Result<(FleetConfig, PathBuf)> {
-    load_in(dir, machine_dir().as_deref())
+/// A checkout with no fleet.toml of its own uses the instance's: see `machine_dir`.
+pub fn load(dir: &Path, instance: &str) -> Result<(FleetConfig, PathBuf)> {
+    load_in(dir, machine_dir(instance).as_deref())
 }
 
 /// `load` with the machine's config dir given: the checkout's own fleet.toml replaces the
@@ -261,17 +261,19 @@ pub fn load_in(dir: &Path, machine: Option<&Path>) -> Result<(FleetConfig, PathB
     Ok((cfg, dir))
 }
 
-/// `AGENT_FLEET_CONFIG_DIR`, else the platform's user config dir for agent-fleet: where the
-/// machine's fleet.toml, brief.md and connected repos live.
-pub fn machine_dir() -> Option<PathBuf> {
+/// Where one instance's fleet.toml, brief.md and connected repos live: `AGENT_FLEET_CONFIG_DIR`
+/// outright, else the platform's user config dir for agent-fleet for the default instance and
+/// `instances/<name>` under it for every other one, as with the data dirs (`client::Paths`).
+pub fn machine_dir(instance: &str) -> Option<PathBuf> {
     if let Some(d) = std::env::var_os("AGENT_FLEET_CONFIG_DIR") {
         return Some(PathBuf::from(d));
     }
-    directories::ProjectDirs::from("", "", "agent-fleet").map(|p| p.config_dir().to_path_buf())
+    directories::ProjectDirs::from("", "", "agent-fleet")
+        .map(|p| crate::client::instance_dir(p.config_dir(), instance))
 }
 
 /// The fleet.toml of the git checkout holding the current directory.
-pub fn find() -> Result<(FleetConfig, PathBuf)> {
+pub fn find(instance: &str) -> Result<(FleetConfig, PathBuf)> {
     let out = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()
@@ -280,7 +282,7 @@ pub fn find() -> Result<(FleetConfig, PathBuf)> {
         bail!("not in a git checkout; run spawn inside the project");
     }
     let top = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let found = load(Path::new(&top))?;
+    let found = load(Path::new(&top), instance)?;
     if found.0.session.is_empty() {
         bail!(
             "fleet.toml names no `session` and HERDR_SESSION is not set; run inside herdr or set `session`"

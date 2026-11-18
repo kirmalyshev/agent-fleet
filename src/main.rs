@@ -29,7 +29,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde_json::json;
 
 use client::{Client, Paths, Sent};
@@ -42,8 +42,15 @@ use store::Store;
 #[command(version = env!("AGENT_FLEET_VERSION"), about)]
 struct Cli {
     /// Which fleet: one instance per project or product, each with its own hub, log, token,
-    /// spool and replica.
-    #[arg(long, global = true, env = "AGENT_FLEET_INSTANCE", default_value = client::DEFAULT_INSTANCE)]
+    /// spool, replica and fleet.toml [default: in a herdr pane, the instance named after its
+    /// session when that instance has a hub file; else `default`].
+    #[arg(
+        long,
+        global = true,
+        env = "AGENT_FLEET_INSTANCE",
+        default_value = client::DEFAULT_INSTANCE,
+        hide_default_value = true
+    )]
     instance: String,
     /// Hub URL [default: the one this instance's hub wrote, else http://127.0.0.1:7710].
     #[arg(long, global = true, env = "AGENT_FLEET_HUB")]
@@ -130,7 +137,7 @@ enum Cmd {
     SelfUpdate,
     /// The agent-fleet instances on this machine and the hub each one uses.
     Instances,
-    /// Write this machine's fleet.toml and brief.md into the user config dir
+    /// Write this machine's fleet.toml and brief.md into the instance's config dir
     /// (`AGENT_FLEET_CONFIG_DIR` overrides it): commented templates with a profile for each agent
     /// program on PATH and one default rule. Never overwrites an existing file. Lists the
     /// user-level Claude and Codex skills that drive terminals (herdr, tmux, cmux).
@@ -802,9 +809,10 @@ impl Ctx {
     }
 }
 
-/// `init` and `repo`: the machine's config dir only; no hub, no instance.
-fn machine_config(cmd: &Cmd) -> Result<()> {
-    let dir = spawn::machine_dir().context("no user config dir; set AGENT_FLEET_CONFIG_DIR")?;
+/// `init` and `repo`: the instance's config dir only; no hub.
+fn machine_config(cmd: &Cmd, instance: &str) -> Result<()> {
+    let dir =
+        spawn::machine_dir(instance).context("no user config dir; set AGENT_FLEET_CONFIG_DIR")?;
     match cmd {
         Cmd::Init => {
             let found = setup::kinds_on_path();
@@ -865,7 +873,15 @@ fn machine_config(cmd: &Cmd) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    if matches.value_source("instance") == Some(clap::parser::ValueSource::DefaultValue)
+        && let Ok(session) = std::env::var("HERDR_SESSION")
+        && let Ok(base) = Paths::base()
+        && let Some(name) = client::session_instance(&base, &session)
+    {
+        cli.instance = name;
+    }
     if let Cmd::Api {
         cmd: ApiCmd::Schema,
     } = cli.cmd
@@ -921,7 +937,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if let Cmd::Init | Cmd::Repo { .. } = &cli.cmd {
-        return machine_config(&cli.cmd);
+        return machine_config(&cli.cmd, &cli.instance);
     }
     if let Cmd::Dev { cmd } = &cli.cmd
         && !matches!(
@@ -987,7 +1003,7 @@ async fn main() -> Result<()> {
                             .map(|s| (s, d.clone()))
                     })
                     .collect(),
-                config_dir: spawn::machine_dir(),
+                config_dir: spawn::machine_dir(&ctx.cli.instance),
                 locks: locks.clone(),
                 stall_min: *stall_min,
                 stuck_act: *stuck_act,
@@ -1009,7 +1025,7 @@ async fn main() -> Result<()> {
                     State::default()
                 }
             };
-            let registered = match spawn::machine_dir() {
+            let registered = match spawn::machine_dir(&ctx.cli.instance) {
                 Some(d) => setup::registered(&d)?,
                 None => Default::default(),
             };
@@ -1108,10 +1124,11 @@ async fn main() -> Result<()> {
         Cmd::Doctor { json, apply } => {
             let state = ctx.state().await?;
             let mut f = doctor::findings(&state, now);
-            let (cfg, cfg_err) = match orphanpr::config(std::path::Path::new(".")) {
-                Ok(c) => (c.unwrap_or_default(), None),
-                Err(e) => (Default::default(), Some(format!("{e:#}"))),
-            };
+            let (cfg, cfg_err) =
+                match orphanpr::config(std::path::Path::new("."), &ctx.cli.instance) {
+                    Ok(c) => (c.unwrap_or_default(), None),
+                    Err(e) => (Default::default(), Some(format!("{e:#}"))),
+                };
             let gh = std::env::var("AGENT_FLEET_GH").unwrap_or_else(|_| "gh".into());
             let (orphans, errs) = orphanpr::scan(&gh, &state, &cfg, now).await;
             for o in &orphans {
@@ -1559,7 +1576,7 @@ async fn main() -> Result<()> {
                 },
                 (None, None) => bail!("{repo} names no issue: say what the work is with --title"),
             };
-            let (cfg, cfg_dir) = spawn::find()?;
+            let (cfg, cfg_dir) = spawn::find(&ctx.cli.instance)?;
             // With no fleet state, caps and quotas are consulted as empty — say so.
             let (state, note) = ctx.snapshot_state().await.unwrap_or_else(|e| {
                 (
@@ -1729,7 +1746,7 @@ async fn main() -> Result<()> {
             if spawn::replacement_open(&state, &sp.request.agent) {
                 bail!("{} was already handed off", sp.request.name);
             }
-            let (cfg, cfg_dir) = spawn::find()?;
+            let (cfg, cfg_dir) = spawn::find(&ctx.cli.instance)?;
             let to = match to {
                 Some(t) => t.clone(),
                 None => cfg

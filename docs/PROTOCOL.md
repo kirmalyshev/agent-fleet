@@ -674,8 +674,9 @@ work and never picks the worker; `label:x` matches only
 a label named x. Config errors name the line that is wrong: an unknown profile, a fallback
 cycle, two defaults, no default.
 
-The machine's rules are `fleet.toml` and its brief in the user config directory
-(`~/.config/agent-fleet` on Linux, `AGENT_FLEET_CONFIG_DIR` overrides it). `agent-fleet init`
+The machine's rules are `fleet.toml` and its brief in the instance's config directory: the user
+config directory (`~/.config/agent-fleet` on Linux) for the default instance and `instances/<name>`
+under it for the others; `AGENT_FLEET_CONFIG_DIR` names the directory outright. `agent-fleet init`
 writes both from `docs/fleet.example.toml` and `docs/brief.example.md`, with a profile for each
 agent program on `PATH` (`claude`, `codex`, `devin`; all three when none is found) and a default
 rule on the first; it never overwrites a file. It also lists the user-level skills
@@ -920,10 +921,17 @@ their blockers; then agents outside a known worktree, and open tasks with no age
 
 One machine can run several fleets, one per project or product. `--instance <name>` (or
 `AGENT_FLEET_INSTANCE`) picks one; each has its own directory, so its own hub log, token, spool and
-replica. `agent-fleet hub` writes its URL into the instance's directory, and every other command
-of that instance finds its hub there, unless `AGENT_FLEET_HUB` says otherwise. Two hubs on one
-machine need two `--listen` ports. A host agent serves one instance and one herdr session.
+replica, and its own config directory, so its own `fleet.toml`, brief and connected repos.
+`agent-fleet hub` writes its URL into the instance's directory, and every other command of that
+instance finds its hub there, unless `AGENT_FLEET_HUB` says otherwise. An instance whose hub runs
+on another machine gets that file by hand: its one line is the hub's URL. Two hubs on one machine
+need two `--listen` ports. A host agent serves one instance and one herdr session.
 `agent-fleet instances` lists them.
+
+With neither `--instance` nor `AGENT_FLEET_INSTANCE`, a command run in a herdr pane (`HERDR_SESSION`
+set) uses the instance named after the session when that instance's directory holds a `hub` file;
+otherwise it uses `default`. So the agents of session `web` talk to instance `web` once it has a
+hub, with nothing set in their environment.
 
 ## Files
 

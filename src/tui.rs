@@ -320,7 +320,7 @@ async fn main_loop(term: &mut DefaultTerminal, fleet: &impl Fleet) -> Result<()>
                 KeyCode::Esc => app.say("cancelled"),
                 KeyCode::Enter if !buf.trim().is_empty() => entered(&mut app, fleet, what, buf),
                 KeyCode::Tab if matches!(what, Input::Command) => {
-                    complete(&mut app, &mut buf);
+                    complete(&mut app, &mut buf, fleet.instance());
                     app.mode = Mode::Input(what, buf);
                 }
                 KeyCode::Backspace => {
@@ -489,11 +489,11 @@ fn finished(app: &mut App, d: Done) {
 /// Completes the last word of the command line from the commands, the agents that are up, tasks,
 /// blockers, levels and the profiles of fleet.toml. Several matches: the common part, and the
 /// matches in the note line.
-fn complete(app: &mut App, buf: &mut String) {
+fn complete(app: &mut App, buf: &mut String, instance: &str) {
     let word = buf.rsplit(' ').next().unwrap_or("").to_string();
     let mut all: Vec<String> = if buf.contains(' ') {
         let s = &app.state;
-        let profiles: Vec<String> = crate::spawn::find()
+        let profiles: Vec<String> = crate::spawn::find(instance)
             .map(|(c, _)| c.profiles.into_keys().collect())
             .unwrap_or_default();
         (s.agents.keys().map(|a| short(a).to_string()))

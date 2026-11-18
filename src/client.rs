@@ -23,26 +23,45 @@ pub struct Paths {
 }
 
 pub const DEFAULT_INSTANCE: &str = "default";
+
+fn valid_instance_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The instance a herdr session's panes use when none is named: the one named after the session,
+/// once its data dir under `base` holds a hub URL file. Any other session stays on the default.
+pub fn session_instance(base: &Path, session: &str) -> Option<String> {
+    (valid_instance_name(session)
+        && session != DEFAULT_INSTANCE
+        && Paths {
+            dir: instance_dir(base, session),
+        }
+        .hub_file()
+        .is_file())
+    .then(|| session.to_string())
+}
+
+/// `base` for the default instance, `base/instances/<name>` for any other: the layout of both
+/// the data dirs and the config dirs.
+pub fn instance_dir(base: &Path, instance: &str) -> PathBuf {
+    match instance {
+        DEFAULT_INSTANCE => base.to_path_buf(),
+        name => base.join("instances").join(name),
+    }
+}
 const DEFAULT_HUB: &str = "http://127.0.0.1:7710";
 
 impl Paths {
     pub fn from_env(instance: &str) -> Result<Self> {
-        if instance.is_empty()
-            || !instance
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
+        if !valid_instance_name(instance) {
             bail!("instance names are letters, digits, - and _: {instance:?}");
         }
         let dir = match std::env::var_os("AGENT_FLEET_HOME") {
             Some(d) => PathBuf::from(d),
-            None => {
-                let base = Self::base()?;
-                match instance {
-                    DEFAULT_INSTANCE => base,
-                    name => base.join("instances").join(name),
-                }
-            }
+            None => instance_dir(&Self::base()?, instance),
         };
         std::fs::create_dir_all(&dir)?;
         Ok(Self { dir })
@@ -570,6 +589,34 @@ mod tests {
     use super::*;
     use crate::event::*;
     use crate::hub::{Hub, router};
+
+    #[test]
+    fn named_instances_live_under_instances() {
+        let base = Path::new("/base");
+        assert_eq!(instance_dir(base, DEFAULT_INSTANCE), base);
+        assert_eq!(instance_dir(base, "web"), base.join("instances/web"));
+    }
+
+    #[test]
+    fn a_session_picks_the_instance_named_after_it_once_that_has_a_hub_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        assert_eq!(session_instance(base, "web"), None, "no instance dir");
+        std::fs::create_dir_all(base.join("instances/web")).unwrap();
+        assert_eq!(
+            session_instance(base, "web"),
+            None,
+            "an instance dir with no hub file"
+        );
+        std::fs::write(base.join("instances/web/hub"), "http://127.0.0.1:7711\n").unwrap();
+        assert_eq!(session_instance(base, "web").as_deref(), Some("web"));
+        assert_eq!(session_instance(base, "other"), None);
+        std::fs::create_dir_all(base.join("instances/default")).unwrap();
+        std::fs::write(base.join("instances/default/hub"), "x").unwrap();
+        assert_eq!(session_instance(base, DEFAULT_INSTANCE), None);
+        assert_eq!(session_instance(base, "../instances/web"), None);
+        assert_eq!(session_instance(base, ""), None);
+    }
     use crate::store::Store;
 
     async fn start_hub(
