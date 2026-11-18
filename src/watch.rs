@@ -142,8 +142,25 @@ impl Watch {
                         t.skip(shell);
                         continue;
                     }
+                    // A pipeline's members are siblings: the reader is not hung while its
+                    // producer works, so one busy member makes the whole command busy.
+                    let mut ranges = Vec::new();
                     for c in t.kids(shell).to_vec() {
+                        let begin = t.out.len();
+                        t.worked = false;
                         t.visit(c, agent);
+                        ranges.push((begin, t.out.len(), t.worked));
+                    }
+                    let busy = ranges.iter().any(|r| r.2);
+                    let start = ranges.first().map_or(t.out.len(), |r| r.0);
+                    if busy {
+                        // Only members that did no work themselves: a busy member's own
+                        // subtree stays judged per process.
+                        for &(a, z, _) in ranges.iter().filter(|r| !r.2) {
+                            t.revive(a, z);
+                        }
+                    } else {
+                        t.spare_followers(start);
                     }
                 }
             }
@@ -184,6 +201,9 @@ struct Tick<'a> {
     next: HashMap<(u32, Option<DateTime<Utc>>), u32>,
     visited: HashSet<(u32, Option<DateTime<Utc>>)>,
     out: Vec<Classified>,
+    /// Set when a process did work itself (`works`); a listener or a lock wait keeps its
+    /// parent busy but is not work a pipeline reader waits on.
+    worked: bool,
 }
 
 impl<'a> Tick<'a> {
@@ -214,6 +234,7 @@ impl<'a> Tick<'a> {
             next: HashMap::new(),
             visited: HashSet::new(),
             out: Vec::new(),
+            worked: false,
         }
     }
 
@@ -264,6 +285,47 @@ impl<'a> Tick<'a> {
         }
     }
 
+    /// The command is busy: what `visit` classified in `out[a..z]` (an idle member's subtree)
+    /// as idle or hung is waiting on a working sibling, and its streak ends.
+    fn revive(&mut self, a: usize, z: usize) {
+        for c in &mut self.out[a..z] {
+            if matches!(c.verdict, Verdict::Idle | Verdict::Hung(_)) {
+                c.verdict = Verdict::Working;
+                let p = &self.now.0[&c.pid];
+                self.next.remove(&(c.pid, p.started));
+            }
+        }
+    }
+
+    /// A command whose only hung members are `tail -f` followers is not hung: a follower
+    /// waits for more of another process's log by design. Any other lone filter blocked on a
+    /// pipe nobody writes is a real hang and is reported.
+    fn spare_followers(&mut self, start: usize) {
+        let follower = |t: &Self, c: &Classified| {
+            let p = &t.now.0[&c.pid];
+            p.name == "tail"
+                && p.args.as_deref().is_some_and(|a| {
+                    a.split_whitespace().any(|w| {
+                        w.starts_with('-') && !w.starts_with("--") && w.contains(['f', 'F'])
+                            || w == "--follow"
+                            || w.starts_with("--follow=")
+                    })
+                })
+        };
+        let hung = |c: &Classified| matches!(c.verdict, Verdict::Hung(_));
+        if self.out[start..]
+            .iter()
+            .filter(|c| hung(c))
+            .all(|c| follower(self, c))
+        {
+            for c in &mut self.out[start..] {
+                if hung(c) {
+                    c.verdict = Verdict::Idle;
+                }
+            }
+        }
+    }
+
     fn deepest(&self, pid: u32) -> Option<(usize, u32)> {
         self.kids(pid)
             .iter()
@@ -307,7 +369,9 @@ impl<'a> Tick<'a> {
         for c in self.kids(pid).to_vec() {
             busy |= self.visit(c, agent);
         }
-        busy |= self.works(pid).is_some();
+        let works = self.works(pid).is_some();
+        self.worked |= works;
+        busy |= works;
         if !old {
             return busy;
         }
@@ -1175,6 +1239,78 @@ mod tests {
         assert_eq!(e.deepest.as_deref(), Some("xcrun simctl bootstatus ABC -b"));
         assert!(matches!(verdict(&v, 31), Some(Verdict::Hung(_))));
         assert_eq!(v[0].agent.as_deref(), Some("agent:h/s/o-1"));
+    }
+
+    #[test]
+    fn a_pipe_reader_beside_a_working_producer_is_not_hung() {
+        // `eait-merge | tail -15`: both are children of the tool shell; the producer works.
+        let mut w = Watch::default();
+        let pipe = |cpu| {
+            tree(&[
+                (30, SHELL, "bash", "bash eait-merge", cpu, 20),
+                (40, SHELL, "tail", "tail -15", 0, 20),
+            ])
+        };
+        w.step(pipe(0), at(0), &seen());
+        w.step(pipe(60_000), at(2), &seen());
+        let v = w.step(pipe(120_000), at(4), &seen());
+        assert_eq!(verdict(&v, 30), Some(&Verdict::Working));
+        assert_eq!(verdict(&v, 40), Some(&Verdict::Working), "{v:#?}");
+    }
+
+    #[test]
+    fn a_lone_tail_follower_is_not_hung_but_a_lone_head_is() {
+        let mut w = Watch::default();
+        let lone = || {
+            tree(&[
+                (40, SHELL, "tail", "tail -f x.log", 0, 20),
+                (41, SHELL, "head", "head -3", 0, 20),
+            ])
+        };
+        w.step(lone(), at(0), &seen());
+        w.step(lone(), at(2), &seen());
+        let v = w.step(lone(), at(4), &seen());
+        assert!(matches!(verdict(&v, 41), Some(Verdict::Hung(_))), "{v:#?}");
+        let mut w = Watch::default();
+        let only = || tree(&[(40, SHELL, "tail", "tail --follow=name x.log", 0, 20)]);
+        w.step(only(), at(0), &seen());
+        w.step(only(), at(2), &seen());
+        let v = w.step(only(), at(4), &seen());
+        assert!(!matches!(verdict(&v, 40), Some(Verdict::Hung(_))), "{v:#?}");
+    }
+
+    #[test]
+    fn a_wedged_sibling_beside_a_listener_stays_hung() {
+        let mut w = Watch::default();
+        let mut sn = seen();
+        sn.listening.insert(31);
+        let t = || {
+            tree(&[
+                (31, SHELL, "node", "node server.js", 0, 20),
+                (32, SHELL, "sleep", "sleep 9999", 0, 20),
+            ])
+        };
+        w.step(t(), at(0), &sn);
+        w.step(t(), at(2), &sn);
+        let v = w.step(t(), at(4), &sn);
+        assert!(matches!(verdict(&v, 32), Some(Verdict::Hung(_))), "{v:#?}");
+    }
+
+    #[test]
+    fn a_wedged_grandchild_beside_a_working_sibling_stays_hung() {
+        let mut w = Watch::default();
+        let t = |cpu| {
+            tree(&[
+                (30, SHELL, "bash", "bash dev.sh", 0, 20),
+                (31, 30, "java", "java Main", cpu, 20),
+                (32, 30, "sleep", "sleep 9999", 0, 20),
+            ])
+        };
+        w.step(t(0), at(0), &seen());
+        w.step(t(60_000), at(2), &seen());
+        let v = w.step(t(120_000), at(4), &seen());
+        assert_eq!(verdict(&v, 31), Some(&Verdict::Working));
+        assert!(matches!(verdict(&v, 32), Some(Verdict::Hung(_))), "{v:#?}");
     }
 
     #[test]

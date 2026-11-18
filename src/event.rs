@@ -644,6 +644,7 @@ pub struct MsgDelivered {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rung: Option<DateTime<Utc>>,
     /// Rings it took, this one included.
+    // `Some(0)`: closed unrung, a stale status report (host.rs delivery_loop).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempts: Option<u32>,
 }
