@@ -457,8 +457,6 @@ pub fn recipients(s: &State, agent: Option<&str>) -> Vec<String> {
     out
 }
 
-/// Each process matching `is` whose parent does not, with it and the matching ones under it.
-/// Tops of one agent in one process group (a pipeline) are one: the lowest pid's.
 /// The pids of a hung report that `agent-fleet kill` would accept from anyone: `Err(why kill
 /// refuses)` when the top itself is an agent, a pane, a multiplexer or above one (a report
 /// nobody can act on is a false alarm), else `pids` without the protected ones.
@@ -480,6 +478,8 @@ fn killable_pids(procs: &Procs, top: u32, pids: &[u32]) -> Result<Vec<u32>, Stri
         None => Ok(pids.iter().copied().filter(|&p| ok(p)).collect()),
     }
 }
+/// Each process matching `is` whose parent does not, with it and the matching ones under it.
+/// Tops of one agent in one process group (a pipeline) are one: the lowest pid's.
 pub fn tops(
     v: &[Classified],
     procs: &Procs,
