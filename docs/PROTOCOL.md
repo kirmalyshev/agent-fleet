@@ -665,7 +665,8 @@ The fleet starts agents itself. A `fleet.toml` says how (`docs/fleet.example.tom
 commented reference, and the template `agent-fleet init` writes): a `session` (absent: the herdr session the CLI runs
 in, from `HERDR_SESSION`), a `base` ref (default `origin/main`), a
 `brief` template next to the file with `@@KEY@@` placeholders, an optional `ready` script run
-inside a new worktree before the agent starts, `[vars]` for extra tokens, `[profiles]` —
+inside a new worktree before the agent starts, an optional `retire` script (same path rules) run
+with a closed agent's worktree as `$1`, `[vars]` for extra tokens, `[profiles]` —
 a `kind` (the `agent.start`/`agent.quota` program), `args`, `unset_env`, a `prefix` for agent
 names, an optional per-repo `cap`, a `fallback`, and `handoff_min` — and `[[rules]]`, first
 match wins, a rule with no `match` being the default. `match` keywords are case-insensitive
@@ -739,7 +740,10 @@ that works: `agent.wait` for `idle` (2 min),
 stall, then one re-send — never twice to an agent that started working. On success the host
 writes `agent.role` (level, lead from the request) and `task.assigned` for
 `task:<repo name>/<issue>` (a 409 is not a failure), answers `spawn.result`, and closes a
-`replaces` agent's pane and workspace — never its worktree. Any failure undoes what the spawn
+`replaces` agent's pane and workspace — never its worktree. `retire` runs (5 min) when an agent's
+last pane closes by any path, and on a failed spawn's new worktree before it is removed; only for
+a worktree a spawn made, and not while a newer spawn (a handoff) holds it. A refusal becomes a
+`blocker.raised` naming the agent, and nothing is forced. Any failure undoes what the spawn
 took and answers `ok=false`; a request older than 15 min when first seen is answered `expired`.
 
 `agent-fleet handoff <agent> [--to <profile>] [--note TEXT]` gives the agent's issue, branch and

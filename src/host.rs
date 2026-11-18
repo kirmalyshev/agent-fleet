@@ -419,7 +419,7 @@ impl Host {
     }
 
     /// Records the agent in `pane` and publishes `agent.up`. Returns the generation to watch.
-    async fn agent_up(&self, pane: &str, info: &Value) -> u64 {
+    pub(crate) async fn agent_up(&self, pane: &str, info: &Value) -> u64 {
         let agent = self.agent_id(info["name"].as_str().unwrap_or(pane));
         let state = agent_state(&info["agent_status"]);
         let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed);
@@ -452,7 +452,7 @@ impl Host {
 
     /// Forgets `pane`. `agent.down` is published only if that agent is not alive in another pane
     /// (a moved pane, or herdr restored with the agent elsewhere).
-    async fn agent_down(&self, pane: &str, reason: &str) {
+    pub(crate) async fn agent_down(self: &Arc<Self>, pane: &str, reason: &str) {
         let gone = {
             let mut panes = self.panes.lock().unwrap();
             let gone = panes.remove(pane);
@@ -460,16 +460,41 @@ impl Host {
         };
         if let Some(l) = gone {
             self.publish(self.presence(Known::AgentDown(AgentDown {
-                agent: l.agent,
+                agent: l.agent.clone(),
                 reason: Some(reason.into()),
             })))
             .await;
+            self.retire_closed(l.agent);
         }
+    }
+
+    /// fleet.toml's `retire` for a closed agent's worktree, off the event loop: the script can
+    /// take minutes. A refusal (dirty tree, unpushed commits) becomes a blocker naming the
+    /// agent, never a forced retire.
+    fn retire_closed(self: &Arc<Self>, agent: String) {
+        let Ok(view) = self.view() else { return };
+        let Some((repo, wt)) = view.state.retire_target(&agent, &self.cfg.host) else {
+            return;
+        };
+        let host = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::spawn::retire_in(&host, &repo, &wt).await {
+                eprintln!("agent-fleet host: retire {wt}: {e:#}");
+                host.publish(host.presence(Known::BlockerRaised(BlockerRaised {
+                    what: crate::spawn::tail(&format!("retire of {wt} refused: {e:#}")),
+                    owner: Some(agent),
+                    unblocks_when: Some("the worktree is retired by hand".into()),
+                    pid: None,
+                    started: None,
+                })))
+                .await;
+            }
+        });
     }
 
     /// herdr's current list, reconciled against what the hub believes about this session: agents
     /// it has but herdr does not are marked down. Returns the panes to watch.
-    async fn inventory(&self) -> Result<Vec<(String, u64)>> {
+    async fn inventory(self: &Arc<Self>) -> Result<Vec<(String, u64)>> {
         let list = herdr_call(&self.cfg.herdr_socket, "agent.list", json!({})).await?;
         let mut watch = Vec::new();
         for a in list["agents"].as_array().into_iter().flatten() {
@@ -536,7 +561,7 @@ impl Host {
     }
 
     /// `Ok` when the watch is over for good (agent gone, or superseded); `Err` when it was lost.
-    async fn watch(&self, pane: &str, epoch: u64) -> Result<()> {
+    async fn watch(self: &Arc<Self>, pane: &str, epoch: u64) -> Result<()> {
         let sub = json!([{ "type": "pane.agent_status_changed", "pane_id": pane }]);
         let mut sub = herdr_subscribe(&self.cfg.herdr_socket, sub).await?;
         // Catch up on whatever changed before the subscription existed.
