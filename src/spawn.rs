@@ -35,6 +35,11 @@ pub struct FleetConfig {
     /// A script run inside a NEW worktree with its path as $1, before the agent starts.
     #[serde(default)]
     pub ready: Option<String>,
+    /// A script run with a closed agent's worktree path as $1, symmetric to `ready`: its pane
+    /// closed any way (close, kill, crash, a handoff's final agent, a failed spawn). It refuses
+    /// what it must keep (a dirty tree, unpushed commits); the host reports that, never forces.
+    #[serde(default)]
+    pub retire: Option<String>,
     /// Extra brief tokens.
     #[serde(default)]
     pub vars: BTreeMap<String, String>,
@@ -162,6 +167,10 @@ impl FleetConfig {
         if let Some(r) = &self.ready {
             check_ready(r)
                 .with_context(|| format!("fleet.toml: ready {r:?}{}", line_of(src, "ready")))?;
+        }
+        if let Some(r) = &self.retire {
+            check_ready(r)
+                .with_context(|| format!("fleet.toml: retire {r:?}{}", line_of(src, "retire")))?;
         }
         let mut by_prefix: BTreeMap<&str, &str> = BTreeMap::new();
         for (name, p) in &self.profiles {
@@ -932,6 +941,47 @@ async fn run_ready(checkout: &Path, worktree: &str, ready: &str) -> Result<()> {
     Ok(())
 }
 
+/// `retire` runs with the closed agent's worktree as $1 (the script is the host checkout's copy,
+/// as for `ready`). Err carries the script's own words: a refusal is a finding, not a retry.
+pub(crate) async fn run_retire(checkout: &Path, worktree: &str, retire: &str) -> Result<()> {
+    let script = checkout.join(retire);
+    if !script.is_file() {
+        bail!("retire script {retire:?} is not in {}", checkout.display());
+    }
+    let out = tokio::time::timeout(
+        Duration::from_secs(5 * 60),
+        tokio::process::Command::new(&script)
+            .arg(worktree)
+            .current_dir(checkout)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("retire script timed out (5m) and was killed")?
+    .with_context(|| format!("retire script {retire} did not start"))?;
+    if !out.status.success() {
+        let said = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
+        let (err, o) = (said(&out.stderr), said(&out.stdout));
+        bail!(
+            "retire script {retire} refused {worktree} ({}): {}",
+            out.status,
+            tail(if err.is_empty() { &o } else { &err })
+        );
+    }
+    Ok(())
+}
+/// Retire `worktree` of `repo` with the HOST checkout's `retire` script. Ok and silent when the
+/// repo's fleet.toml has none; Err names a refusal in the script's own words.
+pub(crate) async fn retire_in(host: &Host, repo: &str, worktree: &str) -> Result<()> {
+    let Some(checkout) = host.cfg.checkouts_now()?.remove(repo) else {
+        return Err(no_checkout(repo));
+    };
+    let (cfg, _) = load_in(&checkout, host.cfg.config_dir.as_deref())?;
+    match &cfg.retire {
+        Some(r) => run_retire(&checkout, worktree, r).await,
+        None => Ok(()),
+    }
+}
 /// `unset NAME` typed into the pane's shell, retried while the shell is not ready.
 async fn unset_env(sock: &Path, pane: &str, var: &str) -> Result<()> {
     let mut err = anyhow!("pane.send_text never ran");
@@ -1209,6 +1259,14 @@ async fn undo(host: &Host, r: &SpawnRequested, made: &Made) {
         let _ = herdr_call(sock, "pane.close", json!({ "pane_id": p })).await;
     }
     if made.fresh {
+        if let Some(wt) = &made.worktree
+            && let Err(e) = retire_in(host, &r.repo, wt).await
+        {
+            // Refused (or no script runnable): the tree may hold work, so it and its branch stay.
+            host.retire_refused(&r.agent, &r.repo, r.issue, wt, &e)
+                .await;
+            return;
+        }
         let checkout = host
             .cfg
             .checkouts_now()
@@ -2395,6 +2453,145 @@ profile = "devin"
         }
     }
 
+    #[test]
+    fn retire_is_a_relative_script_like_ready() {
+        let ok = CFG.replacen(
+            "brief = \"b.md\"",
+            "brief = \"b.md\"\nretire = \"bin/r.sh\"",
+            1,
+        );
+        assert_eq!(cfg(&ok).unwrap().retire.as_deref(), Some("bin/r.sh"));
+        assert_eq!(cfg(CFG).unwrap().retire, None);
+        for bad in ["../x.sh", "/tmp/x.sh", ""] {
+            let src = CFG.replacen(
+                "brief = \"b.md\"",
+                &format!("brief = \"b.md\"\nretire = \"{bad}\""),
+                1,
+            );
+            assert!(
+                cfg(&src).unwrap_err().to_string().contains("retire"),
+                "{bad}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn run_retire_passes_the_worktree_and_reports_a_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let sh = d.path().join("r.sh");
+        std::fs::write(&sh, "#!/bin/sh\necho \"$1\" > \"$1/seen\"\n[ -e \"$1/dirty\" ] && { echo 'has uncommitted work' >&2; exit 1; }\nexit 0\n").unwrap();
+        std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let wt = d.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        run_retire(d.path(), wt.to_str().unwrap(), "r.sh")
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(wt.join("seen")).unwrap().trim(),
+            wt.to_str().unwrap()
+        );
+        std::fs::write(wt.join("dirty"), "").unwrap();
+        let e = run_retire(d.path(), wt.to_str().unwrap(), "r.sh")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("uncommitted"), "{e}");
+        let e = run_retire(d.path(), wt.to_str().unwrap(), "missing.sh")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not in"), "{e}");
+    }
+    fn answered(mut r: SpawnRequested, agent: &str, wt: &str, secs: i64) -> Spawn {
+        r.agent = agent.into();
+        let mut s = spawn_of(r);
+        s.since = Utc::now() + chrono::Duration::seconds(secs);
+        s.result = Some(SpawnResult {
+            agent: agent.into(),
+            ok: true,
+            pane: None,
+            worktree: Some(wt.into()),
+            error: None,
+        });
+        s
+    }
+    fn state_with(spawns: Vec<Spawn>) -> State {
+        let mut s = State::default();
+        for (i, sp) in spawns.into_iter().enumerate() {
+            s.spawns.insert(format!("e{i}"), sp);
+        }
+        s
+    }
+    #[test]
+    fn retire_target_is_the_worktree_the_fleet_made_for_the_agent() {
+        let s = state_with(vec![answered(req(None), "agent:h/s/a", "/w/a", 0)]);
+        assert_eq!(
+            s.retire_target("agent:h/s/a", "h"),
+            Some(("o/r".into(), "/w/a".into(), Some(7)))
+        );
+        assert_eq!(s.retire_target("agent:h/s/a", "other"), None);
+        assert_eq!(s.retire_target("agent:h/s/nobody", "h"), None);
+    }
+    #[test]
+    fn retire_target_skips_a_tree_the_fleet_did_not_make() {
+        // spawned into an existing directory (a main checkout, say): nobody here made it
+        let s = state_with(vec![answered(
+            req(Some("/main".into())),
+            "agent:h/s/a",
+            "/main",
+            0,
+        )]);
+        assert_eq!(s.retire_target("agent:h/s/a", "h"), None);
+    }
+    #[test]
+    fn retire_target_skips_a_tree_handed_to_a_newer_agent_and_follows_a_handoff_to_its_end() {
+        let s = state_with(vec![
+            answered(req(None), "agent:h/s/dv", "/w", 0),
+            answered(req(Some("/w".into())), "agent:h/s/s", "/w", 10),
+        ]);
+        assert_eq!(
+            s.retire_target("agent:h/s/dv", "h"),
+            None,
+            "handed off: the tree is the sonnet\'s now"
+        );
+        assert_eq!(
+            s.retire_target("agent:h/s/s", "h"),
+            Some(("o/r".into(), "/w".into(), Some(7)))
+        );
+    }
+    #[test]
+    fn retire_target_skips_a_tree_another_live_agent_works_in_or_a_handoff_still_pending() {
+        let mut rv = answered(req(Some("/w".into())), "agent:h/s/rev", "/w", 20);
+        let mut s = state_with(vec![
+            answered(req(None), "agent:h/s/a", "/w", 0),
+            rv.clone(),
+        ]);
+        s.agents.insert("agent:h/s/rev".into(), live_agent());
+        assert_eq!(
+            s.retire_target("agent:h/s/a", "h"),
+            None,
+            "a reviewer is in the tree"
+        );
+        rv.result = None; // requested, not answered yet: the pane that dies in that window
+        let s = state_with(vec![answered(req(None), "agent:h/s/a", "/w", 0), rv]);
+        assert_eq!(
+            s.retire_target("agent:h/s/a", "h"),
+            None,
+            "a handoff is pending"
+        );
+    }
+    fn live_agent() -> crate::state::Agent {
+        crate::state::Agent {
+            host: "h".into(),
+            kind: None,
+            pane: None,
+            state: AgentState::Idle,
+            since: Utc::now(),
+            worked: None,
+            finished: None,
+            usage: None,
+        }
+    }
     fn spawn_of(r: SpawnRequested) -> Spawn {
         Spawn {
             request: r,
@@ -3865,6 +4062,204 @@ profile = "devin"
         assert!(wt.join("ready-ran").exists(), "the checkout's ready ran");
     }
 
+    fn retire_cfg(co: &Path, script: &str) {
+        std::fs::write(
+            co.join(".agent-fleet/fleet.toml"),
+            HOST_CFG.replacen(
+                "brief = \"b.md\"",
+                "brief = \"b.md\"\nretire = \"x.sh\"\nready = \"r.sh\"",
+                1,
+            ),
+        )
+        .unwrap();
+        std::fs::write(co.join("x.sh"), script).unwrap();
+        std::fs::write(co.join("r.sh"), "#!/bin/sh\nexit 1\n").unwrap();
+        for f in ["x.sh", "r.sh"] {
+            std::process::Command::new("chmod")
+                .args(["+x", &co.join(f).to_string_lossy()])
+                .status()
+                .unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn retire_in_runs_the_host_checkouts_script_and_is_quiet_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        let (host, _stub) = run(dir.path(), &[]).await;
+        retire_in(&host, "o/r", "/nowhere").await.unwrap(); // no `retire` in fleet.toml
+        retire_cfg(
+            &co,
+            "#!/bin/sh\ntouch \"$(dirname \"$0\")/retired-$(basename \"$1\")\"\n",
+        );
+        retire_in(&host, "o/r", "/some/wt").await.unwrap();
+        assert!(co.join("retired-wt").exists());
+        retire_cfg(&co, "#!/bin/sh\necho dirty >&2\nexit 1\n");
+        let e = retire_in(&host, "o/r", "/some/wt")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("dirty"), "{e}");
+    }
+    #[tokio::test]
+    async fn a_failed_spawn_runs_retire_on_its_new_worktree_before_removing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        retire_cfg(
+            &co,
+            "#!/bin/sh\ntouch \"$(dirname \"$0\")/retired-$(basename \"$1\")\"\n",
+        );
+        let wt = co.join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let (host, _stub) = run(
+            dir.path(),
+            &[("worktree.create", vec![created(wt.to_str().unwrap())])],
+        )
+        .await;
+        execute(&host, "req1", &spawn_of(req(None)), &State::default()).await; // ready exits 1
+        assert!(!result(&host).unwrap().ok);
+        assert!(
+            co.join("retired-wt").exists(),
+            "retire ran for the failed spawn"
+        );
+    }
+    #[tokio::test]
+    async fn closing_a_spawned_agents_pane_retires_its_worktree_once_its_last_one_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        retire_cfg(
+            &co,
+            "#!/bin/sh\ntouch \"$(dirname \"$0\")/retired-$(basename \"$1\")\"\n",
+        );
+        std::fs::write(co.join("r.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        let wt = co.join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let (host, _stub) = run(
+            dir.path(),
+            &[("worktree.create", vec![created(wt.to_str().unwrap())])],
+        )
+        .await;
+        let rq =
+            Envelope::new(actor(), "p", Known::SpawnRequested(Box::new(req(None)))).into_event();
+        host.replica.lock().unwrap().append(&rq).unwrap();
+        execute(&host, &rq.id, &spawn_of(req(None)), &State::default()).await;
+        assert!(result(&host).unwrap().ok);
+        let info = json!({ "name": "dv-7", "agent": "devin", "agent_status": "idle" });
+        host.agent_up("w:1", &info).await;
+        host.agent_up("w:2", &info).await; // alive in another pane: not closed yet
+        host.agent_down("w:1", "pane closed").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!co.join("retired-wt").exists());
+        host.agent_down("w:2", "pane closed").await;
+        for _ in 0..50 {
+            if co.join("retired-wt").exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("retire never ran");
+    }
+    fn blockers(h: &Host) -> Vec<String> {
+        h.replica
+            .lock()
+            .unwrap()
+            .all()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.body {
+                Body::Known(Known::BlockerRaised(b)) => Some(b.what.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    #[tokio::test]
+    async fn a_refused_retire_on_a_failed_spawn_keeps_the_tree_and_raises_a_blocker() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        retire_cfg(&co, "#!/bin/sh\necho 'has unpushed commits' >&2\nexit 1\n");
+        let wt = co.join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let (host, stub) = run(
+            dir.path(),
+            &[("worktree.create", vec![created(wt.to_str().unwrap())])],
+        )
+        .await;
+        execute(&host, "req1", &spawn_of(req(None)), &State::default()).await;
+        assert!(!result(&host).unwrap().ok);
+        assert!(
+            !stub
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("worktree.remove")),
+            "{:?}",
+            stub.calls()
+        );
+        let b = blockers(&host);
+        assert!(b.len() == 1 && b[0].contains("unpushed"), "{b:?}");
+    }
+    #[tokio::test]
+    async fn a_pane_left_by_its_agent_or_a_herdr_gap_retires_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        retire_cfg(
+            &co,
+            "#!/bin/sh\ntouch \"$(dirname \"$0\")/retired-$(basename \"$1\")\"\n",
+        );
+        std::fs::write(co.join("r.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        let wt = co.join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let (host, _stub) = run(
+            dir.path(),
+            &[("worktree.create", vec![created(wt.to_str().unwrap())])],
+        )
+        .await;
+        let rq =
+            Envelope::new(actor(), "p", Known::SpawnRequested(Box::new(req(None)))).into_event();
+        host.replica.lock().unwrap().append(&rq).unwrap();
+        execute(&host, &rq.id, &spawn_of(req(None)), &State::default()).await;
+        let info = json!({ "name": "dv-7", "agent": "devin", "agent_status": "idle" });
+        for why in ["gone from herdr", "agent left the pane"] {
+            host.agent_up("w:1", &info).await;
+            host.agent_down("w:1", why).await;
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!co.join("retired-wt").exists());
+    }
+    #[tokio::test]
+    async fn a_refused_retire_after_a_close_raises_a_blocker_and_forces_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        retire_cfg(&co, "#!/bin/sh\necho 'dirty tree' >&2\nexit 1\n");
+        std::fs::write(co.join("r.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        let wt = co.join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let (host, _stub) = run(
+            dir.path(),
+            &[("worktree.create", vec![created(wt.to_str().unwrap())])],
+        )
+        .await;
+        let rq =
+            Envelope::new(actor(), "p", Known::SpawnRequested(Box::new(req(None)))).into_event();
+        host.replica.lock().unwrap().append(&rq).unwrap();
+        execute(&host, &rq.id, &spawn_of(req(None)), &State::default()).await;
+        host.agent_up(
+            "w:1",
+            &json!({ "name": "dv-7", "agent": "devin", "agent_status": "idle" }),
+        )
+        .await;
+        host.agent_down("w:1", "pane closed").await;
+        for _ in 0..50 {
+            if let [b] = &blockers(&host)[..] {
+                assert!(
+                    b.contains("dirty tree") && b.contains(wt.to_str().unwrap()),
+                    "{b}"
+                );
+                assert!(wt.is_dir(), "a refusal removes nothing");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("no blocker: {:?}", blockers(&host));
+    }
     #[tokio::test]
     async fn worktree_create_uses_the_host_checkouts_base() {
         let dir = tempfile::tempdir().unwrap();

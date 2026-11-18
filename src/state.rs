@@ -985,6 +985,39 @@ impl State {
         });
     }
 
+    /// The (repo, worktree, issue) to retire when `agent`'s last pane on `host` closes: the worktree of
+    /// its latest answered-ok spawn, if the fleet MADE that tree (some spawn with no `worktree`
+    /// in its request answered with it) and no newer spawn handed it to another agent. A handoff
+    /// therefore retires nothing until its last agent closes; a spawn into an existing
+    /// directory (a main checkout) never retires anything.
+    pub fn retire_target(&self, agent: &str, host: &str) -> Option<(String, String, Option<u64>)> {
+        let ok = |s: &Spawn| {
+            s.result
+                .as_ref()
+                .filter(|r| r.ok)
+                .and_then(|r| r.worktree.clone())
+        };
+        let (mine, tree) = self
+            .spawns
+            .values()
+            .filter(|s| s.request.host == host && s.request.agent == agent)
+            .filter_map(|s| ok(s).map(|t| (s, t)))
+            .max_by_key(|(s, _)| s.since)?;
+        let made = self
+            .spawns
+            .values()
+            .any(|s| s.request.worktree.is_none() && ok(s).as_deref() == Some(&tree));
+        // Another agent holds the tree: up in it now, or handed it in a newer spawn that is
+        // answered ok or not answered yet (the window before its pane exists).
+        let held = self.spawns.values().any(|s| {
+            s.request.agent != agent
+                && (ok(s).as_deref() == Some(&tree) && self.agents.contains_key(&s.request.agent)
+                    || s.since > mine.since
+                        && (ok(s).as_deref() == Some(&tree)
+                            || s.result.is_none() && s.request.worktree.as_deref() == Some(&tree)))
+        });
+        (made && !held).then(|| (mine.request.repo.clone(), tree, mine.request.issue))
+    }
     /// The worktree the fleet assigned each agent at spawn on `host`, by agent id: the host's
     /// `spawn.result`, never where the agent's pane stands now (`usage.cwd` follows a `cd`).
     /// Exact rule: among the spawns of an agent that is up (in `agents`) on `host`, drop any the
