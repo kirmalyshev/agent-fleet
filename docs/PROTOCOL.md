@@ -741,8 +741,10 @@ stall, then one re-send — never twice to an agent that started working. On suc
 writes `agent.role` (level, lead from the request) and `task.assigned` for
 `task:<repo name>/<issue>` (a 409 is not a failure), answers `spawn.result`, and closes a
 `replaces` agent's pane and workspace — never its worktree. `retire` runs (5 min) when an agent's
-last pane closes by any path, and on a failed spawn's new worktree before it is removed; only for
-a worktree a spawn made, and not while a newer spawn (a handoff) holds it. A refusal becomes a
+last pane is closed (`pane.closed`, `pane.exited`, `workspace.closed`; not an agent that left its
+pane, not a herdr listing gap), and on a failed spawn's new worktree before it is removed; only for
+a worktree a spawn made, and not while another agent holds it (a handoff, a reviewer). The script must itself refuse an
+occupied or dirty tree; the host does not look. A refusal becomes a
 `blocker.raised` naming the agent, and nothing is forced. Any failure undoes what the spawn
 took and answers `ok=false`; a request older than 15 min when first seen is answered `expired`.
 

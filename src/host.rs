@@ -459,37 +459,81 @@ impl Host {
             gone.filter(|l| !panes.values().any(|o| o.agent == l.agent))
         };
         if let Some(l) = gone {
+            // Read before `agent.down` is applied: it drops the agent, and its spawn record with it
+            // once that is 24 h old. Only a real close retires; a pane its agent merely left, or a
+            // herdr listing gap, leaves a live shell in the tree.
+            let target = matches!(reason, "pane closed" | "workspace closed")
+                .then(|| self.retire_target(&l.agent))
+                .flatten();
             self.publish(self.presence(Known::AgentDown(AgentDown {
                 agent: l.agent.clone(),
                 reason: Some(reason.into()),
             })))
             .await;
-            self.retire_closed(l.agent);
+            if let Some((repo, wt, issue)) = target {
+                self.retire_closed(l.agent, repo, wt, issue);
+            }
         }
     }
 
     /// fleet.toml's `retire` for a closed agent's worktree, off the event loop: the script can
     /// take minutes. A refusal (dirty tree, unpushed commits) becomes a blocker naming the
     /// agent, never a forced retire.
-    fn retire_closed(self: &Arc<Self>, agent: String) {
-        let Ok(view) = self.view() else { return };
-        let Some((repo, wt)) = view.state.retire_target(&agent, &self.cfg.host) else {
-            return;
-        };
+    fn retire_target(&self, agent: &str) -> Option<(String, String, Option<u64>)> {
+        match self.view() {
+            Ok(v) => v
+                .state
+                .retire_target(agent, &self.cfg.host)
+                // Already gone (retired by hand or by a sweep): nothing to retire or report.
+                .filter(|(_, wt, _)| Path::new(wt).exists()),
+            Err(e) => {
+                eprintln!("agent-fleet host: retire for {agent} skipped, no view: {e:#}");
+                None
+            }
+        }
+    }
+    fn retire_closed(
+        self: &Arc<Self>,
+        agent: String,
+        repo: String,
+        wt: String,
+        issue: Option<u64>,
+    ) {
         let host = self.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::spawn::retire_in(&host, &repo, &wt).await {
-                eprintln!("agent-fleet host: retire {wt}: {e:#}");
-                host.publish(host.presence(Known::BlockerRaised(BlockerRaised {
-                    what: crate::spawn::tail(&format!("retire of {wt} refused: {e:#}")),
-                    owner: Some(agent),
-                    unblocks_when: Some("the worktree is retired by hand".into()),
-                    pid: None,
-                    started: None,
-                })))
-                .await;
+                host.retire_refused(&agent, &repo, issue, &wt, &e).await;
             }
         });
+    }
+
+    /// Say a retire did not happen: stderr, and a blocker on the spawn's issue naming the agent
+    /// (a blocker needs a task, so a spawn with no issue is stderr only).
+    pub(crate) async fn retire_refused(
+        &self,
+        agent: &str,
+        repo: &str,
+        issue: Option<u64>,
+        wt: &str,
+        e: &anyhow::Error,
+    ) {
+        eprintln!("agent-fleet host: retire {wt}: {e:#}");
+        let Some(issue) = issue else { return };
+        let b = Known::BlockerRaised(BlockerRaised {
+            what: format!(
+                "retire of {wt} not done: {}",
+                crate::spawn::tail(&format!("{e:#}"))
+            ),
+            owner: Some(agent.to_string()),
+            unblocks_when: Some("the worktree is retired by hand".into()),
+            pid: None,
+            started: None,
+        });
+        let env = Envelope::new(self.actor(), crate::spawn::task_project(repo), b)
+            .task(crate::spawn::task_id(repo, issue));
+        if !self.publish(env).await {
+            eprintln!("agent-fleet host: the blocker for {wt} was not written");
+        }
     }
 
     /// herdr's current list, reconciled against what the hub believes about this session: agents
