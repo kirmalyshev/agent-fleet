@@ -284,8 +284,15 @@ pub fn stalled(a: &Agent, now: DateTime<Utc>, min: Duration) -> Option<String> {
     .then(|| format!("idle for {}m since it worked", idle_for.num_minutes()))
 }
 
-/// `hung`: `working` for HUNG at under HUNG_CPU_PCT, its worktree unchanged as long.
-pub fn hung(s: &State, a: &Agent, now: DateTime<Utc>) -> Option<String> {
+/// `hung`: `working` for HUNG at under HUNG_CPU_PCT, its worktree unchanged as long, and a
+/// process of its own the host's watch proved hung. A pane tree that samples 0% CPU while a
+/// command waits under load is not proof: the watch judges each process, so without its
+/// `proc.hung` for this agent the agent is not hung (idle is `stalled`'s and `stale`'s).
+pub fn hung(s: &State, id: &str, a: &Agent, now: DateTime<Utc>) -> Option<String> {
+    eprintln!("DBG id={id} hung={:?}", s.hung.keys().collect::<Vec<_>>());
+    if !hung_pids_of(s, id, now) {
+        return None;
+    }
     // a worktree waiting on a resource is a legitimate wait, not a hang
     if resource_wait(s, a).is_some() {
         return None;
@@ -382,6 +389,13 @@ pub fn hung_pids(
         .collect()
 }
 
+/// Whether the host's watch has a fresh `proc.hung` for a process this agent started.
+fn hung_pids_of(s: &State, id: &str, now: DateTime<Utc>) -> bool {
+    s.hung
+        .values()
+        .any(|h| h.agent.as_deref() == Some(id) && h.checked.is_some_and(|c| now - c <= HUNG_FRESH))
+}
+
 pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
     let mut out = Vec::new();
     // Worktree key → the live agents working in it.
@@ -440,7 +454,7 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
                 ));
             }
         }
-        if let Some(detail) = hung(s, a, now) {
+        if let Some(detail) = hung(s, id, a, now) {
             out.push(finding(
                 "hung",
                 id,
@@ -1279,6 +1293,7 @@ mod tests {
             "agent:h/s/idle".into(),
             agent(AgentState::Idle, h(3), "/w/late", 0, 1024),
         );
+        proc_hung(&mut s, "agent:h/s/hung", 78, now);
         let f = findings(&s, now);
         let k = kinds(&f);
         assert!(k.contains(&("hung", "agent:h/s/hung")), "{f:#?}");
@@ -1294,7 +1309,8 @@ mod tests {
         assert!(k.contains(&("forgotten", "h:/w/old")));
         assert!(k.contains(&("forgotten", "h:/w/clutter")));
         assert!(k.contains(&("unpushed", "h:/w/late")));
-        assert_eq!(f.len(), 7, "{f:#?}");
+        // the agent-level hung and the process-level hung it needs
+        assert_eq!(f.len(), 8, "{f:#?}");
     }
 
     #[test]
@@ -1632,6 +1648,42 @@ mod tests {
         assert!(findings(&s, now).is_empty(), "no CPU reading is not 0% CPU");
     }
 
+    /// The host's watch proved a process of `agent` hung, just now.
+    fn proc_hung(s: &mut State, agent: &str, pid: u32, now: DateTime<Utc>) {
+        s.hung.insert(
+            format!("h:{pid}"),
+            crate::event::ProcessHung {
+                host: "h".into(),
+                pid,
+                pids: vec![],
+                agent: Some(agent.into()),
+                command: None,
+                started: None,
+                evidence: None,
+                since: None,
+                checked: Some(now),
+            },
+        );
+    }
+
+    #[test]
+    fn an_agent_at_zero_cpu_without_a_hung_process_is_not_hung() {
+        // 24 processes at 0% CPU for 38 min: a check tree waiting under load (s-c844, 18 Nov).
+        let now = Utc::now();
+        let mut s = State::default();
+        s.agents.insert(
+            "agent:h/s/queued".into(),
+            agent(
+                AgentState::Working,
+                now - Duration::hours(1),
+                "/w/a",
+                0,
+                1024,
+            ),
+        );
+        assert!(findings(&s, now).iter().all(|f| f.kind != "hung"));
+    }
+
     #[test]
     fn a_macos_sampled_agent_can_be_hung() {
         // On macOS the numbers now come from `ps`, so the low-CPU read is real.
@@ -1647,7 +1699,10 @@ mod tests {
                 1024,
             ),
         );
-        assert_eq!(kinds(&findings(&s, now)), vec![("hung", "agent:h/s/mac")]);
+        proc_hung(&mut s, "agent:h/s/mac", 77, now);
+        let f = findings(&s, now);
+        let k = kinds(&f);
+        assert!(k.contains(&("hung", "agent:h/s/mac")), "{k:?}");
     }
 
     #[test]
@@ -2019,7 +2074,10 @@ mod tests {
             "{detail}"
         );
         assert_eq!(eta, Some(Duration::minutes(21)));
-        assert!(hung(&s, q, now).is_none(), "a queued agent is not hung");
+        assert!(
+            hung(&s, "q", q, now).is_none(),
+            "a queued agent is not hung"
+        );
         let f = findings(&s, now);
         assert!(
             !f.iter()
