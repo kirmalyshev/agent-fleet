@@ -82,7 +82,8 @@ agent-fleet init
 ```
 
 `agent-fleet init` writes this machine's `fleet.toml` and `brief.md` into the user config dir
-(`~/.config/agent-fleet` on Linux; `AGENT_FLEET_CONFIG_DIR` overrides it). They are the rules
+(`~/.config/agent-fleet` on Linux, `instances/<name>` under it for an instance other than
+`default`; `AGENT_FLEET_CONFIG_DIR` overrides it). They are the rules
 `spawn` uses for every repository: a profile for each agent program found on `PATH` (claude,
 codex, devin), one default rule, and a comment on every key. It never overwrites a file. It also
 lists your Claude and Codex skills that drive terminals (herdr, tmux, cmux): in a fleet, agents
@@ -365,14 +366,14 @@ Flags or environment:
 
 | Variable | Flag | What |
 |---|---|---|
-| `AGENT_FLEET_INSTANCE` | `--instance` | Which fleet (default `default`). |
+| `AGENT_FLEET_INSTANCE` | `--instance` | Which fleet (default: in a herdr pane, the instance named after the session if it has a `hub` file; else `default`). |
 | `AGENT_FLEET_HUB` | `--hub` | The hub's URL (default: the one this instance's hub wrote, else `http://127.0.0.1:7710`). |
 | `AGENT_FLEET_HOME` | | The instance's data directory: hub log, token, spool, replica. |
 | `AGENT_FLEET_TOKEN_FILE` | `--token-file` | The bearer token (default `<data dir>/token`). |
 | `AGENT_FLEET_AGENT` | `--as` | Who is writing, `agent:<host>/<session>/<name>`. Derived inside an agent's herdr pane. |
 | `AGENT_FLEET_PROJECT` | `--project` | Project for events that name none (default `default`). |
 | `AGENT_FLEET_HOST` | `--host-name` | This machine's name in ids (default the hostname). |
-| `AGENT_FLEET_CONFIG_DIR` | | Where the machine's `fleet.toml` and `brief.md` live. |
+| `AGENT_FLEET_CONFIG_DIR` | | Where the instance's `fleet.toml` and `brief.md` live. |
 | `AGENT_FLEET_GH` | | The `gh` binary to run. |
 | `AGENT_FLEET_DEV_SHARED` | | Where `dev` publishes each user's slots (default `/var/tmp/agent-fleet-dev`). |
 
@@ -380,8 +381,11 @@ The default data directory is the platform's (`~/.local/share/agent-fleet` on Li
 
 **Instances.** One machine can run several fleets, one per project or product. Each instance has
 its own directory (`instances/<name>` under the data directory), so its own hub, log, token,
-spool and replica. Two hubs on one machine need two `--listen` ports. A host serves one instance
-and one herdr session. `agent-fleet instances` lists them.
+spool and replica, and its own `fleet.toml` and connected repos (`instances/<name>` under the
+config directory). Two hubs on one machine need two `--listen` ports. A host serves one instance
+and one herdr session. In a herdr pane, commands default to the instance named after the session
+once it has a `hub` file. For an instance whose hub is on another machine, write that file by
+hand: one line, the hub's URL. `agent-fleet instances` lists them.
 
 **Several machines.** Run one hub. Bind it to an address the other machines reach, plus
 loopback (`--listen 127.0.0.1:7710 --listen <address>:7710`); it refuses `0.0.0.0`. On each other
@@ -434,7 +438,7 @@ From `agent-fleet --help`; every command has its own `--help`.
 | `ps` | What every agent is doing |
 | `self-update` | Every host that is up pulls `main` in the clone its binary was built from, rebuilds and restarts; prints the commit each one then runs. A dirty clone or one not on `main` refuses |
 | `instances` | The agent-fleet instances on this machine and the hub each one uses |
-| `init` | Write this machine's fleet.toml and brief.md into the user config dir (`AGENT_FLEET_CONFIG_DIR` overrides it): commented templates with a profile for each agent program on PATH and one default rule. Never overwrites an existing file. Lists the user-level Claude and Codex skills that drive terminals (herdr, tmux, cmux) |
+| `init` | Write this machine's fleet.toml and brief.md into the instance's config dir (`AGENT_FLEET_CONFIG_DIR` overrides it): commented templates with a profile for each agent program on PATH and one default rule. Never overwrites an existing file. Lists the user-level Claude and Codex skills that drive terminals (herdr, tmux, cmux) |
 | `repo` | Connect a repository to the fleet on this machine: `add` records its checkout in the machine's fleet.toml, `ls` lists, `rm` disconnects. The host picks changes up without a restart |
 | `dev` | Per-worktree dev environments from the repository's `.agent-fleet/dev.toml` (`up`, `down`, `status` …: each worktree gets a slot with its own ports and values, runs its own services, and shares the infra; `db`, `test`), the worktrees of the connected repositories (`ls`, `clean`), and the agents and PRs on them (`agents`, `prs`) |
 | `tui` | The fleet on one screen, live: agents, worktrees, tasks, findings, resources, asks; `:` runs any command from it |

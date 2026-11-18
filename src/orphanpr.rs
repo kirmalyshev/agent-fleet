@@ -388,8 +388,8 @@ pub async fn scan(
 
 /// `[orphan_pr]` of the fleet.toml in `dir`'s checkout (or the machine's own). No fleet.toml
 /// anywhere means the check is off: `Ok(None)`. One that cannot be read or parsed is an error.
-pub fn config(dir: &std::path::Path) -> Result<Option<Config>> {
-    config_in(dir, crate::spawn::machine_dir().as_deref())
+pub fn config(dir: &std::path::Path, instance: &str) -> Result<Option<Config>> {
+    config_in(dir, crate::spawn::machine_dir(instance).as_deref())
 }
 
 /// `config` with the machine's config dir given. `repos` unset means the machine's connected

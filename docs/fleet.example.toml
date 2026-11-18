@@ -1,8 +1,8 @@
 # fleet.toml: how `agent-fleet spawn` starts agents, and which repositories this machine serves.
 #
 # `agent-fleet init` writes this file, with a profile for each agent program it finds on PATH,
-# into the user config dir (~/.config/agent-fleet on Linux; AGENT_FLEET_CONFIG_DIR overrides
-# it), next to brief.md. These are the machine's rules: every connected repository uses them,
+# into the user config dir (~/.config/agent-fleet on Linux, instances/<name> under it for an
+# instance other than `default`; AGENT_FLEET_CONFIG_DIR overrides it), next to brief.md. These are the machine's rules: every connected repository uses them,
 # unless the repository has its own `.agent-fleet/fleet.toml`, which then replaces this file
 # wholesale for that repository ([repos] below is only ever read from the machine's file).
 # A commented-out key shows its default or an example: uncomment it to use it.
