@@ -22,6 +22,9 @@ pub const HUNG_TICKS: u32 = 2;
 /// A wait this long is reported: nothing waits more than 30 min.
 pub const WAIT_MAX: Duration = Duration::minutes(30);
 
+/// Commands that only read a pipe: idle without their producer, never hung by themselves.
+const FILTERS: &[&str] = &["tail", "head", "grep", "cat", "tee", "sed", "awk", "jq"];
+
 /// The shells an agent runs its commands in; their subtrees are what the agent started.
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
 
@@ -142,8 +145,17 @@ impl Watch {
                         t.skip(shell);
                         continue;
                     }
+                    // A pipeline's members are siblings: the reader is not hung while its
+                    // producer works, so one busy member makes the whole command busy.
+                    let start = t.out.len();
+                    let mut busy = false;
                     for c in t.kids(shell).to_vec() {
-                        t.visit(c, agent);
+                        busy |= t.visit(c, agent);
+                    }
+                    if busy {
+                        t.revive(start);
+                    } else {
+                        t.spare_filters(start);
                     }
                 }
             }
@@ -261,6 +273,33 @@ impl<'a> Tick<'a> {
     fn skip(&mut self, pid: u32) {
         for p in self.now.tree(pid) {
             self.visited.insert((p, self.now.0[&p].started));
+        }
+    }
+
+    /// The command is busy: what `visit` classified from `start` on as idle or hung is a
+    /// member waiting on a working sibling, and its streak ends.
+    fn revive(&mut self, start: usize) {
+        for c in &mut self.out[start..] {
+            if matches!(c.verdict, Verdict::Idle | Verdict::Hung(_)) {
+                c.verdict = Verdict::Working;
+                let p = &self.now.0[&c.pid];
+                self.next.remove(&(c.pid, p.started));
+            }
+        }
+    }
+
+    /// A command whose only hung members are pure filters is not hung: they wait on a
+    /// producer that is gone or not ours to judge.
+    fn spare_filters(&mut self, start: usize) {
+        let filter = |t: &Self, c: &Classified| FILTERS.contains(&t.now.0[&c.pid].name.as_str());
+        let hung = |c: &Classified| matches!(c.verdict, Verdict::Hung(_));
+        let out = &self.out[start..];
+        if out.iter().filter(|c| hung(c)).all(|c| filter(self, c)) {
+            for c in &mut self.out[start..] {
+                if matches!(c.verdict, Verdict::Hung(_)) {
+                    c.verdict = Verdict::Idle;
+                }
+            }
         }
     }
 
@@ -1175,6 +1214,33 @@ mod tests {
         assert_eq!(e.deepest.as_deref(), Some("xcrun simctl bootstatus ABC -b"));
         assert!(matches!(verdict(&v, 31), Some(Verdict::Hung(_))));
         assert_eq!(v[0].agent.as_deref(), Some("agent:h/s/o-1"));
+    }
+
+    #[test]
+    fn a_pipe_reader_beside_a_working_producer_is_not_hung() {
+        // `eait-merge | tail -15`: both are children of the tool shell; the producer works.
+        let mut w = Watch::default();
+        let pipe = |cpu| {
+            tree(&[
+                (30, SHELL, "bash", "bash eait-merge", cpu, 20),
+                (40, SHELL, "tail", "tail -15", 0, 20),
+            ])
+        };
+        w.step(pipe(0), at(0), &seen());
+        w.step(pipe(60_000), at(2), &seen());
+        let v = w.step(pipe(120_000), at(4), &seen());
+        assert_eq!(verdict(&v, 30), Some(&Verdict::Working));
+        assert_eq!(verdict(&v, 40), Some(&Verdict::Working), "{v:#?}");
+    }
+
+    #[test]
+    fn a_lone_pure_filter_is_never_hung() {
+        let mut w = Watch::default();
+        let lone = || tree(&[(40, SHELL, "tail", "tail -8", 0, 20)]);
+        w.step(lone(), at(0), &seen());
+        w.step(lone(), at(2), &seen());
+        let v = w.step(lone(), at(4), &seen());
+        assert!(!matches!(verdict(&v, 40), Some(Verdict::Hung(_))), "{v:#?}");
     }
 
     #[test]
