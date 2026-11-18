@@ -459,10 +459,10 @@ pub fn recipients(s: &State, agent: Option<&str>) -> Vec<String> {
 
 /// Each process matching `is` whose parent does not, with it and the matching ones under it.
 /// Tops of one agent in one process group (a pipeline) are one: the lowest pid's.
-/// The pids of a hung report that `agent-fleet kill` would accept from anyone: `None` when the
-/// top itself is an agent, a pane, a multiplexer or above one (a report nobody can act on is a
-/// false alarm), else `pids` without the protected ones.
-fn killable_pids(procs: &Procs, top: u32, pids: &[u32]) -> Option<Vec<u32>> {
+/// The pids of a hung report that `agent-fleet kill` would accept from anyone: `Err(why kill
+/// refuses)` when the top itself is an agent, a pane, a multiplexer or above one (a report
+/// nobody can act on is a false alarm), else `pids` without the protected ones.
+fn killable_pids(procs: &Procs, top: u32, pids: &[u32]) -> Result<Vec<u32>, String> {
     let t: crate::kill::Table = procs
         .0
         .iter()
@@ -475,7 +475,10 @@ fn killable_pids(procs: &Procs, top: u32, pids: &[u32]) -> Option<Vec<u32>> {
         })
         .collect();
     let ok = |p: u32| crate::kill::never_killable(&t, p).is_none();
-    ok(top).then(|| pids.iter().copied().filter(|&p| ok(p)).collect())
+    match crate::kill::never_killable(&t, top) {
+        Some(why) => Err(why),
+        None => Ok(pids.iter().copied().filter(|&p| ok(p)).collect()),
+    }
 }
 pub fn tops(
     v: &[Classified],
@@ -941,8 +944,14 @@ async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {
             continue;
         };
         // Only a report its own `kill` line can act on: never an agent, a pane, or above one.
-        let Some(pids) = killable_pids(procs, *top, pids) else {
-            continue;
+        let pids = match killable_pids(procs, *top, pids) {
+            Ok(p) => p,
+            Err(why) => {
+                eprintln!(
+                    "agent-fleet host: pid {top} looks hung but kill would refuse it, not reported: {why}"
+                );
+                continue;
+            }
         };
         let pids = &pids;
         let key = format!("{me}:{top}");
@@ -994,7 +1003,13 @@ async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {
         )
         .await;
     }
-    for key in to_clear(s, &me, &v, procs, &hung, &walked, now) {
+    // A top that is no longer reportable (see `killable_pids`) stops standing, so its old record clears.
+    let reportable: Vec<(u32, Vec<u32>)> = hung
+        .iter()
+        .filter(|(t, p)| killable_pids(procs, *t, p).is_ok())
+        .cloned()
+        .collect();
+    for key in to_clear(s, &me, &v, procs, &reportable, &walked, now) {
         let pid = s.hung[&key].pid;
         host.publish(host.presence(Known::ProcessHung(ProcessHung {
             host: me.clone(),
@@ -1875,10 +1890,11 @@ mod tests {
             (30, 1002, "bash", "bash scripts/e2e.sh", 0, 20),
             (31, 30, "java", "java -jar driver.jar", 0, 20),
         ]);
-        assert_eq!(killable_pids(&p, 30, &[30, 31]), Some(vec![30, 31]));
-        assert_eq!(killable_pids(&p, 30, &[30, 1002]), Some(vec![30]));
+        assert_eq!(killable_pids(&p, 30, &[30, 31]), Ok(vec![30, 31]));
+        assert_eq!(killable_pids(&p, 30, &[30, 1002]), Ok(vec![30]));
         for agent_side in [1000, 1001, 1002] {
-            assert_eq!(killable_pids(&p, agent_side, &[agent_side]), None);
+            let why = killable_pids(&p, agent_side, &[agent_side]).unwrap_err();
+            assert!(why.contains(&format!("pid {agent_side}")), "{why}");
         }
     }
     #[test]
