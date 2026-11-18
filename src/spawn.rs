@@ -1760,7 +1760,7 @@ async fn stuck(
         {
             continue;
         }
-        let Some((kind, mut text)) = crate::doctor::hung(state, a, now)
+        let Some((kind, mut text)) = crate::doctor::hung(state, id, a, now)
             .map(|d| ("HUNG", d))
             .or_else(|| crate::doctor::stalled(a, now, min).map(|d| ("STALLED", d)))
         else {
@@ -3543,6 +3543,20 @@ profile = "devin"
             ts: Utc::now(),
         });
         s.stuck.get_mut("agent:h/s/a").unwrap().cause = crate::event::StuckCause::Unknown;
+        s.hung.insert(
+            "h:9".into(),
+            crate::event::ProcessHung {
+                host: "h".into(),
+                pid: 9,
+                pids: vec![],
+                agent: Some("agent:h/s/a".into()),
+                command: None,
+                started: None,
+                evidence: None,
+                since: None,
+                checked: Some(Utc::now()),
+            },
+        );
         s
     }
 

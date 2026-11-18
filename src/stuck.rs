@@ -755,7 +755,7 @@ pub async fn check(
     now: DateTime<Utc>,
 ) -> Option<(Cause, String)> {
     let eligible = matches!(a.state, AgentState::Idle | AgentState::Blocked)
-        || (a.state == AgentState::Working && crate::doctor::hung(s, a, now).is_some());
+        || (a.state == AgentState::Working && crate::doctor::hung(s, id, a, now).is_some());
     if !eligible {
         if s.stuck.contains_key(id) {
             host.publish(host.presence(Known::AgentStuck(AgentStuck {
