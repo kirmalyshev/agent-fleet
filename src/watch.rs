@@ -459,6 +459,24 @@ pub fn recipients(s: &State, agent: Option<&str>) -> Vec<String> {
 
 /// Each process matching `is` whose parent does not, with it and the matching ones under it.
 /// Tops of one agent in one process group (a pipeline) are one: the lowest pid's.
+/// The pids of a hung report that `agent-fleet kill` would accept from anyone: `None` when the
+/// top itself is an agent, a pane, a multiplexer or above one (a report nobody can act on is a
+/// false alarm), else `pids` without the protected ones.
+fn killable_pids(procs: &Procs, top: u32, pids: &[u32]) -> Option<Vec<u32>> {
+    let t: crate::kill::Table = procs
+        .0
+        .iter()
+        .map(|(&p, x)| {
+            let proc = crate::kill::Proc {
+                ppid: x.ppid,
+                name: x.name.clone(),
+            };
+            (p, proc)
+        })
+        .collect();
+    let ok = |p: u32| crate::kill::never_killable(&t, p).is_none();
+    ok(top).then(|| pids.iter().copied().filter(|&p| ok(p)).collect())
+}
 pub fn tops(
     v: &[Classified],
     procs: &Procs,
@@ -922,6 +940,11 @@ async fn once(host: &Arc<Host>, w: &mut Watch) -> anyhow::Result<()> {
         let Verdict::Hung(e) = &c.verdict else {
             continue;
         };
+        // Only a report its own `kill` line can act on: never an agent, a pane, or above one.
+        let Some(pids) = killable_pids(procs, *top, pids) else {
+            continue;
+        };
+        let pids = &pids;
         let key = format!("{me}:{top}");
         let mut evidence = e.text(mins);
         if let Some((_, r)) = holders
@@ -1843,6 +1866,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_hung_report_never_names_what_kill_would_refuse() {
+        let p = tree(&[
+            (1000, 1, "herdr", "herdr", 0, 60),
+            (1001, 1000, "zsh", "zsh", 0, 60),
+            (1002, 1001, "claude", "claude", 0, 60),
+            (30, 1002, "bash", "bash scripts/e2e.sh", 0, 20),
+            (31, 30, "java", "java -jar driver.jar", 0, 20),
+        ]);
+        assert_eq!(killable_pids(&p, 30, &[30, 31]), Some(vec![30, 31]));
+        assert_eq!(killable_pids(&p, 30, &[30, 1002]), Some(vec![30]));
+        for agent_side in [1000, 1001, 1002] {
+            assert_eq!(killable_pids(&p, agent_side, &[agent_side]), None);
+        }
+    }
     #[test]
     fn kill_confirms_a_hung_report_only_on_an_idle_process() {
         let since = at(-5);
