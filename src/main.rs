@@ -161,8 +161,9 @@ enum Cmd {
     /// any command from it. `--all`: every instance on this machine.
     Tui {
         /// Every instance `agent-fleet instances` lists, each read from its own hub with its own
-        /// token (or its replica), with a line for each; `[` and `]` switch the one on screen,
-        /// which every action and command goes to.
+        /// token (or its replica), all named with their counts under the title; `[` and `]`
+        /// switch the one on screen, which every action and command goes to. Refuses --hub,
+        /// --token-file, AGENT_FLEET_HOME and AGENT_FLEET_CONFIG_DIR.
         #[arg(long)]
         all: bool,
     },
@@ -815,6 +816,18 @@ impl Ctx {
     }
 }
 
+/// `tui --all` refuses what pins one hub, token, data or config dir (`pinned`: the env vars for
+/// the last two): each instance uses its own, and a command the screen runs would inherit them and
+/// go to the wrong instance.
+fn refuse_pinned(cli: &Cli, pinned: bool) -> Result<()> {
+    if cli.hub.is_some() || cli.token_file.is_some() || pinned {
+        bail!(
+            "tui --all reads each instance's own hub, token and config: unset --hub/AGENT_FLEET_HUB, --token-file/AGENT_FLEET_TOKEN_FILE, AGENT_FLEET_HOME and AGENT_FLEET_CONFIG_DIR"
+        );
+    }
+    Ok(())
+}
+
 /// `tui --all`: a context for each instance under `base`, each with its own data dir, so its own
 /// hub, token and replica, and the command line's other flags.
 fn every_instance(matches: &clap::ArgMatches, base: &std::path::Path) -> Result<Vec<Ctx>> {
@@ -970,6 +983,17 @@ async fn main() -> Result<()> {
     {
         return dev::run(cmd).await;
     }
+    if let Cmd::Tui { all: true } = cli.cmd {
+        let pinned = ["AGENT_FLEET_HOME", "AGENT_FLEET_CONFIG_DIR"]
+            .iter()
+            .any(|v| std::env::var_os(v).is_some());
+        refuse_pinned(&cli, pinned)?;
+        // No data dir is made for the instance it runs under: one that does not exist would
+        // then be listed. It starts on that instance when it is listed, else on the first.
+        let fleets = every_instance(&matches, &Paths::base()?)?;
+        let on = fleets.iter().position(|c| c.cli.instance == cli.instance);
+        return tui::run(&fleets, on.unwrap_or(0)).await;
+    }
     let ctx = Ctx {
         paths: Paths::from_env(&cli.instance)?,
         cli,
@@ -1034,23 +1058,7 @@ async fn main() -> Result<()> {
             host::run(cfg, ctx.client()?).await?;
         }
         Cmd::Tui { all: false } => tui::run(std::slice::from_ref(&ctx), 0).await?,
-        Cmd::Tui { all: true } => {
-            // These pin one hub, token or data dir; under --all each instance uses its own, and a
-            // command the screen runs would inherit them and go to the wrong instance.
-            if ctx.cli.hub.is_some()
-                || ctx.cli.token_file.is_some()
-                || std::env::var_os("AGENT_FLEET_HOME").is_some()
-            {
-                bail!(
-                    "tui --all reads each instance's own hub and token: unset --hub/AGENT_FLEET_HUB, --token-file/AGENT_FLEET_TOKEN_FILE and AGENT_FLEET_HOME"
-                );
-            }
-            let fleets = every_instance(&matches, &Paths::base()?)?;
-            let on = fleets
-                .iter()
-                .position(|c| c.cli.instance == ctx.cli.instance);
-            tui::run(&fleets, on.unwrap_or(0)).await?;
-        }
+        Cmd::Tui { all: true } => unreachable!("runs before the context"),
         Cmd::Dev { cmd } => {
             let s = match ctx.snapshot_state().await {
                 Ok((s, note)) => {
@@ -1954,8 +1962,32 @@ mod tests {
             std::fs::write(dir.join("token"), "t").unwrap();
         }
         Store::open(&base.path().join("replica.db")).unwrap();
+        // Not instances: a stray file, a name --instance refuses, a second `default`.
+        let others = base.path().join("instances");
+        std::fs::write(others.join(".DS_Store"), "").unwrap();
+        std::fs::create_dir(others.join("not one")).unwrap();
+        std::fs::create_dir(others.join("default")).unwrap();
         let matches = Cli::command()
             .try_get_matches_from(["agent-fleet", "--project", "p", "tui", "--all"])
+            .unwrap();
+        let mut cli = Cli::from_arg_matches(&matches).unwrap();
+        (cli.hub, cli.token_file) = (None, None);
+        assert!(refuse_pinned(&cli, false).is_ok() && refuse_pinned(&cli, true).is_err());
+        cli.hub = Some("http://x".into());
+        assert!(refuse_pinned(&cli, false).is_err());
+        // Even when the command line names another hub and token, each instance uses its own.
+        let matches = Cli::command()
+            .try_get_matches_from([
+                "agent-fleet",
+                "--hub",
+                "http://x:1",
+                "--token-file",
+                "/nope",
+                "--project",
+                "p",
+                "tui",
+                "--all",
+            ])
             .unwrap();
         let fleets = every_instance(&matches, base.path()).unwrap();
         let names: Vec<&str> = fleets.iter().map(|c| c.cli.instance.as_str()).collect();

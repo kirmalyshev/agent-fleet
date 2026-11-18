@@ -874,16 +874,25 @@ and the hooks are refused there. Keys fill the command line from the selected ro
 handoff for an agent; task add, assign, block, unblock, dep add and rm for a task; kill for a hung
 or orphaned process finding (on this host); a capacity rule; spawn; a tell to the coordinator.
 
-**Every instance.** `tui --all` builds one screen per instance `agent-fleet instances` lists, each
-with that instance's data dir, so its own hub URL, token and replica, and the other flags of the
-command line; it refuses `--hub`, `--token-file` and `AGENT_FLEET_HOME`, which would pin every
-instance to one. Every 2 s it reads all of them at once, each from its hub or else its replica, as
-the single screen does. A line under the title names each instance with its agents, working
-agents and findings, `replica: …` when it is read off its replica, or `no state` when it has
-neither. It starts on the `--instance` it runs under; `[` and `]` switch, and the tabs then show
-only that instance, empty until its own state is read. Every action, answer and `:` command goes
-to the instance on screen (its `--instance`), and its prompt, outcome and output title name it.
-Without `--all`, the screen is the single instance's, as above.
+**Every instance.** `tui --all` shows every instance `agent-fleet instances` lists on one screen,
+each through a context with that instance's data dir, so its own hub URL, token and replica, and
+the other flags of the command line. It refuses `--hub`, `--token-file`, `AGENT_FLEET_HOME` and
+`AGENT_FLEET_CONFIG_DIR`, which would pin every instance to one hub, data or config dir. Every 2 s
+it reads each instance, from its hub or else its replica, as the single screen does. The reads
+run side by side and the screen takes each one as it ends, so a hub that is slow or down holds up
+neither the keys nor the other instances. Lines under the title name each instance with its
+agents, working agents and findings, `replica: …` when it is read off its replica, or `no state`
+when it has neither; they wrap so that none is cut off. It starts on the `--instance` it runs
+under when that one is listed; `[` and `]` switch, and the tabs then show only that instance,
+empty until its own state is read. Every action, answer and `:` command goes to the instance on
+screen (its `--instance`); its prompt and outcome start with the instance's name, its output
+title names it, and the footer lists `[ ] Instance`. A spawn's dry run keeps its spawn behind `y`
+only while its instance is on screen. A worktree is not removed while an agent of any instance
+works in it. With one instance listed, `--all` is the single screen. Without `--all`, the screen
+is the single instance's, as above.
+
+`f` focuses an agent's pane only from inside its herdr session: a pane id names a pane of one
+session.
 
 **Asks.** The Asks tab is the board's Inbox: `a` answers and `A` approves an open question
 through `POST /board/answer`, so it needs the shared token, as the board does.

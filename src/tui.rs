@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use futures_util::FutureExt;
 use ratatui::crossterm::event::{self, Event as Key, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -108,6 +109,8 @@ struct Done {
     then: Option<Vec<String>>,
     /// The instance it ran against, under `tui --all`.
     on: Option<String>,
+    /// That instance's index: a dry run's spawn stays behind `y` only while it is on screen.
+    at: usize,
 }
 
 /// One instance in the strip `tui --all` draws under the title.
@@ -115,6 +118,9 @@ struct Summary {
     name: String,
     text: String,
     color: Color,
+    /// `(host, path)` of each worktree its agents work in: no instance removes one another
+    /// instance's agent works in.
+    busy: Vec<(String, String)>,
 }
 
 /// What the strip says of an instance: its counts, read off its hub or its replica, or that it has
@@ -127,6 +133,7 @@ fn summary(name: String, got: &Result<(State, Option<String>)>, now: DateTime<Ut
                 name,
                 text: "no state".into(),
                 color: Color::Red,
+                busy: Vec::new(),
             };
         }
     };
@@ -134,6 +141,10 @@ fn summary(name: String, got: &Result<(State, Option<String>)>, now: DateTime<Ut
         .filter(|a| a.state == AgentState::Working)
         .count();
     let found = findings(s, now).len();
+    let busy = (s.agents.values())
+        .filter_map(|a| worktree_of(s, a))
+        .map(|(_, w)| (w.state.host.clone(), w.state.path.clone()))
+        .collect();
     let counts = format!(
         "{} agents, {working} working, {found} findings",
         s.agents.len()
@@ -143,11 +154,13 @@ fn summary(name: String, got: &Result<(State, Option<String>)>, now: DateTime<Ut
             name,
             text: format!("replica: {counts}"),
             color: Color::Yellow,
+            busy,
         },
         None => Summary {
             name,
             text: counts,
             color: if found == 0 { Color::Green } else { DIM },
+            busy,
         },
     }
 }
@@ -265,6 +278,10 @@ impl App {
         self.warn = None;
         self.tables = Default::default();
         self.loaded = None;
+        // A dry run's spawn belongs to the instance it ran on.
+        if let Some(l) = &mut self.last {
+            l.then = None;
+        }
         let name = self.instances[self.on].name.clone();
         self.say(format!("instance {name}"));
     }
@@ -334,18 +351,40 @@ pub async fn run<F: Fleet>(fleets: &[F], on: usize) -> Result<()> {
 async fn main_loop<F: Fleet>(term: &mut DefaultTerminal, fleets: &[F], on: usize) -> Result<()> {
     let mut app = App {
         on: on.min(fleets.len().saturating_sub(1)),
+        instances: (fleets.iter())
+            .map(|f| Summary {
+                name: f.instance().to_string(),
+                text: "reading".into(),
+                color: DIM,
+                busy: Vec::new(),
+            })
+            .collect(),
         ..App::new()
     };
+    // Each instance's read in flight. They are polled between keys, never awaited, so a hub that
+    // is slow to answer holds up neither the keys nor the other instances.
+    let mut reading: Vec<_> = fleets.iter().map(|_| None).collect();
     loop {
         while let Ok(done) = app.rx.try_recv() {
             finished(&mut app, done);
         }
         if app.loaded.is_none_or(|t| t.elapsed() >= REFRESH) {
-            refresh(&mut app, fleets).await;
+            app.loaded = Some(Instant::now());
+            for (r, f) in reading.iter_mut().zip(fleets) {
+                if r.is_none() {
+                    *r = Some(Box::pin(f.snapshot()));
+                }
+            }
+        }
+        for (i, r) in reading.iter_mut().enumerate() {
+            if let Some(got) = r.as_mut().and_then(|r| r.now_or_never()) {
+                *r = None;
+                loaded(&mut app, i, got, Utc::now());
+            }
         }
         let now = Utc::now();
-        term.draw(|f| draw(f, &app, &fleets[app.on], now))?;
-        if !event::poll(Duration::from_millis(250))? {
+        term.draw(|f| draw(f, &app, fleets, now))?;
+        if !event::poll(Duration::from_millis(100))? {
             continue;
         }
         let Key::Key(k) = event::read()? else {
@@ -363,24 +402,43 @@ async fn main_loop<F: Fleet>(term: &mut DefaultTerminal, fleets: &[F], on: usize
     }
 }
 
-/// Reads every instance's state at once, each from its own hub or replica: one that is down
-/// shows its own warning and leaves the others live.
+/// Reads every instance's state at once and takes each in, as the screen does between keys.
+#[cfg(test)]
 async fn refresh<F: Fleet>(app: &mut App, fleets: &[F]) {
+    if app.instances.len() != fleets.len() {
+        app.instances = (fleets.iter())
+            .map(|f| {
+                summary(
+                    f.instance().to_string(),
+                    &Err(anyhow::anyhow!("")),
+                    Utc::now(),
+                )
+            })
+            .collect();
+    }
     let got = futures_util::future::join_all(fleets.iter().map(|f| f.snapshot())).await;
-    let now = Utc::now();
-    app.instances = (fleets.iter().zip(&got))
-        .map(|(f, got)| summary(f.instance().to_string(), got, now))
-        .collect();
-    match got.into_iter().nth(app.on) {
-        Some(Ok((s, warn))) => {
+    for (i, got) in got.into_iter().enumerate() {
+        loaded(app, i, got, Utc::now());
+    }
+    app.loaded = Some(Instant::now());
+}
+
+/// One instance's state, from its hub or replica, or why there is none: its line in the strip,
+/// and the tabs when it is the one on screen. One that is down leaves the others as they are.
+fn loaded(app: &mut App, i: usize, got: Result<(State, Option<String>)>, now: DateTime<Utc>) {
+    let name = app.instances[i].name.clone();
+    app.instances[i] = summary(name, &got, now);
+    if i != app.on {
+        return;
+    }
+    match got {
+        Ok((s, warn)) => {
             app.found = findings(&s, now);
             app.state = s;
             app.warn = warn;
         }
-        Some(Err(e)) => app.warn = Some(format!("{e:#}")),
-        None => {}
+        Err(e) => app.warn = Some(format!("{e:#}")),
     }
-    app.loaded = Some(Instant::now());
     for tab in TABS.map(|(t, _)| t) {
         let saved = app.tab;
         app.tab = tab;
@@ -541,7 +599,7 @@ fn words(s: &str) -> Result<Vec<String>, String> {
 fn start(app: &mut App, fleet: &impl Fleet, args: Vec<String>, then: Option<Vec<String>>) {
     let argv = fleet.cli();
     let tx = app.tx.clone();
-    let on = app.multi().then(|| fleet.instance().to_string());
+    let (on, at) = (app.multi().then(|| fleet.instance().to_string()), app.on);
     let label = format!("{}{}", app.label(fleet.instance()), args.join(" "));
     app.jobs.push(label.clone());
     app.say(format!("running {label}"));
@@ -568,6 +626,7 @@ fn start(app: &mut App, fleet: &impl Fleet, args: Vec<String>, then: Option<Vec<
             out,
             then,
             on,
+            at,
         });
     });
 }
@@ -594,7 +653,7 @@ fn finished(app: &mut App, d: Done) {
             if d.ok { "" } else { " (failed)" }
         ),
         text: d.out.clone(),
-        then: d.then.filter(|_| d.ok),
+        then: d.then.filter(|_| d.ok && d.at == app.on),
     };
     let open = !d.ok || d.out.trim().lines().count() > 1 || out.then.is_some();
     app.last = Some(out.clone());
@@ -895,11 +954,14 @@ async fn action(app: &mut App, c: char, fleet: &impl Fleet) {
             if st.path == st.repo {
                 return app.say("a main checkout is never removed");
             }
-            if app
-                .state
-                .agents
-                .values()
-                .any(|a| worktree_of(&app.state, a).is_some_and(|(k, _)| *k == key))
+            let elsewhere = (app.instances.iter())
+                .any(|i| i.busy.iter().any(|(h, p)| *h == st.host && *p == st.path));
+            if elsewhere
+                || app
+                    .state
+                    .agents
+                    .values()
+                    .any(|a| worktree_of(&app.state, a).is_some_and(|(k, _)| *k == key))
             {
                 return app.say("an agent works there");
             }
@@ -1076,6 +1138,16 @@ async fn focus(fleet: &impl Fleet, id: &str, host: &str, pane: Option<&str>) -> 
     if host != fleet.host() {
         return format!("{} runs on {host}", short(id));
     }
+    // A pane id is herdr's per session: another session's agent is not this socket's pane.
+    let session = id.strip_prefix("agent:").and_then(|r| r.split('/').nth(1));
+    if let (Some(s), Ok(here)) = (session, std::env::var("HERDR_SESSION"))
+        && s != here
+    {
+        return format!(
+            "{} runs in herdr session {s}; focus it from there",
+            short(id)
+        );
+    }
     let (Some(pane), Some(sock)) = (pane, std::env::var_os("HERDR_SOCKET_PATH")) else {
         return "focus works from inside the agent's herdr session".into();
     };
@@ -1086,15 +1158,17 @@ async fn focus(fleet: &impl Fleet, id: &str, host: &str, pane: Option<&str>) -> 
     }
 }
 
-fn draw(f: &mut Frame, app: &App, fleet: &impl Fleet, now: DateTime<Utc>) {
+fn draw<F: Fleet>(f: &mut Frame, app: &App, fleets: &[F], now: DateTime<Utc>) {
+    let fleet = &fleets[app.on];
     let alerts: Vec<&Finding> = app
         .found
         .iter()
         .filter(|f| matches!(f.kind, "orphan" | "hung" | "duplicate" | "breach"))
         .take(3)
         .collect();
+    let strip = strip(app, f.area().width as usize);
     let [head, alert, tabs, table, detail, foot] = Layout::vertical([
-        Constraint::Length(1 + u16::from(app.multi())),
+        Constraint::Length(1 + strip.len() as u16),
         Constraint::Length(alerts.len() as u16 + u16::from(app.warn.is_some())),
         Constraint::Length(2),
         Constraint::Min(5),
@@ -1132,23 +1206,7 @@ fn draw(f: &mut Frame, app: &App, fleet: &impl Fleet, now: DateTime<Utc>) {
         Span::raw(format!(" · {} undelivered", s.msgs.len())),
     ]);
     let mut top = vec![summary];
-    if app.multi() {
-        // Every instance, the one on screen reversed: its counts, or why it has none.
-        let mut strip = vec![Span::styled("[ ] ", Style::new().fg(DIM))];
-        for (i, sum) in app.instances.iter().enumerate() {
-            let style = if i == app.on {
-                Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-            } else {
-                Style::new().bold()
-            };
-            strip.push(Span::styled(format!(" {} ", sum.name), style));
-            strip.push(Span::styled(
-                format!(" {}   ", sum.text),
-                Style::new().fg(sum.color),
-            ));
-        }
-        top.push(Line::from(strip));
-    }
+    top.extend(strip);
     f.render_widget(Paragraph::new(top), head);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -1284,6 +1342,33 @@ fn draw(f: &mut Frame, app: &App, fleet: &impl Fleet, now: DateTime<Utc>) {
         Mode::Output(out, scroll) => output(f, out, *scroll),
         _ => {}
     }
+}
+
+/// Under `tui --all`, every instance with its counts or why it has none, the one on screen
+/// reversed; as many lines as `width` needs, so none is cut off. Empty for one instance.
+fn strip(app: &App, width: usize) -> Vec<Line<'_>> {
+    if !app.multi() {
+        return Vec::new();
+    }
+    let mut lines = vec![Line::from(Span::styled("[ ] ", Style::new().fg(DIM)))];
+    for (i, sum) in app.instances.iter().enumerate() {
+        let style = if i == app.on {
+            Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::new().bold()
+        };
+        let entry = [
+            Span::styled(format!(" {} ", sum.name), style),
+            Span::styled(format!(" {}   ", sum.text), Style::new().fg(sum.color)),
+        ];
+        let w: usize = entry.iter().map(Span::width).sum();
+        let last = lines.last_mut().expect("one line at least");
+        if last.width() + w > width && last.width() > 4 {
+            lines.push(Line::from(Span::raw("    ")));
+        }
+        lines.last_mut().expect("one line at least").extend(entry);
+    }
+    lines
 }
 
 type View<'a> = (
@@ -2088,7 +2173,8 @@ mod tests {
             ..App::new()
         };
         let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
-        term.draw(|f| draw(f, &app, &Stub, now)).unwrap();
+        term.draw(|f| draw(f, &app, std::slice::from_ref(&Stub), now))
+            .unwrap();
         let screen: String = term
             .backend()
             .buffer()
@@ -2187,7 +2273,8 @@ mod tests {
                 .map(|r| r.iter().map(|c| c.symbol()).collect())
                 .collect()
         };
-        term.draw(|f| draw(f, &app, &Stub, now)).unwrap();
+        term.draw(|f| draw(f, &app, std::slice::from_ref(&Stub), now))
+            .unwrap();
         let screen = rows(&term);
         let find = |name: &str| screen.iter().find(|r| r.contains(name)).unwrap();
         assert!(
@@ -2200,7 +2287,8 @@ mod tests {
         let detail = screen.join("\n");
         assert!(detail.contains(&format!("until {}", crate::ui::at(now, far))));
         app.tables[Tab::Resources as usize].select(Some(2));
-        term.draw(|f| draw(f, &app, &Stub, now)).unwrap();
+        term.draw(|f| draw(f, &app, std::slice::from_ref(&Stub), now))
+            .unwrap();
         let screen = rows(&term).join("\n");
         for want in [
             "at most 1 of sim".to_string(),
@@ -2211,7 +2299,8 @@ mod tests {
             assert!(screen.contains(&want), "missing {want:?}");
         }
         app.tables[Tab::Resources as usize].select(Some(3));
-        term.draw(|f| draw(f, &app, &Stub, now)).unwrap();
+        term.draw(|f| draw(f, &app, std::slice::from_ref(&Stub), now))
+            .unwrap();
         let screen = rows(&term).join("\n");
         assert!(screen.contains(&format!("expired at {}", crate::ui::at(now, old))));
     }
@@ -2505,6 +2594,7 @@ mod tests {
                 out: "agent-fleet kill: REFUSED not yours\nError: killed nothing\n".into(),
                 then: None,
                 on: None,
+                at: 0,
             },
         );
         assert!(matches!(&app.mode, Mode::Output(o, _) if o.text.contains("REFUSED")));
@@ -2593,9 +2683,9 @@ mod tests {
         s
     }
 
-    fn screen(app: &App, fleet: &impl Fleet) -> String {
+    fn screen<F: Fleet>(app: &App, fleets: &[F]) -> String {
         let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
-        term.draw(|f| draw(f, app, fleet, Utc::now())).unwrap();
+        term.draw(|f| draw(f, app, fleets, Utc::now())).unwrap();
         let w = term.backend().buffer().area.width as usize;
         let cells: Vec<&str> = term
             .backend()
@@ -2628,7 +2718,7 @@ mod tests {
         assert_eq!(text[0], ("alpha", "1 agents, 1 working, 0 findings"));
         assert_eq!(text[1], ("beta", "no state"));
         assert!(text[2].1.starts_with("replica: "), "{text:?}");
-        let shown = screen(&app, &fleets[0]);
+        let shown = screen(&app, &fleets);
         assert!(
             shown.contains("agent-fleet alpha · http://alpha"),
             "{shown}"
@@ -2642,7 +2732,7 @@ mod tests {
         assert_eq!(app.on, 1);
         assert!(app.state.agents.is_empty());
         assert_eq!(app.warn.as_deref(), Some("beta: connection refused"));
-        let shown = screen(&app, &fleets[1]);
+        let shown = screen(&app, &fleets);
         assert!(
             shown.contains("agent-fleet beta") && !shown.contains("builder"),
             "{shown}"
@@ -2654,7 +2744,11 @@ mod tests {
         refresh(&mut app, &fleets).await;
         assert_eq!(app.warn.as_deref(), Some("hub unreachable; local replica"));
         assert!(app.state.tasks.contains_key("task:p/1"));
+        assert!(!app.found.is_empty());
+        // Back to the down one: none of gamma's rows or findings (and so none of its pids to kill).
         press(&mut app, &fleets, KeyCode::Char('[')).await;
+        refresh(&mut app, &fleets).await;
+        assert!(app.found.is_empty() && app.state.tasks.is_empty());
         press(&mut app, &fleets, KeyCode::Char('[')).await;
         refresh(&mut app, &fleets).await;
         assert_eq!(app.on, 0);
@@ -2666,7 +2760,7 @@ mod tests {
         refresh(&mut app, &one).await;
         press(&mut app, &one, KeyCode::Char(']')).await;
         assert_eq!(app.on, 0);
-        let shown = screen(&app, &one[0]);
+        let shown = screen(&app, &one);
         assert!(
             !shown.contains("[ ]") && !shown.contains("no state"),
             "{shown}"
@@ -2687,7 +2781,7 @@ mod tests {
         // A key action: `d` on the first task, `y`. The prompt names the instance.
         app.tab = Tab::Tasks;
         press(&mut app, &fleets, KeyCode::Char('d')).await;
-        assert!(screen(&app, &fleets[1]).contains("beta: mark done task:p/0?"));
+        assert!(screen(&app, &fleets).contains("beta: mark done task:p/0?"));
         press(&mut app, &fleets, KeyCode::Char('y')).await;
         assert!(fleets[0].did.lock().unwrap().is_empty());
         assert_eq!(*fleets[1].did.lock().unwrap(), ["task:p/0"]);
@@ -2705,16 +2799,104 @@ mod tests {
             press(&mut app, &fleets, KeyCode::Char(c)).await;
         }
         press(&mut app, &fleets, KeyCode::Enter).await;
-        assert!(screen(&app, &fleets[1]).contains("beta: run agent-fleet task done 1?"));
+        assert!(screen(&app, &fleets).contains("beta: run agent-fleet task done 1?"));
         press(&mut app, &fleets, KeyCode::Char('y')).await;
         assert_eq!(app.jobs, ["beta: task done 1"]);
         let done = app.rx.recv_timeout(Duration::from_secs(10)).unwrap();
         finished(&mut app, done);
         assert!(app.jobs.is_empty());
+        let title = &app.last.as_ref().unwrap().title;
+        assert_eq!(title, "agent-fleet --instance beta task done 1");
         assert_eq!(
             app.note.as_ref().unwrap().0,
             "beta: task done: --instance beta task done 1"
         );
+
+        // A spawn's dry run on beta that ends after a switch to alpha: its spawn is not behind `y`
+        // there, neither when it ends nor through `o`.
+        press(&mut app, &fleets, KeyCode::Char(':')).await;
+        for c in "spawn o/r#5".chars() {
+            press(&mut app, &fleets, KeyCode::Char(c)).await;
+        }
+        press(&mut app, &fleets, KeyCode::Enter).await;
+        assert_eq!(app.jobs, ["beta: spawn o/r#5 --dry-run"]);
+        press(&mut app, &fleets, KeyCode::Char('[')).await;
+        let done = app.rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        finished(&mut app, done);
+        assert!(app.last.as_ref().unwrap().then.is_none());
+        press(&mut app, &fleets, KeyCode::Char('o')).await;
+        press(&mut app, &fleets, KeyCode::Char('y')).await;
+        assert!(app.jobs.is_empty());
+        // One that ran before the switch loses its spawn on the switch.
+        app.last = Some(Output {
+            title: String::new(),
+            text: String::new(),
+            then: Some(w2("spawn o/r#5")),
+        });
+        press(&mut app, &fleets, KeyCode::Char(']')).await;
+        assert!(app.last.as_ref().unwrap().then.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_instance_removes_a_worktree_another_instances_agent_works_in() {
+        let wt: crate::state::Worktree = serde_json::from_value(serde_json::json!({
+            "state": {
+                "host": "h", "path": "/w/x", "repo": "/w/repo", "head": "abc",
+                "unpushed": 0, "dirty": 0, "files": [], "last_commit": Utc::now(),
+            },
+            "since": Utc::now(),
+        }))
+        .unwrap();
+        let mut alpha = State::default();
+        alpha
+            .worktrees
+            .insert(worktree_key("h", "/w/x"), wt.clone());
+        let mut beta = one_agent();
+        beta.worktrees.insert(worktree_key("h", "/w/x"), wt);
+        beta.agents.values_mut().for_each(|a| {
+            a.usage = Some(crate::state::Usage {
+                rss_kb: None,
+                cpu_pct: None,
+                procs: None,
+                cwd: Some("/w/x/src".into()),
+                ts: Utc::now(),
+            })
+        });
+        let fleets = [
+            Inst::new("alpha", Some(alpha), None),
+            Inst::new("beta", Some(beta), None),
+        ];
+        let mut app = App {
+            tab: Tab::Worktrees,
+            ..App::new()
+        };
+        refresh(&mut app, &fleets).await;
+        press(&mut app, &fleets, KeyCode::Char('x')).await;
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.note.as_ref().unwrap().0, "an agent works there");
+    }
+
+    #[tokio::test]
+    async fn the_strip_wraps_so_every_instance_is_named() {
+        let names = [
+            "instance-one",
+            "instance-two",
+            "instance-three",
+            "instance-four",
+            "five",
+        ];
+        let fleets = names.map(|n| Inst::new(n, Some(one_agent()), None));
+        let mut app = App::new();
+        refresh(&mut app, &fleets).await;
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| draw(f, &app, &fleets, Utc::now())).unwrap();
+        let shown: String = (term.backend().buffer().content().iter())
+            .map(|c| c.symbol())
+            .collect();
+        for n in names {
+            assert!(shown.contains(&format!(" {n}  1 agents")), "{n}: {shown}");
+        }
+        assert!(strip(&app, 120).len() > 1);
     }
 
     #[test]
@@ -2734,7 +2916,8 @@ mod tests {
                 .map(|c| c.symbol())
                 .collect()
         };
-        term.draw(|f| draw(f, &app, &Stub, Utc::now())).unwrap();
+        term.draw(|f| draw(f, &app, std::slice::from_ref(&Stub), Utc::now()))
+            .unwrap();
         for want in [
             "6 Asks",
             "open",
@@ -2748,7 +2931,8 @@ mod tests {
         app.tab = Tab::Findings;
         let hung = app.found.iter().position(|f| f.subject == "h:30").unwrap();
         app.tables[Tab::Findings as usize].select(Some(hung));
-        term.draw(|f| draw(f, &app, &Stub, Utc::now())).unwrap();
+        term.draw(|f| draw(f, &app, std::slice::from_ref(&Stub), Utc::now()))
+            .unwrap();
         assert!(screen(&term).contains("proc 31: hung: no output"));
     }
 }

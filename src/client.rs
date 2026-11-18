@@ -91,7 +91,10 @@ impl Paths {
                 .flatten()
                 .filter_map(|e| {
                     let name = e.file_name().to_str()?.to_string();
-                    Some((name, Self { dir: e.path() }.hub_url()))
+                    // Not a stray file (`.DS_Store`), a name `--instance` refuses, or a second
+                    // `default`: that one is `base` itself.
+                    (valid_instance_name(&name) && name != DEFAULT_INSTANCE && e.path().is_dir())
+                        .then(|| (name, Self { dir: e.path() }.hub_url()))
                 })
                 .collect();
             named.sort();

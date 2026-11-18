@@ -332,11 +332,12 @@ three hung or orphaned processes, duplicate work or capacity breaches. Pick a ta
 `←`/`→`, move with `↑`/`↓` or `j`/`k`, and read the selected row's details in the bottom panel.
 The footer lists the keys of the current tab; `?` shows them all, `q` quits.
 
-`agent-fleet tui --all` watches every instance on this machine (`agent-fleet instances`). A line
-under the title names each one with its agents, working agents and findings, `replica` when its
-hub is down and its replica stands in, or `no state`; the one on screen is highlighted, and `[`
-and `]` switch it. The tabs show the instance on screen, and every action and command goes to it:
-its prompt starts with the instance's name.
+`agent-fleet tui --all` watches every instance on this machine (`agent-fleet instances`). The
+lines under the title name each one with its agents, working agents and findings, `replica` when
+its hub is down and its replica stands in, or `no state`; the one on screen is highlighted, and
+`[` and `]` switch it. The tabs show the instance on screen, and every action and command goes to
+it: its prompt starts with the instance's name. A hub that is slow or down holds up none of the
+others.
 
 ![The Agents tab: state, role, CPU, memory, task and branch of each agent](docs/images/tui-agents.png)
 
