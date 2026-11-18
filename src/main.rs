@@ -158,8 +158,14 @@ enum Cmd {
         cmd: dev::Cmd,
     },
     /// The fleet on one screen, live: agents, worktrees, tasks, findings, resources, asks; `:` runs
-    /// any command from it.
-    Tui,
+    /// any command from it. `--all`: every instance on this machine.
+    Tui {
+        /// Every instance `agent-fleet instances` lists, each read from its own hub with its own
+        /// token (or its replica), with a line for each; `[` and `]` switch the one on screen,
+        /// which every action and command goes to.
+        #[arg(long)]
+        all: bool,
+    },
     /// Tasks: `add` claims (exclusive), `done` finishes, `rm` cancels or releases.
     Task {
         #[command(subcommand)]
@@ -809,6 +815,23 @@ impl Ctx {
     }
 }
 
+/// `tui --all`: a context for each instance under `base`, each with its own data dir, so its own
+/// hub, token and replica, and the command line's other flags.
+fn every_instance(matches: &clap::ArgMatches, base: &std::path::Path) -> Result<Vec<Ctx>> {
+    Paths::instances_in(base)
+        .into_iter()
+        .map(|(name, _)| {
+            let mut cli = Cli::from_arg_matches(matches)?;
+            (cli.instance, cli.hub, cli.token_file) = (name.clone(), None, None);
+            let dir = client::instance_dir(base, &name);
+            Ok(Ctx {
+                cli,
+                paths: Paths { dir },
+            })
+        })
+        .collect()
+}
+
 /// `init` and `repo`: the instance's config dir only; no hub.
 fn machine_config(cmd: &Cmd, instance: &str) -> Result<()> {
     let dir =
@@ -1010,7 +1033,24 @@ async fn main() -> Result<()> {
             };
             host::run(cfg, ctx.client()?).await?;
         }
-        Cmd::Tui => tui::run(&ctx).await?,
+        Cmd::Tui { all: false } => tui::run(std::slice::from_ref(&ctx), 0).await?,
+        Cmd::Tui { all: true } => {
+            // These pin one hub, token or data dir; under --all each instance uses its own, and a
+            // command the screen runs would inherit them and go to the wrong instance.
+            if ctx.cli.hub.is_some()
+                || ctx.cli.token_file.is_some()
+                || std::env::var_os("AGENT_FLEET_HOME").is_some()
+            {
+                bail!(
+                    "tui --all reads each instance's own hub and token: unset --hub/AGENT_FLEET_HUB, --token-file/AGENT_FLEET_TOKEN_FILE and AGENT_FLEET_HOME"
+                );
+            }
+            let fleets = every_instance(&matches, &Paths::base()?)?;
+            let on = fleets
+                .iter()
+                .position(|c| c.cli.instance == ctx.cli.instance);
+            tui::run(&fleets, on.unwrap_or(0)).await?;
+        }
         Cmd::Dev { cmd } => {
             let s = match ctx.snapshot_state().await {
                 Ok((s, note)) => {
@@ -1899,6 +1939,41 @@ fn write_script(path: &std::path::Path, body: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tui_all_reads_each_instance_from_its_own_dir_hub_and_token() {
+        let base = tempfile::tempdir().unwrap();
+        let named = client::instance_dir(base.path(), "side");
+        std::fs::create_dir_all(&named).unwrap();
+        // Nothing listens on either port: the default has a replica, `side` has none.
+        for (dir, hub) in [
+            (base.path(), "127.0.0.1:9"),
+            (named.as_path(), "127.0.0.1:19"),
+        ] {
+            std::fs::write(dir.join("hub"), format!("http://{hub}")).unwrap();
+            std::fs::write(dir.join("token"), "t").unwrap();
+        }
+        Store::open(&base.path().join("replica.db")).unwrap();
+        let matches = Cli::command()
+            .try_get_matches_from(["agent-fleet", "--project", "p", "tui", "--all"])
+            .unwrap();
+        let fleets = every_instance(&matches, base.path()).unwrap();
+        let names: Vec<&str> = fleets.iter().map(|c| c.cli.instance.as_str()).collect();
+        assert_eq!(names, ["default", "side"]);
+        assert_eq!(tui::Fleet::hub(&fleets[0]), "http://127.0.0.1:9");
+        assert_eq!(tui::Fleet::hub(&fleets[1]), "http://127.0.0.1:19");
+        // A command from the screen names its instance and no other instance's hub or token.
+        let argv = tui::Fleet::cli(&fleets[1]);
+        assert!(
+            argv.windows(2).any(|w| w == ["--instance", "side"]),
+            "{argv:?}"
+        );
+        assert!(!argv.iter().any(|a| a == "--hub" || a == "--token-file"));
+        // Its hub down, the default falls back to its own replica; `side` has none, so an error.
+        let (_, note) = fleets[0].snapshot_state().await.unwrap();
+        assert!(note.unwrap().starts_with("hub unreachable"));
+        assert!(fleets[1].snapshot_state().await.is_err());
+    }
 
     #[test]
     fn a_repo_arg_with_an_equals_inside_a_path_stays_a_path() {

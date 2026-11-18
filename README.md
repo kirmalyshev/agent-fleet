@@ -332,6 +332,12 @@ three hung or orphaned processes, duplicate work or capacity breaches. Pick a ta
 `←`/`→`, move with `↑`/`↓` or `j`/`k`, and read the selected row's details in the bottom panel.
 The footer lists the keys of the current tab; `?` shows them all, `q` quits.
 
+`agent-fleet tui --all` watches every instance on this machine (`agent-fleet instances`). A line
+under the title names each one with its agents, working agents and findings, `replica` when its
+hub is down and its replica stands in, or `no state`; the one on screen is highlighted, and `[`
+and `]` switch it. The tabs show the instance on screen, and every action and command goes to it:
+its prompt starts with the instance's name.
+
 ![The Agents tab: state, role, CPU, memory, task and branch of each agent](docs/images/tui-agents.png)
 
 | Tab | Shows | Keys |
@@ -385,7 +391,8 @@ spool and replica, and its own `fleet.toml` and connected repos (`instances/<nam
 config directory). Two hubs on one machine need two `--listen` ports. A host serves one instance
 and one herdr session. In a herdr pane, commands default to the instance named after the session
 once it has a `hub` file. For an instance whose hub is on another machine, write that file by
-hand: one line, the hub's URL. `agent-fleet instances` lists them.
+hand: one line, the hub's URL. `agent-fleet instances` lists them, and `agent-fleet tui --all`
+shows them all on one screen.
 
 **Several machines.** Run one hub. Bind it to an address the other machines reach, plus
 loopback (`--listen 127.0.0.1:7710 --listen <address>:7710`); it refuses `0.0.0.0`. On each other
@@ -441,7 +448,7 @@ From `agent-fleet --help`; every command has its own `--help`.
 | `init` | Write this machine's fleet.toml and brief.md into the instance's config dir (`AGENT_FLEET_CONFIG_DIR` overrides it): commented templates with a profile for each agent program on PATH and one default rule. Never overwrites an existing file. Lists the user-level Claude and Codex skills that drive terminals (herdr, tmux, cmux) |
 | `repo` | Connect a repository to the fleet on this machine: `add` records its checkout in the machine's fleet.toml, `ls` lists, `rm` disconnects. The host picks changes up without a restart |
 | `dev` | Per-worktree dev environments from the repository's `.agent-fleet/dev.toml` (`up`, `down`, `status` …: each worktree gets a slot with its own ports and values, runs its own services, and shares the infra; `db`, `test`), the worktrees of the connected repositories (`ls`, `clean`), and the agents and PRs on them (`agents`, `prs`) |
-| `tui` | The fleet on one screen, live: agents, worktrees, tasks, findings, resources, asks; `:` runs any command from it |
+| `tui` | The fleet on one screen, live: agents, worktrees, tasks, findings, resources, asks; `:` runs any command from it. `--all`: every instance on this machine |
 | `task` | Tasks: `add` claims (exclusive), `done` finishes, `rm` cancels or releases |
 | `dep` | Dependencies between tasks: <task> is blocked by <on> |
 | `block` | Raise a blocker on a task. Prints the blocker id |
