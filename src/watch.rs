@@ -147,8 +147,9 @@ impl Watch {
                     let mut ranges = Vec::new();
                     for c in t.kids(shell).to_vec() {
                         let begin = t.out.len();
-                        let b = t.visit(c, agent);
-                        ranges.push((begin, t.out.len(), b));
+                        t.worked = false;
+                        t.visit(c, agent);
+                        ranges.push((begin, t.out.len(), t.worked));
                     }
                     let busy = ranges.iter().any(|r| r.2);
                     let start = ranges.first().map_or(t.out.len(), |r| r.0);
@@ -200,6 +201,9 @@ struct Tick<'a> {
     next: HashMap<(u32, Option<DateTime<Utc>>), u32>,
     visited: HashSet<(u32, Option<DateTime<Utc>>)>,
     out: Vec<Classified>,
+    /// Set when a process did work itself (`works`); a listener or a lock wait keeps its
+    /// parent busy but is not work a pipeline reader waits on.
+    worked: bool,
 }
 
 impl<'a> Tick<'a> {
@@ -230,6 +234,7 @@ impl<'a> Tick<'a> {
             next: HashMap::new(),
             visited: HashSet::new(),
             out: Vec::new(),
+            worked: false,
         }
     }
 
@@ -303,6 +308,7 @@ impl<'a> Tick<'a> {
                     a.split_whitespace().any(|w| {
                         w.starts_with('-') && !w.starts_with("--") && w.contains(['f', 'F'])
                             || w == "--follow"
+                            || w.starts_with("--follow=")
                     })
                 })
         };
@@ -363,7 +369,9 @@ impl<'a> Tick<'a> {
         for c in self.kids(pid).to_vec() {
             busy |= self.visit(c, agent);
         }
-        busy |= self.works(pid).is_some();
+        let works = self.works(pid).is_some();
+        self.worked |= works;
+        busy |= works;
         if !old {
             return busy;
         }
@@ -1269,6 +1277,24 @@ mod tests {
         w.step(only(), at(2), &seen());
         let v = w.step(only(), at(4), &seen());
         assert!(!matches!(verdict(&v, 40), Some(Verdict::Hung(_))), "{v:#?}");
+    }
+
+    #[test]
+    fn a_wedged_sibling_beside_a_listener_stays_hung_and_follow_eq_is_spared() {
+        let mut w = Watch::default();
+        let mut sn = seen();
+        sn.listening.insert(31);
+        let t = || {
+            tree(&[
+                (31, SHELL, "node", "node server.js", 0, 20),
+                (32, SHELL, "sleep", "sleep 9999", 0, 20),
+                (33, SHELL, "tail", "tail --follow=name x.log", 0, 20),
+            ])
+        };
+        w.step(t(), at(0), &sn);
+        w.step(t(), at(2), &sn);
+        let v = w.step(t(), at(4), &sn);
+        assert!(matches!(verdict(&v, 32), Some(Verdict::Hung(_))), "{v:#?}");
     }
 
     #[test]
