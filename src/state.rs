@@ -482,15 +482,42 @@ impl Msg {
 }
 
 impl State {
-    /// Where the doorbell `id` is: sent (waiting for a ring), delivered (not read), or read.
-    pub fn mail_status(&self, id: &str) -> Option<MailStatus> {
-        if self.msgs.contains_key(id) {
-            Some(MailStatus::Sent)
-        } else if self.unread.contains_key(id) {
-            Some(MailStatus::Delivered)
-        } else {
-            self.read.contains_key(id).then_some(MailStatus::Read)
-        }
+    /// Tells to `me` (by id, or by a role it holds) not read yet, delivered or not, oldest first:
+    /// what `agent-fleet read` shows and acks.
+    pub fn unread_for(&self, me: &str) -> Vec<(&String, &Msg)> {
+        let mine = |m: &Msg| m.to == me || self.recipient(&m.to) == Some(me);
+        let mut v: Vec<_> = self
+            .msgs
+            .iter()
+            .chain(self.unread.iter().map(|(id, u)| (id, &u.msg)))
+            .filter(|(_, m)| mine(m))
+            .collect();
+        v.sort_by_key(|(id, m)| (m.since, *id));
+        v
+    }
+
+    /// Tells `me` sent that the state still holds, oldest first, with where each is.
+    pub fn outbox(&self, me: &str) -> Vec<(&String, &str, DateTime<Utc>, MailStatus)> {
+        let mut v: Vec<_> = self
+            .msgs
+            .iter()
+            .filter(|(_, m)| m.from == me)
+            .map(|(id, m)| (id, m.to.as_str(), m.since, MailStatus::Sent))
+            .chain(
+                self.unread
+                    .iter()
+                    .filter(|(_, u)| u.msg.from == me)
+                    .map(|(id, u)| (id, u.msg.to.as_str(), u.msg.since, MailStatus::Delivered)),
+            )
+            .chain(
+                self.read
+                    .iter()
+                    .filter(|(_, r)| r.from == me)
+                    .map(|(id, r)| (id, r.to.as_str(), r.since, MailStatus::Read)),
+            )
+            .collect();
+        v.sort_by_key(|(id, _, since, _)| (*since, *id));
+        v
     }
 
     /// Tells still undelivered to `to` (`coordinator` follows its holder): how many, and the oldest.
@@ -981,7 +1008,8 @@ impl State {
                         .get(re)
                         .or_else(|| self.unread.get(re).map(|u| &u.msg));
                     if let Some(m) = msg
-                        && (m.to == e.actor.id || self.recipient(&m.to) == Some(e.actor.id.as_str()))
+                        && (m.to == e.actor.id
+                            || self.recipient(&m.to) == Some(e.actor.id.as_str()))
                     {
                         let read = Read {
                             from: m.from.clone(),
@@ -1312,6 +1340,19 @@ mod tests {
             "p",
             body,
         )
+    }
+
+    impl State {
+        /// Where the doorbell `id` is: sent (waiting for a ring), delivered (not read), or read.
+        fn mail_status(&self, id: &str) -> Option<MailStatus> {
+            if self.msgs.contains_key(id) {
+                Some(MailStatus::Sent)
+            } else if self.unread.contains_key(id) {
+                Some(MailStatus::Delivered)
+            } else {
+                self.read.contains_key(id).then_some(MailStatus::Read)
+            }
+        }
     }
 
     fn agent_ev(body: Known) -> Envelope<Known> {
@@ -1899,19 +1940,36 @@ mod tests {
         s.apply(&at(1, "host:h", Some("e0"), delivered()));
         assert!(s.msgs.is_empty(), "delivered: no longer waiting for a ring");
         assert_eq!(s.mail_status("e0"), Some(MailStatus::Delivered));
+        assert_eq!(
+            s.unread_for(to).len(),
+            1,
+            "delivered and unread: still in the inbox"
+        );
+        assert!(s.unread_for("agent:h/s/a").is_empty());
+        assert_eq!(s.outbox("agent:h/s/a")[0].3, MailStatus::Delivered);
         let u = &s.unread["e0"];
-        assert_eq!((u.rings, u.delivered, u.msg.since), (1, t0 + chrono::Duration::minutes(1), t0));
+        assert_eq!(
+            (u.rings, u.delivered, u.msg.since),
+            (1, t0 + chrono::Duration::minutes(1), t0)
+        );
         // A retransmit: delivered again, the ring counted, the clock restarted.
         s.apply(&at(6, "host:h", Some("e0"), delivered()));
         assert_eq!(s.unread["e0"].rings, 2);
         assert_eq!(s.unread["e0"].delivered, t0 + chrono::Duration::minutes(6));
         // Someone else's ack is not an ack.
-        s.apply(&at(7, "agent:h/s/c", Some("e0"), Known::MsgRead(MsgRead {})));
+        s.apply(&at(
+            7,
+            "agent:h/s/c",
+            Some("e0"),
+            Known::MsgRead(MsgRead {}),
+        ));
         assert_eq!(s.mail_status("e0"), Some(MailStatus::Delivered));
         s.apply(&at(8, to, Some("e0"), Known::MsgRead(MsgRead {})));
         assert!(s.unread.is_empty());
         assert_eq!(s.mail_status("e0"), Some(MailStatus::Read));
         assert_eq!(s.read["e0"].at, t0 + chrono::Duration::minutes(8));
+        assert!(s.unread_for(to).is_empty());
+        assert_eq!(s.outbox("agent:h/s/a")[0].3, MailStatus::Read);
         // Read is kept 24 h, then pruned by a later event.
         s.apply(&at(
             8 + 24 * 60 + 1,
@@ -1960,7 +2018,12 @@ mod tests {
         };
         let mut s = State::default();
         s.apply(&at(0, "agent:h/s/a", None, sent("agent:h/s/b")));
-        s.apply(&at(1, "agent:h/s/b", Some("e0"), Known::MsgRead(MsgRead {})));
+        s.apply(&at(
+            1,
+            "agent:h/s/b",
+            Some("e0"),
+            Known::MsgRead(MsgRead {}),
+        ));
         assert!(s.msgs.is_empty() && s.unread.is_empty());
         assert_eq!(s.mail_status("e0"), Some(MailStatus::Read));
         // A stale report closed unrung (`attempts: 0`) was never shown: it is not unread.

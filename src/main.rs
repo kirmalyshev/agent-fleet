@@ -308,7 +308,7 @@ enum Cmd {
         #[arg(long)]
         decide: Option<retire::Decide>,
     },
-    /// Ring an agent's doorbell: `[agent-fleet <from>→<to>] TYPE ref: text (event <id>)`.
+    /// Ring an agent's doorbell: `[agent-fleet <from>→<to>] TYPE ref: text (event <id>; ack: agent-fleet read)`.
     Tell {
         /// An agent that is up (full id or short name), or `coordinator`: the root coordinator,
         /// whoever holds the role when the message is delivered.
@@ -320,6 +320,13 @@ enum Cmd {
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         text: Vec<String>,
     },
+    /// Read your own tells: every one sent to you (or to a role you hold) not read yet, delivered
+    /// or not, oldest first with its original sender and time; each is then acked (`msg.read`),
+    /// so it stops being rung again. Run it at every turn start.
+    Read,
+    /// Your tells and where each is: `sent` (waiting for a ring), `unread <age>` (delivered, not
+    /// read yet), or `read`.
+    Sent,
     /// Numbers about the fleet: doorbell latency and loss, event lag, host and hub vitals.
     Stats {
         /// Window back from now: `90s`, `30m`, `24h`, `7d`.
@@ -1922,6 +1929,28 @@ async fn main() -> Result<()> {
                 eprintln!("{}", done.text);
                 std::process::exit(1);
             }
+        }
+        Cmd::Read => {
+            let me = ctx.me().await?;
+            let state = ctx.state().await?;
+            let mail = state.unread_for(&me.id);
+            if mail.is_empty() {
+                println!("no unread tells");
+            }
+            for (id, m) in &mail {
+                println!("{}", ui::mail_line(id, m));
+            }
+            for (id, _) in mail {
+                ctx.write(
+                    Envelope::new(me.clone(), &ctx.cli.project, Known::MsgRead(MsgRead {})).re(id),
+                )
+                .await?;
+            }
+        }
+        Cmd::Sent => {
+            let me = ctx.me().await?;
+            let state = ctx.state().await?;
+            print!("{}", ui::outbox(&state, &me.id, chrono::Utc::now()));
         }
         Cmd::Tell {
             agent,

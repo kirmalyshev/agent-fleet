@@ -1203,7 +1203,11 @@ fn draw<F: Fleet>(f: &mut Frame, app: &App, fleets: &[F], now: DateTime<Utc>) {
                 Color::Yellow
             }),
         ),
-        Span::raw(format!(" · {} undelivered", s.msgs.len())),
+        Span::raw(format!(
+            " · {} undelivered · {} unread",
+            s.msgs.len(),
+            s.unread.len()
+        )),
     ]);
     let mut top = vec![summary];
     top.extend(strip);

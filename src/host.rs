@@ -1842,7 +1842,11 @@ mod tests {
         let prompts = fake.prompts.lock().unwrap().clone();
         assert_eq!(prompts.len(), 1, "{prompts:?}");
         assert!(prompts[0].contains("agent-fleet read"), "{prompts:?}");
-        assert_eq!(delivered_count(&host), 2, "the retransmit is a second msg.delivered");
+        assert_eq!(
+            delivered_count(&host),
+            2,
+            "the retransmit is a second msg.delivered"
+        );
 
         // Read: never retransmitted, however long ago it was delivered.
         let dir = tempfile::tempdir().unwrap();

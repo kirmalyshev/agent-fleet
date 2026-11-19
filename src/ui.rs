@@ -41,6 +41,37 @@ pub fn hold(now: DateTime<Utc>, h: &Hold) -> String {
 }
 
 /// Each held or queued-for resource, then the capacity rules.
+/// One tell as `agent-fleet read` prints it: its original sender and time, never the reader's.
+pub fn mail_line(id: &str, m: &crate::state::Msg) -> String {
+    format!(
+        "{}  [agent-fleet {}→{}] {} {}: {} (event {id})",
+        m.since.format("%Y-%m-%d %H:%M:%SZ"),
+        crate::host::short(&m.from),
+        crate::host::short(&m.to),
+        m.kind,
+        m.reference,
+        m.text
+    )
+}
+
+/// `agent-fleet sent`: each of `me`'s tells, its recipient and where it is.
+pub fn outbox(s: &State, me: &str, now: DateTime<Utc>) -> String {
+    use crate::state::MailStatus;
+    let mut out = String::new();
+    for (id, to, since, st) in s.outbox(me) {
+        let st = match st {
+            MailStatus::Sent => "sent".to_string(),
+            MailStatus::Delivered => format!("unread {}", ago(now, s.unread[id].delivered)),
+            MailStatus::Read => "read".to_string(),
+        };
+        let _ = writeln!(out, "{id}  {:>7}  → {to}  {st}", ago(now, since));
+    }
+    if out.is_empty() {
+        out.push_str("no tells sent in the last 24 h\n");
+    }
+    out
+}
+
 pub fn resources(s: &State, now: DateTime<Utc>) -> String {
     let mut out = String::new();
     for (key, r) in &s.resources {
@@ -359,6 +390,19 @@ pub fn board(s: &State, now: DateTime<Utc>) -> String {
             m.reference
         );
     }
+    let _ = writeln!(out, "\n== unread doorbells ({})", s.unread.len());
+    for (id, u) in &s.unread {
+        let _ = writeln!(
+            out,
+            "{id}  unread {:>7}  {} → {}  {} {}  (rung {}x)",
+            ago(now, u.delivered),
+            u.msg.from,
+            u.msg.to,
+            u.msg.kind,
+            u.msg.reference,
+            u.rings
+        );
+    }
     out.push('\n');
     out.push_str(&doctor(&crate::doctor::findings(s, now)));
     let _ = writeln!(out, "\n== hosts ({})", s.hosts.len());
@@ -508,6 +552,51 @@ pub fn stats(v: &serde_json::Value) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_keeps_the_original_sender_and_time_and_sent_shows_unread_age() {
+        use crate::state::{Msg, Read, Unread};
+        let now: DateTime<Utc> = "2026-11-19T22:00:00Z".parse().unwrap();
+        let m = |to: &str, h| Msg {
+            from: "agent:h/s/lead".into(),
+            to: to.into(),
+            kind: "ASK".into(),
+            reference: "x#1".into(),
+            text: "which?".into(),
+            since: now - chrono::Duration::hours(h),
+        };
+        assert_eq!(
+            mail_line("01A", &m("agent:h/s/a", 3)),
+            "2026-11-19 19:00:00Z  [agent-fleet lead→a] ASK x#1: which? (event 01A)"
+        );
+        let mut s = State::default();
+        s.msgs.insert("01A".into(), m("agent:h/s/a", 3));
+        s.unread.insert(
+            "01B".into(),
+            Unread {
+                msg: m("agent:h/s/b", 2),
+                delivered: now - chrono::Duration::minutes(7),
+                rings: 1,
+            },
+        );
+        s.read.insert(
+            "01C".into(),
+            Read {
+                from: "agent:h/s/lead".into(),
+                to: "agent:h/s/c".into(),
+                by: "agent:h/s/c".into(),
+                since: now - chrono::Duration::hours(1),
+                at: now,
+            },
+        );
+        let out = outbox(&s, "agent:h/s/lead", now);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        assert!(lines[0].starts_with("01A") && lines[0].ends_with("→ agent:h/s/a  sent"));
+        assert!(lines[1].ends_with("→ agent:h/s/b  unread 7m"), "{out}");
+        assert!(lines[2].ends_with("→ agent:h/s/c  read"), "{out}");
+        assert!(outbox(&s, "agent:h/s/x", now).starts_with("no tells"));
+    }
 
     #[test]
     fn ps_shows_role_and_lead() {
