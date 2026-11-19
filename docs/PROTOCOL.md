@@ -821,7 +821,7 @@ approved PR merges, its author's own included. Any failure refuses with nothing 
 2. `host` set and not this host: the CLI writes `merge.requested` and follows the hub for the
    `merge.result` (75 min); that host runs every step below itself, each request in its own
    task, and writes `merge.done`. A request it first sees more than 15 min old is answered
-   `expired`. The rest of this list runs on the host that merges.
+   `expired` (or ok, when the PR is already merged at that head). The rest of this list runs on the host that merges.
 3. The PR is open and its head starts with `sha` (7 to 40 hex digits). Already `MERGED` at that
    head (a repeated request) reports the merge and does nothing.
 4. The PR's last issue comment (reviews are not read) is by an owner, member or collaborator,
@@ -838,7 +838,7 @@ approved PR merges, its author's own included. Any failure refuses with nothing 
    current one, or a host's `--repo`, when its `origin` is the repository) must be at a commit on
    a freshly fetched `origin/<base>` with the script unmodified, so a PR's own branch never
    judges itself. One gate runs at a time per repository on a machine (a lock in its git common
-   dir). `<checkout>/<gate> <head sha>` runs there with `AGENT_FLEET_MERGE_PR=<owner/repo>#<pr>`
+   dir, taken before the checkout is read); a gate must leave the checkout where it found it. `<checkout>/<gate> <head sha>` runs there with `AGENT_FLEET_MERGE_PR=<owner/repo>#<pr>`
    and, when given, `AGENT_FLEET_ALLOW_PIN_REWIND`, in its own process group; exit 0 passes,
    60 min kills the group. Without a gate: `gh pr checks --required`, waited on while they run
    (9 min); each must `pass` or be `skipping` and at least one must pass; anything else refuses.

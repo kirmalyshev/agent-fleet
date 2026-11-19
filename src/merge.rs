@@ -488,6 +488,14 @@ async fn run_gate(
     say: &(dyn Fn(String) + Sync),
 ) -> Result<()> {
     let checkout = (a.checkout)()?;
+    // One gate at a time per repository on this machine, the checkout read only once it is
+    // held: gates share the checkout, and one that moved it would otherwise hand this one a
+    // tree (and a gate script) nobody checked.
+    let common = git(&checkout, &["rev-parse", "--git-common-dir"])
+        .await
+        .map_err(|e| anyhow!("git rev-parse in {}: {e}", checkout.display()))?;
+    let lock = checkout.join(common).join("agent-fleet-merge.lock");
+    let _held = crate::retire::lock_file(&lock, GATE_MAX, "another merge gate").await?;
     let script = checkout.join(gate);
     if !script.is_file() {
         bail!(
@@ -499,13 +507,6 @@ async fn run_gate(
     let at = gate_from_base(&checkout, base, gate)
         .await
         .map_err(|e| e.context(format!("#{}: refused", a.pr)))?;
-    // One gate at a time per repository on this machine: gates share the checkout, and one
-    // that checks out its sha under another would prove the wrong tree.
-    let common = git(&checkout, &["rev-parse", "--git-common-dir"])
-        .await
-        .map_err(|e| anyhow!("git rev-parse in {}: {e}", checkout.display()))?;
-    let lock = checkout.join(common).join("agent-fleet-merge.lock");
-    let _held = crate::retire::lock_file(&lock, GATE_MAX, "another merge gate").await?;
     say(format!(
         "#{}: merge gate {gate} at {head} (in {}, at {at})",
         a.pr,
@@ -792,10 +793,43 @@ pub fn serve(
     let Ok(view) = host.view() else { return };
     let (todo, expired) = due(&view.state, &host.cfg.host, seen, chrono::Utc::now());
     for id in expired {
+        let Some(m) = view.state.merges.get(&id).cloned() else {
+            continue;
+        };
         let host = host.clone();
         tokio::spawn(async move {
-            let text = "expired: not picked up within 15 min; nothing merged".to_string();
-            answer(&host, &id, false, text).await;
+            // Another run (a crash after `gh pr merge`, a second host agent) may have merged it.
+            let r = &m.request;
+            let gh = std::env::var("AGENT_FLEET_GH").unwrap_or_else(|_| "gh".into());
+            let none = || bail!("no checkout");
+            let ask = Ask {
+                gh: &gh,
+                repo: &r.repo,
+                pr: r.pr,
+                sha: &r.sha,
+                allow_pin_rewind: None,
+                checkout: &none,
+                tick: Duration::from_secs(1),
+            };
+            let (ok, text) = match pr_view(&ask).await {
+                Ok(p) if p.state == "MERGED" && head_matches(&p.head, &r.sha).is_ok() => (
+                    true,
+                    merged_line(
+                        &r.repo,
+                        r.pr,
+                        &Merged {
+                            head: p.head,
+                            commit: p.commit,
+                            already: true,
+                        },
+                    ),
+                ),
+                _ => (
+                    false,
+                    "expired: not picked up within 15 min, so not run here".to_string(),
+                ),
+            };
+            answer(&host, &id, ok, text).await;
         });
     }
     for id in todo {
@@ -1246,6 +1280,48 @@ esac
         std::fs::write(f.dir.path().join("checkout/gate.sh"), "#!/bin/sh\nexit 0\n").unwrap();
         let (r, _) = f.run(H, None).await;
         assert!(format!("{:#}", r.unwrap_err()).contains("local changes"));
+    }
+
+    #[tokio::test]
+    async fn a_gate_waiting_on_another_reads_the_checkout_only_once_it_holds_the_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fake::new();
+        f.put("fleet.toml", "[merge]\ngate = \"gate.sh\"\n");
+        let co = f.dir.path().join("checkout");
+        std::fs::create_dir(&co).unwrap();
+        std::fs::write(co.join("gate.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(co.join("gate.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&co)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["add", "gate.sh"]);
+        git(&["commit", "-qm", "gate"]);
+        git(&["remote", "add", "origin", co.to_str().unwrap()]);
+        // Another gate holds the lock, and moves the checkout to a PR's branch meanwhile.
+        let lock = co.join(".git/agent-fleet-merge.lock");
+        let held = crate::retire::lock_file(&lock, Duration::ZERO, "test")
+            .await
+            .unwrap();
+        let other = async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            git(&["checkout", "-q", "-b", "pr"]);
+            git(&["commit", "-q", "--allow-empty", "-m", "pr"]);
+            drop(held);
+        };
+        let ((r, _), ()) = tokio::join!(f.run(H, None), other);
+        let e = format!("{:#}", r.unwrap_err());
+        assert!(e.contains("not on origin/main"), "{e}");
+        assert!(!f.calls().contains("pr merge"));
     }
 
     #[tokio::test]
