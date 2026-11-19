@@ -664,7 +664,7 @@ function render() {
     ["tasks", `<b>${open}</b> open tasks`, ""],
     ["findings", `<b>${data.findings.length}</b> findings`, data.findings.length ? "warn" : ""],
     undelivered ? ["doorbells", `<b>${undelivered}</b> undelivered`, "warn"] : null,
-    deadLetters ? ["doorbells", `<b>${deadLetters}</b> dead letters`, "warn"] : null,
+    deadLetters ? ["doorbells", `<b>${deadLetters}</b> dead letter${deadLetters === 1 ? "" : "s"}`, "warn"] : null,
   ].filter(Boolean).map(([t, html, cls]) => `<button class="stat ${cls}" data-tab="${t}">${html}</button>`).join("");
   const alerts = data.findings.filter(f => ["orphan", "hung", "duplicate", "breach"].includes(f.kind)).slice(0, 3)
     .map(f => `<div class="banner">${ICON.alert}<div><b>${esc(f.kind)}</b> · <span class="mono">${esc(home(f.subject))}</span><div class="sub">${esc(f.detail)}</div></div></div>`);

@@ -41,6 +41,10 @@ pub struct State {
     /// Delivered doorbells their recipient has not read (`msg.read`) yet: retransmitted until it does.
     #[serde(default)]
     pub unread: BTreeMap<String, Unread>,
+    /// When each agent that is not up went down (`agent.down`), kept 24 h: a tell to it goes to
+    /// the coordinator `GONE_AFTER` later, never on a listing flap.
+    #[serde(default)]
+    pub gone: BTreeMap<String, DateTime<Utc>>,
     /// Read doorbells by the id of their `msg.sent`, kept for 24 h after the read.
     #[serde(default)]
     pub read: BTreeMap<String, Read>,
@@ -495,8 +499,9 @@ fn agent_host(id: &str) -> Option<&str> {
 
 impl State {
     /// Tells `host` must hand to the coordinator now, as `(id, dead letter)`: unread (delivered or
-    /// not) `MSG_EXPIRE` after the send, or sent `GONE_AFTER` ago to an agent that is not up. Each
-    /// is the job of the recipient's host alone; a tell to a role nobody holds waits.
+    /// not) `MSG_EXPIRE` after the send, or to an agent down (`agent.down`) for `GONE_AFTER`. The
+    /// recipient's host hands them over; an expired one also the coordinator's host, for a
+    /// recipient whose host is gone (both write the same event). A tell to a role nobody holds waits.
     pub fn dead_letters(&self, host: &str, now: DateTime<Utc>) -> Vec<(String, MsgSent)> {
         self.msgs
             .iter()
@@ -504,12 +509,17 @@ impl State {
             .filter(|(_, m)| m.kind != DEADLETTER)
             .filter_map(|(id, m)| {
                 let to = self.recipient(&m.to)?;
-                if agent_host(to) != Some(host) {
-                    return None;
-                }
-                let why = if m.expired(now) {
+                let mine = agent_host(to) == Some(host);
+                let coordinator_host = self
+                    .coordinator()
+                    .and_then(|c| self.agents.get(c))
+                    .is_some_and(|c| c.host == host);
+                let why = if m.expired(now) && (mine || coordinator_host) {
                     "expired"
-                } else if !self.agents.contains_key(to) && now - m.since >= GONE_AFTER {
+                } else if mine
+                    && !self.agents.contains_key(to)
+                    && self.gone.get(to).is_some_and(|at| now - *at >= GONE_AFTER)
+                {
                     "recipient gone"
                 } else {
                     return None;
@@ -682,6 +692,7 @@ impl State {
         let ts = e.ts;
         match k {
             Known::AgentUp(d) => {
+                self.gone.remove(&d.agent);
                 // A re-up (host or herdr restart) keeps what the entry already knows: the last
                 // working time, the current stretch when the state did not change, the usage.
                 let old = self.agents.get(&d.agent);
@@ -819,7 +830,9 @@ impl State {
                 }
             }
             Known::AgentDown(d) => {
-                self.agents.remove(&d.agent);
+                if self.agents.remove(&d.agent).is_some() {
+                    self.gone.insert(d.agent.clone(), ts);
+                }
                 self.first_cwd.remove(&d.agent);
                 self.stuck.remove(&d.agent);
                 self.signals.remove(&d.agent);
@@ -1019,12 +1032,15 @@ impl State {
             }
             Known::MsgSent(d) => {
                 // A host's dead letter takes the tell it names (`re`) off the recipient's queue.
+                // One for a tell already read or handed over (a host's view lagging) is dropped.
                 if d.kind == DEADLETTER
                     && e.actor.kind == ActorKind::Host
                     && let Some(re) = &e.re
                 {
-                    self.msgs.remove(re);
-                    self.unread.remove(re);
+                    let open = self.msgs.remove(re).is_some() | self.unread.remove(re).is_some();
+                    if !open {
+                        return;
+                    }
                 }
                 self.msgs.insert(
                     e.id.clone(),
@@ -1250,6 +1266,7 @@ impl State {
         self.answers
             .retain(|_, a| e.ts - a.acked.unwrap_or(a.at) <= ANSWER_KEPT);
         self.read.retain(|_, r| e.ts - r.at <= READ_KEPT);
+        self.gone.retain(|_, at| e.ts - *at <= MSG_EXPIRE);
         // The reducer has no clock: a spawn is pruned once a later event's `ts` is more than
         // SPAWN_KEPT past its answer (or its request, when it was never answered) — but never
         // while its agent is still up, so cap counting cannot lose sight of it.
@@ -2160,7 +2177,7 @@ mod tests {
             s.agents.insert(
                 id.into(),
                 serde_json::from_value(serde_json::json!({
-                    "host": "h", "state": "idle", "since": now
+                    "host": agent_host(id), "state": "idle", "since": now
                 }))
                 .unwrap(),
             );
@@ -2178,10 +2195,17 @@ mod tests {
                 rings: 6,
             },
         );
+        // Down 11 min: its tells go. Down 2 min (a listing flap) with a 30 min old tell: it waits.
+        s.gone
+            .insert("agent:h/s/gone".into(), now - chrono::Duration::minutes(11));
+        s.gone
+            .insert("agent:h/s/flap".into(), now - chrono::Duration::minutes(2));
         s.msgs
-            .insert("gone".into(), msg("agent:h/s/gone", "ASK", 11));
+            .insert("gone".into(), msg("agent:h/s/gone", "ASK", 12));
         s.msgs
-            .insert("gone-young".into(), msg("agent:h/s/gone", "ASK", 9));
+            .insert("flap".into(), msg("agent:h/s/flap", "ASK", 30));
+        s.msgs
+            .insert("never-seen".into(), msg("agent:h/s/nobody", "ASK", 30));
         s.msgs
             .insert("elsewhere".into(), msg("agent:k/s/far", "ASK", 25 * 60));
         s.msgs
@@ -2204,6 +2228,30 @@ mod tests {
         );
         assert!(got[0].1.text.starts_with("[recipient gone, "));
         assert_eq!(s.dead_letters("k", now).len(), 1, "the far host's own");
+        // The coordinator's host also hands over expired tells, for a recipient's host that is gone:
+        // the same events, by the same ids.
+        s.apply(
+            &ev(
+                ActorKind::Agent,
+                Known::AgentRole(AgentRole {
+                    agent: "agent:k/s/far".into(),
+                    level: Some(Level::RootCoordinator),
+                    lead: None,
+                    domain: None,
+                }),
+            )
+            .into_event(),
+        );
+        let ids: Vec<String> = s
+            .dead_letters("k", now)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["elsewhere", "old", "unread-old"],
+            "never a gone one"
+        );
 
         // The host's dead letter closes the original in the same event; an agent's does not.
         let dead = |actor: ActorKind, re: &str| {
@@ -2224,6 +2272,36 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
         assert_eq!(ids, vec!["gone".to_string()], "each goes once");
+        // A second hand-over of a tell already closed (a lagging view) adds nothing.
+        let n = s.msgs.len();
+        s.apply(&dead(ActorKind::Host, "old"));
+        assert_eq!(s.msgs.len(), n);
+    }
+
+    #[test]
+    fn an_agent_down_is_gone_from_then_and_back_up_is_not() {
+        let mut s = State::default();
+        let up = Known::AgentUp(AgentUp {
+            agent: "agent:h/s/a".into(),
+            host: "h".into(),
+            kind: None,
+            state: AgentState::Idle,
+            pane: None,
+        });
+        let down = || {
+            Known::AgentDown(AgentDown {
+                agent: "agent:h/s/a".into(),
+                reason: None,
+            })
+        };
+        s.apply(&ev(ActorKind::Host, down()).into_event());
+        assert!(s.gone.is_empty(), "never up: no down time");
+        s.apply(&ev(ActorKind::Host, up.clone()).into_event());
+        let e = ev(ActorKind::Host, down()).into_event();
+        s.apply(&e);
+        assert_eq!(s.gone.get("agent:h/s/a"), Some(&e.ts));
+        s.apply(&ev(ActorKind::Host, up).into_event());
+        assert!(s.gone.is_empty());
     }
 
     #[test]

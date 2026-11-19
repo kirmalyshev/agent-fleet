@@ -3705,6 +3705,15 @@
           "description": "The cwd an agent's own host first reported for its pane (`agent.usage`), by agent id; fixed\nuntil `agent.down`, so a later `cd` does not move it. The root of an agent nobody spawned.",
           "type": "object"
         },
+        "gone": {
+          "additionalProperties": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "default": {},
+          "description": "When each agent that is not up went down (`agent.down`), kept 24 h: a tell to it goes to\nthe coordinator `GONE_AFTER` later, never on a listing flap.",
+          "type": "object"
+        },
         "hosts": {
           "additionalProperties": {
             "$ref": "#/$defs/Host"
