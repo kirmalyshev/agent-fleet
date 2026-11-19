@@ -344,7 +344,24 @@ impl<'a> Tick<'a> {
                     .collect()
             };
             let below = under(pid);
+            // The reader of a pipe whose producer is a follower (`tail -f X | grep …`): one
+            // process group, and the producer waits by design.
+            // ponytail: a non-job-control shell puts every sibling in one group, so only a known
+            // filter counts as a reader; match the pipe's inode to cover any other reader.
+            let pgid = self.now.0[&pid].pgid;
+            let filter = [
+                "grep", "egrep", "fgrep", "rg", "awk", "gawk", "sed", "head", "tail", "cut", "tr",
+                "tee", "jq",
+            ]
+            .contains(&self.now.0[&pid].name.as_str());
+            let piped = below.is_empty()
+                && filter
+                && pgid.is_some()
+                && members
+                    .iter()
+                    .any(|&q| q != pid && self.now.0[&q].pgid == pgid && by_design(q));
             by_design(pid)
+                || piped
                 || (wrapper(pid)
                     && !below.is_empty()
                     && below.iter().all(|&q| {
@@ -1466,6 +1483,52 @@ mod tests {
             v.iter().all(|c| !matches!(c.verdict, Verdict::Hung(_))),
             "{v:#?}"
         );
+    }
+
+    #[test]
+    fn a_pipe_reader_whose_producer_is_a_follower_is_not_hung() {
+        // `tail -f X | grep …`: one process group, the producer idle by design.
+        let run = |reader: &'static str, producer: &'static str, same_group: bool| {
+            let mut t = tree(&[
+                (40, SHELL, "tail", producer, 0, 20),
+                (41, SHELL, reader.split(' ').next().unwrap(), reader, 0, 20),
+            ]);
+            t.0.get_mut(&40).unwrap().pgid = Some(40);
+            t.0.get_mut(&41).unwrap().pgid = Some(if same_group { 40 } else { 41 });
+            t
+        };
+        let step = |reader: &'static str, producer: &'static str, same_group: bool| {
+            let mut w = Watch::default();
+            w.step(run(reader, producer, same_group), at(0), &seen());
+            w.step(run(reader, producer, same_group), at(2), &seen());
+            w.step(run(reader, producer, same_group), at(4), &seen())
+        };
+        for reader in [
+            "grep -v noise",
+            "grep --line-buffered ERROR",
+            "awk /x/",
+            "head -3",
+        ] {
+            let v = step(reader, "tail -f /tmp/x/all.log", true);
+            assert!(
+                v.iter().all(|c| !matches!(c.verdict, Verdict::Hung(_))),
+                "{reader}: {v:#?}"
+            );
+        }
+        // A stuck non-filter sibling in the follower's group (`tail -f X & sleep 3600`).
+        for stuck in ["sleep 3600", "curl http://localhost:9/x"] {
+            let v = step(stuck, "tail -f /tmp/x/all.log", true);
+            assert!(
+                matches!(verdict(&v, 41), Some(Verdict::Hung(_))),
+                "{stuck}: {v:#?}"
+            );
+        }
+        // Not one pipeline: the reader beside the follower is its own hang.
+        let v = step("grep -v noise", "tail -f /tmp/x/all.log", false);
+        assert!(matches!(verdict(&v, 41), Some(Verdict::Hung(_))), "{v:#?}");
+        // A producer that is no follower is a real hang, the reader too.
+        let v = step("grep -v noise", "tail -n 5 /tmp/x/all.log", true);
+        assert!(matches!(verdict(&v, 41), Some(Verdict::Hung(_))), "{v:#?}");
     }
 
     #[test]
