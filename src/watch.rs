@@ -330,16 +330,30 @@ impl<'a> Tick<'a> {
             .collect();
         let spared = |pid: u32| {
             let by_design = |q: u32| Self::idle_by_design(&self.now.0[&q]);
-            let under: Vec<u32> = self
-                .now
-                .tree(pid)
-                .into_iter()
-                .filter(|q| *q != pid && members.contains(q))
-                .collect();
+            // A launcher that only runs another command: a shell, or an exec-style wrapper.
+            let wrapper = |q: u32| {
+                let n = self.now.0[&q].name.as_str();
+                SHELLS.contains(&n)
+                    || ["timeout", "env", "nohup", "nice", "script", "xargs"].contains(&n)
+            };
+            let under = |q: u32| -> Vec<u32> {
+                self.now
+                    .tree(q)
+                    .into_iter()
+                    .filter(|d| *d != q && members.contains(d))
+                    .collect()
+            };
+            let below = under(pid);
             by_design(pid)
-                || (SHELLS.contains(&self.now.0[&pid].name.as_str())
-                    && !under.is_empty()
-                    && under.iter().all(|&q| by_design(q)))
+                || (wrapper(pid)
+                    && !below.is_empty()
+                    && below.iter().all(|&q| {
+                        if under(q).is_empty() {
+                            by_design(q)
+                        } else {
+                            wrapper(q)
+                        }
+                    }))
         };
         if members.iter().all(|&p| spared(p)) {
             for c in &mut self.out[start..] {
@@ -1424,6 +1438,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_hung_program_above_a_follower_and_a_nested_wrapper_are_judged_apart() {
+        let verdicts = |procs: Vec<(u32, u32, &'static str, &'static str, u64, i64)>| {
+            let mut w = Watch::default();
+            let t = || tree(&procs);
+            w.step(t(), at(0), &seen());
+            w.step(t(), at(2), &seen());
+            w.step(t(), at(4), &seen())
+        };
+        // A stuck program with a follower child is not a wrapper: still hung.
+        let v = verdicts(vec![
+            (30, SHELL, "bash", "bash -c go", 0, 20),
+            (31, 30, "python3", "python3 deadlock.py", 0, 20),
+            (32, 31, "tail", "tail -f x.log", 0, 20),
+        ]);
+        assert!(matches!(verdict(&v, 31), Some(Verdict::Hung(_))), "{v:#?}");
+        // bash -> timeout -> tail -f: the nesting is common, and idle by design.
+        let v = verdicts(vec![
+            (30, SHELL, "bash", "bash -c go", 0, 20),
+            (31, 30, "timeout", "timeout 600 tail -f x.log", 0, 20),
+            (32, 31, "tail", "tail -f x.log", 0, 20),
+        ]);
+        assert!(
+            v.iter().all(|c| !matches!(c.verdict, Verdict::Hung(_))),
+            "{v:#?}"
+        );
     }
 
     #[test]
