@@ -45,6 +45,22 @@ pub fn size(d: &Path) -> u64 {
         .sum()
 }
 
+/// A test temp dir git cannot walk up from into a checkout. An agent's TMPDIR is
+/// `<worktree>/.tmp`, so a bare `tempdir()` there sits inside one; then fall back to `/tmp`
+/// (short, so unix-socket paths under it still fit).
+#[cfg(test)]
+pub fn plain_tempdir() -> tempfile::TempDir {
+    let tmp = std::env::temp_dir();
+    let in_checkout = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&tmp)
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    let base = if in_checkout { "/tmp".into() } else { tmp };
+    tempfile::tempdir_in(base).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,6 +93,16 @@ mod tests {
         assert_eq!(used(d.path()), 0);
         std::fs::write(dir(d.path()).join("x"), [0u8; 7]).unwrap();
         assert_eq!(used(d.path()), 7);
+    }
+
+    #[test]
+    fn a_plain_tempdir_is_outside_any_checkout() {
+        let d = plain_tempdir();
+        assert!(
+            !git(d.path(), &["rev-parse", "--git-dir"]),
+            "{}",
+            d.path().display()
+        );
     }
 
     #[test]
