@@ -314,7 +314,7 @@ impl<'a> Tick<'a> {
             "journalctl" => words().any(|w| flag(w, "--follow", &['f'])),
             "less" => words().any(|w| w == "+F" || w == "--follow-name"),
             "DTServiceHub" | "launchd_sim" | "SimulatorTrampoline" => true,
-            n => n.starts_with("CoreSimulator"),
+            _ => false,
         }
     }
 
@@ -329,18 +329,17 @@ impl<'a> Tick<'a> {
             .map(|c| c.pid)
             .collect();
         let spared = |pid: u32| {
-            Self::idle_by_design(&self.now.0[&pid])
-                || self
-                    .now
-                    .tree(pid)
-                    .into_iter()
-                    .filter(|q| *q != pid && members.contains(q))
-                    .all(|q| Self::idle_by_design(&self.now.0[&q]))
-                    && self
-                        .now
-                        .tree(pid)
-                        .into_iter()
-                        .any(|q| q != pid && members.contains(&q))
+            let by_design = |q: u32| Self::idle_by_design(&self.now.0[&q]);
+            let under: Vec<u32> = self
+                .now
+                .tree(pid)
+                .into_iter()
+                .filter(|q| *q != pid && members.contains(q))
+                .collect();
+            by_design(pid)
+                || (SHELLS.contains(&self.now.0[&pid].name.as_str())
+                    && !under.is_empty()
+                    && under.iter().all(|&q| by_design(q)))
         };
         if members.iter().all(|&p| spared(p)) {
             for c in &mut self.out[start..] {
@@ -1344,13 +1343,13 @@ mod tests {
 
     #[test]
     fn the_exact_follower_command_of_3138_is_not_hung() {
-        // 19 Nov o-3131: `tail -n +1 -f /tmp/o-3131/all.log`, alone and beside a quiet sibling.
+        // `tail -n +1 -f <file>`, alone, in the shapes ps reports it.
         for args in [
-            "tail -n +1 -f /tmp/o-3131/all.log",
-            "/usr/bin/tail -n +1 -f /tmp/o-3131/all.log",
-            "tail -n+1 -F /tmp/o-3131/all.log",
-            "less +F /tmp/o-3131/all.log",
-            "journalctl -f -u eait",
+            "tail -n +1 -f /tmp/x/all.log",
+            "/usr/bin/tail -n +1 -f /tmp/x/all.log",
+            "tail -n+1 -F /tmp/x/all.log",
+            "less +F /tmp/x/all.log",
+            "journalctl -f -u svc",
         ] {
             let name = args
                 .split_whitespace()
@@ -1380,11 +1379,11 @@ mod tests {
                     30,
                     SHELL,
                     "bash",
-                    "bash -c tail -n +1 -f /tmp/o-3131/all.log",
+                    "bash -c tail -n +1 -f /tmp/x/all.log",
                     0,
                     20,
                 ),
-                (31, 30, "tail", "tail -n +1 -f /tmp/o-3131/all.log", 0, 20),
+                (31, 30, "tail", "tail -n +1 -f /tmp/x/all.log", 0, 20),
             ])
         };
         w.step(t(), at(0), &seen());
@@ -1397,8 +1396,58 @@ mod tests {
     }
 
     #[test]
+    fn a_real_hang_beside_a_follower_or_a_daemon_stays_hung() {
+        for (name, args) in [("sleep", "sleep 9999"), ("head", "head -3")] {
+            for (fname, fargs) in [("tail", "tail -f x.log"), ("DTServiceHub", "DTServiceHub")] {
+                // A wrapper over both, and two siblings under the tool shell.
+                let layouts = [
+                    vec![
+                        (30, SHELL, "bash", "bash -c go", 0, 20),
+                        (31, 30, fname, fargs, 0, 20),
+                        (32, 30, name, args, 0, 20),
+                    ],
+                    vec![
+                        (31, SHELL, fname, fargs, 0, 20),
+                        (32, SHELL, name, args, 0, 20),
+                    ],
+                ];
+                for l in layouts {
+                    let mut w = Watch::default();
+                    let t = || tree(&l);
+                    w.step(t(), at(0), &seen());
+                    w.step(t(), at(2), &seen());
+                    let v = w.step(t(), at(4), &seen());
+                    assert!(
+                        matches!(verdict(&v, 32), Some(Verdict::Hung(_))),
+                        "{name} beside {fname}: {v:#?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_tail_less_or_journalctl_that_does_not_follow_stays_hung() {
+        for (name, args) in [
+            ("tail", "tail -n 5 x.log"),
+            ("less", "less x.log"),
+            ("journalctl", "journalctl -u svc -n 100"),
+        ] {
+            let mut w = Watch::default();
+            let only = || tree(&[(40, SHELL, name, args, 0, 20)]);
+            w.step(only(), at(0), &seen());
+            w.step(only(), at(2), &seen());
+            let v = w.step(only(), at(4), &seen());
+            assert!(
+                matches!(verdict(&v, 40), Some(Verdict::Hung(_))),
+                "{args}: {v:#?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_booted_simulators_service_daemon_is_never_hung() {
-        // 19 Nov 07:07 o-3131: DTServiceHub idle by design inside a live sim session.
+        // DTServiceHub is idle by design inside a live sim session.
         for (name, args) in [
             (
                 "DTServiceHub",
@@ -1406,10 +1455,9 @@ mod tests {
             ),
             (
                 "launchd_sim",
-                "launchd_sim /Users/k/Library/Developer/CoreSimulator/Devices/ABC/data/var/run/launchd_bootstrap.plist",
+                "launchd_sim /var/sim/Devices/ABC/launchd_bootstrap.plist",
             ),
             ("SimulatorTrampoline", "SimulatorTrampoline"),
-            ("CoreSimulatorService", "CoreSimulatorService"),
         ] {
             let mut w = Watch::default();
             let only = || tree(&[(40, SHELL, name, args, 0, 20)]);
