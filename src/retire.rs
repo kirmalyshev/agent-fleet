@@ -284,7 +284,7 @@ pub fn save_patch(wt: &Path, dir: &Path, name: &str, changes: &[Change]) -> Resu
 }
 
 /// An exclusive flock on `path`, waiting up to `wait`. `what` names the holder in the refusal.
-async fn lock_file(path: &Path, wait: Duration, what: &str) -> Result<Held> {
+pub(crate) async fn lock_file(path: &Path, wait: Duration, what: &str) -> Result<Held> {
     let f = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -1067,7 +1067,7 @@ mod tests {
         );
         // Detached, so init reaps it the moment it ends: a pane's statusline hook outliving it.
         let ok = std::process::Command::new("sh")
-            .args(["-c", "(sleep 1 & echo $! > ../linger.pid)"])
+            .args(["-c", "(sleep 2 & echo $! > ../linger.pid)"])
             .current_dir(&f.wt)
             .status()
             .unwrap()

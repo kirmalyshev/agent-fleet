@@ -812,30 +812,40 @@ request that failed does not block a retry.
 ## Merging
 
 `agent-fleet merge <owner/repo>#<pr> <sha> [--allow-pin-rewind=<reason>]` is the one way an
-approved PR merges, its author's own included. In order, any failure refusing with nothing merged:
+approved PR merges, its author's own included. Any failure refuses with nothing merged.
 
-1. The PR is open and its head starts with `sha` (7 to 40 hex digits).
-2. The base branch's `.agent-fleet/fleet.toml` (read through `gh api`, so a PR cannot change its
+1. The base branch's `.agent-fleet/fleet.toml` (read through `gh api`, so a PR cannot change its
    own gate) gives `[merge]`: `gate`, a script path in the repository, and `host`, the fleet host
-   that runs the merge. No file or no table: no gate, this host.
-3. `host` set and not this host: the CLI writes `merge.requested` and follows the hub for the
-   `merge.result` (75 min); that host runs the steps below itself, each in its own task, and writes
-   `merge.done`. The rest of this list runs on the host that merges.
-4. The PR's last comment's last non-blank line (`*` and backticks around it are fine) is exactly
-   `VERDICT: READY <the head's full sha>`. A comment after the verdict, a short sha, or unreadable
-   comments refuse.
+   that runs the merge. Only GitHub's 404 means no file (then: no gate, this host); any other
+   read error refuses.
+2. `host` set and not this host: the CLI writes `merge.requested` and follows the hub for the
+   `merge.result` (75 min); that host runs every step below itself, each request in its own
+   task, and writes `merge.done`. A request it first sees more than 15 min old is answered
+   `expired`. The rest of this list runs on the host that merges.
+3. The PR is open and its head starts with `sha` (7 to 40 hex digits). Already `MERGED` at that
+   head (a repeated request) reports the merge and does nothing.
+4. The PR's last issue comment (reviews are not read) is by an owner, member or collaborator,
+   and its last non-blank line (`*` and backticks around it are fine) is exactly
+   `VERDICT: READY <the head's full sha>`. A comment after the verdict, a short sha, or
+   unreadable comments refuse.
 5. Every submodule pin the PR moves (a `Subproject commit` change in its file list) moves forward
    from the base branch's: GitHub's compare says the PR's pin is `ahead` of (or `identical` to) the
-   base's. A pin off GitHub or that compare cannot prove is refused like a rewind;
-   `--allow-pin-rewind=<reason>` lets it through with the reason printed.
-6. `mergeable` is not `CONFLICTING` (`UNKNOWN` is read again 5 times, 6 s apart).
-7. With a `gate`: `<checkout>/<gate> <head sha>` runs in this machine's checkout (the connected
-   one, `agent-fleet repo add`, else the current one when its `origin` is the repository), with
-   `AGENT_FLEET_MERGE_PR=<owner/repo>#<pr>` and, when given, `AGENT_FLEET_ALLOW_PIN_REWIND`; exit 0
-   passes (60 min limit). Without one: `gh pr checks --required`, waited on while they run (9 min);
-   a failed or cancelled check, or no required checks at all, refuses.
+   base's. A pin off GitHub, missing on the base branch, or one compare cannot prove is refused
+   like a rewind; `--allow-pin-rewind=<reason>` lets it through with the reason printed.
+6. `mergeable` is not `CONFLICTING` (`UNKNOWN` is read again 5 times, 6 s apart, then let through:
+   GitHub refuses a conflicting merge itself).
+7. With a `gate`: this machine's checkout (the connected one, `agent-fleet repo add`, else the
+   current one, or a host's `--repo`, when its `origin` is the repository) must be at a commit on
+   a freshly fetched `origin/<base>` with the script unmodified, so a PR's own branch never
+   judges itself. One gate runs at a time per repository on a machine (a lock in its git common
+   dir). `<checkout>/<gate> <head sha>` runs there with `AGENT_FLEET_MERGE_PR=<owner/repo>#<pr>`
+   and, when given, `AGENT_FLEET_ALLOW_PIN_REWIND`, in its own process group; exit 0 passes,
+   60 min kills the group. Without a gate: `gh pr checks --required`, waited on while they run
+   (9 min); each must `pass` or be `skipping` and at least one must pass; anything else refuses.
 8. The head and the verdict are read again (a push or a later comment during the gate refuses),
    then `gh pr merge --squash --match-head-commit <head>`, never `--admin`, and `merge.done`.
+   Not seen `MERGED` within 15 s (a merge queue): reported as issued, `commit` absent.
+
 ## Self-update
 
 A host runs the binary `cargo install --path <clone>` built from its own clone. The build embeds

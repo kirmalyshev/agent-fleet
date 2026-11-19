@@ -95,22 +95,31 @@ pub fn github_slug(url: &str, repo: &str) -> Option<String> {
     }
 }
 
-/// What `gh pr checks --required --json name,bucket` says: Ok(None) all passed, Ok(Some)
-/// still running (their names), Err the failed ones.
+/// What `gh pr checks --required --json name,bucket` says: Ok(None) all passed (`skipping`
+/// counts, but at least one must `pass`), Ok(Some) still running (their names), Err the ones
+/// that did not pass: `fail`, `cancel`, or any bucket this does not know. Err(empty): nothing
+/// passed at all.
 pub fn checks(v: &serde_json::Value) -> Result<Option<Vec<String>>, Vec<String>> {
     let all = v.as_array().map(Vec::as_slice).unwrap_or_default();
-    let named = |want: &[&str]| -> Vec<String> {
+    let bucket = |c: &Value| c["bucket"].as_str().unwrap_or_default().to_string();
+    let named = |keep: &dyn Fn(&str) -> bool| -> Vec<String> {
         all.iter()
-            .filter(|c| want.contains(&c["bucket"].as_str().unwrap_or("fail")))
+            .filter(|c| keep(&bucket(c)))
             .map(|c| c["name"].as_str().unwrap_or("?").to_string())
             .collect()
     };
-    let failed = named(&["fail", "cancel"]);
-    if all.is_empty() || !failed.is_empty() {
+    let failed = named(&|b| !matches!(b, "pass" | "skipping" | "pending"));
+    if !failed.is_empty() {
         return Err(failed);
     }
-    let running = named(&["pending"]);
-    Ok((!running.is_empty()).then_some(running))
+    let running = named(&|b| b == "pending");
+    if !running.is_empty() {
+        return Ok(Some(running));
+    }
+    if named(&|b| b == "pass").is_empty() {
+        return Err(vec![]);
+    }
+    Ok(None)
 }
 
 /// The approved `sha` (7 to 40 hex digits) against the PR's head.
@@ -146,7 +155,27 @@ pub struct Ask<'a> {
 #[derive(Debug, PartialEq)]
 pub struct Merged {
     pub head: String,
+    /// The merge commit; `None` when `gh pr merge` answered but the PR was not seen `MERGED`
+    /// (a merge queue, or GitHub lagging).
     pub commit: Option<String>,
+    /// It was merged at this head before this run (a repeated request): nothing was done.
+    pub already: bool,
+}
+
+/// GitHub answered 404 (`gh` says `(HTTP 404)` on stderr).
+#[derive(Debug)]
+struct NotFound;
+
+impl std::fmt::Display for NotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HTTP 404")
+    }
+}
+
+impl std::error::Error for NotFound {}
+
+fn not_found(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<NotFound>().is_some()
 }
 
 /// `gh args`' stdout; Err carries its stderr. `ok_codes` are exit codes that still answer
@@ -162,11 +191,13 @@ async fn gh(bin: &str, args: &[&str], ok_codes: &[i32]) -> Result<String> {
     let code = out.status.code().unwrap_or(-1);
     // An allowed failure still has to answer: empty stdout is the plain failure it looks like.
     if !out.status.success() && (!ok_codes.contains(&code) || out.stdout.is_empty()) {
-        bail!(
-            "gh {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let what = format!("gh {}: {err}", args.join(" "));
+        // Only gh's own words decide a 404, never the arguments (a branch named `fix-404`).
+        if err.contains("(HTTP 404)") {
+            return Err(anyhow::Error::new(NotFound).context(what));
+        }
+        bail!("{what}");
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -176,6 +207,7 @@ struct Pr {
     head: String,
     base: String,
     mergeable: String,
+    commit: Option<String>,
 }
 
 async fn pr_view(a: &Ask<'_>) -> Result<Pr> {
@@ -189,24 +221,35 @@ async fn pr_view(a: &Ask<'_>) -> Result<Pr> {
             "-R",
             a.repo,
             "--json",
-            "state,headRefOid,baseRefName,mergeable",
+            "state,headRefOid,baseRefName,mergeable,mergeCommit",
         ],
         &[],
     )
     .await?;
     let v: Value = serde_json::from_str(&out).context("gh pr view: bad JSON")?;
     let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
-    Ok(Pr {
+    let pr = Pr {
         state: s("state"),
         head: s("headRefOid"),
         base: s("baseRefName"),
         mergeable: s("mergeable"),
-    })
+        commit: v["mergeCommit"]["oid"].as_str().map(str::to_string),
+    };
+    if pr.head.is_empty() || pr.base.is_empty() {
+        bail!(
+            "gh pr view {n} -R {}: no head or base branch in {out}",
+            a.repo
+        );
+    }
+    Ok(pr)
 }
 
 /// fleet.toml's `[merge]` on the PR's base branch; none when the file is not there.
 pub async fn config(gh_bin: &str, repo: &str, base: &str) -> Result<Config> {
-    let path = format!("repos/{repo}/contents/.agent-fleet/fleet.toml?ref={base}");
+    let path = format!(
+        "repos/{repo}/contents/.agent-fleet/fleet.toml?ref={}",
+        enc(base)
+    );
     match gh(
         gh_bin,
         &[
@@ -222,7 +265,7 @@ pub async fn config(gh_bin: &str, repo: &str, base: &str) -> Result<Config> {
         Ok(src) => {
             config_of(&src).with_context(|| format!("{repo}'s .agent-fleet/fleet.toml on {base}"))
         }
-        Err(e) if format!("{e:#}").contains("404") => Ok(Config::default()),
+        Err(e) if not_found(&e) => Ok(Config::default()),
         Err(e) => Err(e.context(format!("read {repo}'s fleet.toml on {base}"))),
     }
 }
@@ -237,15 +280,30 @@ pub async fn plan(gh_bin: &str, repo: &str, pr: u64) -> Result<Config> {
     )
     .await?;
     let v: Value = serde_json::from_str(&out).context("gh pr view: bad JSON")?;
-    config(gh_bin, repo, v["baseRefName"].as_str().unwrap_or("main")).await
+    let Some(base) = v["baseRefName"].as_str().filter(|b| !b.is_empty()) else {
+        bail!("gh pr view {n} -R {repo}: no base branch in {out}");
+    };
+    config(gh_bin, repo, base).await
 }
 
-/// The PR's last comment. Unreadable refuses: failing open would merge an unreviewed head.
-async fn last_comment(a: &Ask<'_>) -> Result<Option<String>> {
+/// Who may post a verdict: the repository's owner, members and collaborators. Every fleet agent
+/// posts as one such account, so the author is not checked beyond that; a passer-by on a
+/// public repository is.
+const REVIEWERS: [&str; 3] = ["OWNER", "MEMBER", "COLLABORATOR"];
+
+/// The PR's last issue comment (not a review) and its author's association. Unreadable
+/// refuses: failing open would merge an unreviewed head.
+async fn last_comment(a: &Ask<'_>) -> Result<Option<(String, String)>> {
     let path = format!("repos/{}/issues/{}/comments", a.repo, a.pr);
     let out = gh(
         a.gh,
-        &["api", "--paginate", &path, "--jq", ".[-1].body | @json"],
+        &[
+            "api",
+            "--paginate",
+            &path,
+            "--jq",
+            ".[-1] | if . == null then null else [.body, .author_association] end | @json",
+        ],
         &[],
     )
     .await
@@ -253,12 +311,33 @@ async fn last_comment(a: &Ask<'_>) -> Result<Option<String>> {
     // One line per page; the last page's last comment is the PR's.
     match out.lines().rfind(|l| !l.trim().is_empty()) {
         None => Ok(None),
-        Some(l) => serde_json::from_str::<Option<String>>(l).context("the verdict is unreadable"),
+        Some(l) => serde_json::from_str(l).context("the verdict is unreadable"),
     }
 }
 
 async fn approved(a: &Ask<'_>, head: &str) -> Result<()> {
-    verdict(last_comment(a).await?.as_deref(), head).map_err(|e| anyhow!("#{}: {e}", a.pr))
+    let last = last_comment(a).await?;
+    if let Some((_, who)) = &last
+        && !REVIEWERS.contains(&who.as_str())
+    {
+        bail!(
+            "#{}: the PR's last comment is by a {who}, not an owner, member or collaborator: it is no verdict",
+            a.pr
+        );
+    }
+    verdict(last.as_ref().map(|(b, _)| b.as_str()), head).map_err(|e| anyhow!("#{}: {e}", a.pr))
+}
+
+/// `s` safe in a URL query value.
+fn enc(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// Every submodule pin the PR moves must move forward from the base branch's: the base's pin
@@ -282,10 +361,15 @@ async fn pins(a: &Ask<'_>, base: &str, say: &(dyn Fn(String) + Sync)) -> Result<
         let (path, patch): (String, String) =
             serde_json::from_str(line).context("gh api pulls/files: bad JSON")?;
         let Some((_, new)) = pin_change(&patch) else {
-            continue;
+            bail!(
+                "#{}: {path} looks like a submodule change, but its patch does not parse: {patch:?}",
+                a.pr
+            );
         };
-        let at_base = format!("repos/{}/contents/{path}?ref={base}", a.repo);
-        let main = match gh(
+        let at_base = format!("repos/{}/contents/{path}?ref={}", a.repo, enc(base));
+        // A `-1 +1` patch is a pin the merge base had: one the base branch lacks (removed there,
+        // or a token that cannot read it) is not provably forward, so it refuses too.
+        let main = gh(
             a.gh,
             &[
                 "api",
@@ -296,12 +380,7 @@ async fn pins(a: &Ask<'_>, base: &str, say: &(dyn Fn(String) + Sync)) -> Result<
             &[],
         )
         .await
-        {
-            Ok(o) => o,
-            // Not on the base branch: a new submodule has nothing to rewind.
-            Err(e) if format!("{e:#}").contains("404") => continue,
-            Err(e) => return Err(e.context(format!("{path}'s pin on {base} is unreadable"))),
-        };
+        .with_context(|| format!("#{}: {path}'s pin on {base} is unreadable", a.pr))?;
         let (kind, old, url): (String, String, String) =
             serde_json::from_str(main.trim()).context("gh api contents: bad JSON")?;
         if kind != "submodule" || old == new {
@@ -340,10 +419,71 @@ async fn pins(a: &Ask<'_>, base: &str, say: &(dyn Fn(String) + Sync)) -> Result<
     Ok(())
 }
 
-/// The repository's gate, `<checkout>/<gate> <head>`, in the checkout as it is now.
+/// `git -C dir args`: Ok(stdout) on exit 0, Err(stderr) otherwise.
+async fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|e| format!("run git: {e}"))?;
+    let said = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
+    if out.status.success() {
+        Ok(said(&out.stdout))
+    } else {
+        Err(said(&out.stderr))
+    }
+}
+
+/// The checkout's gate is one the base branch held: its HEAD is on `origin/<base>` (freshly
+/// fetched) and the script has no local changes. A PR's own worktree is not, so the PR cannot
+/// rewrite the gate that judges it. Ok is the checkout's short HEAD.
+async fn gate_from_base(checkout: &Path, base: &str, gate: &str) -> Result<String> {
+    let remote = format!("refs/remotes/origin/{base}");
+    git(
+        checkout,
+        &[
+            "fetch",
+            "-q",
+            "origin",
+            &format!("+refs/heads/{base}:{remote}"),
+        ],
+    )
+    .await
+    .map_err(|e| anyhow!("git fetch origin {base} in {}: {e}", checkout.display()))?;
+    let at = git(checkout, &["rev-parse", "--short", "HEAD"])
+        .await
+        .map_err(|e| anyhow!("{} has no HEAD: {e}", checkout.display()))?;
+    if git(checkout, &["merge-base", "--is-ancestor", "HEAD", &remote])
+        .await
+        .is_err()
+    {
+        bail!(
+            "{} is at {at}, which is not on origin/{base} (a PR's branch?): its {gate} is not the base branch's, so it does not judge this PR",
+            checkout.display()
+        );
+    }
+    let dirty = git(checkout, &["status", "--porcelain", "--", gate])
+        .await
+        .map_err(|e| anyhow!("git status in {}: {e}", checkout.display()))?;
+    if !dirty.is_empty() {
+        bail!(
+            "{gate} has local changes in {}: {dirty}",
+            checkout.display()
+        );
+    }
+    Ok(at)
+}
+
+/// The repository's gate, `<checkout>/<gate> <head>`, in the checkout as it is now, once
+/// `gate_from_base` holds.
 async fn run_gate(
     a: &Ask<'_>,
     gate: &str,
+    base: &str,
     head: &str,
     say: &(dyn Fn(String) + Sync),
 ) -> Result<()> {
@@ -356,18 +496,16 @@ async fn run_gate(
             checkout.display()
         );
     }
-    let at = std::process::Command::new("git")
-        .args([
-            "-C",
-            &checkout.to_string_lossy(),
-            "rev-parse",
-            "--short",
-            "HEAD",
-        ])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+    let at = gate_from_base(&checkout, base, gate)
+        .await
+        .map_err(|e| e.context(format!("#{}: refused", a.pr)))?;
+    // One gate at a time per repository on this machine: gates share the checkout, and one
+    // that checks out its sha under another would prove the wrong tree.
+    let common = git(&checkout, &["rev-parse", "--git-common-dir"])
+        .await
+        .map_err(|e| anyhow!("git rev-parse in {}: {e}", checkout.display()))?;
+    let lock = checkout.join(common).join("agent-fleet-merge.lock");
+    let _held = crate::retire::lock_file(&lock, GATE_MAX, "another merge gate").await?;
     say(format!(
         "#{}: merge gate {gate} at {head} (in {}, at {at})",
         a.pr,
@@ -378,14 +516,31 @@ async fn run_gate(
         .current_dir(&checkout)
         .env("AGENT_FLEET_MERGE_PR", format!("{}#{}", a.repo, a.pr))
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Its own group, so a timeout stops what it started (a test run) too.
+        .process_group(0)
         .kill_on_drop(true);
     if let Some(r) = a.allow_pin_rewind {
         cmd.env("AGENT_FLEET_ALLOW_PIN_REWIND", r);
     }
-    let out = tokio::time::timeout(Duration::from_secs(60 * 60), cmd.output())
-        .await
-        .context("the merge gate timed out (60 min) and was killed")?
+    let child = cmd
+        .spawn()
         .with_context(|| format!("the merge gate {gate} did not start"))?;
+    let pgid = child.id();
+    let out = match tokio::time::timeout(GATE_MAX, child.wait_with_output()).await {
+        Ok(out) => out.context("the merge gate")?,
+        Err(_) => {
+            if let Some(g) = pgid {
+                // SAFETY: killpg only sends a signal.
+                unsafe { libc::killpg(g as libc::pid_t, libc::SIGKILL) };
+            }
+            bail!(
+                "#{}: the merge gate timed out (60 min); its process group was killed",
+                a.pr
+            );
+        }
+    };
     let said = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -400,6 +555,9 @@ async fn run_gate(
     }
     Ok(())
 }
+
+/// How long a gate may run, and wait for another gate on this machine.
+const GATE_MAX: Duration = Duration::from_secs(60 * 60);
 
 /// The required checks, waited on while they run.
 async fn required_checks(a: &Ask<'_>) -> Result<()> {
@@ -439,6 +597,14 @@ async fn required_checks(a: &Ask<'_>) -> Result<()> {
 pub async fn run(a: &Ask<'_>, say: &(dyn Fn(String) + Sync)) -> Result<Merged> {
     let n = a.pr;
     let pr = pr_view(a).await?;
+    // A repeated request (a host restarted before its answer went out) finds its own merge.
+    if pr.state == "MERGED" && head_matches(&pr.head, a.sha).is_ok() {
+        return Ok(Merged {
+            head: pr.head,
+            commit: pr.commit,
+            already: true,
+        });
+    }
     if pr.state != "OPEN" {
         bail!("#{n} is {}, not open", pr.state);
     }
@@ -459,7 +625,7 @@ pub async fn run(a: &Ask<'_>, say: &(dyn Fn(String) + Sync)) -> Result<Merged> {
         bail!("#{n} CONFLICTS with {}", pr.base);
     }
     match &cfg.gate {
-        Some(g) => run_gate(a, g, &head, say).await?,
+        Some(g) => run_gate(a, g, &pr.base, &head, say).await?,
         None => required_checks(a).await?,
     }
     // Again right before the merge: the gate takes minutes, and a push or a BLOCK posted
@@ -488,40 +654,41 @@ pub async fn run(a: &Ask<'_>, say: &(dyn Fn(String) + Sync)) -> Result<Merged> {
         &[],
     )
     .await?;
+    // From here the merge is issued: a read that fails or lags is not a refusal.
     for _ in 0..5 {
-        let out = gh(
-            a.gh,
-            &[
-                "pr",
-                "view",
-                &nn,
-                "-R",
-                a.repo,
-                "--json",
-                "state,mergeCommit",
-            ],
-            &[],
-        )
-        .await?;
-        let v: Value = serde_json::from_str(&out).context("gh pr view: bad JSON")?;
-        if v["state"] == "MERGED" {
-            return Ok(Merged {
-                head,
-                commit: v["mergeCommit"]["oid"].as_str().map(str::to_string),
-            });
-        }
         tokio::time::sleep(a.tick * 3).await;
+        match pr_view(a).await {
+            Ok(p) if p.state == "MERGED" => {
+                return Ok(Merged {
+                    head,
+                    commit: p.commit,
+                    already: false,
+                });
+            }
+            Ok(_) => {}
+            Err(e) => say(format!("#{n}: reading the merged PR: {e:#}")),
+        }
     }
-    bail!("#{n}: gh pr merge answered, but the PR is not MERGED yet; check it")
+    say(format!(
+        "#{n}: gh pr merge answered, but the PR is not MERGED after 15 s (a merge queue, or GitHub lagging): check it"
+    ));
+    Ok(Merged {
+        head,
+        commit: None,
+        already: false,
+    })
 }
 
 /// What `agent-fleet merge` prints for a merged PR.
 pub fn merged_line(repo: &str, pr: u64, m: &Merged) -> String {
-    format!(
-        "{repo}#{pr} MERGED at {} (head {})",
-        m.commit.as_deref().unwrap_or("an unreported commit"),
-        m.head
-    )
+    match (&m.commit, m.already) {
+        (Some(c), false) => format!("{repo}#{pr} MERGED at {c} (head {})", m.head),
+        (Some(c), true) => format!("{repo}#{pr} was already MERGED at {c} (head {})", m.head),
+        (None, _) => format!(
+            "{repo}#{pr} merge issued at head {}, not seen MERGED yet",
+            m.head
+        ),
+    }
 }
 
 /// The `merge.done` of a merged PR.
@@ -543,59 +710,95 @@ pub async fn wait_result(
     id: &str,
 ) -> Result<crate::event::MergeResult> {
     let deadline = tokio::time::Instant::now() + WAIT;
+    let mut last: Option<String> = None;
     loop {
         match client.state().await {
             Ok(s) => {
                 if let Some(r) = s.merges.get(id).and_then(|m| m.result.clone()) {
                     return Ok(r);
                 }
+                last = None;
             }
             Err(e) if e.downcast_ref::<crate::client::Refused>().is_some() => {
                 bail!("waiting for the merge result: {e:#}");
             }
-            Err(_) => {}
+            Err(e) => {
+                let e = format!("{e:#}");
+                if last.as_deref() != Some(e.as_str()) {
+                    eprintln!("waiting for the merge result: the hub: {e}");
+                }
+                last = Some(e);
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             bail!(
-                "no merge.result for {id} within 75 min: the host may be down (or too old an agent-fleet to answer merge requests)"
+                "no merge.result for {id} within 75 min: the host may be down (or too old an agent-fleet to answer merge requests){}",
+                last.map(|e| format!("; last hub error: {e}"))
+                    .unwrap_or_default()
             );
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
-/// The `merge.requested` ids this host should run: its own, unanswered, not seen before, and
-/// younger than a spawn request may be.
+/// The `merge.requested` ids this host should act on, each once: (to run, to answer
+/// `expired`). Its own and unanswered; one older than a spawn request may be is expired.
 pub fn due(
     state: &crate::state::State,
     host: &str,
     seen: &mut std::collections::HashSet<String>,
     now: chrono::DateTime<chrono::Utc>,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<String>) {
     seen.retain(|id| state.merges.get(id).is_some_and(|m| m.result.is_none()));
-    state
-        .merges
-        .iter()
-        .filter(|(id, m)| {
-            m.request.host == host
-                && m.result.is_none()
-                && now - m.since <= crate::spawn::REQUEST_MAX_AGE
-                && seen.insert((*id).clone())
-        })
-        .map(|(id, _)| id.clone())
-        .collect()
+    let (mut run, mut expired) = (vec![], vec![]);
+    for (id, m) in &state.merges {
+        if m.request.host == host && m.result.is_none() && seen.insert(id.clone()) {
+            if now - m.since <= crate::spawn::REQUEST_MAX_AGE {
+                run.push(id.clone());
+            } else {
+                expired.push(id.clone());
+            }
+        }
+    }
+    (run, expired)
+}
+
+/// `merge.result` for request `id`, tried 3 times: a lost answer leaves its asker waiting 75 min.
+async fn answer(host: &crate::host::Host, id: &str, ok: bool, text: String) {
+    for _ in 0..3 {
+        let e = host
+            .presence(crate::event::Known::MergeResult(
+                crate::event::MergeResult {
+                    ok,
+                    text: text.clone(),
+                },
+            ))
+            .re(id);
+        if host.publish(e).await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
 }
 
 /// The host's side: each merge asked of this host runs in its own task (a gate takes minutes,
 /// the spawn loop must not wait on it) and is answered with `merge.result`, plus `merge.done`.
 // ponytail: two host agents on one host (two herdr sessions) both run it; the second finds the
-// PR merged and refuses. A per-host claim if a doubled gate run ever costs too much.
+// PR merged (`already`). A per-host claim if a doubled gate run ever costs too much.
 pub fn serve(
     host: &std::sync::Arc<crate::host::Host>,
     seen: &mut std::collections::HashSet<String>,
 ) {
     let Ok(view) = host.view() else { return };
-    for id in due(&view.state, &host.cfg.host, seen, chrono::Utc::now()) {
+    let (todo, expired) = due(&view.state, &host.cfg.host, seen, chrono::Utc::now());
+    for id in expired {
+        let host = host.clone();
+        tokio::spawn(async move {
+            let text = "expired: not picked up within 15 min; nothing merged".to_string();
+            answer(&host, &id, false, text).await;
+        });
+    }
+    for id in todo {
         let Some(m) = view.state.merges.get(&id).cloned() else {
             continue;
         };
@@ -603,6 +806,7 @@ pub fn serve(
         tokio::spawn(async move {
             let r = &m.request;
             // A self-update drain waits for this: a restart mid-gate would kill it half done.
+            // Draining: the restarted host runs it (or answers it expired).
             let Some(_busy) = host.busy_guard(format!("merge of {}#{}", r.repo, r.pr)) else {
                 return;
             };
@@ -629,12 +833,14 @@ pub fn serve(
             let ok = match out {
                 Ok(merged) => {
                     text.push(merged_line(&r.repo, r.pr, &merged));
-                    host.publish(Envelope::new(
-                        host.actor(),
-                        &m.project,
-                        crate::event::Known::MergeDone(done(&r.repo, r.pr, merged)),
-                    ))
-                    .await;
+                    if !merged.already {
+                        host.publish(Envelope::new(
+                            host.actor(),
+                            &m.project,
+                            crate::event::Known::MergeDone(done(&r.repo, r.pr, merged)),
+                        ))
+                        .await;
+                    }
                     true
                 }
                 Err(e) => {
@@ -644,13 +850,7 @@ pub fn serve(
             };
             let text = crate::spawn::tail(&text.join("\n"));
             eprintln!("agent-fleet host: merge of {}#{}: {text}", r.repo, r.pr);
-            host.publish(
-                host.presence(crate::event::Known::MergeResult(
-                    crate::event::MergeResult { ok, text },
-                ))
-                .re(&id),
-            )
-            .await;
+            answer(&host, &id, ok, text).await;
         });
     }
 }
@@ -687,18 +887,19 @@ mod tests {
 d={d}
 echo "$*" >> $d/calls
 case "$*" in
-  "pr view 7 -R o/r --json state,headRefOid,baseRefName,mergeable")
+  "pr view 7 -R o/r --json state,headRefOid,baseRefName,mergeable,mergeCommit")
     h=$(cat $d/head); [ -f $d/head2 ] && [ -f $d/gated ] && h=$(cat $d/head2)
-    echo "{{\"state\":\"OPEN\",\"headRefOid\":\"$h\",\"baseRefName\":\"main\",\"mergeable\":\"MERGEABLE\"}}" ;;
-  "pr view 7 -R o/r --json state,mergeCommit") echo '{{"state":"MERGED","mergeCommit":{{"oid":"m1"}}}}' ;;
+    st=OPEN; mc=null; [ -f $d/merged ] && {{ st=MERGED; mc='{{"oid":"m1"}}'; }}
+    echo "{{\"state\":\"$st\",\"headRefOid\":\"$h\",\"baseRefName\":\"main\",\"mergeable\":\"MERGEABLE\",\"mergeCommit\":$mc}}" ;;
   "api -H Accept: application/vnd.github.raw+json repos/o/r/contents/.agent-fleet/fleet.toml?ref=main")
+    [ -f $d/config_err ] && {{ cat $d/config_err >&2; exit 1; }}
     [ -f $d/fleet.toml ] && cat $d/fleet.toml || {{ echo "gh: Not Found (HTTP 404)" >&2; exit 1; }} ;;
   "api --paginate repos/o/r/issues/7/comments"*) cat $d/comment ;;
   "api --paginate repos/o/r/pulls/7/files"*) cat $d/files 2>/dev/null; true ;;
   "api repos/o/r/contents/sub?ref=main"*) cat $d/sub ;;
-  "api repos/o/sub/compare/"*) cat $d/compare ;;
+  "api repos/o/sub/compare/"*) [ -f $d/compare ] && cat $d/compare || {{ echo "gh: No commit found (HTTP 404)" >&2; exit 1; }} ;;
   "pr checks 7 -R o/r --required --json name,bucket") cat $d/checks; exit $(cat $d/checks_rc 2>/dev/null || echo 0) ;;
-  "pr merge 7"*) echo merged ;;
+  "pr merge 7"*) touch $d/merged; echo merged ;;
   *) echo "fake gh: unexpected $*" >&2; exit 3 ;;
 esac
 "#
@@ -708,12 +909,20 @@ esac
             std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
             let f = Self { dir };
             f.put("head", H);
-            f.put(
-                "comment",
-                &serde_json::to_string(&format!("ok\nVERDICT: READY {H}")).unwrap(),
-            );
+            f.comment(&format!("ok\nVERDICT: READY {H}"), "OWNER");
             f.put("checks", r#"[{"name":"build","bucket":"pass"}]"#);
             f
+        }
+        /// The PR's comments: one page per `(body, author association)`.
+        fn comments(&self, pages: &[(&str, &str)]) {
+            let lines: Vec<String> = pages
+                .iter()
+                .map(|p| serde_json::to_string(p).unwrap())
+                .collect();
+            self.put("comment", &lines.join("\n"));
+        }
+        fn comment(&self, body: &str, who: &str) {
+            self.comments(&[(body, who)]);
         }
         fn put(&self, name: &str, body: &str) {
             std::fs::write(self.dir.path().join(name), body).unwrap();
@@ -773,8 +982,11 @@ esac
             );
         }
         let mut seen = Default::default();
-        assert_eq!(due(&state, "box", &mut seen, now), vec!["mine".to_string()]);
-        assert!(due(&state, "box", &mut seen, now).is_empty(), "once");
+        assert_eq!(
+            due(&state, "box", &mut seen, now),
+            (vec!["mine".to_string()], vec!["old".to_string()])
+        );
+        assert_eq!(due(&state, "box", &mut seen, now), (vec![], vec![]), "once");
         assert_eq!(
             head_matches(H, "xyz"),
             Err("\"xyz\" is not a sha (7 to 40 hex digits)".into())
@@ -789,7 +1001,8 @@ esac
             r.unwrap(),
             Merged {
                 head: H.into(),
-                commit: Some("m1".into())
+                commit: Some("m1".into()),
+                already: false,
             }
         );
         let calls = f.calls();
@@ -813,13 +1026,36 @@ esac
         refused(Fake::new(), "xyz", "not a sha").await;
 
         let f = Fake::new();
-        let late = format!("VERDICT: READY {H}\nnit: later");
-        f.put("comment", &serde_json::to_string(&late).unwrap());
+        f.comment(&format!("VERDICT: READY {H}\nnit: later"), "OWNER");
         refused(f, H, "last comment").await;
+
+        let f = Fake::new();
+        let ready = format!("VERDICT: READY {H}");
+        f.comments(&[(&ready, "OWNER"), ("nit: on page two", "OWNER")]);
+        refused(f, H, "last comment").await;
+
+        let f = Fake::new();
+        f.comment(&format!("VERDICT: READY {H}"), "NONE");
+        refused(f, H, "not an owner, member or collaborator").await;
 
         let f = Fake::new();
         f.put("comment", "null");
         refused(f, H, "no comments").await;
+
+        let f = Fake::new();
+        f.put("config_err", "gh: Server Error (HTTP 500)");
+        refused(f, H, "HTTP 500").await;
+
+        let f = Fake::new();
+        f.put("checks", r#"[{"name":"build","bucket":"skipping"}]"#);
+        refused(f, H, "no required checks").await;
+
+        let f = Fake::new();
+        f.put(
+            "checks",
+            r#"[{"name":"build","bucket":"pass"},{"name":"x","bucket":"weird"}]"#,
+        );
+        refused(f, H, "REQUIRED CHECK FAILED: x").await;
 
         let f = Fake::new();
         f.put("checks", r#"[{"name":"build","bucket":"fail"}]"#);
@@ -875,12 +1111,42 @@ esac
         let f = rewind();
         f.put("compare", "ahead\n");
         assert!(f.run(H, None).await.0.is_ok(), "a forward pin merges");
+
+        let f = rewind();
+        std::fs::remove_file(f.dir.path().join("compare")).unwrap();
+        let e = format!("{:#}", f.run(H, None).await.0.unwrap_err());
+        assert!(e.contains("not forward"), "an unprovable pin refuses: {e}");
+        assert!(!f.calls().contains("pr merge"));
+
+        let f = rewind();
+        f.put(
+            "sub",
+            &serde_json::to_string(&("submodule", "c".repeat(40), "https://gitlab.com/o/sub.git"))
+                .unwrap(),
+        );
+        let e = format!("{:#}", f.run(H, None).await.0.unwrap_err());
+        assert!(e.contains("not on GitHub"), "{e}");
+        assert!(!f.calls().contains("pr merge"));
+
+        let f = rewind();
+        f.put("compare", "identical\n");
+        assert!(f.run(H, None).await.0.is_ok(), "a forward pin merges");
     }
 
     #[tokio::test]
     async fn the_base_branchs_gate_runs_in_the_checkout_and_a_red_gate_or_a_push_during_it_refuses()
     {
         use std::os::unix::fs::PermissionsExt;
+        let git = |dir: &Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
         let gated = |exit: u8| {
             let f = Fake::new();
             f.put("fleet.toml", "[merge]\ngate = \"gate.sh\"\n");
@@ -890,12 +1156,38 @@ esac
             std::fs::write(
                 &g,
                 format!(
-                    "#!/bin/sh\necho \"gate $1 $AGENT_FLEET_MERGE_PR\"\ntouch {}/gated\nexit {exit}\n",
-                    f.dir.path().display()
+                    "#!/bin/sh\necho \"gate $1 $AGENT_FLEET_MERGE_PR\"\ntouch {d}/gated\n[ -f {d}/comment2 ] && cp {d}/comment2 {d}/comment\nexit {exit}\n",
+                    d = f.dir.path().display()
                 ),
             )
             .unwrap();
             std::fs::set_permissions(&g, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // A checkout on main whose origin is itself: its gate is the base branch's.
+            git(&co, &["init", "-q", "-b", "main"]);
+            git(
+                &co,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "add",
+                    "gate.sh",
+                ],
+            );
+            git(
+                &co,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "-qm",
+                    "gate",
+                ],
+            );
+            git(&co, &["remote", "add", "origin", co.to_str().unwrap()]);
             f
         };
         let f = gated(0);
@@ -919,6 +1211,50 @@ esac
         f.put("head2", &"9".repeat(40));
         let (r, _) = f.run(H, None).await;
         assert!(format!("{:#}", r.unwrap_err()).contains("head moved during the gate"));
+        assert!(!f.calls().contains("pr merge"));
+
+        // A BLOCK posted while the gate runs stops the merge.
+        let f = gated(0);
+        let block = serde_json::to_string(&(format!("VERDICT: BLOCK {H} flaky"), "OWNER")).unwrap();
+        f.put("comment2", &block);
+        let (r, _) = f.run(H, None).await;
+        assert!(format!("{:#}", r.unwrap_err()).contains("last comment"));
+        assert!(!f.calls().contains("pr merge"));
+
+        // The PR's own branch rewrote the gate: a checkout off the base branch does not judge.
+        let f = gated(0);
+        let co = f.dir.path().join("checkout");
+        git(&co, &["checkout", "-q", "-b", "pr"]);
+        std::fs::write(co.join("gate.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        git(
+            &co,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qam",
+                "pass",
+            ],
+        );
+        let (r, _) = f.run(H, None).await;
+        assert!(format!("{:#}", r.unwrap_err()).contains("not on origin/main"));
+        assert!(!f.calls().contains("pr merge"));
+
+        let f = gated(0);
+        std::fs::write(f.dir.path().join("checkout/gate.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        let (r, _) = f.run(H, None).await;
+        assert!(format!("{:#}", r.unwrap_err()).contains("local changes"));
+    }
+
+    #[tokio::test]
+    async fn a_pr_already_merged_at_the_approved_head_is_reported_not_merged_again() {
+        let f = Fake::new();
+        f.put("merged", "");
+        let (r, _) = f.run(H, None).await;
+        let m = r.unwrap();
+        assert!(m.already && m.commit.as_deref() == Some("m1"), "{m:?}");
         assert!(!f.calls().contains("pr merge"));
     }
 

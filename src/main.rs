@@ -1992,6 +1992,7 @@ async fn main() -> Result<()> {
                 tick: std::time::Duration::from_secs(1),
             };
             match merge::run(&ask, &|l| eprintln!("{l}")).await {
+                Ok(m) if m.already => println!("{}", merge::merged_line(&repo, pr, &m)),
                 Ok(m) => {
                     println!("{}", merge::merged_line(&repo, pr, &m));
                     let body = Known::MergeDone(merge::done(&repo, pr, m));

@@ -719,7 +719,7 @@
               "type": "string"
             },
             "sha": {
-              "description": "The approved head sha, or a prefix of it (7+ hex digits).",
+              "description": "The approved head sha, or a prefix of it (7 to 40 hex digits).",
               "type": "string"
             }
           },
@@ -736,11 +736,11 @@
           "description": "The `merge.requested` named by `re`, answered by the host that ran it.",
           "properties": {
             "ok": {
-              "description": "False when nothing was merged: a refusal, a failed gate, or an error.",
+              "description": "False when nothing was merged: a refusal, a failed gate, an expired request, or an error.",
               "type": "boolean"
             },
             "text": {
-              "description": "What `agent-fleet merge` prints on that host.",
+              "description": "What `agent-fleet merge` prints on that host: its last 4 KiB.",
               "type": "string"
             }
           },
@@ -2684,7 +2684,7 @@
               "type": "string"
             },
             "sha": {
-              "description": "The approved head sha, or a prefix of it (7+ hex digits).",
+              "description": "The approved head sha, or a prefix of it (7 to 40 hex digits).",
               "type": "string"
             }
           },
@@ -2701,11 +2701,11 @@
           "description": "The `merge.requested` named by `re`, answered by the host that ran it.",
           "properties": {
             "ok": {
-              "description": "False when nothing was merged: a refusal, a failed gate, or an error.",
+              "description": "False when nothing was merged: a refusal, a failed gate, an expired request, or an error.",
               "type": "boolean"
             },
             "text": {
-              "description": "What `agent-fleet merge` prints on that host.",
+              "description": "What `agent-fleet merge` prints on that host: its last 4 KiB.",
               "type": "string"
             }
           },

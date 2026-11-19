@@ -858,7 +858,7 @@ pub struct MergeRequested {
     /// `owner/repo`.
     pub repo: String,
     pub pr: u64,
-    /// The approved head sha, or a prefix of it (7+ hex digits).
+    /// The approved head sha, or a prefix of it (7 to 40 hex digits).
     pub sha: String,
     /// The host that runs it.
     pub host: String,
@@ -871,9 +871,9 @@ pub struct MergeRequested {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MergeResult {
-    /// False when nothing was merged: a refusal, a failed gate, or an error.
+    /// False when nothing was merged: a refusal, a failed gate, an expired request, or an error.
     pub ok: bool,
-    /// What `agent-fleet merge` prints on that host.
+    /// What `agent-fleet merge` prints on that host: its last 4 KiB.
     pub text: String,
 }
 
