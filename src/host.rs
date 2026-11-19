@@ -1371,6 +1371,10 @@ impl Host {
                         );
                     }
                     Ok(_) if queue || self.saw_working(&pane, before).await => {
+                        if queue {
+                            // Typed: if `msg.delivered` fails to write, never type it again.
+                            typed.insert(id.clone());
+                        }
                         let delivered = MsgDelivered {
                             to: to.to_string(),
                             observed: AgentState::Working,
