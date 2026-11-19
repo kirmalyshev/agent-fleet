@@ -18,7 +18,7 @@ use tokio::sync::Notify;
 use crate::client::{Client, Refused, Sent};
 use crate::event::*;
 use crate::scan;
-use crate::state::State;
+use crate::state::{Msg, State};
 use crate::store::{Store, UnknownCursor};
 
 /// herdr socket protocol this build understands.
@@ -1306,6 +1306,15 @@ impl Host {
                     continue;
                 }
                 tried.insert(id.clone(), Instant::now());
+                // Typed once as a queued ring and not seen, the agent since idle: still never a
+                // second typing. Acknowledge it if it shows, else leave it pending.
+                if !queue && typed.contains(id) {
+                    let shown = crate::stuck::screen(&self, to).await;
+                    if shown.as_deref().is_some_and(|t| has_id(t, id)) {
+                        self.ack_seen(id, to, msg, attempts.get(id).copied()).await;
+                    }
+                    continue;
+                }
                 // A queued ring types into a pane that may have turned blocked since the snapshot,
                 // and herdr's state lags a dialog: read the screen, and never ring over one.
                 if queue {
@@ -1332,21 +1341,7 @@ impl Host {
                     // `msg.delivered`): acknowledge, never type it twice. Typed once and still
                     // not seen: wait for it, do not type again.
                     if shown.as_deref().is_some_and(|t| has_id(t, id)) {
-                        let delivered = MsgDelivered {
-                            to: to.to_string(),
-                            observed: AgentState::Working,
-                            rung: None,
-                            attempts: Some(attempts.get(id).copied().unwrap_or(1)),
-                        };
-                        if self
-                            .publish(self.presence(Known::MsgDelivered(delivered)).re(id))
-                            .await
-                        {
-                            eprintln!(
-                                "agent-fleet host: delivered {id} to {} (seen queued)",
-                                msg.to
-                            );
-                        }
+                        self.ack_seen(id, to, msg, attempts.get(id).copied()).await;
                         continue;
                     }
                     if typed.contains(id) {
@@ -1411,6 +1406,25 @@ impl Host {
 
     /// After a queued ring: whether the doorbell's event id shows on the agent's screen (its
     /// input or queue area) `QUEUE_CHECK` later. Whitespace is dropped: the screen wraps lines.
+    /// `msg.delivered` for a doorbell already on the agent's screen: acknowledged, not retyped.
+    async fn ack_seen(&self, id: &str, to: &str, msg: &Msg, attempts: Option<u32>) {
+        let delivered = MsgDelivered {
+            to: to.to_string(),
+            observed: AgentState::Working,
+            rung: None,
+            attempts: Some(attempts.unwrap_or(1)),
+        };
+        if self
+            .publish(self.presence(Known::MsgDelivered(delivered)).re(id))
+            .await
+        {
+            eprintln!(
+                "agent-fleet host: delivered {id} to {} (seen queued)",
+                msg.to
+            );
+        }
+    }
+
     async fn queued_visible(&self, to: &str, id: &str) -> Option<bool> {
         tokio::time::sleep(QUEUE_CHECK).await;
         crate::stuck::screen(self, to).await.map(|t| has_id(&t, id))
@@ -1818,6 +1832,22 @@ mod tests {
         }
         assert!(types(&host).contains(&"msg.delivered".to_string()));
         assert_eq!(fake.prompts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unseen_queued_ring_is_not_typed_again_when_the_agent_turns_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_host, fake, _) =
+            host_on_fake_prog(dir.path(), "working", "OK", 0, "claude", ("> ", false)).await;
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        assert_eq!(fake.prompts.lock().unwrap().len(), 1);
+        fake.set("idle").await;
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(
+            fake.prompts.lock().unwrap().len(),
+            1,
+            "typed again after idle"
+        );
     }
 
     #[tokio::test]
