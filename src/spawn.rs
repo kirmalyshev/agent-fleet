@@ -1706,6 +1706,7 @@ async fn handoffs(
             kind: kind.into(),
             reference: name.to_string(),
             text,
+            closes: Vec::new(),
         })))
         .await;
     }
@@ -1818,6 +1819,7 @@ async fn stuck(
                     kind: "ESCALATED".into(),
                     reference: short(id).into(),
                     text: esctext,
+                    closes: Vec::new(),
                 })))
                 .await;
             }
@@ -1843,6 +1845,7 @@ async fn stuck(
             kind: kind.into(),
             reference: short(id).into(),
             text,
+            closes: Vec::new(),
         })))
         .await;
         seen.reported.insert(key);
@@ -3711,6 +3714,7 @@ profile = "devin"
                 kind: "STALLED".into(),
                 reference: "a".into(),
                 text: "idle".into(),
+                closes: Vec::new(),
             }),
         )
         .into_event();
@@ -3906,6 +3910,7 @@ profile = "devin"
                 kind: "HUNG".into(),
                 reference: "a".into(),
                 text: "hung".into(),
+                closes: Vec::new(),
             }),
         )
         .into_event();
@@ -4494,6 +4499,7 @@ profile = "devin"
                 kind: "STALLED".into(),
                 reference: "a".into(),
                 text: "idle for 20m".into(),
+                closes: Vec::new(),
             }),
         )
         .into_event();

@@ -486,6 +486,7 @@ fn drain_warnings(s: &State, text: &str) -> Vec<MsgSent> {
             kind: "UPDATE".into(),
             reference: "update-drain".into(),
             text: text.to_string(),
+            closes: Vec::new(),
         })
         .collect()
 }

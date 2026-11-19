@@ -888,6 +888,7 @@ mod tests {
                 kind: "orphan-pr".into(),
                 reference: key.into(),
                 text: "t".into(),
+                closes: Vec::new(),
             }),
         );
         e.ts = at;

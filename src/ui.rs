@@ -390,7 +390,17 @@ pub fn board(s: &State, now: DateTime<Utc>) -> String {
             m.reference
         );
     }
-    let _ = writeln!(out, "\n== unread doorbells ({})", s.unread.len());
+    let dead = s
+        .msgs
+        .values()
+        .chain(s.unread.values().map(|u| &u.msg))
+        .filter(|m| m.kind == crate::state::DEADLETTER)
+        .count();
+    let _ = writeln!(
+        out,
+        "\n== unread doorbells ({}, {dead} dead letters for the coordinator)",
+        s.unread.len()
+    );
     for (id, u) in &s.unread {
         let _ = writeln!(
             out,
