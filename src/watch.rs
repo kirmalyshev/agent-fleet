@@ -346,10 +346,16 @@ impl<'a> Tick<'a> {
             let below = under(pid);
             // The reader of a pipe whose producer is a follower (`tail -f X | grep …`): one
             // process group, and the producer waits by design.
-            // ponytail: a shared group also joins unrelated siblings of a non-job-control shell;
-            // match the pipe's inode if a stuck sibling is ever seen hidden by a follower.
+            // ponytail: a non-job-control shell puts every sibling in one group, so only a known
+            // filter counts as a reader; match the pipe's inode to cover any other reader.
             let pgid = self.now.0[&pid].pgid;
+            let filter = [
+                "grep", "egrep", "fgrep", "rg", "awk", "gawk", "sed", "head", "tail", "cut", "tr",
+                "tee", "jq",
+            ]
+            .contains(&self.now.0[&pid].name.as_str());
             let piped = below.is_empty()
+                && filter
                 && pgid.is_some()
                 && members
                     .iter()
@@ -1507,6 +1513,14 @@ mod tests {
             assert!(
                 v.iter().all(|c| !matches!(c.verdict, Verdict::Hung(_))),
                 "{reader}: {v:#?}"
+            );
+        }
+        // A stuck non-filter sibling in the follower's group (`tail -f X & sleep 3600`).
+        for stuck in ["sleep 3600", "curl http://localhost:9/x"] {
+            let v = step(stuck, "tail -f /tmp/x/all.log", true);
+            assert!(
+                matches!(verdict(&v, 41), Some(Verdict::Hung(_))),
+                "{stuck}: {v:#?}"
             );
         }
         // Not one pipeline: the reader beside the follower is its own hang.
