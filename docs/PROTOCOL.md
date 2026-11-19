@@ -278,7 +278,8 @@ typed mid-turn, so it is rung at once (its pane re-read as `working`) and `msg.d
 written once the doorbell's event id shows on its screen 2 s later. It is never rung while its
 screen shows a selection dialog (`Do you want to…`, a `❯ 1.` option list, `Esc to cancel`): the tell
 stays pending, since an Enter there would answer the dialog. A ring whose text is not on the screen
-after 2 s is logged as an alert and left undelivered. Any other busy agent waits. A failed ring is retried at most once a
+after 2 s (or whose screen cannot be read) is logged as an alert and left pending; it is never typed a
+second time, and is acknowledged if the text later shows. An unreadable screen blocks a queued ring like a dialog. Any other busy agent waits. A failed ring is retried at most once a
 minute; if `msg.delivered` itself cannot be written, the message stays pending. `agent-fleet doctor`
 raises `undelivered` for an up recipient whose tell has waited 10 minutes.
 

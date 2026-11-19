@@ -184,6 +184,8 @@ const LOCKS_EVERY: Duration = Duration::from_secs(5);
 /// How often the host samples agents' processes and the worktrees.
 const SCAN_EVERY: Duration = Duration::from_secs(300);
 
+/// A failed ring is retried at most this often.
+const RETRY_AFTER: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 60 });
 /// How long after a queued ring the host waits before it looks for the text on the screen.
 const QUEUE_CHECK: Duration = Duration::from_secs(2);
 /// How often the host reads each agent program's usage quota.
@@ -1235,6 +1237,8 @@ impl Host {
         let mut tried: HashMap<String, Instant> = HashMap::new();
         let mut attempts: HashMap<String, u32> = HashMap::new();
         let mut waiting: HashSet<String> = HashSet::new();
+        // Queued rings typed once whose text was not seen: never typed a second time.
+        let mut typed: HashSet<String> = HashSet::new();
         loop {
             tokio::select! {
                 _ = self.wake.notified() => {}
@@ -1251,6 +1255,7 @@ impl Host {
             tried.retain(|id, _| pending.contains_key(id));
             attempts.retain(|id, _| pending.contains_key(id));
             waiting.retain(|id| pending.contains_key(id));
+            typed.retain(|id| pending.contains_key(id));
             for (id, msg) in pending {
                 // Resolved per pass: a message to `coordinator` follows the role to its holder now.
                 let Some(to) = view.state.recipient(&msg.to) else {
@@ -1297,10 +1302,7 @@ impl Host {
                     }
                     continue;
                 }
-                if tried
-                    .get(id)
-                    .is_some_and(|t| t.elapsed() < Duration::from_secs(60))
-                {
+                if tried.get(id).is_some_and(|t| t.elapsed() < RETRY_AFTER) {
                     continue;
                 }
                 tried.insert(id.clone(), Instant::now());
@@ -1326,6 +1328,30 @@ impl Host {
                         }
                         continue;
                     }
+                    // Already on the screen (a retry after a missed check, or a lost
+                    // `msg.delivered`): acknowledge, never type it twice. Typed once and still
+                    // not seen: wait for it, do not type again.
+                    if shown.as_deref().is_some_and(|t| has_id(t, id)) {
+                        let delivered = MsgDelivered {
+                            to: to.to_string(),
+                            observed: AgentState::Working,
+                            rung: None,
+                            attempts: Some(attempts.get(id).copied().unwrap_or(1)),
+                        };
+                        if self
+                            .publish(self.presence(Known::MsgDelivered(delivered)).re(id))
+                            .await
+                        {
+                            eprintln!(
+                                "agent-fleet host: delivered {id} to {} (seen queued)",
+                                msg.to
+                            );
+                        }
+                        continue;
+                    }
+                    if typed.contains(id) {
+                        continue;
+                    }
                 }
                 let text = doorbell(&msg.from, &msg.to, &msg.kind, &msg.reference, &msg.text, id);
                 // A queued ring is already `working`: there is no new turn to wait for.
@@ -1340,10 +1366,11 @@ impl Host {
                 bump(&self.n.rings);
                 let rung = chrono::Utc::now();
                 match herdr_call(&self.cfg.herdr_socket, "agent.prompt", params).await {
-                    Ok(_) if queue && !self.queued_visible(to, id).await => {
+                    Ok(_) if queue && self.queued_visible(to, id).await != Some(true) => {
+                        typed.insert(id.clone());
                         bump(&self.n.ring_failures);
                         eprintln!(
-                            "agent-fleet host: ALERT {id} to {}: typed into a busy pane but not visible in its input after {}s; left undelivered",
+                            "agent-fleet host: ALERT {id} to {}: typed into a busy pane, not seen in its input after {}s (or its screen was unreadable); left pending, not typed again",
                             msg.to,
                             QUEUE_CHECK.as_secs()
                         );
@@ -1384,13 +1411,18 @@ impl Host {
 
     /// After a queued ring: whether the doorbell's event id shows on the agent's screen (its
     /// input or queue area) `QUEUE_CHECK` later. Whitespace is dropped: the screen wraps lines.
-    async fn queued_visible(&self, to: &str, id: &str) -> bool {
+    async fn queued_visible(&self, to: &str, id: &str) -> Option<bool> {
         tokio::time::sleep(QUEUE_CHECK).await;
-        crate::stuck::screen(self, to)
-            .await
-            .is_some_and(|t| t.split_whitespace().collect::<String>().contains(id))
+        crate::stuck::screen(self, to).await.map(|t| has_id(&t, id))
     }
+}
 
+/// Whether the doorbell's event `id` shows in `screen`; whitespace is dropped, the screen wraps.
+fn has_id(screen: &str, id: &str) -> bool {
+    screen.split_whitespace().collect::<String>().contains(id)
+}
+
+impl Host {
     /// Waits up to 20 s for this host to log the agent in `pane` turning `working` again.
     async fn saw_working(&self, pane: &str, before: u64) -> bool {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -1762,6 +1794,30 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(3000)).await;
         assert_eq!(fake.prompts.lock().unwrap().len(), 1, "it was typed once");
         assert!(!types(&host).contains(&"msg.delivered".to_string()));
+    }
+
+    #[tokio::test]
+    async fn an_unseen_queued_ring_is_never_typed_twice_and_is_acked_once_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, fake, _) =
+            host_on_fake_prog(dir.path(), "working", "OK", 0, "claude", ("> ", false)).await;
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        assert_eq!(fake.prompts.lock().unwrap().len(), 1, "typed once");
+        assert!(!types(&host).contains(&"msg.delivered".to_string()));
+        // Past RETRY_AFTER, still unseen: no second typing.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(fake.prompts.lock().unwrap().len(), 1, "never typed twice");
+        // The text turns up on the screen (a slow redraw): acknowledged without typing again.
+        let typed = fake.prompts.lock().unwrap()[0].clone();
+        *fake.screen.lock().unwrap() = format!("> {typed}");
+        for _ in 0..200 {
+            if types(&host).contains(&"msg.delivered".to_string()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(types(&host).contains(&"msg.delivered".to_string()));
+        assert_eq!(fake.prompts.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
