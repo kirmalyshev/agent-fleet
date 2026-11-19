@@ -696,6 +696,11 @@
           ],
           "type": "object"
         },
+        "MsgRead": {
+          "additionalProperties": false,
+          "description": "The recipient read the `msg.sent` named by `re` itself (`agent-fleet read`): its ack. Only\nthe agent the message reached counts; anyone else's `msg.read` is ignored.",
+          "type": "object"
+        },
         "MsgSent": {
           "additionalProperties": false,
           "description": "A doorbell: a short prompt pointing at an event or a task.",
@@ -1913,6 +1918,22 @@
         {
           "properties": {
             "data": {
+              "$ref": "#/$defs/MsgRead"
+            },
+            "type": {
+              "const": "msg.read",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
               "$ref": "#/$defs/Handoff"
             },
             "type": {
@@ -2685,6 +2706,37 @@
           ],
           "type": "object"
         },
+        "Read": {
+          "description": "A doorbell its recipient read.",
+          "properties": {
+            "at": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "by": {
+              "description": "The reader: the agent the message reached.",
+              "type": "string"
+            },
+            "from": {
+              "type": "string"
+            },
+            "since": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "from",
+            "to",
+            "by",
+            "since",
+            "at"
+          ],
+          "type": "object"
+        },
         "RefusedKill": {
           "properties": {
             "by": {
@@ -3310,6 +3362,52 @@
           ],
           "type": "object"
         },
+        "Unread": {
+          "description": "A delivered doorbell not read yet.",
+          "properties": {
+            "delivered": {
+              "description": "The last delivery's `ts`: the retransmit clock starts here.",
+              "format": "date-time",
+              "type": "string"
+            },
+            "from": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "ref": {
+              "type": "string"
+            },
+            "rings": {
+              "description": "Deliveries so far, the first one included.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "since": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "from",
+            "to",
+            "kind",
+            "ref",
+            "text",
+            "since",
+            "delivered",
+            "rings"
+          ],
+          "type": "object"
+        },
         "Update": {
           "description": "An `update.requested` and each host's `update.result`.",
           "properties": {
@@ -3655,6 +3753,14 @@
           "description": "Usage quotas of the agent programs by `<host>:<kind>`.",
           "type": "object"
         },
+        "read": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Read"
+          },
+          "default": {},
+          "description": "Read doorbells by the id of their `msg.sent`, kept for 24 h after the read.",
+          "type": "object"
+        },
         "refused_kills": {
           "default": [],
           "description": "The latest kills `agent-fleet kill` refused, oldest first; at most `MAX_REFUSED`.",
@@ -3729,6 +3835,14 @@
           },
           "default": {},
           "description": "Agent programs outside herdr on each host, keyed `<host>:<pid>`.",
+          "type": "object"
+        },
+        "unread": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Unread"
+          },
+          "default": {},
+          "description": "Delivered doorbells their recipient has not read (`msg.read`) yet: retransmitted until it does.",
           "type": "object"
         },
         "updates": {

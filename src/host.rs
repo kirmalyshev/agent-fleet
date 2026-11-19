@@ -1289,18 +1289,28 @@ impl Host {
                     continue;
                 }
             };
-            let pending = &view.state.msgs;
-            tried.retain(|id, _| pending.contains_key(id));
-            attempts.retain(|id, _| pending.contains_key(id));
-            waiting.retain(|id| pending.contains_key(id));
-            typed.retain(|id| pending.contains_key(id));
-            for (id, msg) in pending {
+            let now = chrono::Utc::now();
+            let (pending, unread) = (&view.state.msgs, &view.state.unread);
+            let live = |id: &String| pending.contains_key(id) || unread.contains_key(id);
+            tried.retain(|id, _| live(id));
+            attempts.retain(|id, _| live(id));
+            waiting.retain(live);
+            typed.retain(live);
+            // Delivered and not read (`msg.read`) once its backoff is up: rung again, like a first
+            // ring, except that its old ring on the screen proves nothing. An expired one rests.
+            let due = unread
+                .iter()
+                .filter(|(_, u)| {
+                    now - u.delivered >= retransmit_after(u.rings) && u.msg.stale(now).is_none()
+                })
+                .map(|(id, u)| (id, &u.msg, true));
+            for (id, msg, again) in pending.iter().map(|(id, m)| (id, m, false)).chain(due) {
                 // Resolved per pass: a message to `coordinator` follows the role to its holder now.
                 let Some(to) = view.state.recipient(&msg.to) else {
                     continue;
                 };
-                // A status report that waited out a reconnect is history: close it unrung.
-                if let Some(why) = msg.stale(chrono::Utc::now()) {
+                // A status report that waited out a reconnect, or any tell a day old: close it unrung.
+                if let Some(why) = msg.stale(now) {
                     let dropped = MsgDelivered {
                         to: to.to_string(),
                         observed: AgentState::Idle,
@@ -1346,7 +1356,7 @@ impl Host {
                 tried.insert(id.clone(), Instant::now());
                 // Typed once as a queued ring and not seen, the agent since idle: still never a
                 // second typing. Acknowledge it if it shows, else leave it pending.
-                if !queue && typed.contains(id) {
+                if !queue && !again && typed.contains(id) {
                     let shown = crate::stuck::screen(&self, to).await;
                     if shown.as_deref().is_some_and(|t| has_id(t, id)) {
                         self.ack_seen(id, to, msg, attempts.get(id).copied()).await;
@@ -1378,12 +1388,14 @@ impl Host {
                     // Already on the screen (a retry after a missed check, or a lost
                     // `msg.delivered`): acknowledge, never type it twice. Typed once and still
                     // not seen: wait for it, do not type again.
-                    if shown.as_deref().is_some_and(|t| has_id(t, id)) {
-                        self.ack_seen(id, to, msg, attempts.get(id).copied()).await;
-                        continue;
-                    }
-                    if typed.contains(id) {
-                        continue;
+                    if !again {
+                        if shown.as_deref().is_some_and(|t| has_id(t, id)) {
+                            self.ack_seen(id, to, msg, attempts.get(id).copied()).await;
+                            continue;
+                        }
+                        if typed.contains(id) {
+                            continue;
+                        }
                     }
                 }
                 let text = doorbell(&msg.from, &msg.to, &msg.kind, &msg.reference, &msg.text, id);
@@ -1423,7 +1435,8 @@ impl Host {
                             .publish(self.presence(Known::MsgDelivered(delivered)).re(id))
                             .await
                         {
-                            eprintln!("agent-fleet host: delivered {id} to {}", msg.to);
+                            let how = if again { "retransmitted" } else { "delivered" };
+                            eprintln!("agent-fleet host: {how} {id} to {}", msg.to);
                         } else {
                             eprintln!(
                                 "agent-fleet host: {id} reached {} but msg.delivered was not written; will retry",
@@ -1471,6 +1484,13 @@ impl Host {
         tokio::time::sleep(QUEUE_CHECK).await;
         crate::stuck::screen(self, to).await.map(|t| has_id(&t, id))
     }
+}
+
+/// How long a delivered tell waits for its `msg.read` after its `rings`-th delivery before it is
+/// rung again: 5 min, doubling, at most an hour.
+pub(crate) fn retransmit_after(rings: u32) -> chrono::Duration {
+    let first = chrono::Duration::minutes(5);
+    (first * 2i32.saturating_pow(rings.saturating_sub(1))).min(chrono::Duration::hours(1))
 }
 
 /// Whether the doorbell's event `id` shows in `screen`; whitespace is dropped, the screen wraps.
@@ -1522,7 +1542,7 @@ pub(crate) fn short(id: &str) -> &str {
 /// The text typed into the agent. The `[agent-fleet …]` prefix marks it as machine-sent, never a human turn.
 pub fn doorbell(from: &str, to: &str, kind: &str, reference: &str, text: &str, id: &str) -> String {
     format!(
-        "[agent-fleet {}→{}] {kind} {reference}: {text} (event {id})",
+        "[agent-fleet {}→{}] {kind} {reference}: {text} (event {id}; ack: agent-fleet read)",
         short(from),
         short(to)
     )
@@ -1572,7 +1592,7 @@ mod tests {
         );
         assert_eq!(
             d,
-            "[agent-fleet lead→impl] REVIEW task:p/7: please look (event 01ABC)"
+            "[agent-fleet lead→impl] REVIEW task:p/7: please look (event 01ABC; ack: agent-fleet read)"
         );
     }
 
@@ -1672,6 +1692,39 @@ mod tests {
         program: &str,
         (screen, echo): (&str, bool),
     ) -> (Arc<Host>, Arc<FakeHerdr>, u64) {
+        let (host, fake, epoch) = fake_host(dir, status, program, (screen, echo)).await;
+        let mut msg = tell(kind).into_event();
+        msg.ts -= chrono::Duration::hours(age_h);
+        host.replica.lock().unwrap().append(&msg).unwrap();
+        tokio::spawn(host.clone().delivery_loop());
+        host.wake.notify_one();
+        (host, fake, epoch)
+    }
+
+    /// A tell from `lead` to `a`, as `agent-fleet tell` writes it.
+    fn tell(kind: &str) -> Envelope<Known> {
+        Envelope::new(
+            Actor {
+                kind: ActorKind::Agent,
+                id: "agent:h/s/lead".into(),
+            },
+            "p",
+            Known::MsgSent(MsgSent {
+                to: "agent:h/s/a".into(),
+                kind: kind.into(),
+                reference: "x".into(),
+                text: "hi".into(),
+            }),
+        )
+    }
+
+    /// A host on a fake herdr whose one pane `w:1` holds agent `a`, a `program`; no delivery loop yet.
+    async fn fake_host(
+        dir: &Path,
+        status: &str,
+        program: &str,
+        (screen, echo): (&str, bool),
+    ) -> (Arc<Host>, Arc<FakeHerdr>, u64) {
         let sock = dir.join("herdr.sock");
         let fake = Arc::new(FakeHerdr::default());
         *fake.status.lock().unwrap() = status.into();
@@ -1706,25 +1759,123 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let msg = Envelope::new(
-            Actor {
-                kind: ActorKind::Agent,
-                id: "agent:h/s/lead".into(),
-            },
-            "p",
-            Known::MsgSent(MsgSent {
-                to: "agent:h/s/a".into(),
-                kind: kind.into(),
-                reference: "x".into(),
-                text: "hi".into(),
-            }),
-        );
-        let mut msg = msg.into_event();
-        msg.ts -= chrono::Duration::hours(age_h);
-        host.replica.lock().unwrap().append(&msg).unwrap();
+        (host, fake, epoch)
+    }
+
+    /// A host whose replica holds a tell sent 1 h ago and delivered `ago_min` minutes ago after
+    /// `rings` deliveries, then `read` by `a` if set; the delivery loop runs.
+    async fn host_with_delivered(
+        dir: &Path,
+        status: &str,
+        ago_min: i64,
+        rings: u32,
+        read: bool,
+    ) -> (Arc<Host>, Arc<FakeHerdr>) {
+        let (host, fake, _) = fake_host(dir, status, "claude", ("> ", true)).await;
+        let now = chrono::Utc::now();
+        let mut sent = tell("ASK").into_event();
+        sent.ts = now - chrono::Duration::hours(1);
+        // The first ring is still in the scrollback: that is no proof it was read.
+        *fake.screen.lock().unwrap() = format!("{} (event {})\n> ", "old ring", sent.id);
+        let mut log = vec![sent.clone()];
+        let actor = |id: &str, kind| Actor {
+            kind,
+            id: id.into(),
+        };
+        for _ in 0..rings {
+            let mut d = Envelope::new(
+                actor("host:h", ActorKind::Host),
+                "p",
+                Known::MsgDelivered(MsgDelivered {
+                    to: "agent:h/s/a".into(),
+                    observed: AgentState::Working,
+                    rung: None,
+                    attempts: Some(1),
+                }),
+            )
+            .re(&sent.id)
+            .into_event();
+            d.ts = now - chrono::Duration::minutes(ago_min);
+            log.push(d);
+        }
+        if read {
+            let mut r = Envelope::new(
+                actor("agent:h/s/a", ActorKind::Agent),
+                "p",
+                Known::MsgRead(MsgRead {}),
+            )
+            .re(&sent.id)
+            .into_event();
+            r.ts = now - chrono::Duration::minutes(ago_min - 1);
+            log.push(r);
+        }
+        for e in &log {
+            host.replica.lock().unwrap().append(e).unwrap();
+        }
         tokio::spawn(host.clone().delivery_loop());
         host.wake.notify_one();
-        (host, fake, epoch)
+        (host, fake)
+    }
+
+    fn delivered_count(host: &Host) -> usize {
+        types(host).iter().filter(|t| *t == "msg.delivered").count()
+    }
+
+    #[tokio::test]
+    async fn an_unread_tell_is_retransmitted_after_its_backoff_and_a_read_one_never_is() {
+        // Delivered 6 min ago, once: past the 5 min first backoff. Idle, so rung as a new turn.
+        let dir = tempfile::tempdir().unwrap();
+        let (host, fake) = host_with_delivered(dir.path(), "idle", 6, 1, false).await;
+        for _ in 0..200 {
+            if !fake.prompts.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        fake.set("working").await;
+        for _ in 0..200 {
+            if delivered_count(&host) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let prompts = fake.prompts.lock().unwrap().clone();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert!(prompts[0].contains("agent-fleet read"), "{prompts:?}");
+        assert_eq!(delivered_count(&host), 2, "the retransmit is a second msg.delivered");
+
+        // Read: never retransmitted, however long ago it was delivered.
+        let dir = tempfile::tempdir().unwrap();
+        let (_host, fake) = host_with_delivered(dir.path(), "idle", 50, 1, true).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(fake.prompts.lock().unwrap().is_empty());
+
+        // Twice delivered, the last 6 min ago: the backoff is now 10 min, so not yet.
+        let dir = tempfile::tempdir().unwrap();
+        let (_host, fake) = host_with_delivered(dir.path(), "idle", 6, 2, false).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(fake.prompts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_busy_claude_agent_gets_an_unread_tell_retyped_though_its_old_ring_is_on_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, fake) = host_with_delivered(dir.path(), "working", 6, 1, false).await;
+        for _ in 0..200 {
+            if delivered_count(&host) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(fake.prompts.lock().unwrap().len(), 1);
+        assert_eq!(delivered_count(&host), 2);
+    }
+
+    #[test]
+    fn retransmits_back_off_from_five_minutes_doubling_to_an_hour() {
+        let m = chrono::Duration::minutes;
+        let got: Vec<_> = (1..=6).map(retransmit_after).collect();
+        assert_eq!(got, vec![m(5), m(10), m(20), m(40), m(60), m(60)]);
     }
 
     fn types(host: &Host) -> Vec<String> {

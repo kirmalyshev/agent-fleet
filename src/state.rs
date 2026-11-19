@@ -38,6 +38,12 @@ pub struct State {
     pub answers: BTreeMap<String, Answered>,
     /// Undelivered doorbells by the id of their `msg.sent`.
     pub msgs: BTreeMap<String, Msg>,
+    /// Delivered doorbells their recipient has not read (`msg.read`) yet: retransmitted until it does.
+    #[serde(default)]
+    pub unread: BTreeMap<String, Unread>,
+    /// Read doorbells by the id of their `msg.sent`, kept for 24 h after the read.
+    #[serde(default)]
+    pub read: BTreeMap<String, Read>,
     /// Git worktrees by `<host>:<path>`.
     pub worktrees: BTreeMap<String, Worktree>,
     /// Processes running in worktrees (or orphaned beside them) by `<host>:<path>`.
@@ -404,9 +410,47 @@ pub struct Msg {
     pub since: DateTime<Utc>,
 }
 
+/// A delivered doorbell not read yet.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Unread {
+    #[serde(flatten)]
+    pub msg: Msg,
+    /// The last delivery's `ts`: the retransmit clock starts here.
+    pub delivered: DateTime<Utc>,
+    /// Deliveries so far, the first one included.
+    pub rings: u32,
+}
+
+/// A doorbell its recipient read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Read {
+    pub from: String,
+    pub to: String,
+    /// The reader: the agent the message reached.
+    pub by: String,
+    pub since: DateTime<Utc>,
+    pub at: DateTime<Utc>,
+}
+
+/// Where a doorbell is, as its sender sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MailStatus {
+    Sent,
+    Delivered,
+    Read,
+}
+
+/// A read doorbell is kept this long after the read, for its sender to see.
+pub const READ_KEPT: chrono::Duration = chrono::Duration::hours(24);
+
 /// A status report (`MERGED`, `DONE`, `RETIRE`, `OPEN`, `FIX`) still undelivered this long
 /// after it was sent is history: its host was away, and what it announced has long been acted on.
 pub const MSG_FRESH: chrono::Duration = chrono::Duration::hours(6);
+
+/// Any doorbell still unread this long after it was sent has expired: it is closed unrung, and
+/// an unread one is no longer retransmitted. Whatever it said has been overtaken.
+pub const MSG_EXPIRE: chrono::Duration = chrono::Duration::hours(24);
 
 /// Whether an agent of this program takes a prompt typed mid-turn: Claude Code queues it and
 /// reads it at the next turn boundary. Any other program is never typed into while busy.
@@ -416,8 +460,16 @@ pub fn queues_input(kind: Option<&str>) -> bool {
 
 impl Msg {
     /// Why ringing this doorbell now would be a false alarm, if it would: a status report that
-    /// waited out a host reconnect. Questions and instructions (`ASK`, `BLOCKED`, ...) never go stale.
+    /// waited out a host reconnect. Questions and instructions (`ASK`, `BLOCKED`, ...) go stale only
+    /// at `MSG_EXPIRE`, like every doorbell.
     pub fn stale(&self, now: DateTime<Utc>) -> Option<String> {
+        if now - self.since > MSG_EXPIRE {
+            return Some(format!(
+                "{} sent {}h ago: expired",
+                self.kind,
+                (now - self.since).num_hours()
+            ));
+        }
         let status = ["MERGED", "DONE", "RETIRE", "OPEN", "FIX"];
         (status.contains(&self.kind.as_str()) && now - self.since > MSG_FRESH).then(|| {
             format!(
@@ -430,6 +482,17 @@ impl Msg {
 }
 
 impl State {
+    /// Where the doorbell `id` is: sent (waiting for a ring), delivered (not read), or read.
+    pub fn mail_status(&self, id: &str) -> Option<MailStatus> {
+        if self.msgs.contains_key(id) {
+            Some(MailStatus::Sent)
+        } else if self.unread.contains_key(id) {
+            Some(MailStatus::Delivered)
+        } else {
+            self.read.contains_key(id).then_some(MailStatus::Read)
+        }
+    }
+
     /// Tells still undelivered to `to` (`coordinator` follows its holder): how many, and the oldest.
     pub fn pending_for(&self, to: &str) -> (usize, Option<DateTime<Utc>>) {
         let who = self.recipient(to);
@@ -885,11 +948,51 @@ impl State {
                     },
                 );
             }
-            Known::MsgDelivered(_) => {
+            Known::MsgDelivered(d) => {
                 if let Some(re) = &e.re {
-                    self.msgs.remove(re);
+                    // `attempts: 0` closes a stale report unrung: nothing was shown, nothing to read.
+                    let shown = d.attempts != Some(0);
+                    if let Some(msg) = self.msgs.remove(re) {
+                        if shown {
+                            let delivered = ts;
+                            self.unread.insert(
+                                re.clone(),
+                                Unread {
+                                    msg,
+                                    delivered,
+                                    rings: 1,
+                                },
+                            );
+                        }
+                    } else if shown && let Some(u) = self.unread.get_mut(re) {
+                        u.delivered = ts;
+                        u.rings += 1;
+                    }
                     for a in self.answers.values_mut().filter(|a| &a.msg == re) {
                         a.acked.get_or_insert(ts);
+                    }
+                }
+            }
+            // Only the recipient's own read counts: the agent `to` names, or holds as a role.
+            Known::MsgRead(_) => {
+                if let Some(re) = &e.re {
+                    let msg = self
+                        .msgs
+                        .get(re)
+                        .or_else(|| self.unread.get(re).map(|u| &u.msg));
+                    if let Some(m) = msg
+                        && (m.to == e.actor.id || self.recipient(&m.to) == Some(e.actor.id.as_str()))
+                    {
+                        let read = Read {
+                            from: m.from.clone(),
+                            to: m.to.clone(),
+                            by: e.actor.id.clone(),
+                            since: m.since,
+                            at: ts,
+                        };
+                        self.msgs.remove(re);
+                        self.unread.remove(re);
+                        self.read.insert(re.clone(), read);
                     }
                 }
             }
@@ -1053,6 +1156,8 @@ impl State {
             .retain(|id, u| e.ts - u.since <= UPDATE_KEPT || keep.contains(id));
         self.answers
             .retain(|_, a| e.ts - a.acked.unwrap_or(a.at) <= ANSWER_KEPT);
+        self.read.retain(|_, r| e.ts - r.at <= READ_KEPT);
+        self.unread.retain(|_, u| e.ts - u.msg.since <= MSG_EXPIRE);
         // The reducer has no clock: a spawn is pruned once a later event's `ts` is more than
         // SPAWN_KEPT past its answer (or its request, when it was never answered) — but never
         // while its agent is still up, so cap counting cannot lose sight of it.
@@ -1748,6 +1853,131 @@ mod tests {
 
         s.apply(&role(None, ActorKind::Agent));
         assert!(s.roles.is_empty());
+    }
+
+    #[test]
+    fn a_tell_goes_sent_then_delivered_then_read_and_only_its_recipient_reads_it() {
+        let t0 = Utc::now();
+        let at = |mins, actor: &str, re: Option<&str>, body| {
+            let kind = if actor.starts_with("host:") {
+                ActorKind::Host
+            } else {
+                ActorKind::Agent
+            };
+            let mut e = Envelope::new(
+                Actor {
+                    kind,
+                    id: actor.into(),
+                },
+                "p",
+                body,
+            );
+            e.id = format!("e{mins}");
+            e.re = re.map(str::to_string);
+            let mut e = e.into_event();
+            e.ts = t0 + chrono::Duration::minutes(mins);
+            e
+        };
+        let to = "agent:h/s/b";
+        let sent = Known::MsgSent(MsgSent {
+            to: to.into(),
+            kind: "ASK".into(),
+            reference: "r".into(),
+            text: "t".into(),
+        });
+        let delivered = || {
+            Known::MsgDelivered(MsgDelivered {
+                to: to.into(),
+                observed: AgentState::Working,
+                rung: None,
+                attempts: Some(1),
+            })
+        };
+        let mut s = State::default();
+        s.apply(&at(0, "agent:h/s/a", None, sent));
+        assert_eq!(s.mail_status("e0"), Some(MailStatus::Sent));
+        s.apply(&at(1, "host:h", Some("e0"), delivered()));
+        assert!(s.msgs.is_empty(), "delivered: no longer waiting for a ring");
+        assert_eq!(s.mail_status("e0"), Some(MailStatus::Delivered));
+        let u = &s.unread["e0"];
+        assert_eq!((u.rings, u.delivered, u.msg.since), (1, t0 + chrono::Duration::minutes(1), t0));
+        // A retransmit: delivered again, the ring counted, the clock restarted.
+        s.apply(&at(6, "host:h", Some("e0"), delivered()));
+        assert_eq!(s.unread["e0"].rings, 2);
+        assert_eq!(s.unread["e0"].delivered, t0 + chrono::Duration::minutes(6));
+        // Someone else's ack is not an ack.
+        s.apply(&at(7, "agent:h/s/c", Some("e0"), Known::MsgRead(MsgRead {})));
+        assert_eq!(s.mail_status("e0"), Some(MailStatus::Delivered));
+        s.apply(&at(8, to, Some("e0"), Known::MsgRead(MsgRead {})));
+        assert!(s.unread.is_empty());
+        assert_eq!(s.mail_status("e0"), Some(MailStatus::Read));
+        assert_eq!(s.read["e0"].at, t0 + chrono::Duration::minutes(8));
+        // Read is kept 24 h, then pruned by a later event.
+        s.apply(&at(
+            8 + 24 * 60 + 1,
+            "agent:h/s/a",
+            None,
+            Known::MsgSent(MsgSent {
+                to: "agent:h/s/c".into(),
+                kind: "FYI".into(),
+                reference: "r".into(),
+                text: "later".into(),
+            }),
+        ));
+        assert_eq!(s.mail_status("e0"), None);
+    }
+
+    #[test]
+    fn a_tell_pulled_before_its_ring_is_never_rung_and_a_dropped_report_is_not_unread() {
+        let t0 = Utc::now();
+        let at = |mins, actor: &str, re: Option<&str>, body| {
+            let kind = if actor.starts_with("host:") {
+                ActorKind::Host
+            } else {
+                ActorKind::Agent
+            };
+            let mut e = Envelope::new(
+                Actor {
+                    kind,
+                    id: actor.into(),
+                },
+                "p",
+                body,
+            );
+            e.id = format!("e{mins}");
+            e.re = re.map(str::to_string);
+            let mut e = e.into_event();
+            e.ts = t0 + chrono::Duration::minutes(mins);
+            e
+        };
+        let sent = |to: &str| {
+            Known::MsgSent(MsgSent {
+                to: to.into(),
+                kind: "DONE".into(),
+                reference: "r".into(),
+                text: "t".into(),
+            })
+        };
+        let mut s = State::default();
+        s.apply(&at(0, "agent:h/s/a", None, sent("agent:h/s/b")));
+        s.apply(&at(1, "agent:h/s/b", Some("e0"), Known::MsgRead(MsgRead {})));
+        assert!(s.msgs.is_empty() && s.unread.is_empty());
+        assert_eq!(s.mail_status("e0"), Some(MailStatus::Read));
+        // A stale report closed unrung (`attempts: 0`) was never shown: it is not unread.
+        s.apply(&at(2, "agent:h/s/a", None, sent("agent:h/s/b")));
+        s.apply(&at(
+            3,
+            "host:h",
+            Some("e2"),
+            Known::MsgDelivered(MsgDelivered {
+                to: "agent:h/s/b".into(),
+                observed: AgentState::Idle,
+                rung: None,
+                attempts: Some(0),
+            }),
+        ));
+        assert!(s.unread.is_empty());
+        assert_eq!(s.mail_status("e2"), None);
     }
 
     #[test]
@@ -2668,7 +2898,7 @@ mod tests {
     }
 
     #[test]
-    fn a_status_report_older_than_six_hours_is_stale_and_a_question_never_is() {
+    fn a_status_report_older_than_six_hours_is_stale_and_any_tell_expires_at_a_day() {
         let now = Utc::now();
         let msg = |kind: &str, ago: i64| Msg {
             from: "agent:h/s/a".into(),
@@ -2683,7 +2913,8 @@ mod tests {
             assert!(msg(k, 7).stale(now).unwrap().contains("7h ago"), "{k}");
         }
         for k in ["BLOCKED", "ASK", "FYI"] {
-            assert!(msg(k, 30).stale(now).is_none(), "{k} never goes stale");
+            assert!(msg(k, 23).stale(now).is_none(), "{k} at 23h still rings");
+            assert!(msg(k, 25).stale(now).unwrap().contains("expired"), "{k}");
         }
     }
 }
