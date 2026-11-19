@@ -905,7 +905,10 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
     }
     // Per recipient: how many tells wait, the oldest, and what the recipient is doing.
     let mut waiting: BTreeMap<&str, (usize, DateTime<Utc>)> = BTreeMap::new();
-    for m in s.msgs.values().filter(|m| now - m.since >= UNDELIVERED) {
+    // A recipient that is not up has no host to ring it; `tell` refuses such a recipient.
+    for m in s.msgs.values().filter(|m| {
+        now - m.since >= UNDELIVERED && s.recipient(&m.to).is_some_and(|r| s.agents.contains_key(r))
+    }) {
         let w = waiting.entry(&m.to).or_insert((0, m.since));
         w.0 += 1;
         w.1 = w.1.min(m.since);

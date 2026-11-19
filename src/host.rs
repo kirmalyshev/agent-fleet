@@ -1226,8 +1226,9 @@ impl Host {
     }
 
     /// Rings doorbells for this host's agents. `msg.delivered` is written only after this host
-    /// has itself logged the agent turning `working` after the prompt; herdr accepting the
-    /// prompt proves nothing.
+    /// has itself logged the agent turning `working` after the prompt; herdr accepting the prompt
+    /// proves nothing. The exception is a busy claude agent, which queues the input: that ring is
+    /// logged on submission.
     async fn delivery_loop(self: Arc<Self>) {
         let mut tried: HashMap<String, Instant> = HashMap::new();
         let mut attempts: HashMap<String, u32> = HashMap::new();

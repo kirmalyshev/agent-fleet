@@ -1848,6 +1848,12 @@ async fn main() -> Result<()> {
                 .recipient(&to)
                 .and_then(|r| state.agents.get(r))
                 .is_some_and(|a| !matches!(a.state, AgentState::Idle | AgentState::Done));
+            let recipient_queues = state::queues_input(
+                state
+                    .recipient(&to)
+                    .and_then(|r| state.agents.get(r))
+                    .and_then(|a| a.kind.as_deref()),
+            );
             let waiting = state.pending_for(&to).0 + 1;
             let body = MsgSent {
                 to: to.clone(),
@@ -1862,10 +1868,12 @@ async fn main() -> Result<()> {
             ))
             .await?;
             if busy {
-                println!(
-                    "queued: {} busy, delivers when idle ({waiting} pending)",
-                    short(agent)
-                );
+                let how = if recipient_queues {
+                    "queued, read at its next turn boundary"
+                } else {
+                    "delivers when idle"
+                };
+                println!("queued: {} busy, {how} ({waiting} pending)", short(agent));
             }
         }
     }

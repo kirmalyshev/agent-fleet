@@ -271,13 +271,14 @@ The host agent of the recipient's machine types it into the agent as
 ```
 
 The `[fleet` prefix marks the turn as machine-sent, so it is never mistaken for a human
-instruction. The host agent rings only an `idle` or `done` agent, never a blocked one. A busy `claude` agent
-(it queues input typed mid-turn) is rung too at once; that delivery is
-logged without waiting for a new `working` turn, since there is none. Any other busy agent waits.
-`agent-fleet doctor` raises `undelivered` for a recipient whose tell has waited 10 minutes. A queued ring is logged `delivered` on submission (the pane is re-read as `working` first); it carries no later proof, since claude queues the input silently. It
-writes `msg.delivered` only after it has itself observed and logged the agent turning `working`
-after the prompt. A prompt that was merely submitted proves nothing. A failed ring is retried at
-most once a minute; if `msg.delivered` itself cannot be written, the message stays pending.
+instruction. The host agent rings an `idle` or `done` agent, never a blocked one, and writes `msg.delivered`
+only after it has itself observed and logged the agent turning `working` after the prompt: a prompt
+that was merely submitted proves nothing. A busy `claude` agent is the one exception. It queues input
+typed mid-turn, so it is rung at once (its pane re-read as `working` first) and `msg.delivered` is
+written on submission, with no later proof; a ring that lands in a permission dialog herdr has not
+yet noticed is a known risk. Any other busy agent waits. A failed ring is retried at most once a
+minute; if `msg.delivered` itself cannot be written, the message stays pending. `agent-fleet doctor`
+raises `undelivered` for an up recipient whose tell has waited 10 minutes.
 
 ## Presence (herdr)
 
