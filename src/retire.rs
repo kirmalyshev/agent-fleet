@@ -17,6 +17,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::client::Held;
+use crate::event::Envelope;
 
 /// The repository-wide lock file, in the git common dir. A repo's own retire may take it too.
 pub const REPO_LOCK: &str = "agent-fleet-retire.lock";
@@ -44,6 +45,16 @@ impl std::str::FromStr for Decide {
             "stash" => Ok(Decide::Stash),
             _ => Err(format!("unknown decision {s:?}: delete, keep or stash")),
         }
+    }
+}
+
+impl std::fmt::Display for Decide {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Decide::Delete => "delete",
+            Decide::Keep => "keep",
+            Decide::Stash => "stash",
+        })
     }
 }
 
@@ -939,5 +950,237 @@ mod tests {
                 .unwrap_err()
                 .contains("no pane")
         );
+    }
+}
+
+// ---------- `agent-fleet retire`, on the agent's host ----------
+
+/// What a retire on this host needs: the CLI fills it from its own process, the host from its
+/// config (its herdr socket, not an environment variable a request cannot carry).
+pub struct Here<'a> {
+    pub state: &'a crate::state::State,
+    pub sp: &'a crate::state::Spawn,
+    pub host: &'a str,
+    pub decide: Option<Decide>,
+    pub machine: Option<PathBuf>,
+    /// The checkout to use when the repo is not registered: the CLI's own, if it is in one.
+    pub cwd_checkout: Option<PathBuf>,
+    pub data_dir: &'a Path,
+    pub sock: Option<PathBuf>,
+}
+
+/// What `run_here` did: the text to print (stdout when `ok`, stderr when not), and the BLOCKED
+/// message for the agent's lead when the retire was refused over uncommitted changes.
+pub struct Done {
+    pub ok: bool,
+    pub text: String,
+    pub blocked: Option<crate::event::MsgSent>,
+}
+
+fn done(ok: bool, text: impl Into<String>) -> Done {
+    Done {
+        ok,
+        text: text.into(),
+        blocked: None,
+    }
+}
+
+/// The guarded retire of `h.sp`'s agent, here: only a tree the fleet made on THIS host, locked,
+/// read, the pane closed, the repository's hook run. Never an error: whatever went wrong is the
+/// text of a not-ok `Done`.
+pub async fn run_here(h: &Here<'_>) -> Done {
+    match try_here(h).await {
+        Ok(d) => d,
+        Err(e) => done(false, format!("{e:#}")),
+    }
+}
+
+async fn try_here(h: &Here<'_>) -> Result<Done> {
+    let sp = h.sp;
+    let agent = crate::spawn::short(&sp.request.agent);
+    // The host's own rule: only a tree the fleet made, on THIS host, that no newer spawn handed
+    // to another agent — never a main checkout, never another agent's tree.
+    let Some((repo, wt, issue)) = h.state.retire_target(&sp.request.agent, h.host) else {
+        bail!(
+            "{agent}: no worktree to retire on {} (a main checkout, a tree handed to another agent, or another host's agent)",
+            h.host
+        );
+    };
+    // keep = leave it: the pane too, so the host's own close-retire never starts.
+    if h.decide == Some(Decide::Keep) {
+        return Ok(done(
+            true,
+            format!("kept {wt}: decided keep; pane and tree untouched"),
+        ));
+    }
+    if !Path::new(&wt).exists() {
+        return Ok(done(true, format!("{wt} was already retired")));
+    }
+    let registered = h
+        .machine
+        .as_deref()
+        .map(crate::setup::registered)
+        .transpose()?
+        .and_then(|mut r| r.remove(&repo));
+    let checkout = checkout_for(&repo, registered, h.cwd_checkout.clone())?;
+    let (cfg, _) = crate::spawn::load_in(&checkout, h.machine.as_deref())?;
+    let Some(script) = cfg.retire.clone() else {
+        bail!(
+            "{}'s fleet.toml has no `retire` hook; nothing would retire {wt}",
+            checkout.display()
+        );
+    };
+    let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
+    let patches = patches_dir(cfg.retire_patches.as_deref(), home.as_deref(), h.data_dir)?;
+    let cmd = format!("agent-fleet retire {agent}");
+    let plan = Plan {
+        checkout: &checkout,
+        script: &script,
+        base: &cfg.base,
+        patches: &patches,
+        decide_cmd: &cmd,
+    };
+    // Locked, then read, all BEFORE the pane closes: a refusal leaves the agent up and starts no
+    // host retire; the host's retire of the close that does follow waits on these locks and finds
+    // the tree gone.
+    let (_a, b) = locks(&checkout, Path::new(&wt), WAIT).await?;
+    let outcome = match assess(&plan, &wt, h.decide) {
+        Ready::Gone => Outcome::Gone,
+        Ready::Kept => Outcome::Kept,
+        Ready::Refused(why) => Outcome::Refused(why),
+        Ready::Go => {
+            let pane = sp.result.as_ref().and_then(|r| r.pane.clone());
+            let up = h.state.agents.contains_key(&sp.request.agent);
+            let step = pane_step(up, pane.as_deref(), h.sock.as_deref())
+                .map_err(|e| anyhow::anyhow!("refusing to retire {wt}: {e}; nothing removed"))?;
+            if let Some((p, s)) = step
+                && let Err(e) =
+                    crate::host::herdr_call(s, "pane.close", serde_json::json!({ "pane_id": p }))
+                        .await
+            {
+                bail!(
+                    "refusing to retire {wt}: {agent} is up and its pane {p} did not close ({e:#}); nothing removed"
+                );
+            }
+            finish(&plan, &wt, h.decide, &b).await?
+        }
+    };
+    Ok(match outcome {
+        Outcome::Retired => done(true, format!("retired {wt}")),
+        Outcome::Kept => done(true, format!("kept {wt}: decided keep, nothing removed")),
+        Outcome::Gone => done(true, format!("{wt} was already retired")),
+        Outcome::Refused(why) => Done {
+            ok: false,
+            blocked: Some(crate::event::MsgSent {
+                to: crate::spawn::lead_of(sp),
+                kind: "BLOCKED".into(),
+                reference: issue
+                    .map(|n| format!("{repo}#{n}"))
+                    .unwrap_or_else(|| repo.clone()),
+                text: why.clone(),
+            }),
+            text: why,
+        },
+    })
+}
+
+/// Follows the hub until the request's `retire.result` arrives. A retire waits on locks (90 s)
+/// and the repository's hook, so the wait is longer than a spawn's poll interval suggests.
+pub async fn wait_result(
+    client: &crate::client::Client,
+    id: &str,
+) -> Result<crate::event::RetireResult> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    loop {
+        match client.state().await {
+            Ok(s) => {
+                if let Some(r) = s.retires.get(id).and_then(|r| r.result.clone()) {
+                    return Ok(r);
+                }
+            }
+            Err(e) if e.downcast_ref::<crate::client::Refused>().is_some() => {
+                bail!("waiting for the retire result: {e:#}");
+            }
+            Err(_) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("no retire.result for {id} within 10 min — the agent's host may be down");
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// The `retire.requested` ids this host should run: its own, unanswered, not seen before, and
+/// younger than a spawn request may be.
+pub fn due(
+    state: &crate::state::State,
+    host: &str,
+    seen: &mut std::collections::HashSet<String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    seen.retain(|id| state.retires.get(id).is_some_and(|r| r.result.is_none()));
+    state
+        .retires
+        .iter()
+        .filter(|(id, r)| {
+            r.request.host == host
+                && r.result.is_none()
+                && now - r.since <= crate::spawn::REQUEST_MAX_AGE
+                && seen.insert((*id).clone())
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// The host's side: run each retire asked of this host and answer it. Runs on the spawn loop's
+/// tick, one at a time, so a retire never overlaps another on this host.
+pub async fn serve(host: &crate::host::Host, seen: &mut std::collections::HashSet<String>) {
+    let Ok(view) = host.view() else { return };
+    let state = &view.state;
+    for id in due(state, &host.cfg.host, seen, chrono::Utc::now()) {
+        let Some(req) = state.retires.get(&id) else {
+            continue;
+        };
+        let (done, project) = match crate::spawn::find_spawn(state, &req.request.agent) {
+            None => (
+                done(false, format!("{} has no spawn record", req.request.agent)),
+                req.project.clone(),
+            ),
+            Some(sp) => {
+                let decide = req
+                    .request
+                    .decide
+                    .as_deref()
+                    .and_then(|d| d.parse::<Decide>().ok());
+                let here = Here {
+                    state,
+                    sp,
+                    host: &host.cfg.host,
+                    decide,
+                    machine: host.cfg.config_dir.clone(),
+                    cwd_checkout: None,
+                    data_dir: &host.cfg.data_dir,
+                    sock: Some(host.cfg.herdr_socket.clone()),
+                };
+                (run_here(&here).await, req.project.clone())
+            }
+        };
+        if let Some(body) = done.blocked {
+            host.publish(Envelope::new(
+                host.actor(),
+                &project,
+                crate::event::Known::MsgSent(body),
+            ))
+            .await;
+        }
+        host.publish(
+            host.presence(crate::event::Known::RetireResult(crate::event::RetireResult {
+                agent: req.request.agent.clone(),
+                ok: done.ok,
+                text: done.text,
+            }))
+            .re(&id),
+        )
+        .await;
     }
 }
