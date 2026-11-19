@@ -311,7 +311,8 @@ enum Cmd {
         decide: Option<retire::Decide>,
     },
     /// Merge an approved PR: only when the PR's last comment ends `VERDICT: READY <full head
-    /// sha>`, its head is still `sha`, no submodule pin moves backwards, and the repository's gate
+    /// sha>` (a READY at an ancestor sha carries across clean merges of the base), its head is
+    /// still `sha`, no submodule pin moves backwards, and the repository's gate
     /// (`[merge] gate` in the base branch's fleet.toml) or else its required checks pass; then
     /// `gh pr merge --squash --match-head-commit`, never `--admin`. `[merge] host` names the host
     /// it runs on, asked through the hub.

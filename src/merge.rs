@@ -144,7 +144,8 @@ pub struct Ask<'a> {
     pub pr: u64,
     pub sha: &'a str,
     pub allow_pin_rewind: Option<&'a str>,
-    /// This machine's checkout of `repo`, asked for only when a gate is configured.
+    /// This machine's checkout of `repo`, asked for when a gate is configured or a READY
+    /// must be carried across merges of the base.
     pub checkout: &'a (dyn Fn() -> Result<PathBuf> + Sync),
     /// The unit of every wait (1 s; the tests use 0): `mergeable` 5 × 6, checks 27 × 20, the
     /// merge's landing 5 × 3.
@@ -315,7 +316,12 @@ async fn last_comment(a: &Ask<'_>) -> Result<Option<(String, String)>> {
     }
 }
 
-async fn approved(a: &Ask<'_>, head: &str) -> Result<()> {
+async fn approved(
+    a: &Ask<'_>,
+    base: &str,
+    head: &str,
+    say: &(dyn Fn(String) + Sync),
+) -> Result<()> {
     let last = last_comment(a).await?;
     if let Some((_, who)) = &last
         && !REVIEWERS.contains(&who.as_str())
@@ -325,7 +331,128 @@ async fn approved(a: &Ask<'_>, head: &str) -> Result<()> {
             a.pr
         );
     }
-    verdict(last.as_ref().map(|(b, _)| b.as_str()), head).map_err(|e| anyhow!("#{}: {e}", a.pr))
+    let body = last.as_ref().map(|(b, _)| b.as_str());
+    match verdict(body, head) {
+        Ok(()) => Ok(()),
+        Err(e) => match ready_at_other(body, head) {
+            // A READY still counts when the head only moved by clean merges of the base.
+            Some(x) => carried(a, base, head, &x, say).await,
+            None => Err(anyhow!("#{}: {e}", a.pr)),
+        },
+    }
+}
+
+/// `VERDICT: READY <full sha>` on the comment's last line, at a sha that is not `head`: the
+/// verdict `carried` may still honour.
+fn ready_at_other(body: Option<&str>, head: &str) -> Option<String> {
+    let last = body?
+        .lines()
+        .rev()
+        .map(|l| l.trim_matches(|ch: char| ch.is_whitespace() || ch == '*' || ch == '`'))
+        .find(|l| !l.is_empty())?;
+    let s = last.strip_prefix("VERDICT: READY ")?.trim();
+    (s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()) && !s.eq_ignore_ascii_case(head))
+        .then(|| s.to_ascii_lowercase())
+}
+
+/// The first 9 chars of a sha, for messages.
+fn short(s: &str) -> &str {
+    &s[..9.min(s.len())]
+}
+
+/// A READY at `x` still counts at `head` when every commit on head's first-parent chain down
+/// to `x` is a clean two-parent merge: the other parent an ancestor of `origin/<base>` and the
+/// merge's tree equal to `git merge-tree --write-tree`'s own answer, so nothing hand-edited
+/// rides in on an approval. Up to 50 merges; Err says why the carry refuses.
+async fn carried(
+    a: &Ask<'_>,
+    base: &str,
+    head: &str,
+    x: &str,
+    say: &(dyn Fn(String) + Sync),
+) -> Result<()> {
+    let n = a.pr;
+    let no = |m: String| {
+        anyhow!(
+            "#{n}: READY at {} does not carry to {}: {m}",
+            short(x),
+            short(head)
+        )
+    };
+    let co = (a.checkout)().map_err(|e| no(format!("no checkout to prove it: {e:#}")))?;
+    let remote = format!("refs/remotes/origin/{base}");
+    git(
+        &co,
+        &[
+            "fetch",
+            "-q",
+            "origin",
+            &format!("+refs/heads/{base}:{remote}"),
+            &format!("pull/{n}/head"),
+        ],
+    )
+    .await
+    .map_err(|e| no(format!("git fetch in {}: {e}", co.display())))?;
+    if git(&co, &["cat-file", "-e", &format!("{x}^{{commit}}")])
+        .await
+        .is_err()
+        || git(&co, &["merge-base", "--is-ancestor", x, head])
+            .await
+            .is_err()
+    {
+        return Err(no(format!("{x} is not an ancestor of {head}")));
+    }
+    let mut c = head.to_string();
+    let mut count = 0u32;
+    while c != *x {
+        count += 1;
+        if count > 50 {
+            return Err(no("more than 50 commits between them".into()));
+        }
+        let line = git(&co, &["rev-list", "--parents", "-n", "1", &c])
+            .await
+            .map_err(|e| no(format!("rev-list {c}: {e}")))?;
+        let p: Vec<&str> = line.split_whitespace().collect();
+        if p.len() != 3 {
+            return Err(no(format!("{} is not a two-parent merge", short(&c))));
+        }
+        let (p1, p2) = (p[1].to_string(), p[2].to_string());
+        if git(&co, &["merge-base", "--is-ancestor", &p2, &remote])
+            .await
+            .is_err()
+        {
+            return Err(no(format!(
+                "{}'s other parent {} is not on origin/{base}",
+                short(&c),
+                short(&p2)
+            )));
+        }
+        let t = git(&co, &["merge-tree", "--write-tree", &p1, &p2])
+            .await
+            .map_err(|e| {
+                no(format!(
+                    "{} does not merge clean: {}",
+                    short(&c),
+                    if e.is_empty() { "conflicts" } else { &e }
+                ))
+            })?;
+        let ct = git(&co, &["rev-parse", &format!("{c}^{{tree}}")])
+            .await
+            .map_err(|e| no(format!("rev-parse {c}: {e}")))?;
+        if t.lines().next().unwrap_or_default() != ct {
+            return Err(no(format!(
+                "{} is not the clean auto-merge (its tree is not merge-tree's answer)",
+                short(&c)
+            )));
+        }
+        c = p1;
+    }
+    say(format!(
+        "#{n} READY at {} carried to {} ({count} clean merge(s) of {base}, each the auto-merge)",
+        short(x),
+        short(head)
+    ));
+    Ok(())
 }
 
 /// `s` safe in a URL query value.
@@ -612,7 +739,7 @@ pub async fn run(a: &Ask<'_>, say: &(dyn Fn(String) + Sync)) -> Result<Merged> {
     head_matches(&pr.head, a.sha).map_err(|e| anyhow!("#{n}: {e}"))?;
     let head = pr.head;
     let cfg = config(a.gh, a.repo, &pr.base).await?;
-    approved(a, &head).await?;
+    approved(a, &pr.base, &head, say).await?;
     pins(a, &pr.base, say).await?;
     let mut mergeable = pr.mergeable;
     for _ in 0..5 {
@@ -638,7 +765,7 @@ pub async fn run(a: &Ask<'_>, say: &(dyn Fn(String) + Sync)) -> Result<Merged> {
             now.head
         );
     }
-    approved(a, &head).await?;
+    approved(a, &pr.base, &head, say).await?;
     let nn = n.to_string();
     gh(
         a.gh,
@@ -1109,6 +1236,169 @@ esac
         f.put("checks", "");
         f.put("checks_rc", "1");
         refused(f, H, "unreadable").await;
+    }
+
+    /// A `git` call in `dir` with a throwaway identity; returns stdout, panics on failure.
+    fn sh(dir: &Path, args: &[&str]) -> String {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "git {args:?} in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8(o.stdout).unwrap().trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_ready_at_another_sha_carries_only_across_clean_merges_of_the_base() {
+        // `checkout` is a working clone of the bare `origin`: `main` and the PR head
+        // (`pull/7/head`) are pushed to it, so `carried` has real objects to walk.
+        let pair = |f: &Fake| -> PathBuf {
+            let dir = f.dir.path();
+            let co = dir.join("checkout");
+            sh(dir, &["init", "-q", "--bare", "origin"]);
+            std::fs::create_dir(&co).unwrap();
+            sh(&co, &["init", "-q", "-b", "main"]);
+            sh(&co, &["remote", "add", "origin", "../origin"]);
+            sh(&co, &["commit", "-q", "--allow-empty", "-m", "m0"]);
+            sh(&co, &["push", "-q", "origin", "main"]);
+            co
+        };
+        // On feat: commit the approved sha, advance main, merge it back, push the PR head.
+        let approved_at_x = |f: &Fake, co: &Path, build: &dyn Fn(&Path)| {
+            let x = {
+                sh(co, &["checkout", "-q", "-B", "feat", "main"]);
+                sh(co, &["commit", "-q", "--allow-empty", "-m", "x"]);
+                sh(co, &["rev-parse", "HEAD"])
+            };
+            sh(co, &["checkout", "-q", "main"]);
+            sh(co, &["commit", "-q", "--allow-empty", "-m", "m1"]);
+            sh(co, &["push", "-q", "-f", "origin", "main"]);
+            sh(co, &["checkout", "-q", "feat"]);
+            build(co);
+            let h = sh(co, &["rev-parse", "HEAD"]);
+            sh(co, &["push", "-q", "-f", "origin", "HEAD:refs/pull/7/head"]);
+            sh(co, &["checkout", "-q", "main"]);
+            f.put("head", &h);
+            f.comment(&format!("ok\nVERDICT: READY {x}"), "OWNER");
+            h
+        };
+
+        // A READY at X counts at a head that is only X plus a clean merge of main.
+        let f = Fake::new();
+        let co = pair(&f);
+        let h = approved_at_x(&f, &co, &|co| {
+            sh(co, &["merge", "-q", "--no-edit", "main"]);
+        });
+        let (r, said) = f.run(&h, None).await;
+        assert!(r.is_ok(), "{r:?}");
+        assert!(said.iter().any(|l| l.contains("carried")), "{said:?}");
+        assert!(f.calls().contains("pr merge"));
+
+        // ... and across a chain of them.
+        let f = Fake::new();
+        let co = pair(&f);
+        let h = approved_at_x(&f, &co, &|co| {
+            for _ in 0..3 {
+                sh(co, &["merge", "-q", "--no-edit", "main"]);
+                sh(co, &["checkout", "-q", "main"]);
+                sh(co, &["commit", "-q", "--allow-empty", "-m", "more"]);
+                sh(co, &["push", "-q", "-f", "origin", "main"]);
+                sh(co, &["checkout", "-q", "feat"]);
+                sh(co, &["merge", "-q", "--no-edit", "main"]);
+            }
+        });
+        let (r, _) = f.run(&h, None).await;
+        assert!(r.is_ok(), "{r:?}");
+
+        // A hand-edited merge (its tree is not merge-tree's) does not carry.
+        let f = Fake::new();
+        let co = pair(&f);
+        let h = approved_at_x(&f, &co, &|co| {
+            sh(co, &["merge", "-q", "--no-commit", "main"]);
+            std::fs::write(co.join("edited"), "by hand").unwrap();
+            sh(co, &["add", "edited"]);
+            sh(co, &["commit", "-q", "-m", "merged, and touched"]);
+        });
+        let (r, _) = f.run(&h, None).await;
+        assert!(
+            format!("{:#}", r.as_ref().unwrap_err()).contains("not the clean auto-merge"),
+            "{r:?}"
+        );
+        assert!(!f.calls().contains("pr merge"));
+
+        // A plain commit on top of X is not a merge to carry over.
+        let f = Fake::new();
+        let co = pair(&f);
+        let h = approved_at_x(&f, &co, &|co| {
+            sh(co, &["commit", "-q", "--allow-empty", "-m", "not a merge"]);
+        });
+        let (r, _) = f.run(&h, None).await;
+        assert!(
+            format!("{:#}", r.as_ref().unwrap_err()).contains("not a two-parent merge"),
+            "{r:?}"
+        );
+
+        // A merge whose other parent never landed on the base does not carry.
+        let f = Fake::new();
+        let co = pair(&f);
+        let h = approved_at_x(&f, &co, &|co| {
+            sh(co, &["checkout", "-q", "-b", "topic"]);
+            sh(co, &["commit", "-q", "--allow-empty", "-m", "topic"]);
+            sh(co, &["checkout", "-q", "feat"]);
+            sh(co, &["merge", "-q", "--no-ff", "--no-edit", "topic"]);
+        });
+        let (r, _) = f.run(&h, None).await;
+        assert!(
+            format!("{:#}", r.as_ref().unwrap_err()).contains("not on origin/main"),
+            "{r:?}"
+        );
+
+        // A READY at a sha that is not an ancestor of the head does not carry.
+        let f = Fake::new();
+        pair(&f);
+        f.comment(&format!("ok\nVERDICT: READY {}", "f".repeat(40)), "OWNER");
+        let (r, _) = f.run(H, None).await;
+        assert!(
+            format!("{:#}", r.as_ref().unwrap_err()).contains("does not carry"),
+            "{r:?}"
+        );
+
+        // More than 50 commits between the verdict and the head refuse to be walked.
+        let f = Fake::new();
+        let co = pair(&f);
+        let h = approved_at_x(&f, &co, &|co| {
+            for _ in 0..51 {
+                sh(co, &["checkout", "-q", "main"]);
+                sh(co, &["commit", "-q", "--allow-empty", "-m", "m"]);
+                sh(co, &["checkout", "-q", "feat"]);
+                sh(co, &["merge", "-q", "--no-ff", "--no-edit", "main"]);
+            }
+            sh(co, &["push", "-q", "-f", "origin", "main"]);
+        });
+        let (r, _) = f.run(&h, None).await;
+        assert!(
+            format!("{:#}", r.as_ref().unwrap_err()).contains("more than 50"),
+            "{r:?}"
+        );
+
+        // A BLOCK as the last comment is never carried past.
+        let f = Fake::new();
+        let co = pair(&f);
+        let h = approved_at_x(&f, &co, &|co| {
+            sh(co, &["merge", "-q", "--no-edit", "main"]);
+        });
+        f.comment(&format!("VERDICT: BLOCK {h} flaky"), "OWNER");
+        let (r, _) = f.run(&h, None).await;
+        assert!(r.is_err());
+        assert!(!f.calls().contains("pr merge"));
     }
 
     #[tokio::test]
