@@ -1885,17 +1885,16 @@ async fn main() -> Result<()> {
                 sock: std::env::var_os("HERDR_SOCKET_PATH").map(PathBuf::from),
             };
             let done = retire::run_here(&here).await;
-            if let Some(body) = done.blocked {
-                if let Err(e) = ctx
+            if let Some(body) = done.blocked
+                && let Err(e) = ctx
                     .write(Envelope::new(
                         ctx.me().await?,
                         &ctx.cli.project,
                         Known::MsgSent(body),
                     ))
                     .await
-                {
-                    eprintln!("the lead was not told: {e:#}");
-                }
+            {
+                eprintln!("the lead was not told: {e:#}");
             }
             if done.ok {
                 println!("{}", done.text);
