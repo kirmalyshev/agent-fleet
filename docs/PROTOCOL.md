@@ -327,7 +327,9 @@ undelivered 6 h after they were sent are not rung (they waited out a reconnect);
 host that would hand them over writes them to the coordinator as **one** `DEADLETTER` digest, ref
 `digest`, text `<n> status reports unread over 6 h:` and one line each (`- <age> ago <from> → <to>
 <TYPE> <ref>: <text>`), oldest first. The digest's `closes` lists every report it hands over, and
-that one event takes them all off their queues; its id is derived from the first. A long absence
+that one event takes them all off their queues. Every hand-over's id is a ULID derived from the
+whole set it closes (the earliest id's time, an FNV-1a hash of the sorted ids): the same set is the
+same event, and a larger one is a new event. A long absence
 costs the coordinator one message per pass, never one per report. A spooled tell replays with its own actor and `ts`, whichever call drains the
 spool, so a tell spooled for days arrives expired and goes to the coordinator, never rung.
 

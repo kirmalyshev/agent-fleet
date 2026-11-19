@@ -1299,7 +1299,7 @@ impl Host {
             let dead = view.state.dead_letters(&self.cfg.host, now);
             for (id, letter) in &dead {
                 let mut e = self.presence(Known::MsgSent(letter.clone())).re(id);
-                e.id = dead_letter_id(id);
+                e.id = dead_letter_id(std::slice::from_ref(id));
                 if self.publish(e).await {
                     eprintln!(
                         "agent-fleet host: {id} handed to the coordinator: {}",
@@ -1310,7 +1310,7 @@ impl Host {
             // Status reports that waited out a reconnect: one digest per pass, never one each.
             if let Some((ids, digest)) = view.state.report_digest(&self.cfg.host, now) {
                 let mut e = self.presence(Known::MsgSent(digest));
-                e.id = dead_letter_id(&ids[0]);
+                e.id = dead_letter_id(&ids);
                 if self.publish(e).await {
                     eprintln!(
                         "agent-fleet host: {} stale reports handed to the coordinator in one digest",
@@ -1530,13 +1530,28 @@ impl Host {
     }
 }
 
-/// The id of the dead letter for the tell `id`: a ULID made from it, so handing the same tell
-/// over twice writes the same event, which the hub keeps once.
-pub(crate) fn dead_letter_id(id: &str) -> String {
-    match ulid::Ulid::from_string(id) {
-        Ok(u) => ulid::Ulid::from_parts(u.timestamp_ms(), u.random() ^ 0xDEAD_1E77E5).to_string(),
-        Err(_) => ulid::Ulid::new().to_string(),
-    }
+/// The id of the dead letter (or digest) handing over the tells `ids`: a ULID made from the whole
+/// set, the earliest id's time and a stable hash (FNV-1a, the same on every host) of the sorted
+/// ids. The same set handed over twice is the same event, which the hub keeps once; a larger set is
+/// a new one.
+pub(crate) fn dead_letter_id(ids: &[String]) -> String {
+    let mut sorted: Vec<&str> = ids.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let fnv = |seed: u64| {
+        sorted.iter().fold(seed, |h, id| {
+            id.bytes()
+                .chain(*b"\n")
+                .fold(h, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+        })
+    };
+    let random = (u128::from(fnv(0xcbf2_9ce4_8422_2325)) << 64
+        | u128::from(fnv(0x6c62_272e_07bb_0142)))
+        & ((1u128 << 80) - 1);
+    let ms = sorted
+        .first()
+        .and_then(|id| ulid::Ulid::from_string(id).ok())
+        .map_or(0, |u| u.timestamp_ms());
+    ulid::Ulid::from_parts(ms, random).to_string()
 }
 
 /// Deliveries after which an unread tell is rung no more (about 2 h 15 min of retransmits): an
@@ -1941,6 +1956,31 @@ mod tests {
     }
 
     #[test]
+    fn a_hand_over_id_is_the_same_for_the_same_set_and_new_for_a_larger_one() {
+        let (a, b, c) = (
+            ulid::Ulid::new().to_string(),
+            ulid::Ulid::new().to_string(),
+            ulid::Ulid::new().to_string(),
+        );
+        let ab = dead_letter_id(&[a.clone(), b.clone()]);
+        assert_eq!(ab, dead_letter_id(&[b.clone(), a.clone()]), "any order");
+        assert_ne!(
+            ab,
+            dead_letter_id(&[a.clone(), b.clone(), c]),
+            "a larger set is a new event"
+        );
+        assert_ne!(ab, dead_letter_id(std::slice::from_ref(&a)));
+        assert!(ulid::Ulid::from_string(&ab).is_ok());
+        let first = ulid::Ulid::from_string(&a).unwrap().timestamp_ms();
+        assert_eq!(ulid::Ulid::from_string(&ab).unwrap().timestamp_ms(), first);
+        // Pinned: every host, every build, computes the same id.
+        assert_eq!(
+            dead_letter_id(&["01M7TX00000000000000000000".into()]),
+            "01M7TX0000HT0BP7S8N0Q4DNT9"
+        );
+    }
+
+    #[test]
     fn retransmits_back_off_from_five_minutes_doubling_to_an_hour() {
         let m = chrono::Duration::minutes;
         let got: Vec<_> = (1..=6).map(retransmit_after).collect();
@@ -2088,7 +2128,7 @@ mod tests {
         );
         // A replay of the same hand-over is the same event: the hub keeps one.
         let orig = got[0].re.clone().unwrap();
-        assert_eq!(dead_letter_id(&orig), got[0].id);
+        assert_eq!(dead_letter_id(&[orig]), got[0].id);
     }
 
     #[tokio::test]
