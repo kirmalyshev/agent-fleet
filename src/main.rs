@@ -310,6 +310,20 @@ enum Cmd {
         #[arg(long)]
         decide: Option<retire::Decide>,
     },
+    /// Merge an approved PR: only when the PR's last comment ends `VERDICT: READY <full head
+    /// sha>`, its head is still `sha`, no submodule pin moves backwards, and the repository's gate
+    /// (`[merge] gate` in the base branch's fleet.toml) or else its required checks pass; then
+    /// `gh pr merge --squash --match-head-commit`, never `--admin`. `[merge] host` names the host
+    /// it runs on, asked through the hub.
+    Merge {
+        /// `<owner/repo>#<pr>`.
+        target: String,
+        /// The approved head sha (7 to 40 hex digits).
+        sha: String,
+        /// Let a submodule pin move backwards, with the reason printed.
+        #[arg(long, value_name = "REASON")]
+        allow_pin_rewind: Option<String>,
+    },
     /// Ring an agent's doorbell: `[agent-fleet <from>→<to>] TYPE ref: text (event <id>; ack: agent-fleet read)`.
     Tell {
         /// An agent that is up (full id or short name), or `coordinator`: the root coordinator,
@@ -1931,6 +1945,69 @@ async fn main() -> Result<()> {
             } else {
                 eprintln!("{}", done.text);
                 std::process::exit(1);
+            }
+        }
+        Cmd::Merge {
+            target,
+            sha,
+            allow_pin_rewind,
+        } => {
+            let (repo, Some(pr)) = spawn::parse_target(target)? else {
+                bail!("not <owner/repo>#<pr>: {target}");
+            };
+            let gh = std::env::var("AGENT_FLEET_GH").unwrap_or_else(|_| "gh".into());
+            let cfg = merge::plan(&gh, &repo, pr).await?;
+            let host = ctx.host_name();
+            if let Some(there) = cfg.host.filter(|h| *h != host) {
+                let body = Known::MergeRequested(event::MergeRequested {
+                    repo: repo.clone(),
+                    pr,
+                    sha: sha.clone(),
+                    host: there.clone(),
+                    allow_pin_rewind: allow_pin_rewind.clone(),
+                });
+                let id = ctx
+                    .write(Envelope::new(ctx.me().await?, &ctx.cli.project, body))
+                    .await?;
+                eprintln!("{repo}#{pr} merges on {there} ([merge] host): asked it");
+                let done = merge::wait_result(&ctx.client()?, &id).await?;
+                if done.ok {
+                    println!("{}", done.text);
+                } else {
+                    eprintln!("{}", done.text);
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            let machine = spawn::machine_dir(&ctx.cli.instance);
+            let here = git_toplevel().ok().map(PathBuf::from);
+            let co = || merge::checkout(&repo, machine.as_deref(), here.clone());
+            let ask = merge::Ask {
+                gh: &gh,
+                repo: &repo,
+                pr,
+                sha,
+                allow_pin_rewind: allow_pin_rewind.as_deref(),
+                checkout: &co,
+                tick: std::time::Duration::from_secs(1),
+            };
+            match merge::run(&ask, &|l| eprintln!("{l}")).await {
+                Ok(m) => {
+                    println!("{}", merge::merged_line(&repo, pr, &m));
+                    let body = Known::MergeDone(merge::done(&repo, pr, m));
+                    if let Err(e) = async {
+                        ctx.write(Envelope::new(ctx.me().await?, &ctx.cli.project, body))
+                            .await
+                    }
+                    .await
+                    {
+                        eprintln!("merged, but merge.done was not logged: {e:#}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    std::process::exit(1);
+                }
             }
         }
         Cmd::Read => {

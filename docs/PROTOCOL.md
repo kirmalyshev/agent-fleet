@@ -101,6 +101,9 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `spawn.result` | agent, ok, pane?, worktree?, error? | re = the request | host |
 | | `retire.requested` | agent, host, decide? — the agent's host runs `retire` itself | | agent, host |
 | | `retire.result` | agent, ok, text | re = the request | host |
+| | `merge.requested` | repo, pr, sha, host, allow_pin_rewind? — `[merge] host` runs `merge` itself | | agent, host |
+| | `merge.result` | ok, text | re = the request | host |
+| | `merge.done` | repo, pr, sha, commit? — a PR `merge` merged; a record, the state keeps nothing | | agent, host |
 | | `agent.unmanaged` | host, pid, program?, cwd?, since? — no `program` clears the report | | host |
 | | `proc.orphaned` | host, pid, cwd?, why?, since? — no `why` clears the report | | host |
 | | `proc.hung` | host, pid, pids[]?, agent?, command?, started?, evidence?, since?, checked? — the topmost hung process an agent started and the hung ones under it (the watch tick, every 2 min); no `evidence` clears the report; folded only from the host actor it names (`host:<host>`) | | host |
@@ -708,7 +711,8 @@ commented reference, and the template `agent-fleet init` writes): a `session` (a
 in, from `HERDR_SESSION`), a `base` ref (default `origin/main`), a
 `brief` template next to the file with `@@KEY@@` placeholders, an optional `ready` script run
 inside a new worktree before the agent starts, an optional `retire` script (same path rules) run
-with a closed agent's worktree as `$1`, `[vars]` for extra tokens, `[profiles]` —
+with a closed agent's worktree as `$1`, `[merge]` for `agent-fleet merge` (see Merging),
+`[vars]` for extra tokens, `[profiles]` —
 a `kind` (the `agent.start`/`agent.quota` program), `args`, `unset_env`, a `prefix` for agent
 names, an optional per-repo `cap`, a `fallback`, and `handoff_min` — and `[[rules]]`, first
 match wins, a rule with no `match` being the default. `match` keywords are case-insensitive
@@ -788,7 +792,9 @@ writes `agent.role` (level, lead from the request) and `task.assigned` for
 last pane is closed (`pane.closed`, `pane.exited`, `workspace.closed`; not an agent that left its
 pane, not a herdr listing gap), and on a failed spawn's new worktree before it is removed; only for
 a worktree a spawn made, and not while another agent holds it (a handoff, a reviewer). The script must itself refuse an
-occupied or dirty tree; the host does not look. A refusal becomes a
+occupied or dirty tree; the host does not look, except that it waits up to 5 s for processes
+rooted in the tree to leave before the script runs: a closed pane's own hooks (a statusline
+script) outlive it by a second or so. A refusal becomes a
 `blocker.raised` naming the agent, and nothing is forced. Any failure undoes what the spawn
 took and answers `ok=false`; a request older than 15 min when first seen is answered `expired`.
 
@@ -803,6 +809,33 @@ without reaching `working`) is a tell to the lead, never a handoff. An agent
 that worked, is `working` or `done`, or whose task closed is never handed off; a replacement
 request that failed does not block a retry.
 
+## Merging
+
+`agent-fleet merge <owner/repo>#<pr> <sha> [--allow-pin-rewind=<reason>]` is the one way an
+approved PR merges, its author's own included. In order, any failure refusing with nothing merged:
+
+1. The PR is open and its head starts with `sha` (7 to 40 hex digits).
+2. The base branch's `.agent-fleet/fleet.toml` (read through `gh api`, so a PR cannot change its
+   own gate) gives `[merge]`: `gate`, a script path in the repository, and `host`, the fleet host
+   that runs the merge. No file or no table: no gate, this host.
+3. `host` set and not this host: the CLI writes `merge.requested` and follows the hub for the
+   `merge.result` (75 min); that host runs the steps below itself, each in its own task, and writes
+   `merge.done`. The rest of this list runs on the host that merges.
+4. The PR's last comment's last non-blank line (`*` and backticks around it are fine) is exactly
+   `VERDICT: READY <the head's full sha>`. A comment after the verdict, a short sha, or unreadable
+   comments refuse.
+5. Every submodule pin the PR moves (a `Subproject commit` change in its file list) moves forward
+   from the base branch's: GitHub's compare says the PR's pin is `ahead` of (or `identical` to) the
+   base's. A pin off GitHub or that compare cannot prove is refused like a rewind;
+   `--allow-pin-rewind=<reason>` lets it through with the reason printed.
+6. `mergeable` is not `CONFLICTING` (`UNKNOWN` is read again 5 times, 6 s apart).
+7. With a `gate`: `<checkout>/<gate> <head sha>` runs in this machine's checkout (the connected
+   one, `agent-fleet repo add`, else the current one when its `origin` is the repository), with
+   `AGENT_FLEET_MERGE_PR=<owner/repo>#<pr>` and, when given, `AGENT_FLEET_ALLOW_PIN_REWIND`; exit 0
+   passes (60 min limit). Without one: `gh pr checks --required`, waited on while they run (9 min);
+   a failed or cancelled check, or no required checks at all, refuses.
+8. The head and the verdict are read again (a push or a later comment during the gate refuses),
+   then `gh pr merge --squash --match-head-commit <head>`, never `--admin`, and `merge.done`.
 ## Self-update
 
 A host runs the binary `cargo install --path <clone>` built from its own clone. The build embeds

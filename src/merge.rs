@@ -11,6 +11,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::event::Envelope;
+
 /// fleet.toml's `[merge]`, read from the PR's base branch so a PR cannot change its own gate.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -158,7 +160,8 @@ async fn gh(bin: &str, args: &[&str], ok_codes: &[i32]) -> Result<String> {
         .await
         .with_context(|| format!("run gh {}", args.join(" ")))?;
     let code = out.status.code().unwrap_or(-1);
-    if !out.status.success() && !ok_codes.contains(&code) {
+    // An allowed failure still has to answer: empty stdout is the plain failure it looks like.
+    if !out.status.success() && (!ok_codes.contains(&code) || out.stdout.is_empty()) {
         bail!(
             "gh {}: {}",
             args.join(" "),
@@ -512,6 +515,146 @@ pub async fn run(a: &Ask<'_>, say: &(dyn Fn(String) + Sync)) -> Result<Merged> {
     bail!("#{n}: gh pr merge answered, but the PR is not MERGED yet; check it")
 }
 
+/// What `agent-fleet merge` prints for a merged PR.
+pub fn merged_line(repo: &str, pr: u64, m: &Merged) -> String {
+    format!(
+        "{repo}#{pr} MERGED at {} (head {})",
+        m.commit.as_deref().unwrap_or("an unreported commit"),
+        m.head
+    )
+}
+
+/// The `merge.done` of a merged PR.
+pub fn done(repo: &str, pr: u64, m: Merged) -> crate::event::MergeDone {
+    crate::event::MergeDone {
+        repo: repo.into(),
+        pr,
+        sha: m.head,
+        commit: m.commit,
+    }
+}
+
+/// How long a `merge.requested` waits for its host: a gate takes minutes.
+const WAIT: Duration = Duration::from_secs(75 * 60);
+
+/// Follows the hub until the request's `merge.result` arrives.
+pub async fn wait_result(
+    client: &crate::client::Client,
+    id: &str,
+) -> Result<crate::event::MergeResult> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        match client.state().await {
+            Ok(s) => {
+                if let Some(r) = s.merges.get(id).and_then(|m| m.result.clone()) {
+                    return Ok(r);
+                }
+            }
+            Err(e) if e.downcast_ref::<crate::client::Refused>().is_some() => {
+                bail!("waiting for the merge result: {e:#}");
+            }
+            Err(_) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "no merge.result for {id} within 75 min: the host may be down (or too old an agent-fleet to answer merge requests)"
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// The `merge.requested` ids this host should run: its own, unanswered, not seen before, and
+/// younger than a spawn request may be.
+pub fn due(
+    state: &crate::state::State,
+    host: &str,
+    seen: &mut std::collections::HashSet<String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    seen.retain(|id| state.merges.get(id).is_some_and(|m| m.result.is_none()));
+    state
+        .merges
+        .iter()
+        .filter(|(id, m)| {
+            m.request.host == host
+                && m.result.is_none()
+                && now - m.since <= crate::spawn::REQUEST_MAX_AGE
+                && seen.insert((*id).clone())
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// The host's side: each merge asked of this host runs in its own task (a gate takes minutes,
+/// the spawn loop must not wait on it) and is answered with `merge.result`, plus `merge.done`.
+// ponytail: two host agents on one host (two herdr sessions) both run it; the second finds the
+// PR merged and refuses. A per-host claim if a doubled gate run ever costs too much.
+pub fn serve(
+    host: &std::sync::Arc<crate::host::Host>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    let Ok(view) = host.view() else { return };
+    for id in due(&view.state, &host.cfg.host, seen, chrono::Utc::now()) {
+        let Some(m) = view.state.merges.get(&id).cloned() else {
+            continue;
+        };
+        let host = host.clone();
+        tokio::spawn(async move {
+            let r = &m.request;
+            // A self-update drain waits for this: a restart mid-gate would kill it half done.
+            let Some(_busy) = host.busy_guard(format!("merge of {}#{}", r.repo, r.pr)) else {
+                return;
+            };
+            let gh = std::env::var("AGENT_FLEET_GH").unwrap_or_else(|_| "gh".into());
+            let machine = host.cfg.config_dir.clone();
+            let here = host
+                .cfg
+                .checkouts_now()
+                .ok()
+                .and_then(|mut c| c.remove(&r.repo));
+            let co = || checkout(&r.repo, machine.as_deref(), here.clone());
+            let said = std::sync::Mutex::new(Vec::<String>::new());
+            let ask = Ask {
+                gh: &gh,
+                repo: &r.repo,
+                pr: r.pr,
+                sha: &r.sha,
+                allow_pin_rewind: r.allow_pin_rewind.as_deref(),
+                checkout: &co,
+                tick: Duration::from_secs(1),
+            };
+            let out = run(&ask, &|l| said.lock().unwrap().push(l)).await;
+            let mut text = said.into_inner().unwrap();
+            let ok = match out {
+                Ok(merged) => {
+                    text.push(merged_line(&r.repo, r.pr, &merged));
+                    host.publish(Envelope::new(
+                        host.actor(),
+                        &m.project,
+                        crate::event::Known::MergeDone(done(&r.repo, r.pr, merged)),
+                    ))
+                    .await;
+                    true
+                }
+                Err(e) => {
+                    text.push(format!("{e:#}"));
+                    false
+                }
+            };
+            let text = crate::spawn::tail(&text.join("\n"));
+            eprintln!("agent-fleet host: merge of {}#{}: {text}", r.repo, r.pr);
+            host.publish(
+                host.presence(crate::event::Known::MergeResult(
+                    crate::event::MergeResult { ok, text },
+                ))
+                .re(&id),
+            )
+            .await;
+        });
+    }
+}
+
 /// This machine's checkout of `repo` for its gate: the connected one (`agent-fleet repo add`,
 /// in `machine`), else `here` when its `origin` is `repo`.
 pub fn checkout(repo: &str, machine: Option<&Path>, here: Option<PathBuf>) -> Result<PathBuf> {
@@ -597,6 +740,47 @@ esac
         }
     }
 
+    #[test]
+    fn a_host_runs_only_its_own_fresh_unanswered_merges_once() {
+        use crate::event::{MergeRequested, MergeResult};
+        use crate::state::{Merge, State};
+        let now = chrono::Utc::now();
+        let mut state = State::default();
+        for (id, host, age_min, answered) in [
+            ("mine", "box", 1, false),
+            ("old", "box", 20, false),
+            ("answered", "box", 1, true),
+            ("theirs", "mac", 1, false),
+        ] {
+            state.merges.insert(
+                id.into(),
+                Merge {
+                    request: MergeRequested {
+                        repo: "o/r".into(),
+                        pr: 7,
+                        sha: H.into(),
+                        host: host.into(),
+                        allow_pin_rewind: None,
+                    },
+                    by: "agent:mac/s/me".into(),
+                    project: "p".into(),
+                    result: answered.then(|| MergeResult {
+                        ok: true,
+                        text: String::new(),
+                    }),
+                    since: now - chrono::Duration::minutes(age_min),
+                },
+            );
+        }
+        let mut seen = Default::default();
+        assert_eq!(due(&state, "box", &mut seen, now), vec!["mine".to_string()]);
+        assert!(due(&state, "box", &mut seen, now).is_empty(), "once");
+        assert_eq!(
+            head_matches(H, "xyz"),
+            Err("\"xyz\" is not a sha (7 to 40 hex digits)".into())
+        );
+    }
+
     #[tokio::test]
     async fn an_approved_head_with_green_required_checks_squash_merges_without_admin() {
         let f = Fake::new();
@@ -620,41 +804,41 @@ esac
 
     #[tokio::test]
     async fn a_moved_head_a_missing_verdict_or_red_checks_refuse_and_merge_nothing() {
-        let f = Fake::new();
-        let (r, _) = f.run("abcdef12", None).await;
-        assert!(format!("{:#}", r.unwrap_err()).contains("head moved"));
+        async fn refused(f: Fake, sha: &str, says: &str) {
+            let e = format!("{:#}", f.run(sha, None).await.0.unwrap_err());
+            assert!(e.contains(says), "{e}");
+            assert!(!f.calls().contains("pr merge"), "{}", f.calls());
+        }
+        refused(Fake::new(), "abcdef12", "head moved").await;
+        refused(Fake::new(), "xyz", "not a sha").await;
 
         let f = Fake::new();
-        f.put(
-            "comment",
-            &serde_json::to_string(&format!("VERDICT: READY {H}\nnit: later")).unwrap(),
-        );
-        let (r, _) = f.run(H, None).await;
-        assert!(format!("{:#}", r.unwrap_err()).contains("last comment"));
+        let late = format!("VERDICT: READY {H}\nnit: later");
+        f.put("comment", &serde_json::to_string(&late).unwrap());
+        refused(f, H, "last comment").await;
 
         let f = Fake::new();
         f.put("comment", "null");
-        assert!(f.run(H, None).await.0.is_err(), "no comments at all");
+        refused(f, H, "no comments").await;
 
         let f = Fake::new();
         f.put("checks", r#"[{"name":"build","bucket":"fail"}]"#);
         f.put("checks_rc", "1");
-        let (r, _) = f.run(H, None).await;
-        assert!(format!("{:#}", r.unwrap_err()).contains("REQUIRED CHECK FAILED: build"));
+        refused(f, H, "REQUIRED CHECK FAILED: build").await;
 
         let f = Fake::new();
         f.put("checks", r#"[{"name":"build","bucket":"pending"}]"#);
         f.put("checks_rc", "8");
-        let (r, _) = f.run(H, None).await;
-        assert!(format!("{:#}", r.unwrap_err()).contains("still running"));
+        refused(f, H, "still running").await;
+
+        let f = Fake::new();
+        f.put("checks", "[]");
+        refused(f, H, "no required checks").await;
 
         let f = Fake::new();
         f.put("checks", "");
         f.put("checks_rc", "1");
-        assert!(f.run(H, None).await.0.is_err(), "unreadable checks refuse");
-        for f in [f] {
-            assert!(!f.calls().contains("pr merge"), "{}", f.calls());
-        }
+        refused(f, H, "unreadable").await;
     }
 
     #[tokio::test]
@@ -756,6 +940,8 @@ esac
             config_of("[merge]\ngate = \"/bin/true\"\n").is_err(),
             "absolute"
         );
+        let full = "brief = \"b.md\"\n[merge]\ngate = \"g.sh\"\n[profiles.x]\nkind = \"claude\"\n[[rules]]\nprofile = \"x\"\n";
+        crate::spawn::FleetConfig::parse(full).expect("spawn reads a fleet.toml with [merge]");
     }
 
     #[test]

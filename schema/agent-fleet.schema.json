@@ -662,6 +662,94 @@
           ],
           "type": "string"
         },
+        "MergeDone": {
+          "additionalProperties": false,
+          "description": "A PR merged by `agent-fleet merge`.",
+          "properties": {
+            "commit": {
+              "description": "The merge commit on the base branch, when `gh` reported it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pr": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "repo": {
+              "description": "`owner/repo`.",
+              "type": "string"
+            },
+            "sha": {
+              "description": "The approved head that was merged.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo",
+            "pr",
+            "sha"
+          ],
+          "type": "object"
+        },
+        "MergeRequested": {
+          "additionalProperties": false,
+          "description": "`agent-fleet merge` for a repository whose fleet.toml `[merge] host` names another host asks\nthat host to run the whole merge: the verdict, pin and head checks, its gate, `gh pr merge`.",
+          "properties": {
+            "allow_pin_rewind": {
+              "description": "`--allow-pin-rewind`: the reason a submodule pin may move backwards.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "description": "The host that runs it.",
+              "type": "string"
+            },
+            "pr": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "repo": {
+              "description": "`owner/repo`.",
+              "type": "string"
+            },
+            "sha": {
+              "description": "The approved head sha, or a prefix of it (7+ hex digits).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo",
+            "pr",
+            "sha",
+            "host"
+          ],
+          "type": "object"
+        },
+        "MergeResult": {
+          "additionalProperties": false,
+          "description": "The `merge.requested` named by `re`, answered by the host that ran it.",
+          "properties": {
+            "ok": {
+              "description": "False when nothing was merged: a refusal, a failed gate, or an error.",
+              "type": "boolean"
+            },
+            "text": {
+              "description": "What `agent-fleet merge` prints on that host.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "ok",
+            "text"
+          ],
+          "type": "object"
+        },
         "MsgDelivered": {
           "additionalProperties": false,
           "description": "The `msg.sent` named by `re` reached the agent, which then turned `observed`.",
@@ -2018,6 +2106,54 @@
         {
           "properties": {
             "data": {
+              "$ref": "#/$defs/MergeRequested"
+            },
+            "type": {
+              "const": "merge.requested",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/MergeResult"
+            },
+            "type": {
+              "const": "merge.result",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/MergeDone"
+            },
+            "type": {
+              "const": "merge.done",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
               "$ref": "#/$defs/AgentUnmanaged"
             },
             "type": {
@@ -2485,6 +2621,99 @@
             "root-coordinator"
           ],
           "type": "string"
+        },
+        "Merge": {
+          "description": "A `merge.requested` and the `merge.result` that answered it.",
+          "properties": {
+            "by": {
+              "description": "Who asked (the request's actor id).",
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            },
+            "request": {
+              "$ref": "#/$defs/MergeRequested"
+            },
+            "result": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/MergeResult"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "since": {
+              "description": "The request's `ts`.",
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "request",
+            "by",
+            "project",
+            "since"
+          ],
+          "type": "object"
+        },
+        "MergeRequested": {
+          "additionalProperties": false,
+          "description": "`agent-fleet merge` for a repository whose fleet.toml `[merge] host` names another host asks\nthat host to run the whole merge: the verdict, pin and head checks, its gate, `gh pr merge`.",
+          "properties": {
+            "allow_pin_rewind": {
+              "description": "`--allow-pin-rewind`: the reason a submodule pin may move backwards.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "description": "The host that runs it.",
+              "type": "string"
+            },
+            "pr": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "repo": {
+              "description": "`owner/repo`.",
+              "type": "string"
+            },
+            "sha": {
+              "description": "The approved head sha, or a prefix of it (7+ hex digits).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo",
+            "pr",
+            "sha",
+            "host"
+          ],
+          "type": "object"
+        },
+        "MergeResult": {
+          "additionalProperties": false,
+          "description": "The `merge.requested` named by `re`, answered by the host that ran it.",
+          "properties": {
+            "ok": {
+              "description": "False when nothing was merged: a refusal, a failed gate, or an error.",
+              "type": "boolean"
+            },
+            "text": {
+              "description": "What `agent-fleet merge` prints on that host.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "ok",
+            "text"
+          ],
+          "type": "object"
         },
         "Msg": {
           "properties": {
@@ -3732,6 +3961,14 @@
           },
           "default": {},
           "description": "Capacity rules by `<host>:<name>`.",
+          "type": "object"
+        },
+        "merges": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Merge"
+          },
+          "default": {},
+          "description": "Merge requests by their `merge.requested` id, kept for 24 h.",
           "type": "object"
         },
         "msgs": {

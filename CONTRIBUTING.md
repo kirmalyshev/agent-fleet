@@ -74,6 +74,7 @@ One crate, one binary. `docs/PROTOCOL.md` is the spec, `schema/` the generated J
 | `src/setup.rs` | `init` and `repo add`, `ls`, `rm`: the machine's `fleet.toml`, brief and connected repos. |
 | `src/dev.rs` | `agent-fleet dev`: per-worktree slots and services from `.agent-fleet/dev.toml`. |
 | `src/kill.rs` | `agent-fleet kill` and `hook bash`. |
+| `src/merge.rs` | `agent-fleet merge`: the approved-sha merge, its gate or required checks, and the host's side of `merge.requested`. |
 | `src/doctor.rs` | Findings read off the state. |
 | `src/worktree.rs` | `dev ls` and `dev clean`: every connected repo's worktrees and finished branches. |
 | `src/prs.rs` | `dev agents` and `dev prs`: open PRs, their health, and the agents on them. |
