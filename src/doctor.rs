@@ -903,30 +903,29 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
             ));
         }
     }
-    // Per recipient: how many tells wait, the oldest, and what the recipient is doing.
+    // Per recipient (a `coordinator` tell counts for its holder): how many tells wait, the
+    // oldest, and what the recipient is doing. A recipient that is not up has no host to ring
+    // it; `tell` refuses such a recipient.
     let mut waiting: BTreeMap<&str, (usize, DateTime<Utc>)> = BTreeMap::new();
-    // A recipient that is not up has no host to ring it; `tell` refuses such a recipient.
-    for m in s.msgs.values().filter(|m| {
-        now - m.since >= UNDELIVERED && s.recipient(&m.to).is_some_and(|r| s.agents.contains_key(r))
-    }) {
-        let w = waiting.entry(&m.to).or_insert((0, m.since));
+    for m in s.msgs.values().filter(|m| now - m.since >= UNDELIVERED) {
+        let Some(r) = s.recipient(&m.to).filter(|r| s.agents.contains_key(*r)) else {
+            continue;
+        };
+        let w = waiting.entry(r).or_insert((0, m.since));
         w.0 += 1;
         w.1 = w.1.min(m.since);
     }
     for (to, (n, since)) in waiting {
-        let doing =
-            s.recipient(to)
-                .and_then(|r| s.agents.get(r))
-                .map_or("not up".to_string(), |a| {
-                    let st = serde_json::to_value(a.state).unwrap_or_default();
-                    format!("{} for {}", st.as_str().unwrap_or("?"), ago(now, a.since))
-                });
+        let a = &s.agents[to];
+        let st = serde_json::to_value(a.state).unwrap_or_default();
         out.push(finding(
             "undelivered",
             to,
             format!(
-                "{n} tell(s) waiting, oldest {}; recipient is {doing}",
-                ago(now, since)
+                "{n} tell(s) waiting, oldest {}; recipient is {} for {}",
+                ago(now, since),
+                st.as_str().unwrap_or("?"),
+                ago(now, a.since)
             ),
         ));
     }
@@ -2255,5 +2254,47 @@ mod tests {
             f[0].detail
         );
         assert!(f[0].detail.contains("working"), "{}", f[0].detail);
+    }
+
+    #[test]
+    fn a_coordinator_tell_counts_for_its_holder() {
+        use crate::state::Msg;
+        let now = Utc::now();
+        let id = "agent:h/s/c";
+        let mut s = State::default();
+        s.agents
+            .insert(id.into(), agent(AgentState::Working, now, "/w/c", 0, 0));
+        s.roles.insert(
+            id.into(),
+            crate::state::Role {
+                level: Level::RootCoordinator,
+                lead: None,
+                domain: None,
+                by: id.into(),
+                since: now,
+            },
+        );
+        for (k, to) in [("m1", "coordinator"), ("m2", id)] {
+            s.msgs.insert(
+                k.into(),
+                Msg {
+                    from: "agent:h/s/x".into(),
+                    to: to.into(),
+                    kind: "OK".into(),
+                    reference: "r".into(),
+                    text: "t".into(),
+                    since: now - UNDELIVERED - Duration::minutes(1),
+                },
+            );
+        }
+        assert_eq!(s.pending_for(id).0, 2);
+        assert_eq!(s.pending_for("coordinator").0, 2);
+        let f = findings(&s, now);
+        assert_eq!(
+            kinds(&f),
+            [("undelivered", id)],
+            "one finding, for the holder"
+        );
+        assert!(f[0].detail.starts_with("2 tell(s)"), "{}", f[0].detail);
     }
 }

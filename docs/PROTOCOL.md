@@ -383,6 +383,7 @@ how many worktrees may hold any of a set of resources at once.
 | `unpushed` | an agent's worktree holding commits no remote has for an hour |
 | `orphan` | processes running in a deleted worktree, with their pids |
 | `breach` | more worktrees hold a rule's resources than its `max`, while the rule lasts |
+| `undelivered` | tells to an up recipient pending 10 min (a `coordinator` tell counts for its holder); one per recipient, with the count, the oldest, and what the recipient is doing |
 | `queued` | a process waiting 10 min for a resource, with who holds it |
 | `refused` | `agent-fleet kill` refused a pid in the last hour, with the reason; a pid already gone (`no such process`) is no finding |
 | `role` | an agent's declared lead is down, the lead's level is not above its own, or a second root coordinator is up |

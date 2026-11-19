@@ -1848,12 +1848,12 @@ async fn main() -> Result<()> {
                 .recipient(&to)
                 .and_then(|r| state.agents.get(r))
                 .is_some_and(|a| !matches!(a.state, AgentState::Idle | AgentState::Done));
-            let recipient_queues = state::queues_input(
-                state
-                    .recipient(&to)
-                    .and_then(|r| state.agents.get(r))
-                    .and_then(|a| a.kind.as_deref()),
-            );
+            let recipient_queues = state
+                .recipient(&to)
+                .and_then(|r| state.agents.get(r))
+                .is_some_and(|a| {
+                    a.state == AgentState::Working && state::queues_input(a.kind.as_deref())
+                });
             let waiting = state.pending_for(&to).0 + 1;
             let body = MsgSent {
                 to: to.clone(),
