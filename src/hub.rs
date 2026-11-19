@@ -1487,6 +1487,7 @@ mod tests {
                 observed: AgentState::Working,
                 rung: None,
                 attempts: None,
+                ack: false,
             }),
         )
         .re(mid.clone());

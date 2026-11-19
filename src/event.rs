@@ -653,6 +653,10 @@ pub struct MsgDelivered {
     // `Some(0)`: closed unrung, a stale status report (host.rs delivery_loop).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempts: Option<u32>,
+    /// The ring asked for an ack (`(ack: agent-fleet read)`): the tell stays unread, and is rung
+    /// again, until its recipient's `msg.read`. Absent on rings older than the ack.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ack: bool,
 }
 
 /// The recipient read the `msg.sent` named by `re` itself (`agent-fleet read`): its ack. Only

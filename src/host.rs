@@ -1277,6 +1277,9 @@ impl Host {
         let mut waiting: HashSet<String> = HashSet::new();
         // Queued rings typed once whose text was not seen: never typed a second time.
         let mut typed: HashSet<String> = HashSet::new();
+        // Retransmits typed, by the ring count they answer: one typing per backoff cycle, even when
+        // its `msg.delivered` fails to write (the next pass writes it, never types again).
+        let mut retyped: HashMap<String, u32> = HashMap::new();
         loop {
             tokio::select! {
                 _ = self.wake.notified() => {}
@@ -1296,15 +1299,19 @@ impl Host {
             attempts.retain(|id, _| live(id));
             waiting.retain(live);
             typed.retain(live);
+            retyped.retain(|id, _| unread.contains_key(id));
             // Delivered and not read (`msg.read`) once its backoff is up: rung again, like a first
             // ring, except that its old ring on the screen proves nothing. An expired one rests.
             let due = unread
                 .iter()
                 .filter(|(_, u)| {
-                    now - u.delivered >= retransmit_after(u.rings) && u.msg.stale(now).is_none()
+                    u.rings < MAX_RINGS
+                        && now - u.delivered >= retransmit_after(u.rings)
+                        && u.msg.stale(now).is_none()
                 })
-                .map(|(id, u)| (id, &u.msg, true));
-            for (id, msg, again) in pending.iter().map(|(id, m)| (id, m, false)).chain(due) {
+                .map(|(id, u)| (id, &u.msg, Some(u.rings)));
+            for (id, msg, cycle) in pending.iter().map(|(id, m)| (id, m, None)).chain(due) {
+                let again = cycle.is_some();
                 // Resolved per pass: a message to `coordinator` follows the role to its holder now.
                 let Some(to) = view.state.recipient(&msg.to) else {
                     continue;
@@ -1316,6 +1323,7 @@ impl Host {
                         observed: AgentState::Idle,
                         rung: None,
                         attempts: Some(0),
+                        ack: false,
                     };
                     if self
                         .publish(self.presence(Known::MsgDelivered(dropped)).re(id))
@@ -1398,6 +1406,22 @@ impl Host {
                         }
                     }
                 }
+                if cycle.is_some() && retyped.get(id) == cycle.as_ref() {
+                    let delivered = MsgDelivered {
+                        to: to.to_string(),
+                        observed: state,
+                        rung: None,
+                        attempts: attempts.get(id).copied(),
+                        ack: true,
+                    };
+                    if self
+                        .publish(self.presence(Known::MsgDelivered(delivered)).re(id))
+                        .await
+                    {
+                        eprintln!("agent-fleet host: retransmitted {id} to {}", msg.to);
+                    }
+                    continue;
+                }
                 let text = doorbell(&msg.from, &msg.to, &msg.kind, &msg.reference, &msg.text, id);
                 // A queued ring is already `working`: there is no new turn to wait for.
                 let params = if queue {
@@ -1411,7 +1435,9 @@ impl Host {
                 bump(&self.n.rings);
                 let rung = chrono::Utc::now();
                 match herdr_call(&self.cfg.herdr_socket, "agent.prompt", params).await {
-                    Ok(_) if queue && self.queued_visible(to, id).await != Some(true) => {
+                    // A retransmit's id is on the screen already (its first ring): seeing it proves
+                    // nothing, so a retyped one counts as rung and waits for its `msg.read`.
+                    Ok(_) if queue && !again && self.queued_visible(to, id).await != Some(true) => {
                         typed.insert(id.clone());
                         bump(&self.n.ring_failures);
                         eprintln!(
@@ -1425,11 +1451,15 @@ impl Host {
                             // Typed: if `msg.delivered` fails to write, never type it again.
                             typed.insert(id.clone());
                         }
+                        if let Some(r) = cycle {
+                            retyped.insert(id.clone(), r);
+                        }
                         let delivered = MsgDelivered {
                             to: to.to_string(),
                             observed: AgentState::Working,
                             rung: Some(rung),
                             attempts: Some(attempt),
+                            ack: true,
                         };
                         if self
                             .publish(self.presence(Known::MsgDelivered(delivered)).re(id))
@@ -1468,6 +1498,7 @@ impl Host {
             observed: AgentState::Working,
             rung: None,
             attempts: Some(attempts.unwrap_or(1)),
+            ack: true,
         };
         if self
             .publish(self.presence(Known::MsgDelivered(delivered)).re(id))
@@ -1485,6 +1516,10 @@ impl Host {
         crate::stuck::screen(self, to).await.map(|t| has_id(&t, id))
     }
 }
+
+/// Deliveries after which an unread tell is rung no more (about 2 h 15 min of retransmits): an
+/// agent that never runs `agent-fleet read` is not typed into all day. It stays unread on the board.
+pub(crate) const MAX_RINGS: u32 = 6;
 
 /// How long a delivered tell waits for its `msg.read` after its `rings`-th delivery before it is
 /// rung again: 5 min, doubling, at most an hour.
@@ -1791,6 +1826,7 @@ mod tests {
                     observed: AgentState::Working,
                     rung: None,
                     attempts: Some(1),
+                    ack: true,
                 }),
             )
             .re(&sent.id)
@@ -1848,9 +1884,15 @@ mod tests {
             "the retransmit is a second msg.delivered"
         );
 
-        // Read: never retransmitted, however long ago it was delivered.
+        // Read: never retransmitted, however long ago it was delivered, busy or not.
         let dir = tempfile::tempdir().unwrap();
-        let (_host, fake) = host_with_delivered(dir.path(), "idle", 50, 1, true).await;
+        let (_host, fake) = host_with_delivered(dir.path(), "working", 50, 1, true).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(fake.prompts.lock().unwrap().is_empty());
+
+        // Rung MAX_RINGS times: left unread, never typed again.
+        let dir = tempfile::tempdir().unwrap();
+        let (_host, fake) = host_with_delivered(dir.path(), "idle", 120, MAX_RINGS, false).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(fake.prompts.lock().unwrap().is_empty());
 

@@ -293,6 +293,7 @@ mod tests {
                 observed: AgentState::Working,
                 rung: Some(s(8)),
                 attempts: Some(2),
+                ack: false,
             }))
             .re(&m1.id),
             s(10),

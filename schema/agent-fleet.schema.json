@@ -666,6 +666,10 @@
           "additionalProperties": false,
           "description": "The `msg.sent` named by `re` reached the agent, which then turned `observed`.",
           "properties": {
+            "ack": {
+              "description": "The ring asked for an ack (`(ack: agent-fleet read)`): the tell stays unread, and is rung\nagain, until its recipient's `msg.read`. Absent on rings older than the ack.",
+              "type": "boolean"
+            },
             "attempts": {
               "description": "Rings it took, this one included.",
               "format": "uint32",

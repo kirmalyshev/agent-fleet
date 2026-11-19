@@ -4450,6 +4450,7 @@ profile = "devin"
                 observed: AgentState::Working,
                 rung: None,
                 attempts: None,
+                ack: false,
             }),
         )
         .re(&send.id)

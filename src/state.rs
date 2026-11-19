@@ -482,15 +482,15 @@ impl Msg {
 }
 
 impl State {
-    /// Tells to `me` (by id, or by a role it holds) not read yet, delivered or not, oldest first:
-    /// what `agent-fleet read` shows and acks.
-    pub fn unread_for(&self, me: &str) -> Vec<(&String, &Msg)> {
+    /// Tells to `me` (by id, or by a role it holds) not read yet and not expired at `now`,
+    /// delivered or not, oldest first: what `agent-fleet read` shows and acks.
+    pub fn unread_for(&self, me: &str, now: DateTime<Utc>) -> Vec<(&String, &Msg)> {
         let mine = |m: &Msg| m.to == me || self.recipient(&m.to) == Some(me);
         let mut v: Vec<_> = self
             .msgs
             .iter()
             .chain(self.unread.iter().map(|(id, u)| (id, &u.msg)))
-            .filter(|(_, m)| mine(m))
+            .filter(|(_, m)| mine(m) && m.stale(now).is_none())
             .collect();
         v.sort_by_key(|(id, m)| (m.since, *id));
         v
@@ -977,8 +977,10 @@ impl State {
             }
             Known::MsgDelivered(d) => {
                 if let Some(re) = &e.re {
-                    // `attempts: 0` closes a stale report unrung: nothing was shown, nothing to read.
-                    let shown = d.attempts != Some(0);
+                    // Only a ring that asked for an ack leaves the tell unread: one older than the ack
+                    // (an upgrade folding its log) never comes back. `attempts: 0` closes a stale
+                    // report unrung: nothing was shown, nothing to read.
+                    let shown = d.ack && d.attempts != Some(0);
                     if let Some(msg) = self.msgs.remove(re) {
                         if shown {
                             let delivered = ts;
@@ -1932,6 +1934,7 @@ mod tests {
                 observed: AgentState::Working,
                 rung: None,
                 attempts: Some(1),
+                ack: true,
             })
         };
         let mut s = State::default();
@@ -1941,11 +1944,11 @@ mod tests {
         assert!(s.msgs.is_empty(), "delivered: no longer waiting for a ring");
         assert_eq!(s.mail_status("e0"), Some(MailStatus::Delivered));
         assert_eq!(
-            s.unread_for(to).len(),
+            s.unread_for(to, t0 + chrono::Duration::minutes(9)).len(),
             1,
             "delivered and unread: still in the inbox"
         );
-        assert!(s.unread_for("agent:h/s/a").is_empty());
+        assert!(s.unread_for("agent:h/s/a", t0).is_empty());
         assert_eq!(s.outbox("agent:h/s/a")[0].3, MailStatus::Delivered);
         let u = &s.unread["e0"];
         assert_eq!(
@@ -1968,8 +1971,28 @@ mod tests {
         assert!(s.unread.is_empty());
         assert_eq!(s.mail_status("e0"), Some(MailStatus::Read));
         assert_eq!(s.read["e0"].at, t0 + chrono::Duration::minutes(8));
-        assert!(s.unread_for(to).is_empty());
+        assert!(
+            s.unread_for(to, t0 + chrono::Duration::minutes(9))
+                .is_empty()
+        );
         assert_eq!(s.outbox("agent:h/s/a")[0].3, MailStatus::Read);
+        // An expired tell is never shown, even before its host closes it.
+        s.apply(&at(
+            10,
+            "agent:h/s/a",
+            None,
+            Known::MsgSent(MsgSent {
+                to: to.into(),
+                kind: "FYI".into(),
+                reference: "r".into(),
+                text: "old".into(),
+            }),
+        ));
+        assert_eq!(s.unread_for(to, t0 + chrono::Duration::hours(23)).len(), 1);
+        assert!(
+            s.unread_for(to, t0 + chrono::Duration::hours(25))
+                .is_empty()
+        );
         // Read is kept 24 h, then pruned by a later event.
         s.apply(&at(
             8 + 24 * 60 + 1,
@@ -2037,10 +2060,26 @@ mod tests {
                 observed: AgentState::Idle,
                 rung: None,
                 attempts: Some(0),
+                ack: false,
             }),
         ));
         assert!(s.unread.is_empty());
         assert_eq!(s.mail_status("e2"), None);
+        // A ring older than the ack (no `ack`): delivered for good, never unread, never rung again.
+        s.apply(&at(4, "agent:h/s/a", None, sent("agent:h/s/b")));
+        s.apply(&at(
+            5,
+            "host:h",
+            Some("e4"),
+            Known::MsgDelivered(MsgDelivered {
+                to: "agent:h/s/b".into(),
+                observed: AgentState::Working,
+                rung: None,
+                attempts: Some(1),
+                ack: false,
+            }),
+        ));
+        assert!(s.msgs.is_empty() && s.unread.is_empty());
     }
 
     #[test]
@@ -2319,6 +2358,7 @@ mod tests {
                     observed: AgentState::Working,
                     rung: None,
                     attempts: None,
+                    ack: false,
                 }),
             )
             .re(&mid)
@@ -2429,6 +2469,7 @@ mod tests {
                     observed: AgentState::Working,
                     rung: None,
                     attempts: None,
+                    ack: false,
                 }),
             )
             .re(&mid)

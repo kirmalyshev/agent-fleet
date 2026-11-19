@@ -292,14 +292,19 @@ raises `undelivered` for an up recipient whose tell has waited 10 minutes.
 A ring is not proof the agent saw it: Claude Code can drop queued input. So every tell goes
 **sent → delivered → read**. The doorbell ends `(event <id>; ack: agent-fleet read)`, and the
 recipient pulls its own mail with `agent-fleet read` at every turn start: it prints each tell sent
-to it (or to a role it holds) that it has not read, delivered or not, oldest first with the
+to it (or to a role it holds) that it has not read and that has not expired, delivered or not, oldest first with the
 **original** sender and send time, then writes one `msg.read` per tell (`re` = the send). Only the
 recipient's own `msg.read` counts; one from any other actor is ignored. A tell read before its
 ring is never rung.
 
-A delivered tell with no `msg.read` is rung again (a retransmit, written as another
-`msg.delivered`) 5 min after its delivery, then 10, 20, 40 and every 60 min after each further
-one, under the same rules as a first ring, except that its old ring on the screen proves nothing.
+A ring that asks for the ack writes `msg.delivered` with `ack: true`; only such a delivery leaves
+the tell unread (a `msg.delivered` without it, from a host older than the ack, delivers for good,
+so an upgrade never re-rings the day's tells). A delivered tell with no `msg.read` is rung again (a
+retransmit, written as another `msg.delivered`) 5 min after its delivery, then 10, 20, 40 and
+60 min after each further one, at most 6 deliveries in all; then it stays unread on the board. A
+retransmit follows the rules of a first ring, except that its old ring on the screen proves
+nothing: once typed it counts as rung, and it is typed at most once per backoff step, even when
+its `msg.delivered` has to be written again.
 `agent-fleet sent` shows the sender each of its tells as `sent`, `unread <age since the last
 delivery>`, or `read`; the board lists unread ones the same way. Read tells stay in the state for
 24 h after the read.
