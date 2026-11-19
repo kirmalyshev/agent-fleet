@@ -582,6 +582,41 @@ pub async fn guarded(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_host_runs_only_its_own_unanswered_retires_once() {
+        use crate::event::RetireRequested;
+        use crate::state::{Retire, State};
+        let now = chrono::Utc::now();
+        let mut state = State::default();
+        let mut add = |id: &str, host: &str, age_min: i64, answered: bool| {
+            state.retires.insert(
+                id.into(),
+                Retire {
+                    request: RetireRequested {
+                        agent: "agent:kir/s/a".into(),
+                        host: host.into(),
+                        decide: None,
+                    },
+                    by: "agent:mac/s/me".into(),
+                    project: "p".into(),
+                    result: answered.then(|| crate::event::RetireResult {
+                        agent: "agent:kir/s/a".into(),
+                        ok: true,
+                        text: String::new(),
+                    }),
+                    since: now - chrono::Duration::minutes(age_min),
+                },
+            );
+        };
+        add("mine", "kir", 1, false);
+        add("theirs", "mac", 1, false);
+        add("done", "kir", 1, true);
+        add("old", "kir", 60, false);
+        let mut seen = std::collections::HashSet::new();
+        assert_eq!(due(&state, "kir", &mut seen, now), vec!["mine".to_string()]);
+        assert!(due(&state, "kir", &mut seen, now).is_empty(), "not twice");
+    }
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 

@@ -98,6 +98,8 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `handoff` | to, next, done?, evidence[], learned? | task | agent |
 | spawn | `spawn.requested` | name, agent, host, session, repo, issue?, branch, profile, brief, level?, lead?, worktree?, replaces?, why | | agent, host |
 | | `spawn.result` | agent, ok, pane?, worktree?, error? | re = the request | host |
+| | `retire.requested` | agent, host, decide? — the agent's host runs `retire` itself | | agent, host |
+| | `retire.result` | agent, ok, text | re = the request | host |
 | | `agent.unmanaged` | host, pid, program?, cwd?, since? — no `program` clears the report | | host |
 | | `proc.orphaned` | host, pid, cwd?, why?, since? — no `why` clears the report | | host |
 | | `proc.hung` | host, pid, pids[]?, agent?, command?, started?, evidence?, since?, checked? — the topmost hung process an agent started and the hung ones under it (the watch tick, every 2 min); no `evidence` clears the report; folded only from the host actor it names (`host:<host>`) | | host |

@@ -2286,6 +2286,41 @@ mod tests {
         assert_eq!(State::fold(&events).tasks["task:p/1"].blocked_by.len(), 20);
     }
 
+    #[test]
+    fn a_retire_is_answered_once_and_only_by_the_host_it_names() {
+        use crate::event::{RetireRequested, RetireResult};
+        let mut s = State::default();
+        let req = by(
+            "agent:mac/s/me",
+            Known::RetireRequested(RetireRequested {
+                agent: "agent:kir/s/dv-1".into(),
+                host: "kir".into(),
+                decide: None,
+            }),
+        );
+        let id = req.id.clone();
+        s.apply(&req.into_event());
+        assert!(s.retires[&id].result.is_none());
+        let answer = |host: &str, ok: bool| {
+            by(
+                host,
+                Known::RetireResult(RetireResult {
+                    agent: "agent:kir/s/dv-1".into(),
+                    ok,
+                    text: format!("from {host}"),
+                }),
+            )
+            .re(&id)
+            .into_event()
+        };
+        s.apply(&answer("host:mac", true));
+        assert!(s.retires[&id].result.is_none(), "another host cannot answer");
+        s.apply(&answer("host:kir", false));
+        s.apply(&answer("host:kir", true));
+        let r = s.retires[&id].result.as_ref().unwrap();
+        assert!(!r.ok && r.text == "from host:kir", "the first answer stands");
+    }
+
     fn by(id: &str, body: Known) -> Envelope<Known> {
         let kind = if id.starts_with("host:") {
             ActorKind::Host
