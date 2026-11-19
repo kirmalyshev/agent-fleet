@@ -6,6 +6,7 @@ mod event;
 mod host;
 mod hub;
 mod kill;
+mod merge;
 mod orphanpr;
 mod prs;
 mod quota;

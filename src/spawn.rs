@@ -137,7 +137,7 @@ fn is_env_name(s: &str) -> bool {
 }
 
 /// A `ready` path is relative and made only of normal components — no `..`, no root.
-fn check_ready(r: &str) -> Result<()> {
+pub(crate) fn check_ready(r: &str) -> Result<()> {
     let p = Path::new(r);
     if r.is_empty()
         || p.components()
