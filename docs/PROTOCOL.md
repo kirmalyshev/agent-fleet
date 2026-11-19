@@ -846,7 +846,11 @@ approved PR merges, its author's own included. Any failure refuses with nothing 
 4. The PR's last issue comment (reviews are not read) is by an owner, member or collaborator,
    and its last non-blank line (`*` and backticks around it are fine) is exactly
    `VERDICT: READY <the head's full sha>`. A comment after the verdict, a short sha, or
-   unreadable comments refuse.
+   unreadable comments refuse. A `VERDICT: READY <other full sha>` still counts — it is
+   "carried" — when every commit on the head's first-parent chain down to that sha is a clean
+   two-parent merge: the other parent an ancestor of `origin/<base>` and the merge's tree equal
+   to `git merge-tree --write-tree`'s own answer, so the verdict covered exactly this content.
+   Up to 50 merges, proved in this machine's checkout (step 7's); anything else refuses.
 5. Every submodule pin the PR moves (a `Subproject commit` change in its file list) moves forward
    from the base branch's: GitHub's compare says the PR's pin is `ahead` of (or `identical` to) the
    base's. A pin off GitHub, missing on the base branch, or one compare cannot prove is refused
