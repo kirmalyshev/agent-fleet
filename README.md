@@ -461,7 +461,7 @@ From `agent-fleet --help`; every command has its own `--help`.
 | `role` | Declare an agent's level of responsibility (root-coordinator, domain-lead, implementation-lead, implementer), or with no level show its role, its chain of leads and its direct reports |
 | `spawn` | Spawn an agent on an issue, or with `--title` on work that has none: the machine's fleet.toml (`agent-fleet init`), or the project's own `.agent-fleet/fleet.toml`, picks the profile and host, the host agent runs it (worktree, env scrub, agent start, the brief) and answers `spawn.result`. Follows the hub until the result arrives (10 min) |
 | `handoff` | Hand an agent's issue, branch and existing worktree to a new agent of `--to` (default: its profile's fallback), then close the replaced agent's pane and workspace |
-| `retire` | Close a spawned agent and retire its worktree, locked: real uncommitted changes stop the retire and are shown to you and the agent's lead until `--decide` says delete, keep, or stash (a patch first). Run it in the agent's repository, on the agent's host |
+| `retire` | Close a spawned agent and retire its worktree, locked: real uncommitted changes stop the retire and are shown to you and the agent's lead until `--decide` says delete, keep, or stash (a patch first). Run it on any host: from another host it asks the agent's host (through the hub) to run it there |
 | `tell` | Ring an agent's doorbell: `[agent-fleet <from>→<to>] TYPE ref: text (event <id>)` |
 | `stats` | Numbers about the fleet: doorbell latency and loss, event lag, host and hub vitals |
 | `proc` | What the log says of a process on this host: `hung`, `orphan`, `waiting` (in a lock's queue), `no report` (not hung, or not watched), or `gone` |
