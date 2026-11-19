@@ -1901,7 +1901,7 @@ async fn main() -> Result<()> {
             // Locked, then read, all BEFORE the pane closes: a refusal leaves the agent up and
             // starts no host retire; the host's retire of the close that does follow waits on
             // these locks and finds the tree gone.
-            let (_a, b) = retire::locks(Path::new(&wt), retire::WAIT).await?;
+            let (_a, b) = retire::locks(&checkout, Path::new(&wt), retire::WAIT).await?;
             let outcome = match retire::assess(&plan, &wt, *decide) {
                 retire::Ready::Gone => retire::Outcome::Gone,
                 retire::Ready::Kept => retire::Outcome::Kept,

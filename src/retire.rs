@@ -298,13 +298,21 @@ async fn lock_file(path: &Path, wait: Duration, what: &str) -> Result<Held> {
 }
 
 /// (A) this worktree's lock, then (B) the repository's, both in the WORKTREE's git common dir —
-/// the same files whichever checkout or clone the caller stands in. Never the other order, and
+/// the same files whichever checkout or clone the caller stands in (the checkout's for a
+/// directory that is no worktree). Never the other order, and
 /// nothing takes A while holding B, so no two retires can wait on each other.
-pub async fn locks(wt: &Path, wait: Duration) -> Result<(Held, Held)> {
+pub async fn locks(checkout: &Path, wt: &Path, wait: Duration) -> Result<(Held, Held)> {
+    // The checkout's only for a directory that is no git worktree at all (it holds no git work).
     let common = git(
         wt,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )
+    .or_else(|| {
+        git(
+            checkout,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+    })
     .with_context(|| {
         format!(
             "git could not name {}'s common dir, where the retire locks live",
@@ -532,7 +540,7 @@ pub async fn guarded(
     if !tree.exists() {
         return Ok(Outcome::Gone);
     }
-    let (_a, b) = locks(tree, wait).await?;
+    let (_a, b) = locks(plan.checkout, tree, wait).await?;
     match assess(plan, wt, decide) {
         Ready::Gone => Ok(Outcome::Gone),
         Ready::Kept => Ok(Outcome::Kept),
