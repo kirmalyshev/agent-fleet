@@ -1907,28 +1907,20 @@ async fn main() -> Result<()> {
                 retire::Ready::Kept => retire::Outcome::Kept,
                 retire::Ready::Refused(why) => retire::Outcome::Refused(why),
                 retire::Ready::Go => {
-                    if state.agents.contains_key(&sp.request.agent) {
-                        let pane = sp.result.as_ref().and_then(|r| r.pane.clone());
-                        let sock = std::env::var_os("HERDR_SOCKET_PATH");
-                        let closed = match (&pane, &sock) {
-                            (Some(p), Some(s)) => host::herdr_call(
-                                Path::new(s),
-                                "pane.close",
-                                json!({ "pane_id": p }),
-                            )
-                            .await
-                            .map(|_| ())
-                            .map_err(|e| format!("{e:#}")),
-                            _ => Err(
-                                "no herdr here (HERDR_SOCKET_PATH unset) or no pane on record"
-                                    .to_string(),
-                            ),
-                        };
-                        if let Err(e) = closed {
-                            bail!(
-                                "refusing to retire {wt}: {agent} is still up and its pane was not closed ({e}); nothing removed"
-                            );
-                        }
+                    let pane = sp.result.as_ref().and_then(|r| r.pane.clone());
+                    let sock = std::env::var_os("HERDR_SOCKET_PATH").map(PathBuf::from);
+                    let up = state.agents.contains_key(&sp.request.agent);
+                    let step =
+                        retire::pane_step(up, pane.as_deref(), sock.as_deref()).map_err(|e| {
+                            anyhow::anyhow!("refusing to retire {wt}: {e}; nothing removed")
+                        })?;
+                    if let Some((p, s)) = step
+                        && let Err(e) =
+                            host::herdr_call(s, "pane.close", json!({ "pane_id": p })).await
+                    {
+                        bail!(
+                            "refusing to retire {wt}: {agent} is up and its pane {p} did not close ({e:#}); nothing removed"
+                        );
                     }
                     retire::finish(&plan, &wt, *decide, &b).await?
                 }

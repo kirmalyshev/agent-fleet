@@ -408,6 +408,26 @@ pub fn checkout_for(
     }
 }
 
+/// What happens to the agent's pane before its tree is removed: nothing if the agent is not up;
+/// closed if it is and herdr and the pane are both at hand; otherwise the retire must not go on —
+/// removing a tree under a live agent is what this refuses. Err is the reason.
+pub fn pane_step<'a>(
+    up: bool,
+    pane: Option<&'a str>,
+    sock: Option<&'a Path>,
+) -> std::result::Result<Option<(&'a str, &'a Path)>, String> {
+    if !up {
+        return Ok(None);
+    }
+    match (pane, sock) {
+        (Some(p), Some(s)) => Ok(Some((p, s))),
+        (None, _) => Err("the agent is up and its spawn records no pane".into()),
+        (_, None) => {
+            Err("the agent is up and there is no herdr here (HERDR_SOCKET_PATH unset)".into())
+        }
+    }
+}
+
 /// Where `stash` writes: fleet.toml's `retire_patches` (absolute, or `~/…` under `home`), else
 /// `retired-patches` in the instance's data dir.
 pub fn patches_dir(configured: Option<&str>, home: Option<&Path>, data: &Path) -> Result<PathBuf> {
@@ -898,5 +918,26 @@ mod tests {
         );
         assert!(patches_dir(Some("rel"), Some(home), data).is_err());
         assert!(patches_dir(Some("~/p"), None, data).is_err());
+    }
+
+    #[test]
+    fn pane_step_closes_an_up_agents_pane_and_refuses_when_it_cannot() {
+        let s = Path::new("/sock");
+        assert_eq!(
+            pane_step(false, None, None),
+            Ok(None),
+            "an agent that is down needs nothing"
+        );
+        assert_eq!(pane_step(true, Some("p1"), Some(s)), Ok(Some(("p1", s))));
+        assert!(
+            pane_step(true, Some("p1"), None)
+                .unwrap_err()
+                .contains("no herdr here")
+        );
+        assert!(
+            pane_step(true, None, Some(s))
+                .unwrap_err()
+                .contains("no pane")
+        );
     }
 }
