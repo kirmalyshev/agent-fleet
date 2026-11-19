@@ -69,8 +69,8 @@ const SHARED_BY_ALL: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Finding {
     /// `stale`, `hung`, `heavy`, `duplicate`, `forgotten`, `unpushed`, `orphan`, `breach`,
-    /// `queued`, `undelivered`, `refused`, `role`, `quota`, `spawn`, `unmanaged`, `stalled`, `build`, `update`, `orphan-pr`
-    /// (added by `main`).
+    /// `queued`, `undelivered`, `refused`, `role`, `quota`, `spawn`, `unmanaged`, `stalled`, `build`, `update`, `orphan-pr`, `tmp`
+    /// (the last two added by `main`).
     pub kind: &'static str,
     /// The agent id or `<host>:<path>` it is about.
     pub subject: String,
@@ -150,6 +150,24 @@ fn procs(n: u32) -> String {
 
 fn mb(kb: u64) -> String {
     format!("{:.0} MB", kb as f64 / 1024.0)
+}
+
+/// `tmp`: each agent of `host` whose worktree holds scratch in `.tmp` (see `tmpdir`), with its
+/// size. Reads the local disk, so only an agent on this host is checked.
+pub fn tmp_findings(s: &State, host: &str) -> Vec<Finding> {
+    s.agents
+        .iter()
+        .filter(|(_, a)| a.host == host)
+        .filter_map(|(id, a)| {
+            let wt = &worktree_of(s, a)?.1.state;
+            let w = std::path::Path::new(&wt.path);
+            let b = crate::tmpdir::used(w);
+            (b > 0).then(|| {
+                let d = crate::tmpdir::dir(w);
+                finding("tmp", id, format!("{} in {}", mb(b / 1024), d.display()))
+            })
+        })
+        .collect()
 }
 
 fn files(v: &[&String]) -> String {
@@ -981,6 +999,31 @@ mod tests {
             },
             since,
         }
+    }
+
+    #[test]
+    fn tmp_reports_the_size_of_each_local_agents_scratch_dir_and_skips_empty_ones() {
+        let now = Utc::now();
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = (d.path().join("a"), d.path().join("b"));
+        std::fs::create_dir_all(a.join(".tmp")).unwrap();
+        std::fs::create_dir_all(b.join(".tmp")).unwrap();
+        std::fs::write(a.join(".tmp/x"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        std::fs::write(b.join(".tmp/.gitignore"), "*\n").unwrap(); // the export line's own file
+        let mut s = State::default();
+        for (id, p) in [("agent:h/s/a", &a), ("agent:h/s/b", &b)] {
+            let p = p.to_str().unwrap();
+            s.agents
+                .insert(id.into(), agent(AgentState::Idle, now, p, 0, 0));
+            s.worktrees
+                .insert(worktree_key("h", p), tree(p, &[], 0, 0, now));
+        }
+        let mut other = agent(AgentState::Idle, now, a.to_str().unwrap(), 0, 0);
+        other.host = "elsewhere".into();
+        s.agents.insert("agent:e/s/c".into(), other);
+        let f = tmp_findings(&s, "h");
+        assert_eq!(kinds(&f), [("tmp", "agent:h/s/a")]);
+        assert!(f[0].detail.starts_with("3 MB in "), "{}", f[0].detail);
     }
 
     fn kinds(f: &[Finding]) -> Vec<(&str, &str)> {

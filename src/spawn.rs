@@ -994,15 +994,15 @@ pub(crate) async fn retire_in(host: &Host, repo: &str, worktree: &str, agent: &s
         None => Ok(()),
     }
 }
-/// `unset NAME` typed into the pane's shell, retried while the shell is not ready.
-async fn unset_env(sock: &Path, pane: &str, var: &str) -> Result<()> {
+/// `line` typed into the pane's shell, retried while the shell is not ready.
+async fn pane_run(sock: &Path, pane: &str, line: &str) -> Result<()> {
     let mut err = anyhow!("pane.send_text never ran");
     for _ in 0..BUSY_TRIES {
         let send = async {
             herdr_call(
                 sock,
                 "pane.send_text",
-                json!({ "pane_id": pane, "text": format!("unset {var}") }),
+                json!({ "pane_id": pane, "text": line }),
             )
             .await?;
             herdr_call(
@@ -1241,13 +1241,24 @@ async fn run_spawn(
         run_ready(&checkout, &wt, ready).await?;
     }
     for var in &prof.unset_env {
-        unset_env(
+        pane_run(
             &host.cfg.herdr_socket,
             made.pane.as_deref().unwrap_or_default(),
-            var,
+            &format!("unset {var}"),
         )
         .await
         .with_context(|| format!("env scrub: unset {var}"))?;
+    }
+    // Scratch inside the worktree: retire takes it with the tree. Best effort: a pane that
+    // refuses the line costs the isolation, not the spawn.
+    if let Err(e) = pane_run(
+        &host.cfg.herdr_socket,
+        made.pane.as_deref().unwrap_or_default(),
+        &crate::tmpdir::export_line(Path::new(&wt)),
+    )
+    .await
+    {
+        eprintln!("agent-fleet host: spawn {}: TMPDIR export: {e:#}", r.name);
     }
     agent_start(
         host,
@@ -2684,6 +2695,25 @@ profile = "devin"
     }
 
     #[tokio::test]
+    async fn a_pane_that_refuses_the_tmpdir_line_costs_the_isolation_not_the_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        let wt = co.join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let (host, stub) = run(
+            dir.path(),
+            &[
+                ("worktree.create", vec![created(wt.to_str().unwrap())]),
+                ("pane.send_text", vec![err("agent_pane_busy")]),
+            ],
+        )
+        .await;
+        execute(&host, "req1", &spawn_of(req(None)), &State::default()).await;
+        assert!(stub.calls().contains(&"agent.start".to_string()));
+        assert!(result(&host).unwrap().ok);
+    }
+
+    #[tokio::test]
     async fn new_worktree_happy_path() {
         let dir = tempfile::tempdir().unwrap();
         let co = checkout(dir.path());
@@ -2699,6 +2729,8 @@ profile = "devin"
             stub.calls(),
             [
                 "worktree.create",
+                "pane.send_text",
+                "pane.send_keys",
                 "agent.start",
                 "agent.wait",
                 "agent.prompt"
@@ -2817,6 +2849,8 @@ profile = "devin"
             stub.calls(),
             [
                 "worktree.create",
+                "pane.send_text",
+                "pane.send_keys",
                 "agent.start",
                 "agent.wait",
                 "agent.prompt",
@@ -3490,12 +3524,27 @@ profile = "devin"
                 "worktree.create",
                 "pane.send_text",
                 "pane.send_keys",
+                "pane.send_text",
+                "pane.send_keys",
                 "agent.start",
                 "agent.wait",
                 "agent.prompt"
             ]
         );
         let got = stub.calls.lock().unwrap().clone();
+        let texts: Vec<String> = got
+            .iter()
+            .filter(|(m, _)| m == "pane.send_text")
+            .map(|(_, p)| p["text"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(texts[0], "unset SCRUB_ME");
+        for v in ["TMPDIR", "TMP", "TEMP"] {
+            assert!(
+                texts[1].contains(&format!("{v}='")) && texts[1].contains(".tmp'"),
+                "{}",
+                texts[1]
+            );
+        }
         let start = got
             .iter()
             .find(|(m, _)| m == "agent.start")
