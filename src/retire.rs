@@ -11,7 +11,6 @@
 
 use anyhow::{Context, Result, bail};
 use rustix::fs::{FlockOperation, flock};
-use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -339,4 +338,188 @@ pub async fn guarded_with(plan: &Plan<'_>, wt: &str, decide: Option<Decide>, hel
     }
     run_hook(plan.checkout, wt, plan.script, &extra, &b).await?;
     Ok(Outcome::Retired)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn sh(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// A checkout `co` on `main` with `a.txt`, a worktree `wt` on `feat`, and a hook `x.sh` that
+    /// records its arguments and whether it inherited the lock fd, then removes the tree.
+    struct Fx {
+        _d: tempfile::TempDir,
+        co: PathBuf,
+        wt: PathBuf,
+        patches: PathBuf,
+    }
+    fn fx() -> Fx {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().canonicalize().unwrap();
+        let (co, wt) = (root.join("co"), root.join("wt"));
+        std::fs::create_dir(&co).unwrap();
+        sh(&co, &["init", "-q", "-b", "main"]);
+        std::fs::write(co.join("a.txt"), "a\n").unwrap();
+        sh(&co, &["add", "a.txt"]);
+        sh(&co, &["commit", "-qm", "init"]);
+        sh(&co, &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "feat"]);
+        let hook = co.join("x.sh");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {log}/hook-args\n[ -n \"${LOCK_FD_ENV}\" ] && [ -e \"/dev/fd/${LOCK_FD_ENV}\" ] && echo inherited >> {log}/hook-fd\nsleep \"${{HOOK_SLEEP:-0}}\"\ngit worktree remove --force \"$1\"\n",
+                log = root.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let patches = root.join("patches");
+        Fx { _d: d, co, wt, patches }
+    }
+    impl Fx {
+        fn plan(&self) -> Plan<'_> {
+            Plan { checkout: &self.co, script: "x.sh", base: "main", patches: &self.patches, decide_cmd: "agent-fleet retire dv-1" }
+        }
+        fn wt(&self) -> &str {
+            self.wt.to_str().unwrap()
+        }
+        fn read(&self, f: &str) -> String {
+            std::fs::read_to_string(self.co.parent().unwrap().join(f)).unwrap_or_default()
+        }
+        fn dirty(&self) {
+            std::fs::write(self.wt.join("a.txt"), "edited, nowhere else\n").unwrap();
+            std::fs::write(self.wt.join("new.txt"), "untracked\n").unwrap();
+        }
+    }
+
+    #[test]
+    fn changes_label_each_path_by_where_its_content_already_lives() {
+        let f = fx();
+        // main moves on with b.txt; the tree holds the same bytes uncommitted
+        std::fs::write(f.co.join("b.txt"), "landed\n").unwrap();
+        sh(&f.co, &["add", "b.txt"]);
+        sh(&f.co, &["commit", "-qm", "b"]);
+        std::fs::write(f.wt.join("b.txt"), "landed\n").unwrap();
+        f.dirty();
+        std::fs::create_dir(f.wt.join("dir")).unwrap();
+        std::fs::write(f.wt.join("dir/x"), "x\n").unwrap();
+        let mut got: Vec<(String, String)> = changes(&f.wt, "main", "feat").unwrap().into_iter().map(|c| (c.path, c.kind)).collect();
+        got.sort();
+        let w = |p: &str, k: &str| (p.to_string(), k.to_string());
+        assert_eq!(got, vec![w("a.txt", "work"), w("b.txt", "in main"), w("dir/", "work"), w("new.txt", "work")]);
+    }
+
+    #[tokio::test]
+    async fn a_clean_tree_is_retired_by_the_hook_with_no_decision_and_the_lock_fd() {
+        let f = fx();
+        assert_eq!(guarded(&f.plan(), f.wt(), None).await.unwrap(), Outcome::Retired);
+        assert_eq!(f.read("hook-args").trim(), f.wt());
+        assert_eq!(f.read("hook-fd").trim(), "inherited");
+        assert!(!f.wt.exists());
+    }
+
+    #[tokio::test]
+    async fn real_changes_stop_the_retire_before_the_hook_and_say_what_they_are() {
+        let f = fx();
+        f.dirty();
+        let Outcome::Refused(why) = guarded(&f.plan(), f.wt(), None).await.unwrap() else { panic!("not refused") };
+        for want in ["a.txt — work", "new.txt — work", "1 file changed", "decide: agent-fleet retire dv-1 --decide=delete|keep|stash"] {
+            assert!(why.contains(want), "missing {want:?} in:\n{why}");
+        }
+        assert_eq!(f.read("hook-args"), "", "the hook ran");
+        assert!(f.wt.join("new.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn keep_removes_nothing_and_runs_no_hook() {
+        let f = fx();
+        f.dirty();
+        assert_eq!(guarded(&f.plan(), f.wt(), Some(Decide::Keep)).await.unwrap(), Outcome::Kept);
+        assert_eq!(f.read("hook-args"), "");
+        assert!(f.wt.join("new.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_tells_the_hook_the_dirt_was_accepted() {
+        let f = fx();
+        f.dirty();
+        assert_eq!(guarded(&f.plan(), f.wt(), Some(Decide::Delete)).await.unwrap(), Outcome::Retired);
+        assert_eq!(f.read("hook-args").trim(), format!("{} --decide=delete", f.wt()));
+    }
+
+    #[tokio::test]
+    async fn stash_writes_a_patch_that_applies_back_before_the_hook_runs() {
+        let f = fx();
+        f.dirty();
+        std::fs::write(f.wt.join("bin.dat"), [0u8, 1, 0, 255]).unwrap();
+        assert_eq!(guarded(&f.plan(), f.wt(), Some(Decide::Stash)).await.unwrap(), Outcome::Retired);
+        assert_eq!(f.read("hook-args").trim(), format!("{} --decide=delete", f.wt()));
+        let p: Vec<PathBuf> = std::fs::read_dir(&f.patches).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(p.len(), 1);
+        assert!(p[0].file_name().unwrap().to_string_lossy().starts_with("feat-"));
+        sh(&f.co, &["switch", "-q", "feat"]);
+        sh(&f.co, &["apply", p[0].to_str().unwrap()]);
+        assert_eq!(std::fs::read_to_string(f.co.join("a.txt")).unwrap(), "edited, nowhere else\n");
+        assert_eq!(std::fs::read(f.co.join("bin.dat")).unwrap(), vec![0u8, 1, 0, 255]);
+    }
+
+    #[tokio::test]
+    async fn stash_refuses_what_a_patch_cannot_carry_and_removes_nothing() {
+        let f = fx();
+        sh(&f.wt, &["init", "-q", "nested"]);
+        std::fs::write(f.wt.join("nested/w.txt"), "w\n").unwrap();
+        let Outcome::Refused(why) = guarded(&f.plan(), f.wt(), Some(Decide::Stash)).await.unwrap() else { panic!("not refused") };
+        assert!(why.contains("nested/"), "{why}");
+        assert!(!f.patches.exists());
+        assert_eq!(f.read("hook-args"), "");
+    }
+
+    #[tokio::test]
+    async fn a_status_git_cannot_read_is_refused_never_clean() {
+        let f = fx();
+        let gd = git(&f.wt, &["rev-parse", "--absolute-git-dir"]).unwrap();
+        std::fs::write(Path::new(gd.trim()).join("index"), "junk").unwrap();
+        let Outcome::Refused(why) = guarded(&f.plan(), f.wt(), Some(Decide::Delete)).await.unwrap() else { panic!("not refused") };
+        assert!(why.contains("could not be read"), "{why}");
+        assert_eq!(f.read("hook-args"), "");
+    }
+
+    #[tokio::test]
+    async fn two_retires_of_one_tree_one_removes_it_and_the_other_finds_it_gone() {
+        let f = fx();
+        // SAFETY of the env write: tests in this module do not read HOOK_SLEEP concurrently
+        // with other env writers; the hook reads it through its own environment.
+        unsafe { std::env::set_var("HOOK_SLEEP", "1") };
+        let (p1, p2) = (f.plan(), f.plan());
+        let both = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(guarded(&p1, f.wt(), None), guarded(&p2, f.wt(), None))
+        })
+        .await
+        .expect("a retire hung");
+        unsafe { std::env::remove_var("HOOK_SLEEP") };
+        let mut got = vec![both.0.unwrap(), both.1.unwrap()];
+        got.sort_by_key(|o| format!("{o:?}"));
+        assert_eq!(got, vec![Outcome::Gone, Outcome::Retired]);
+        assert_eq!(f.read("hook-args").lines().count(), 1, "the hook ran twice");
+    }
+
+    #[tokio::test]
+    async fn a_tree_already_gone_runs_no_hook() {
+        let f = fx();
+        sh(&f.co, &["worktree", "remove", f.wt()]);
+        assert_eq!(guarded(&f.plan(), f.wt(), None).await.unwrap(), Outcome::Gone);
+        assert_eq!(f.read("hook-args"), "");
+    }
 }
