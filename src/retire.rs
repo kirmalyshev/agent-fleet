@@ -72,6 +72,8 @@ pub struct Change {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Retired,
+    /// Retired after the uncommitted changes were saved as this patch.
+    Stashed(PathBuf),
     /// `keep`: nothing removed.
     Kept,
     /// The tree was already gone when the locks were held (another retire removed it).
@@ -528,6 +530,7 @@ pub async fn finish(
         Err(e) => return Ok(Outcome::Refused(format!("{e:#}; nothing removed"))),
     };
     let mut extra: Vec<&str> = vec![];
+    let mut stashed = None;
     if !found.is_empty() {
         match decide {
             None => return Ok(Outcome::Refused(report(tree, &found, plan.decide_cmd))),
@@ -543,7 +546,7 @@ pub async fn finish(
                     b
                 };
                 match save_patch(tree, plan.patches, &name, &found) {
-                    Ok(f) => println!("stashed {wt}'s uncommitted changes in {}", f.display()),
+                    Ok(f) => stashed = Some(f),
                     Err(e) => {
                         return Ok(Outcome::Refused(format!(
                             "could not stash {wt}: {e:#}; nothing removed"
@@ -556,7 +559,7 @@ pub async fn finish(
         extra.push("--decide=delete");
     }
     run_hook(plan.checkout, wt, plan.script, &extra, b).await?;
-    Ok(Outcome::Retired)
+    Ok(stashed.map_or(Outcome::Retired, Outcome::Stashed))
 }
 
 /// The guarded retire in one call, for a caller with nothing to do between the read and the
@@ -694,6 +697,13 @@ async fn try_here(h: &Here<'_>) -> Result<Done> {
     };
     Ok(match outcome {
         Outcome::Retired => done(true, format!("retired {wt}")),
+        Outcome::Stashed(f) => done(
+            true,
+            format!(
+                "stashed {wt}'s uncommitted changes in {} (on this host)\nretired {wt}",
+                f.display()
+            ),
+        ),
         Outcome::Kept => done(true, format!("kept {wt}: decided keep, nothing removed")),
         Outcome::Gone => done(true, format!("{wt} was already retired")),
         Outcome::Refused(why) => Done {
@@ -717,7 +727,7 @@ pub async fn wait_result(
     client: &crate::client::Client,
     id: &str,
 ) -> Result<crate::event::RetireResult> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    let deadline = tokio::time::Instant::now() + crate::spawn::REQUEST_MAX_AGE.to_std().unwrap_or(Duration::from_secs(900));
     loop {
         match client.state().await {
             Ok(s) => {
@@ -731,7 +741,7 @@ pub async fn wait_result(
             Err(_) => {}
         }
         if tokio::time::Instant::now() >= deadline {
-            bail!("no retire.result for {id} within 10 min — the agent's host may be down");
+            bail!("no retire.result for {id} within 15 min — the agent's host may be down (or too old an agent-fleet to answer retire requests)");
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -742,6 +752,7 @@ pub async fn wait_result(
 pub fn due(
     state: &crate::state::State,
     host: &str,
+    session: &str,
     seen: &mut std::collections::HashSet<String>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<String> {
@@ -751,6 +762,10 @@ pub fn due(
         .iter()
         .filter(|(id, r)| {
             r.request.host == host
+                // One host agent per herdr session: pane ids repeat across sessions, so only the
+                // session the agent runs in may close its pane.
+                && crate::spawn::find_spawn(state, &r.request.agent)
+                    .is_some_and(|sp| sp.request.session == session)
                 && r.result.is_none()
                 && now - r.since <= crate::spawn::REQUEST_MAX_AGE
                 && seen.insert((*id).clone())
@@ -764,8 +779,12 @@ pub fn due(
 pub async fn serve(host: &crate::host::Host, seen: &mut std::collections::HashSet<String>) {
     let Ok(view) = host.view() else { return };
     let state = &view.state;
-    for id in due(state, &host.cfg.host, seen, chrono::Utc::now()) {
+    for id in due(state, &host.cfg.host, &host.cfg.session, seen, chrono::Utc::now()) {
         let Some(req) = state.retires.get(&id) else {
+            continue;
+        };
+        // A self-update drain waits for this: a restart mid-hook would kill it half done.
+        let Some(_busy) = host.busy_guard(format!("retire of {}", req.request.agent)) else {
             continue;
         };
         let (done, project) = match crate::spawn::find_spawn(state, &req.request.agent) {
@@ -785,7 +804,12 @@ pub async fn serve(host: &crate::host::Host, seen: &mut std::collections::HashSe
                     host: &host.cfg.host,
                     decide,
                     machine: host.cfg.config_dir.clone(),
-                    cwd_checkout: None,
+                    // The host's `--repo` flags too, as a spawn resolves its checkout.
+                    cwd_checkout: host
+                        .cfg
+                        .checkouts_now()
+                        .ok()
+                        .and_then(|mut c| c.remove(&sp.request.repo)),
                     data_dir: &host.cfg.data_dir,
                     sock: Some(host.cfg.herdr_socket.clone()),
                 };
@@ -847,9 +871,22 @@ mod tests {
         add("theirs", "mac", 1, false);
         add("done", "kir", 1, true);
         add("old", "kir", 60, false);
+        state.spawns.insert("sp".into(), crate::state::Spawn {
+            request: crate::event::SpawnRequested {
+                name: "a".into(), agent: "agent:kir/s/a".into(), host: "kir".into(),
+                session: "s".into(), repo: "o/r".into(), issue: None, branch: "b".into(),
+                profile: "p".into(), brief: String::new(), level: None, lead: None,
+                worktree: None, replaces: None, why: String::new(),
+            },
+            by: "x".into(), project: "p".into(), result: None, since: now, answered: None,
+        });
         let mut seen = std::collections::HashSet::new();
-        assert_eq!(due(&state, "kir", &mut seen, now), vec!["mine".to_string()]);
-        assert!(due(&state, "kir", &mut seen, now).is_empty(), "not twice");
+        assert_eq!(due(&state, "kir", "s", &mut seen, now), vec!["mine".to_string()]);
+        assert!(due(&state, "kir", "s", &mut seen, now).is_empty(), "not twice");
+        assert!(
+            due(&state, "kir", "other", &mut std::collections::HashSet::new(), now).is_empty(),
+            "another session's host leaves it alone"
+        );
     }
     use super::*;
     use std::os::unix::fs::PermissionsExt;

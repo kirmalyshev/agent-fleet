@@ -1856,6 +1856,23 @@ async fn main() -> Result<()> {
             // The agent's host runs the retire: its herdr socket closes the pane, its checkout
             // and hook retire the tree. From any other host the request goes through the hub.
             if sp.request.host != host {
+                // A short name is reused across hosts: never retire a remote agent by a name that
+                // also names another one.
+                let mut same: Vec<&str> = state
+                    .spawns
+                    .values()
+                    .filter(|o| spawn::short(&o.request.agent) == agent.as_str())
+                    .map(|o| o.request.agent.as_str())
+                    .collect();
+                same.sort();
+                same.dedup();
+                if same.len() > 1 {
+                    bail!(
+                        "{agent} names {} agents ({}): use the full id",
+                        same.len(),
+                        same.join(", ")
+                    );
+                }
                 let body = Known::RetireRequested(event::RetireRequested {
                     agent: sp.request.agent.clone(),
                     host: sp.request.host.clone(),
