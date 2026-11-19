@@ -297,27 +297,65 @@ impl<'a> Tick<'a> {
         }
     }
 
-    /// A command whose only hung members are `tail -f` followers is not hung: a follower
-    /// waits for more of another process's log by design. Any other lone filter blocked on a
-    /// pipe nobody writes is a real hang and is reported.
-    fn spare_followers(&mut self, start: usize) {
-        let follower = |t: &Self, c: &Classified| {
-            let p = &t.now.0[&c.pid];
-            p.name == "tail"
-                && p.args.as_deref().is_some_and(|a| {
-                    a.split_whitespace().any(|w| {
-                        w.starts_with('-') && !w.starts_with("--") && w.contains(['f', 'F'])
-                            || w == "--follow"
-                            || w.starts_with("--follow=")
-                    })
-                })
+    /// Idle by design, never HUNG: a follower of a file (`tail -f/-F/--follow`, `less +F`,
+    /// `journalctl -f/--follow`) has no producer process to wait on, and Xcode's simulator
+    /// service daemons sit idle for as long as their device is booted.
+    // ponytail: daemons are spared by name without asking whether a device is booted; add the
+    // `simctl list` check if one is ever seen hung with its device shut down.
+    fn idle_by_design(p: &Proc) -> bool {
+        let words = || p.args.as_deref().unwrap_or("").split_whitespace();
+        let flag = |w: &str, long: &str, short: &[char]| {
+            w == long
+                || w.starts_with(&format!("{long}="))
+                || (w.starts_with('-') && !w.starts_with("--") && w.contains(short))
         };
+        match p.name.as_str() {
+            "tail" => words().any(|w| flag(w, "--follow", &['f', 'F'])),
+            "journalctl" => words().any(|w| flag(w, "--follow", &['f'])),
+            "less" => words().any(|w| w == "+F" || w == "--follow-name"),
+            "DTServiceHub" | "launchd_sim" | "SimulatorTrampoline" => true,
+            _ => false,
+        }
+    }
+
+    /// A command whose hung members are all idle by design is not hung. A wrapper (`bash -c
+    /// 'tail -f x'`) is hung beside its follower and is spared with it, when every hung process
+    /// under it is one. Any other lone filter blocked on a pipe nobody writes is a real hang.
+    fn spare_followers(&mut self, start: usize) {
         let hung = |c: &Classified| matches!(c.verdict, Verdict::Hung(_));
-        if self.out[start..]
+        let members: HashSet<u32> = self.out[start..]
             .iter()
             .filter(|c| hung(c))
-            .all(|c| follower(self, c))
-        {
+            .map(|c| c.pid)
+            .collect();
+        let spared = |pid: u32| {
+            let by_design = |q: u32| Self::idle_by_design(&self.now.0[&q]);
+            // A launcher that only runs another command: a shell, or an exec-style wrapper.
+            let wrapper = |q: u32| {
+                let n = self.now.0[&q].name.as_str();
+                SHELLS.contains(&n)
+                    || ["timeout", "env", "nohup", "nice", "script", "xargs"].contains(&n)
+            };
+            let under = |q: u32| -> Vec<u32> {
+                self.now
+                    .tree(q)
+                    .into_iter()
+                    .filter(|d| *d != q && members.contains(d))
+                    .collect()
+            };
+            let below = under(pid);
+            by_design(pid)
+                || (wrapper(pid)
+                    && !below.is_empty()
+                    && below.iter().all(|&q| {
+                        if under(q).is_empty() {
+                            by_design(q)
+                        } else {
+                            wrapper(q)
+                        }
+                    }))
+        };
+        if members.iter().all(|&p| spared(p)) {
             for c in &mut self.out[start..] {
                 if hung(c) {
                     c.verdict = Verdict::Idle;
@@ -1315,6 +1353,164 @@ mod tests {
         w.step(only(), at(2), &seen());
         let v = w.step(only(), at(4), &seen());
         assert!(!matches!(verdict(&v, 40), Some(Verdict::Hung(_))), "{v:#?}");
+    }
+
+    #[test]
+    fn the_exact_follower_command_of_3138_is_not_hung() {
+        // `tail -n +1 -f <file>`, alone, in the shapes ps reports it.
+        for args in [
+            "tail -n +1 -f /tmp/x/all.log",
+            "/usr/bin/tail -n +1 -f /tmp/x/all.log",
+            "tail -n+1 -F /tmp/x/all.log",
+            "less +F /tmp/x/all.log",
+            "journalctl -f -u svc",
+        ] {
+            let name = args
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap();
+            let mut w = Watch::default();
+            let only = || tree(&[(40, SHELL, name, args, 0, 20)]);
+            w.step(only(), at(0), &seen());
+            w.step(only(), at(2), &seen());
+            let v = w.step(only(), at(4), &seen());
+            assert!(
+                !matches!(verdict(&v, 40), Some(Verdict::Hung(_))),
+                "{args}: {v:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_follower_under_a_wrapper_shell_is_not_hung() {
+        let mut w = Watch::default();
+        let t = || {
+            tree(&[
+                (
+                    30,
+                    SHELL,
+                    "bash",
+                    "bash -c tail -n +1 -f /tmp/x/all.log",
+                    0,
+                    20,
+                ),
+                (31, 30, "tail", "tail -n +1 -f /tmp/x/all.log", 0, 20),
+            ])
+        };
+        w.step(t(), at(0), &seen());
+        w.step(t(), at(2), &seen());
+        let v = w.step(t(), at(4), &seen());
+        assert!(
+            v.iter().all(|c| !matches!(c.verdict, Verdict::Hung(_))),
+            "{v:#?}"
+        );
+    }
+
+    #[test]
+    fn a_real_hang_beside_a_follower_or_a_daemon_stays_hung() {
+        for (name, args) in [("sleep", "sleep 9999"), ("head", "head -3")] {
+            for (fname, fargs) in [("tail", "tail -f x.log"), ("DTServiceHub", "DTServiceHub")] {
+                // A wrapper over both, and two siblings under the tool shell.
+                let layouts = [
+                    vec![
+                        (30, SHELL, "bash", "bash -c go", 0, 20),
+                        (31, 30, fname, fargs, 0, 20),
+                        (32, 30, name, args, 0, 20),
+                    ],
+                    vec![
+                        (31, SHELL, fname, fargs, 0, 20),
+                        (32, SHELL, name, args, 0, 20),
+                    ],
+                ];
+                for l in layouts {
+                    let mut w = Watch::default();
+                    let t = || tree(&l);
+                    w.step(t(), at(0), &seen());
+                    w.step(t(), at(2), &seen());
+                    let v = w.step(t(), at(4), &seen());
+                    assert!(
+                        matches!(verdict(&v, 32), Some(Verdict::Hung(_))),
+                        "{name} beside {fname}: {v:#?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_hung_program_above_a_follower_and_a_nested_wrapper_are_judged_apart() {
+        let verdicts = |procs: Vec<(u32, u32, &'static str, &'static str, u64, i64)>| {
+            let mut w = Watch::default();
+            let t = || tree(&procs);
+            w.step(t(), at(0), &seen());
+            w.step(t(), at(2), &seen());
+            w.step(t(), at(4), &seen())
+        };
+        // A stuck program with a follower child is not a wrapper: still hung.
+        let v = verdicts(vec![
+            (30, SHELL, "bash", "bash -c go", 0, 20),
+            (31, 30, "python3", "python3 deadlock.py", 0, 20),
+            (32, 31, "tail", "tail -f x.log", 0, 20),
+        ]);
+        assert!(matches!(verdict(&v, 31), Some(Verdict::Hung(_))), "{v:#?}");
+        // bash -> timeout -> tail -f: the nesting is common, and idle by design.
+        let v = verdicts(vec![
+            (30, SHELL, "bash", "bash -c go", 0, 20),
+            (31, 30, "timeout", "timeout 600 tail -f x.log", 0, 20),
+            (32, 31, "tail", "tail -f x.log", 0, 20),
+        ]);
+        assert!(
+            v.iter().all(|c| !matches!(c.verdict, Verdict::Hung(_))),
+            "{v:#?}"
+        );
+    }
+
+    #[test]
+    fn a_tail_less_or_journalctl_that_does_not_follow_stays_hung() {
+        for (name, args) in [
+            ("tail", "tail -n 5 x.log"),
+            ("less", "less x.log"),
+            ("journalctl", "journalctl -u svc -n 100"),
+        ] {
+            let mut w = Watch::default();
+            let only = || tree(&[(40, SHELL, name, args, 0, 20)]);
+            w.step(only(), at(0), &seen());
+            w.step(only(), at(2), &seen());
+            let v = w.step(only(), at(4), &seen());
+            assert!(
+                matches!(verdict(&v, 40), Some(Verdict::Hung(_))),
+                "{args}: {v:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_booted_simulators_service_daemon_is_never_hung() {
+        // DTServiceHub is idle by design inside a live sim session.
+        for (name, args) in [
+            (
+                "DTServiceHub",
+                "/Applications/Xcode.app/Contents/Developer/Library/PrivateFrameworks/DTDeviceKitBase.framework/Versions/A/Resources/DTServiceHub",
+            ),
+            (
+                "launchd_sim",
+                "launchd_sim /var/sim/Devices/ABC/launchd_bootstrap.plist",
+            ),
+            ("SimulatorTrampoline", "SimulatorTrampoline"),
+        ] {
+            let mut w = Watch::default();
+            let only = || tree(&[(40, SHELL, name, args, 0, 20)]);
+            w.step(only(), at(0), &seen());
+            w.step(only(), at(2), &seen());
+            let v = w.step(only(), at(4), &seen());
+            assert!(
+                !matches!(verdict(&v, 40), Some(Verdict::Hung(_))),
+                "{name}: {v:#?}"
+            );
+        }
     }
 
     #[test]
