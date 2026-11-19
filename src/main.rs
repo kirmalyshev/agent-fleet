@@ -1844,7 +1844,11 @@ async fn main() -> Result<()> {
         } => {
             let state = ctx.state().await?;
             let to = tell_to(&state, agent)?;
-            let waiting = state.msgs.values().filter(|m| m.to == to).count();
+            let busy = state
+                .recipient(&to)
+                .and_then(|r| state.agents.get(r))
+                .is_some_and(|a| !matches!(a.state, AgentState::Idle | AgentState::Done));
+            let waiting = state.pending_for(&to).0 + 1;
             let body = MsgSent {
                 to: to.clone(),
                 kind: kind.clone(),
@@ -1857,9 +1861,10 @@ async fn main() -> Result<()> {
                 Known::MsgSent(body),
             ))
             .await?;
-            if waiting > 0 {
-                eprintln!(
-                    "{waiting} earlier tell(s) to {to} still undelivered; it is busy (see `agent-fleet doctor`)"
+            if busy {
+                println!(
+                    "queued: {} busy, delivers when idle ({waiting} pending)",
+                    short(agent)
                 );
             }
         }

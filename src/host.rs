@@ -1285,9 +1285,8 @@ impl Host {
                 // Never type into a blocked agent, or a busy one that cannot queue input; retry a
                 // failed ring at most once a minute.
                 let queue = state == AgentState::Working
-                    && msg.queueable(
+                    && crate::state::queues_input(
                         view.state.agents.get(to).and_then(|a| a.kind.as_deref()),
-                        chrono::Utc::now(),
                     );
                 if !queue && !matches!(state, AgentState::Idle | AgentState::Done) {
                     if waiting.insert(id.clone()) {
@@ -1302,6 +1301,17 @@ impl Host {
                     continue;
                 }
                 tried.insert(id.clone(), Instant::now());
+                // A queued ring types into a pane that may have turned blocked since the snapshot.
+                if queue
+                    && self
+                        .panes
+                        .lock()
+                        .unwrap()
+                        .get(&pane)
+                        .is_none_or(|l| l.state != AgentState::Working)
+                {
+                    continue;
+                }
                 let text = doorbell(&msg.from, &msg.to, &msg.kind, &msg.reference, &msg.text, id);
                 // A queued ring is already `working`: there is no new turn to wait for.
                 let params = if queue {
@@ -1521,6 +1531,16 @@ mod tests {
         kind: &str,
         age_h: i64,
     ) -> (Arc<Host>, Arc<FakeHerdr>, u64) {
+        host_on_fake_prog(dir, status, kind, age_h, "claude").await
+    }
+    /// As `host_on_fake_msg`, the agent being a `program` (`claude`, `devin`).
+    async fn host_on_fake_prog(
+        dir: &Path,
+        status: &str,
+        kind: &str,
+        age_h: i64,
+        program: &str,
+    ) -> (Arc<Host>, Arc<FakeHerdr>, u64) {
         let sock = dir.join("herdr.sock");
         let fake = Arc::new(FakeHerdr::default());
         *fake.status.lock().unwrap() = status.into();
@@ -1544,7 +1564,7 @@ mod tests {
             client,
             Store::open(&dir.join("replica.db")).unwrap(),
         ));
-        let info = json!({ "name": "a", "agent": "claude", "agent_status": status });
+        let info = json!({ "name": "a", "agent": program, "agent_status": status });
         let epoch = host.agent_up("w:1", &info).await;
         host.watch_pane("w:1".into(), epoch);
         for _ in 0..100 {
@@ -1647,9 +1667,9 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn a_busy_claude_agent_is_rung_once_the_tell_has_waited() {
+    async fn a_busy_claude_agent_gets_the_tell_queued() {
         let dir = tempfile::tempdir().unwrap();
-        let (host, fake, _) = host_on_fake_msg(dir.path(), "working", "OK", 1).await;
+        let (host, fake, _) = host_on_fake_msg(dir.path(), "working", "OK", 0).await;
         for _ in 0..200 {
             if types(&host).contains(&"msg.delivered".to_string()) {
                 break;
@@ -1663,7 +1683,7 @@ mod tests {
     #[tokio::test]
     async fn a_busy_agent_is_not_rung() {
         let dir = tempfile::tempdir().unwrap();
-        let (host, fake, _) = host_on_fake(dir.path(), "working").await;
+        let (host, fake, _) = host_on_fake_prog(dir.path(), "working", "OK", 1, "devin").await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(fake.prompts.lock().unwrap().is_empty());
         assert!(!types(&host).contains(&"msg.delivered".to_string()));

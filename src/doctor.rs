@@ -30,7 +30,7 @@ pub const REFUSED: Duration = Duration::hours(1);
 /// Queued this long for a resource: worth a look at who holds it.
 pub const QUEUED: Duration = Duration::minutes(10);
 /// A tell still undelivered this long: its recipient is busy, blocked, or has no host ringing.
-pub const UNDELIVERED: Duration = Duration::minutes(5);
+pub const UNDELIVERED: Duration = Duration::minutes(10);
 /// A quota window this full with its reset still ahead: slow down or it will run out.
 pub const QUOTA_PCT: f64 = 90.0;
 /// A spawn request unanswered this long means its host is not listening.
