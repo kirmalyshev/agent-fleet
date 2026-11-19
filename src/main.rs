@@ -1864,7 +1864,10 @@ async fn main() -> Result<()> {
                 let id = ctx
                     .write(Envelope::new(ctx.me().await?, &sp.project, body))
                     .await?;
-                eprintln!("{agent} runs on {}: asked its host to retire it", sp.request.host);
+                eprintln!(
+                    "{agent} runs on {}: asked its host to retire it",
+                    sp.request.host
+                );
                 let done = retire::wait_result(&ctx.client()?, &id).await?;
                 if done.ok {
                     println!("{}", done.text);

@@ -801,11 +801,13 @@ pub async fn serve(host: &crate::host::Host, seen: &mut std::collections::HashSe
             .await;
         }
         host.publish(
-            host.presence(crate::event::Known::RetireResult(crate::event::RetireResult {
-                agent: req.request.agent.clone(),
-                ok: done.ok,
-                text: done.text,
-            }))
+            host.presence(crate::event::Known::RetireResult(
+                crate::event::RetireResult {
+                    agent: req.request.agent.clone(),
+                    ok: done.ok,
+                    text: done.text,
+                },
+            ))
             .re(&id),
         )
         .await;

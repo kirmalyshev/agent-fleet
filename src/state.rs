@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::event::{
     AgentState, Body, COORDINATOR, Event, Known, Level, ProcessHung, QuotaWindow, ResourceHold,
-    ResourceLimit, RetireRequested, RetireResult, SpawnRequested, SpawnResult, StuckCause, TYPE_VERSION, TaskState, UpdateResult,
-    WorktreeProcs, WorktreeState,
+    ResourceLimit, RetireRequested, RetireResult, SpawnRequested, SpawnResult, StuckCause,
+    TYPE_VERSION, TaskState, UpdateResult, WorktreeProcs, WorktreeState,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -2314,11 +2314,17 @@ mod tests {
             .into_event()
         };
         s.apply(&answer("host:mac", true));
-        assert!(s.retires[&id].result.is_none(), "another host cannot answer");
+        assert!(
+            s.retires[&id].result.is_none(),
+            "another host cannot answer"
+        );
         s.apply(&answer("host:kir", false));
         s.apply(&answer("host:kir", true));
         let r = s.retires[&id].result.as_ref().unwrap();
-        assert!(!r.ok && r.text == "from host:kir", "the first answer stands");
+        assert!(
+            !r.ok && r.text == "from host:kir",
+            "the first answer stands"
+        );
     }
 
     fn by(id: &str, body: Known) -> Envelope<Known> {

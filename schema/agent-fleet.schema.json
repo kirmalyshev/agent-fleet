@@ -967,6 +967,55 @@
           ],
           "type": "object"
         },
+        "RetireRequested": {
+          "additionalProperties": false,
+          "description": "`agent-fleet retire` run on a host that is not the agent's asks the agent's host to run the\nretire itself: the pane, the locks and the repository's hook are all that host's.",
+          "properties": {
+            "agent": {
+              "description": "The agent's full id: `agent:<host>/<session>/<name>`.",
+              "type": "string"
+            },
+            "decide": {
+              "description": "`delete`, `keep` or `stash`: what to do with real uncommitted changes.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "description": "The host that runs it: the agent's.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "agent",
+            "host"
+          ],
+          "type": "object"
+        },
+        "RetireResult": {
+          "additionalProperties": false,
+          "description": "The `retire.requested` named by `re`, answered by the host that ran it.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "ok": {
+              "description": "False when nothing was retired: refused over uncommitted changes, or an error.",
+              "type": "boolean"
+            },
+            "text": {
+              "description": "What `agent-fleet retire` prints on that host.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "agent",
+            "ok",
+            "text"
+          ],
+          "type": "object"
+        },
         "SpawnRequested": {
           "additionalProperties": false,
           "description": "`agent-fleet spawn` (or `handoff`) asks the host agent on `host` to create a worktree (or a\nworkspace in an existing one), start the agent and give it the brief. The requester and the\nhost may be on different machines.",
@@ -1912,6 +1961,38 @@
         {
           "properties": {
             "data": {
+              "$ref": "#/$defs/RetireRequested"
+            },
+            "type": {
+              "const": "retire.requested",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/RetireResult"
+            },
+            "type": {
+              "const": "retire.result",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
               "$ref": "#/$defs/AgentUnmanaged"
             },
             "type": {
@@ -2705,6 +2786,92 @@
             "name",
             "resources",
             "max"
+          ],
+          "type": "object"
+        },
+        "Retire": {
+          "description": "A `retire.requested` and the `retire.result` that answered it.",
+          "properties": {
+            "by": {
+              "description": "Who asked (the request's actor id).",
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            },
+            "request": {
+              "$ref": "#/$defs/RetireRequested"
+            },
+            "result": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/RetireResult"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "since": {
+              "description": "The request's `ts`.",
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "request",
+            "by",
+            "project",
+            "since"
+          ],
+          "type": "object"
+        },
+        "RetireRequested": {
+          "additionalProperties": false,
+          "description": "`agent-fleet retire` run on a host that is not the agent's asks the agent's host to run the\nretire itself: the pane, the locks and the repository's hook are all that host's.",
+          "properties": {
+            "agent": {
+              "description": "The agent's full id: `agent:<host>/<session>/<name>`.",
+              "type": "string"
+            },
+            "decide": {
+              "description": "`delete`, `keep` or `stash`: what to do with real uncommitted changes.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "description": "The host that runs it: the agent's.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "agent",
+            "host"
+          ],
+          "type": "object"
+        },
+        "RetireResult": {
+          "additionalProperties": false,
+          "description": "The `retire.requested` named by `re`, answered by the host that ran it.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "ok": {
+              "description": "False when nothing was retired: refused over uncommitted changes, or an error.",
+              "type": "boolean"
+            },
+            "text": {
+              "description": "What `agent-fleet retire` prints on that host.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "agent",
+            "ok",
+            "text"
           ],
           "type": "object"
         },
@@ -3502,6 +3669,14 @@
           },
           "default": {},
           "description": "Held or queued-for resources by `<host>:<resource>`.",
+          "type": "object"
+        },
+        "retires": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Retire"
+          },
+          "default": {},
+          "description": "Retire requests by their `retire.requested` id, kept for 24 h.",
           "type": "object"
         },
         "roles": {
