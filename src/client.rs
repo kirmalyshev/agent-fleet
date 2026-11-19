@@ -740,7 +740,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_spooled_tell_drained_by_anyone_keeps_its_sender_and_time_and_expires_unrung() {
+    async fn a_spooled_tell_drained_by_anyone_keeps_its_sender_and_time_and_expires() {
         let dir = tempfile::tempdir().unwrap();
         let spool = dir.path().join("spool.jsonl");
         let mut tell = Envelope::new(
@@ -776,8 +776,10 @@ mod tests {
         );
         assert_eq!(got.ts, tell.ts, "the original time");
         let s = crate::state::State::fold(&events);
-        let why = s.msgs[&tell.id].stale(chrono::Utc::now());
-        assert!(why.is_some_and(|w| w.contains("expired")), "closed unrung");
+        assert!(
+            s.msgs[&tell.id].expired(chrono::Utc::now()),
+            "never rung: a dead letter"
+        );
         hub.abort();
     }
 

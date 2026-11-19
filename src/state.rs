@@ -7,9 +7,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::event::{
-    AgentState, Body, COORDINATOR, Event, Known, Level, ProcessHung, QuotaWindow, ResourceHold,
-    ResourceLimit, RetireRequested, RetireResult, SpawnRequested, SpawnResult, StuckCause,
-    TYPE_VERSION, TaskState, UpdateResult, WorktreeProcs, WorktreeState,
+    ActorKind, AgentState, Body, COORDINATOR, Event, Known, Level, MsgSent, ProcessHung,
+    QuotaWindow, ResourceHold, ResourceLimit, RetireRequested, RetireResult, SpawnRequested,
+    SpawnResult, StuckCause, TYPE_VERSION, TaskState, UpdateResult, WorktreeProcs, WorktreeState,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -448,8 +448,8 @@ pub const READ_KEPT: chrono::Duration = chrono::Duration::hours(24);
 /// after it was sent is history: its host was away, and what it announced has long been acted on.
 pub const MSG_FRESH: chrono::Duration = chrono::Duration::hours(6);
 
-/// Any doorbell still unread this long after it was sent has expired: it is closed unrung, and
-/// an unread one is no longer retransmitted. Whatever it said has been overtaken.
+/// Any doorbell still unread this long after it was sent has expired: it is no longer rung, and
+/// its recipient's host hands it to the coordinator as a dead letter. Nothing is dropped.
 pub const MSG_EXPIRE: chrono::Duration = chrono::Duration::hours(24);
 
 /// Whether an agent of this program takes a prompt typed mid-turn: Claude Code queues it and
@@ -460,16 +460,9 @@ pub fn queues_input(kind: Option<&str>) -> bool {
 
 impl Msg {
     /// Why ringing this doorbell now would be a false alarm, if it would: a status report that
-    /// waited out a host reconnect. Questions and instructions (`ASK`, `BLOCKED`, ...) go stale only
-    /// at `MSG_EXPIRE`, like every doorbell.
+    /// waited out a host reconnect. Questions and instructions (`ASK`, `BLOCKED`, ...) never go
+    /// stale; past `MSG_EXPIRE` every tell goes to the coordinator instead (`dead_letters`).
     pub fn stale(&self, now: DateTime<Utc>) -> Option<String> {
-        if now - self.since > MSG_EXPIRE {
-            return Some(format!(
-                "{} sent {}h ago: expired",
-                self.kind,
-                (now - self.since).num_hours()
-            ));
-        }
         let status = ["MERGED", "DONE", "RETIRE", "OPEN", "FIX"];
         (status.contains(&self.kind.as_str()) && now - self.since > MSG_FRESH).then(|| {
             format!(
@@ -481,7 +474,69 @@ impl Msg {
     }
 }
 
+impl Msg {
+    /// Unread `MSG_EXPIRE` after it was sent: no longer rung, it goes to the coordinator. A dead
+    /// letter itself never expires.
+    pub fn expired(&self, now: DateTime<Utc>) -> bool {
+        self.kind != DEADLETTER && now - self.since > MSG_EXPIRE
+    }
+}
+
+/// The kind of the tell that hands an expired or orphaned tell to the coordinator.
+pub const DEADLETTER: &str = "DEADLETTER";
+
+/// A tell whose recipient is not up this long after it was sent goes to the coordinator.
+pub const GONE_AFTER: chrono::Duration = chrono::Duration::minutes(10);
+
+/// The host part of `agent:<host>/<session>/<name>`.
+fn agent_host(id: &str) -> Option<&str> {
+    id.strip_prefix("agent:")?.split('/').next()
+}
+
 impl State {
+    /// Tells `host` must hand to the coordinator now, as `(id, dead letter)`: unread (delivered or
+    /// not) `MSG_EXPIRE` after the send, or sent `GONE_AFTER` ago to an agent that is not up. Each
+    /// is the job of the recipient's host alone; a tell to a role nobody holds waits.
+    pub fn dead_letters(&self, host: &str, now: DateTime<Utc>) -> Vec<(String, MsgSent)> {
+        self.msgs
+            .iter()
+            .chain(self.unread.iter().map(|(id, u)| (id, &u.msg)))
+            .filter(|(_, m)| m.kind != DEADLETTER)
+            .filter_map(|(id, m)| {
+                let to = self.recipient(&m.to)?;
+                if agent_host(to) != Some(host) {
+                    return None;
+                }
+                let why = if m.expired(now) {
+                    "expired"
+                } else if !self.agents.contains_key(to) && now - m.since >= GONE_AFTER {
+                    "recipient gone"
+                } else {
+                    return None;
+                };
+                let age = now - m.since;
+                let text = format!(
+                    "[{why}, queued {}h{:02}m ago from {} to {}, sent {}] {}",
+                    age.num_hours(),
+                    age.num_minutes() % 60,
+                    m.from,
+                    m.to,
+                    m.since.format("%Y-%m-%d %H:%MZ"),
+                    m.text
+                );
+                Some((
+                    id.clone(),
+                    MsgSent {
+                        to: COORDINATOR.into(),
+                        kind: DEADLETTER.into(),
+                        reference: m.reference.clone(),
+                        text,
+                    },
+                ))
+            })
+            .collect()
+    }
+
     /// Tells to `me` (by id, or by a role it holds) not read yet and not expired at `now`,
     /// delivered or not, oldest first: what `agent-fleet read` shows and acks.
     pub fn unread_for(&self, me: &str, now: DateTime<Utc>) -> Vec<(&String, &Msg)> {
@@ -490,7 +545,7 @@ impl State {
             .msgs
             .iter()
             .chain(self.unread.iter().map(|(id, u)| (id, &u.msg)))
-            .filter(|(_, m)| mine(m) && m.stale(now).is_none())
+            .filter(|(_, m)| mine(m) && m.stale(now).is_none() && !m.expired(now))
             .collect();
         v.sort_by_key(|(id, m)| (m.since, *id));
         v
@@ -963,6 +1018,14 @@ impl State {
                 }
             }
             Known::MsgSent(d) => {
+                // A host's dead letter takes the tell it names (`re`) off the recipient's queue.
+                if d.kind == DEADLETTER
+                    && e.actor.kind == ActorKind::Host
+                    && let Some(re) = &e.re
+                {
+                    self.msgs.remove(re);
+                    self.unread.remove(re);
+                }
                 self.msgs.insert(
                     e.id.clone(),
                     Msg {
@@ -1187,7 +1250,6 @@ impl State {
         self.answers
             .retain(|_, a| e.ts - a.acked.unwrap_or(a.at) <= ANSWER_KEPT);
         self.read.retain(|_, r| e.ts - r.at <= READ_KEPT);
-        self.unread.retain(|_, u| e.ts - u.msg.since <= MSG_EXPIRE);
         // The reducer has no clock: a spawn is pruned once a later event's `ts` is more than
         // SPAWN_KEPT past its answer (or its request, when it was never answered) — but never
         // while its agent is still up, so cap counting cannot lose sight of it.
@@ -2080,6 +2142,88 @@ mod tests {
             }),
         ));
         assert!(s.msgs.is_empty() && s.unread.is_empty());
+    }
+
+    #[test]
+    fn expired_and_orphaned_tells_go_to_the_coordinator_from_the_recipients_host_once() {
+        let now = Utc::now();
+        let mut s = State::default();
+        let msg = |to: &str, kind: &str, mins: i64| Msg {
+            from: "agent:h/s/lead".into(),
+            to: to.into(),
+            kind: kind.into(),
+            reference: "x#1".into(),
+            text: "which?".into(),
+            since: now - chrono::Duration::minutes(mins),
+        };
+        let up = |s: &mut State, id: &str| {
+            s.agents.insert(
+                id.into(),
+                serde_json::from_value(serde_json::json!({
+                    "host": "h", "state": "idle", "since": now
+                }))
+                .unwrap(),
+            );
+        };
+        up(&mut s, "agent:h/s/a");
+        up(&mut s, "agent:k/s/far");
+        s.msgs.insert("fresh".into(), msg("agent:h/s/a", "ASK", 60));
+        s.msgs
+            .insert("old".into(), msg("agent:h/s/a", "ASK", 25 * 60));
+        s.unread.insert(
+            "unread-old".into(),
+            Unread {
+                msg: msg("agent:h/s/a", "FYI", 25 * 60),
+                delivered: now - chrono::Duration::hours(24),
+                rings: 6,
+            },
+        );
+        s.msgs
+            .insert("gone".into(), msg("agent:h/s/gone", "ASK", 11));
+        s.msgs
+            .insert("gone-young".into(), msg("agent:h/s/gone", "ASK", 9));
+        s.msgs
+            .insert("elsewhere".into(), msg("agent:k/s/far", "ASK", 25 * 60));
+        s.msgs
+            .insert("dl".into(), msg(COORDINATOR, DEADLETTER, 50 * 60));
+        let got = s.dead_letters("h", now);
+        let ids: Vec<&str> = got.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["gone", "old", "unread-old"], "{got:?}");
+        let (_, dl) = &got[1];
+        assert_eq!(
+            (dl.to.as_str(), dl.kind.as_str()),
+            (COORDINATOR, DEADLETTER)
+        );
+        assert_eq!(dl.reference, "x#1");
+        assert!(
+            dl.text.starts_with(
+                "[expired, queued 25h00m ago from agent:h/s/lead to agent:h/s/a, sent "
+            ) && dl.text.ends_with("] which?"),
+            "{}",
+            dl.text
+        );
+        assert!(got[0].1.text.starts_with("[recipient gone, "));
+        assert_eq!(s.dead_letters("k", now).len(), 1, "the far host's own");
+
+        // The host's dead letter closes the original in the same event; an agent's does not.
+        let dead = |actor: ActorKind, re: &str| {
+            let mut e = ev(actor, Known::MsgSent(got[1].1.clone()))
+                .re(re)
+                .into_event();
+            e.ts = now;
+            e
+        };
+        s.apply(&dead(ActorKind::Agent, "old"));
+        assert!(s.msgs.contains_key("old"));
+        s.apply(&dead(ActorKind::Host, "old"));
+        s.apply(&dead(ActorKind::Host, "unread-old"));
+        assert!(!s.msgs.contains_key("old") && s.unread.is_empty());
+        let ids: Vec<String> = s
+            .dead_letters("h", now)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec!["gone".to_string()], "each goes once");
     }
 
     #[test]
@@ -3002,7 +3146,8 @@ mod tests {
     }
 
     #[test]
-    fn a_status_report_older_than_six_hours_is_stale_and_any_tell_expires_at_a_day() {
+    fn a_status_report_older_than_six_hours_is_stale_and_any_tell_but_a_dead_letter_expires_at_a_day()
+     {
         let now = Utc::now();
         let msg = |kind: &str, ago: i64| Msg {
             from: "agent:h/s/a".into(),
@@ -3016,9 +3161,14 @@ mod tests {
             assert!(msg(k, 5).stale(now).is_none(), "{k} at 5h is still news");
             assert!(msg(k, 7).stale(now).unwrap().contains("7h ago"), "{k}");
         }
+        assert!(
+            !msg(DEADLETTER, 100).expired(now),
+            "a dead letter waits for the coordinator"
+        );
         for k in ["BLOCKED", "ASK", "FYI"] {
-            assert!(msg(k, 23).stale(now).is_none(), "{k} at 23h still rings");
-            assert!(msg(k, 25).stale(now).unwrap().contains("expired"), "{k}");
+            assert!(msg(k, 30).stale(now).is_none(), "{k} is never stale");
+            assert!(!msg(k, 23).expired(now), "{k} at 23h still rings");
+            assert!(msg(k, 25).expired(now), "{k}");
         }
     }
 }

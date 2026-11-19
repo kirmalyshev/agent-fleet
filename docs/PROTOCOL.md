@@ -258,7 +258,7 @@ first showed the account out) keyed by `<host>:<kind>`,
 `tasks` (state + since, owner, lead,
 blocked_by, handoffs), open `blockers` and `asks` (with their context link) keyed by their raising event id, undelivered
 `msgs` keyed by their `msg.sent` id, delivered-but-`unread` ones (with the last delivery and
-the ring count, dropped 24 h after the send), `read` ones (kept 24 h after the read), the id of the `last` event folded, and the `unknown` count.
+the ring count, kept until read or handed to the coordinator), `read` ones (kept 24 h after the read), the id of the `last` event folded, and the `unknown` count.
 
 ## Doorbells
 
@@ -309,10 +309,16 @@ its `msg.delivered` has to be written again.
 delivery>`, or `read`; the board lists unread ones the same way. Read tells stay in the state for
 24 h after the read.
 
-Every tell expires 24 h after it was sent (status reports at 6 h, above): undelivered, it is
-closed unrung (`msg.delivered` with `attempts: 0`); unread, it is no longer retransmitted. A
-spooled tell replays with its own actor and `ts`, whichever call drains the spool, so a tell
-spooled for days arrives expired and is never rung.
+Nothing is dropped. A tell still unread (delivered or not) 24 h after it was sent, or sent 10 min
+ago to an agent that is not up, is a **dead letter**: the recipient's host, and only it, writes one
+`msg.sent` to `coordinator` with kind `DEADLETTER`, `re` = the tell, the tell's ref, and the text
+`[expired|recipient gone, queued <age> ago from <sender> to <recipient>, sent <time>] <text>`. That
+one event takes the tell off its recipient's queue (only a host's `DEADLETTER` does), and its id is
+derived from the tell's id, so a retry or a second writer is the same event and the hub keeps it
+once. The coordinator redistributes it. A dead letter never expires itself and waits while no
+agent holds the role; the board counts them. A status report older than 6 h is still closed
+unrung, above. A spooled tell replays with its own actor and `ts`, whichever call drains the
+spool, so a tell spooled for days arrives expired and goes to the coordinator, never rung.
 
 ## Presence (herdr)
 

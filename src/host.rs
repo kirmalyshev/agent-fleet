@@ -1293,6 +1293,20 @@ impl Host {
                 }
             };
             let now = chrono::Utc::now();
+            // Expired, or its recipient gone: handed to the coordinator, never rung. The dead
+            // letter's id comes from the tell's, so a retry or a second writer is the same event.
+            let dead = view.state.dead_letters(&self.cfg.host, now);
+            for (id, letter) in &dead {
+                let mut e = self.presence(Known::MsgSent(letter.clone())).re(id);
+                e.id = dead_letter_id(id);
+                if self.publish(e).await {
+                    eprintln!(
+                        "agent-fleet host: {id} handed to the coordinator: {}",
+                        letter.text
+                    );
+                }
+            }
+            let dead: HashSet<&String> = dead.iter().map(|(id, _)| id).collect();
             let (pending, unread) = (&view.state.msgs, &view.state.unread);
             let live = |id: &String| pending.contains_key(id) || unread.contains_key(id);
             tried.retain(|id, _| live(id));
@@ -1307,16 +1321,19 @@ impl Host {
                 .filter(|(_, u)| {
                     u.rings < MAX_RINGS
                         && now - u.delivered >= retransmit_after(u.rings)
-                        && u.msg.stale(now).is_none()
+                        && !u.msg.expired(now)
                 })
                 .map(|(id, u)| (id, &u.msg, Some(u.rings)));
             for (id, msg, cycle) in pending.iter().map(|(id, m)| (id, m, None)).chain(due) {
                 let again = cycle.is_some();
+                if dead.contains(id) || msg.expired(now) {
+                    continue;
+                }
                 // Resolved per pass: a message to `coordinator` follows the role to its holder now.
                 let Some(to) = view.state.recipient(&msg.to) else {
                     continue;
                 };
-                // A status report that waited out a reconnect, or any tell a day old: close it unrung.
+                // A status report that waited out a reconnect is history: close it unrung.
                 if let Some(why) = msg.stale(now) {
                     let dropped = MsgDelivered {
                         to: to.to_string(),
@@ -1514,6 +1531,15 @@ impl Host {
     async fn queued_visible(&self, to: &str, id: &str) -> Option<bool> {
         tokio::time::sleep(QUEUE_CHECK).await;
         crate::stuck::screen(self, to).await.map(|t| has_id(&t, id))
+    }
+}
+
+/// The id of the dead letter for the tell `id`: a ULID made from it, so handing the same tell
+/// over twice writes the same event, which the hub keeps once.
+pub(crate) fn dead_letter_id(id: &str) -> String {
+    match ulid::Ulid::from_string(id) {
+        Ok(u) => ulid::Ulid::from_parts(u.timestamp_ms(), u.random() ^ 0xDEAD_1E77E5).to_string(),
+        Err(_) => ulid::Ulid::new().to_string(),
     }
 }
 
@@ -1996,6 +2022,50 @@ mod tests {
             "dropped, so it leaves the undelivered list"
         );
     }
+    #[tokio::test]
+    async fn an_expired_tell_goes_to_the_coordinator_once_and_is_never_rung() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, fake, _) = host_on_fake_msg(dir.path(), "idle", "ASK", 25).await;
+        let dead = || {
+            let log = host.replica.lock().unwrap().all().unwrap();
+            log.into_iter()
+                .filter(
+                    |e| matches!(&e.body, Body::Known(Known::MsgSent(m)) if m.kind == "DEADLETTER"),
+                )
+                .collect::<Vec<_>>()
+        };
+        for _ in 0..200 {
+            if !dead().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // More passes: it is handed over once, never again.
+        for _ in 0..3 {
+            host.wake.notify_one();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let got = dead();
+        assert_eq!(got.len(), 1, "{got:?}");
+        let Body::Known(Known::MsgSent(m)) = &got[0].body else {
+            unreachable!()
+        };
+        assert_eq!(m.to, "coordinator");
+        assert!(m.text.contains("from agent:h/s/lead to agent:h/s/a") && m.text.ends_with("] hi"));
+        assert!(
+            fake.prompts.lock().unwrap().is_empty(),
+            "an expired tell is never rung"
+        );
+        let view = host.view().unwrap();
+        assert!(
+            view.state.msgs.values().all(|m| m.kind == "DEADLETTER"),
+            "the original is closed"
+        );
+        // A replay of the same hand-over is the same event: the hub keeps one.
+        let orig = got[0].re.clone().unwrap();
+        assert_eq!(dead_letter_id(&orig), got[0].id);
+    }
+
     #[tokio::test]
     async fn a_busy_claude_agent_gets_the_tell_queued() {
         let dir = tempfile::tempdir().unwrap();

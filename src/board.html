@@ -650,6 +650,7 @@ function render() {
   const count = x => a.filter(v => v.state === x).length;
   const open = Object.values(s.tasks).filter(t => !TERMINAL.includes(t.state)).length;
   const undelivered = Object.keys(s.msgs).length;
+  const deadLetters = [...Object.values(s.msgs), ...Object.values(s.unread || {})].filter(m => m.kind === "DEADLETTER").length;
   const n = {
     inbox: inboxItems().live.length, kanban: kanbanCards(s).filter(c => c.col !== "done").length, tree: new Set(Object.values(s.worktrees).map(w => w.state.host + ":" + w.state.repo)).size, agents: a.length,
     worktrees: Object.keys(s.worktrees).length, tasks: open, resources: Object.values(s.resources).filter(r => r.holder).length, findings: data.findings.length, doorbells: undelivered, hosts: Object.keys(s.hosts).length,
@@ -663,6 +664,7 @@ function render() {
     ["tasks", `<b>${open}</b> open tasks`, ""],
     ["findings", `<b>${data.findings.length}</b> findings`, data.findings.length ? "warn" : ""],
     undelivered ? ["doorbells", `<b>${undelivered}</b> undelivered`, "warn"] : null,
+    deadLetters ? ["doorbells", `<b>${deadLetters}</b> dead letters`, "warn"] : null,
   ].filter(Boolean).map(([t, html, cls]) => `<button class="stat ${cls}" data-tab="${t}">${html}</button>`).join("");
   const alerts = data.findings.filter(f => ["orphan", "hung", "duplicate", "breach"].includes(f.kind)).slice(0, 3)
     .map(f => `<div class="banner">${ICON.alert}<div><b>${esc(f.kind)}</b> · <span class="mono">${esc(home(f.subject))}</span><div class="sub">${esc(f.detail)}</div></div></div>`);
