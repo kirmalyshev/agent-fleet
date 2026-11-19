@@ -727,7 +727,10 @@ pub async fn wait_result(
     client: &crate::client::Client,
     id: &str,
 ) -> Result<crate::event::RetireResult> {
-    let deadline = tokio::time::Instant::now() + crate::spawn::REQUEST_MAX_AGE.to_std().unwrap_or(Duration::from_secs(900));
+    let deadline = tokio::time::Instant::now()
+        + crate::spawn::REQUEST_MAX_AGE
+            .to_std()
+            .unwrap_or(Duration::from_secs(900));
     loop {
         match client.state().await {
             Ok(s) => {
@@ -741,7 +744,9 @@ pub async fn wait_result(
             Err(_) => {}
         }
         if tokio::time::Instant::now() >= deadline {
-            bail!("no retire.result for {id} within 15 min — the agent's host may be down (or too old an agent-fleet to answer retire requests)");
+            bail!(
+                "no retire.result for {id} within 15 min — the agent's host may be down (or too old an agent-fleet to answer retire requests)"
+            );
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -779,7 +784,13 @@ pub fn due(
 pub async fn serve(host: &crate::host::Host, seen: &mut std::collections::HashSet<String>) {
     let Ok(view) = host.view() else { return };
     let state = &view.state;
-    for id in due(state, &host.cfg.host, &host.cfg.session, seen, chrono::Utc::now()) {
+    for id in due(
+        state,
+        &host.cfg.host,
+        &host.cfg.session,
+        seen,
+        chrono::Utc::now(),
+    ) {
         let Some(req) = state.retires.get(&id) else {
             continue;
         };
@@ -871,20 +882,50 @@ mod tests {
         add("theirs", "mac", 1, false);
         add("done", "kir", 1, true);
         add("old", "kir", 60, false);
-        state.spawns.insert("sp".into(), crate::state::Spawn {
-            request: crate::event::SpawnRequested {
-                name: "a".into(), agent: "agent:kir/s/a".into(), host: "kir".into(),
-                session: "s".into(), repo: "o/r".into(), issue: None, branch: "b".into(),
-                profile: "p".into(), brief: String::new(), level: None, lead: None,
-                worktree: None, replaces: None, why: String::new(),
+        state.spawns.insert(
+            "sp".into(),
+            crate::state::Spawn {
+                request: crate::event::SpawnRequested {
+                    name: "a".into(),
+                    agent: "agent:kir/s/a".into(),
+                    host: "kir".into(),
+                    session: "s".into(),
+                    repo: "o/r".into(),
+                    issue: None,
+                    branch: "b".into(),
+                    profile: "p".into(),
+                    brief: String::new(),
+                    level: None,
+                    lead: None,
+                    worktree: None,
+                    replaces: None,
+                    why: String::new(),
+                },
+                by: "x".into(),
+                project: "p".into(),
+                result: None,
+                since: now,
+                answered: None,
             },
-            by: "x".into(), project: "p".into(), result: None, since: now, answered: None,
-        });
+        );
         let mut seen = std::collections::HashSet::new();
-        assert_eq!(due(&state, "kir", "s", &mut seen, now), vec!["mine".to_string()]);
-        assert!(due(&state, "kir", "s", &mut seen, now).is_empty(), "not twice");
+        assert_eq!(
+            due(&state, "kir", "s", &mut seen, now),
+            vec!["mine".to_string()]
+        );
         assert!(
-            due(&state, "kir", "other", &mut std::collections::HashSet::new(), now).is_empty(),
+            due(&state, "kir", "s", &mut seen, now).is_empty(),
+            "not twice"
+        );
+        assert!(
+            due(
+                &state,
+                "kir",
+                "other",
+                &mut std::collections::HashSet::new(),
+                now
+            )
+            .is_empty(),
             "another session's host leaves it alone"
         );
     }
@@ -1064,12 +1105,12 @@ mod tests {
         let f = fx();
         f.dirty();
         std::fs::write(f.wt.join("bin.dat"), [0u8, 1, 0, 255]).unwrap();
-        assert_eq!(
+        assert!(matches!(
             guarded(&f.plan(), f.wt(), Some(Decide::Stash), WAIT)
                 .await
                 .unwrap(),
-            Outcome::Retired
-        );
+            Outcome::Stashed(_)
+        ));
         assert_eq!(
             f.read("hook-args").trim(),
             format!("{} --decide=delete", f.wt())
@@ -1169,12 +1210,12 @@ mod tests {
         let latin1 = b"caf\xe9, na\xefve\n".to_vec();
         std::fs::write(f.wt.join("a.txt"), &latin1).unwrap();
         std::fs::write(f.wt.join("l1.txt"), &latin1).unwrap();
-        assert_eq!(
+        assert!(matches!(
             guarded(&f.plan(), f.wt(), Some(Decide::Stash), WAIT)
                 .await
                 .unwrap(),
-            Outcome::Retired
-        );
+            Outcome::Stashed(_)
+        ));
         let p = std::fs::read_dir(&f.patches)
             .unwrap()
             .next()
