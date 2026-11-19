@@ -721,6 +721,17 @@ pub(crate) fn short(id: &str) -> &str {
     id.rsplit('/').next().unwrap_or(id)
 }
 
+/// Who hears about an agent's retire: its spawn's `lead`, else the agent that spawned it, else
+/// the root coordinator.
+pub fn lead_of(sp: &Spawn) -> String {
+    sp.request
+        .lead
+        .clone()
+        .filter(|l| is_agent_id(l))
+        .or_else(|| is_agent_id(&sp.by).then(|| sp.by.clone()))
+        .unwrap_or_else(|| COORDINATOR.into())
+}
+
 /// The latest fleet spawn of an agent: by full id or by its name in the session.
 pub fn find_spawn<'a>(state: &'a State, agent: &str) -> Option<&'a Spawn> {
     state
@@ -966,7 +977,7 @@ pub(crate) async fn run_retire(
         patches: &patches,
         decide_cmd: &cmd,
     };
-    match crate::retire::guarded(&plan, worktree, None).await? {
+    match crate::retire::guarded(&plan, worktree, None, crate::retire::HOST_WAIT).await? {
         crate::retire::Outcome::Refused(why) => bail!("{why}"),
         _ => Ok(()),
     }

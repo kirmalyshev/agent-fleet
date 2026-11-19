@@ -511,8 +511,9 @@ impl Host {
         });
     }
 
-    /// Say a retire did not happen: stderr, and a blocker on the spawn's issue naming the agent
-    /// (a blocker needs a task, so a spawn with no issue is stderr only).
+    /// Say a retire did not happen: stderr, a `BLOCKED` message to the agent's lead, and a
+    /// blocker on the spawn's issue naming the agent (a blocker needs a task, so a spawn with no
+    /// issue gets the message only).
     pub(crate) async fn retire_refused(
         &self,
         agent: &str,
@@ -551,15 +552,10 @@ impl Host {
     /// spawned it, else the root coordinator): the changes it found and the command that decides
     /// are in `text`, so the lead can act on the message alone.
     async fn tell_lead(&self, agent: &str, repo: &str, issue: Option<u64>, text: &str) {
-        let lead = self.view().ok().and_then(|v| {
-            crate::spawn::find_spawn(&v.state, agent).and_then(|sp| {
-                sp.request
-                    .lead
-                    .clone()
-                    .filter(|l| crate::event::is_agent_id(l))
-                    .or_else(|| crate::event::is_agent_id(&sp.by).then(|| sp.by.clone()))
-            })
-        });
+        let lead = self
+            .view()
+            .ok()
+            .and_then(|v| crate::spawn::find_spawn(&v.state, agent).map(crate::spawn::lead_of));
         let reference = match issue {
             Some(n) => format!("{repo}#{n}"),
             None => repo.to_string(),

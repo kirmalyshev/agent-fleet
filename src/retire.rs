@@ -1,5 +1,5 @@
-//! Retiring a worktree: the one guarded path every close takes (`agent-fleet retire`, a closed
-//! pane, a failed spawn).
+//! Retiring a worktree: the guarded path `agent-fleet retire`, a closed pane and a failed spawn
+//! take (the TUI `x`, `dev clean` and the pre-spawn sweep do not yet: #120).
 //!
 //! Real uncommitted changes STOP a retire and are shown — each path and where its content
 //! already lives — until someone decides `delete`, `keep` or `stash`; stash writes a patch first.
@@ -24,6 +24,9 @@ pub const REPO_LOCK: &str = "agent-fleet-retire.lock";
 pub const LOCK_FD_ENV: &str = "AGENT_FLEET_RETIRE_LOCK_FD";
 /// How long a retire waits for another to finish with the same tree or repository.
 pub const WAIT: Duration = Duration::from_secs(90);
+/// How long the host's own close-retire waits: past the 5 min a hook may run, so a retire
+/// `agent-fleet retire` is running when it closes the pane is waited out, not reported.
+pub const HOST_WAIT: Duration = Duration::from_secs(6 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decide {
@@ -79,6 +82,21 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn git_bytes(dir: &Path, args: &[&str], index: Option<&Path>) -> Option<Vec<u8>> {
+    let mut c = Command::new("git");
+    c.arg("-C")
+        .arg(dir)
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE");
+    if let Some(i) = index {
+        c.env("GIT_INDEX_FILE", i);
+    }
+    let out = c.output().ok()?;
+    out.status.success().then_some(out.stdout)
 }
 
 /// `git status` pinned so config cannot hide work: untracked files shown, submodules not ignored.
@@ -184,9 +202,11 @@ pub fn report(wt: &Path, changes: &[Change], decide_cmd: &str) -> String {
 }
 
 /// `stash`: every uncommitted change — tracked edits against HEAD and each untracked file — as
-/// ONE binary patch in `dir`, written before anything is removed. Err, and nothing written, for
-/// what a patch cannot carry: work inside a submodule, an untracked nested repository, an
-/// untracked file git cannot diff. A stash that leaves work out is a delete.
+/// ONE binary patch in `dir`, written before anything is removed and checked to apply to HEAD.
+/// The bytes are git's own (no text decoding), and colour, prefixes, external diffs and
+/// textconv are pinned so no config changes them. Err, and nothing left written, for what a patch
+/// cannot carry: work inside a submodule, an untracked nested repository, an untracked file git
+/// cannot diff, a patch that does not apply. A stash that leaves work out is a delete.
 pub fn save_patch(wt: &Path, dir: &Path, name: &str, changes: &[Change]) -> Result<PathBuf> {
     if let Some(c) = changes.iter().find(|c| is_gitlink(wt, &c.path)) {
         bail!(
@@ -194,11 +214,18 @@ pub fn save_patch(wt: &Path, dir: &Path, name: &str, changes: &[Change]) -> Resu
             c.path
         );
     }
-    let mut patch = git(
-        wt,
-        &["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--binary"],
-    )
-    .context("git diff HEAD failed")?;
+    const PIN: [&str; 6] = [
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--binary",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+    ];
+    let mut args = vec!["diff"];
+    args.extend(PIN);
+    args.push("HEAD");
+    let mut patch = git_bytes(wt, &args, None).context("git diff HEAD failed")?;
     let others = git(wt, &["ls-files", "--others", "--exclude-standard", "-z"])
         .context("git ls-files failed")?;
     for f in others.split('\0').filter(|f| !f.is_empty()) {
@@ -209,30 +236,37 @@ pub fn save_patch(wt: &Path, dir: &Path, name: &str, changes: &[Change]) -> Resu
         let o = Command::new("git")
             .arg("-C")
             .arg(wt)
-            .args([
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--binary",
-                "--no-index",
-                "--",
-                "/dev/null",
-                f,
-            ])
+            .arg("diff")
+            .args(PIN)
+            .args(["--no-index", "--", "/dev/null", f])
             .output()
             .with_context(|| format!("diff {f}"))?;
         if o.status.code() != Some(1) || o.stdout.is_empty() {
             bail!("could not diff the untracked {f}");
         }
-        patch += &String::from_utf8_lossy(&o.stdout);
+        patch.extend_from_slice(&o.stdout);
     }
-    if patch.trim().is_empty() {
+    if patch.iter().all(u8::is_ascii_whitespace) {
         bail!("the patch came out empty");
     }
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let file = dir.join(format!("{}-{stamp}.patch", name.replace('/', "-")));
-    std::fs::write(&file, patch).with_context(|| format!("write {}", file.display()))?;
+    std::fs::write(&file, &patch).with_context(|| format!("write {}", file.display()))?;
+    // Proof it gives the work back: applied to HEAD in a scratch index, never this tree's.
+    let index = dir.join(format!(".check-{stamp}.index"));
+    let applies = git_bytes(wt, &["read-tree", "HEAD"], Some(&index)).is_some()
+        && git_bytes(
+            wt,
+            &["apply", "--cached", "--check", &file.to_string_lossy()],
+            Some(&index),
+        )
+        .is_some();
+    let _ = std::fs::remove_file(&index);
+    if !applies {
+        let _ = std::fs::remove_file(&file);
+        bail!("the patch does not apply back to HEAD");
+    }
     Ok(file)
 }
 
@@ -263,14 +297,20 @@ async fn lock_file(path: &Path, wait: Duration, what: &str) -> Result<Held> {
     }
 }
 
-/// (A) this worktree's lock, then (B) the repository's. Never the other order, and nothing takes
-/// A while holding B, so no two retires can wait on each other.
-pub async fn locks(checkout: &Path, wt: &Path, wait: Duration) -> Result<(Held, Held)> {
+/// (A) this worktree's lock, then (B) the repository's, both in the WORKTREE's git common dir —
+/// the same files whichever checkout or clone the caller stands in. Never the other order, and
+/// nothing takes A while holding B, so no two retires can wait on each other.
+pub async fn locks(wt: &Path, wait: Duration) -> Result<(Held, Held)> {
     let common = git(
-        checkout,
+        wt,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )
-    .context("git could not name the common dir, where the retire locks live")?;
+    .with_context(|| {
+        format!(
+            "git could not name {}'s common dir, where the retire locks live",
+            wt.display()
+        )
+    })?;
     let common = PathBuf::from(common.trim());
     let tree = wt
         .file_name()
@@ -336,6 +376,45 @@ pub async fn run_hook(
     Ok(())
 }
 
+/// The checkout whose `retire` hook and locks a retire of `repo` uses: the connected one
+/// (`agent-fleet repo add`), else the checkout `here` only if its `origin` IS `repo` — another
+/// repository's hook run on this agent's tree, and locks taken where the host's retire does not
+/// look, would guard nothing.
+pub fn checkout_for(
+    repo: &str,
+    registered: Option<PathBuf>,
+    here: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(c) = registered {
+        return Ok(c);
+    }
+    match here {
+        Some(h) if crate::spawn::slug_of(&h).as_deref() == Some(repo) => Ok(h),
+        Some(h) => bail!(
+            "{} is not a checkout of {repo}, and {repo} is not connected (`agent-fleet repo add`)",
+            h.display()
+        ),
+        None => bail!(
+            "not in a checkout of {repo}, and {repo} is not connected (`agent-fleet repo add`)"
+        ),
+    }
+}
+
+/// Where `stash` writes: fleet.toml's `retire_patches` (absolute, or `~/…` under `home`), else
+/// `retired-patches` in the instance's data dir.
+pub fn patches_dir(configured: Option<&str>, home: Option<&Path>, data: &Path) -> Result<PathBuf> {
+    match configured {
+        None => Ok(data.join("retired-patches")),
+        Some(p) => match p.strip_prefix("~/") {
+            Some(rest) => Ok(home
+                .context("retire_patches starts with ~/ and there is no home dir")?
+                .join(rest)),
+            None if Path::new(p).is_absolute() => Ok(PathBuf::from(p)),
+            None => bail!("retire_patches must be absolute or start with ~/: {p:?}"),
+        },
+    }
+}
+
 /// What a retire needs besides the tree: the checkout whose `retire` hook runs, the hook (a repo
 /// with none is not retired by the fleet at all, as before), the
 /// base ref, where stash writes, and the command a refusal tells its reader to run.
@@ -347,58 +426,85 @@ pub struct Plan<'a> {
     pub decide_cmd: &'a str,
 }
 
-/// The guarded retire. Locks, then reads the tree, then acts on what it found and on `decide`;
-/// the hook runs only for a clean tree or a decision that accepted the changes, and is then told
-/// so with `--decide=delete` (the dirt, nothing else: its own guards still stand).
-pub async fn guarded(plan: &Plan<'_>, wt: &str, decide: Option<Decide>) -> Result<Outcome> {
-    let held = locks(plan.checkout, Path::new(wt), WAIT).await?;
-    guarded_with(plan, wt, decide, held).await
+/// Under the locks, before anything irreversible: may this retire go on?
+#[derive(Debug, PartialEq, Eq)]
+pub enum Ready {
+    Go,
+    Gone,
+    Kept,
+    Refused(String),
 }
 
-/// `guarded` for a caller that took the locks itself, to do something under them first —
-/// `agent-fleet retire` closes the agent's pane there, so the host's own close-retire waits.
-pub async fn guarded_with(
+fn branch_of(tree: &Path) -> String {
+    git(tree, &["symbolic-ref", "-q", "--short", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// The tree's real changes. A tree with its own `.git` is a worktree and is read, and one git
+/// cannot read is an Err; a directory without one holds no git work, and the hook alone decides it.
+fn read(plan: &Plan<'_>, tree: &Path) -> Result<Vec<Change>> {
+    if tree.join(".git").exists() {
+        changes(tree, plan.base, &branch_of(tree))
+    } else {
+        Ok(vec![])
+    }
+}
+
+/// Whether a retire of `wt` with `decide` goes on: real changes and no decision stop it here,
+/// before a pane closes or a file moves.
+pub fn assess(plan: &Plan<'_>, wt: &str, decide: Option<Decide>) -> Ready {
+    let tree = Path::new(wt);
+    if !tree.exists() {
+        return Ready::Gone;
+    }
+    if decide == Some(Decide::Keep) {
+        return Ready::Kept;
+    }
+    match read(plan, tree) {
+        Err(e) => Ready::Refused(format!("{e:#}; nothing removed")),
+        Ok(found) if !found.is_empty() && decide.is_none() => {
+            Ready::Refused(report(tree, &found, plan.decide_cmd))
+        }
+        Ok(_) => Ready::Go,
+    }
+}
+
+/// After `assess` said Go (and the caller did what it does first, e.g. close the pane): reads
+/// the tree again — the agent may have written since — stashes if told to, and runs the hook,
+/// with `--decide=delete` when changes were accepted (the dirt, nothing else: the hook's own
+/// guards still stand). `b` is the held repository lock the hook inherits.
+pub async fn finish(
     plan: &Plan<'_>,
     wt: &str,
     decide: Option<Decide>,
-    held: (Held, Held),
+    b: &Held,
 ) -> Result<Outcome> {
     let tree = Path::new(wt);
-    let (_a, b) = held;
     if !tree.exists() {
         return Ok(Outcome::Gone);
     }
-    let branch = git(tree, &["symbolic-ref", "-q", "--short", "HEAD"])
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    // A tree with its own `.git` is a worktree and is read, and one git cannot read is refused;
-    // a directory without one holds no git work to lose, and the hook alone decides it.
-    let found = if tree.join(".git").exists() {
-        match changes(tree, plan.base, &branch) {
-            Ok(c) => c,
-            Err(e) => return Ok(Outcome::Refused(format!("{e:#}; nothing removed"))),
-        }
-    } else {
-        vec![]
+    let found = match read(plan, tree) {
+        Ok(f) => f,
+        Err(e) => return Ok(Outcome::Refused(format!("{e:#}; nothing removed"))),
     };
-    if decide == Some(Decide::Keep) {
-        return Ok(Outcome::Kept);
-    }
     let mut extra: Vec<&str> = vec![];
     if !found.is_empty() {
         match decide {
             None => return Ok(Outcome::Refused(report(tree, &found, plan.decide_cmd))),
+            Some(Decide::Keep) => return Ok(Outcome::Kept),
             Some(Decide::Stash) => {
-                let name = if branch.is_empty() {
+                let b = branch_of(tree);
+                let name = if b.is_empty() {
                     tree.file_name()
                         .unwrap_or_default()
                         .to_string_lossy()
                         .into_owned()
                 } else {
-                    branch.clone()
+                    b
                 };
                 match save_patch(tree, plan.patches, &name, &found) {
-                    Ok(f) => println!("stashed {}'s uncommitted changes in {}", wt, f.display()),
+                    Ok(f) => println!("stashed {wt}'s uncommitted changes in {}", f.display()),
                     Err(e) => {
                         return Ok(Outcome::Refused(format!(
                             "could not stash {wt}: {e:#}; nothing removed"
@@ -406,12 +512,33 @@ pub async fn guarded_with(
                     }
                 }
             }
-            Some(Decide::Delete) | Some(Decide::Keep) => {}
+            Some(Decide::Delete) => {}
         }
         extra.push("--decide=delete");
     }
-    run_hook(plan.checkout, wt, plan.script, &extra, &b).await?;
+    run_hook(plan.checkout, wt, plan.script, &extra, b).await?;
     Ok(Outcome::Retired)
+}
+
+/// The guarded retire in one call, for a caller with nothing to do between the read and the
+/// removal (the host's close-retire, a failed spawn): locks up to `wait`, `assess`, `finish`.
+pub async fn guarded(
+    plan: &Plan<'_>,
+    wt: &str,
+    decide: Option<Decide>,
+    wait: Duration,
+) -> Result<Outcome> {
+    let tree = Path::new(wt);
+    if !tree.exists() {
+        return Ok(Outcome::Gone);
+    }
+    let (_a, b) = locks(tree, wait).await?;
+    match assess(plan, wt, decide) {
+        Ready::Gone => Ok(Outcome::Gone),
+        Ready::Kept => Ok(Outcome::Kept),
+        Ready::Refused(why) => Ok(Outcome::Refused(why)),
+        Ready::Go => finish(plan, wt, decide, &b).await,
+    }
 }
 
 #[cfg(test)]
@@ -440,6 +567,10 @@ mod tests {
         patches: PathBuf,
     }
     fn fx() -> Fx {
+        fx_hook("")
+    }
+    /// `fx` with `extra` shell run by the hook before it removes the tree.
+    fn fx_hook(extra: &str) -> Fx {
         let d = tempfile::tempdir().unwrap();
         let root = d.path().canonicalize().unwrap();
         let (co, wt) = (root.join("co"), root.join("wt"));
@@ -456,8 +587,9 @@ mod tests {
         std::fs::write(
             &hook,
             format!(
-                "#!/bin/sh\necho \"$@\" >> {log}/hook-args\n[ -n \"${LOCK_FD_ENV}\" ] && [ -e \"/dev/fd/${LOCK_FD_ENV}\" ] && echo inherited >> {log}/hook-fd\nsleep \"${{HOOK_SLEEP:-0}}\"\ngit worktree remove --force \"$1\"\n",
-                log = root.display()
+                "#!/bin/sh\necho \"$@\" >> {log}/hook-args\n[ -n \"${LOCK_FD_ENV}\" ] && [ -e \"/dev/fd/${LOCK_FD_ENV}\" ] && echo inherited >> {log}/hook-fd\n{extra}\ngit worktree remove --force \"$1\"\n",
+                log = root.display(),
+                extra = extra
             ),
         )
         .unwrap();
@@ -525,7 +657,7 @@ mod tests {
     async fn a_clean_tree_is_retired_by_the_hook_with_no_decision_and_the_lock_fd() {
         let f = fx();
         assert_eq!(
-            guarded(&f.plan(), f.wt(), None).await.unwrap(),
+            guarded(&f.plan(), f.wt(), None, WAIT).await.unwrap(),
             Outcome::Retired
         );
         assert_eq!(f.read("hook-args").trim(), f.wt());
@@ -537,7 +669,7 @@ mod tests {
     async fn real_changes_stop_the_retire_before_the_hook_and_say_what_they_are() {
         let f = fx();
         f.dirty();
-        let Outcome::Refused(why) = guarded(&f.plan(), f.wt(), None).await.unwrap() else {
+        let Outcome::Refused(why) = guarded(&f.plan(), f.wt(), None, WAIT).await.unwrap() else {
             panic!("not refused")
         };
         for want in [
@@ -557,7 +689,7 @@ mod tests {
         let f = fx();
         f.dirty();
         assert_eq!(
-            guarded(&f.plan(), f.wt(), Some(Decide::Keep))
+            guarded(&f.plan(), f.wt(), Some(Decide::Keep), WAIT)
                 .await
                 .unwrap(),
             Outcome::Kept
@@ -571,7 +703,7 @@ mod tests {
         let f = fx();
         f.dirty();
         assert_eq!(
-            guarded(&f.plan(), f.wt(), Some(Decide::Delete))
+            guarded(&f.plan(), f.wt(), Some(Decide::Delete), WAIT)
                 .await
                 .unwrap(),
             Outcome::Retired
@@ -588,7 +720,7 @@ mod tests {
         f.dirty();
         std::fs::write(f.wt.join("bin.dat"), [0u8, 1, 0, 255]).unwrap();
         assert_eq!(
-            guarded(&f.plan(), f.wt(), Some(Decide::Stash))
+            guarded(&f.plan(), f.wt(), Some(Decide::Stash), WAIT)
                 .await
                 .unwrap(),
             Outcome::Retired
@@ -625,7 +757,7 @@ mod tests {
         let f = fx();
         sh(&f.wt, &["init", "-q", "nested"]);
         std::fs::write(f.wt.join("nested/w.txt"), "w\n").unwrap();
-        let Outcome::Refused(why) = guarded(&f.plan(), f.wt(), Some(Decide::Stash))
+        let Outcome::Refused(why) = guarded(&f.plan(), f.wt(), Some(Decide::Stash), WAIT)
             .await
             .unwrap()
         else {
@@ -641,7 +773,7 @@ mod tests {
         let f = fx();
         let gd = git(&f.wt, &["rev-parse", "--absolute-git-dir"]).unwrap();
         std::fs::write(Path::new(gd.trim()).join("index"), "junk").unwrap();
-        let Outcome::Refused(why) = guarded(&f.plan(), f.wt(), Some(Decide::Delete))
+        let Outcome::Refused(why) = guarded(&f.plan(), f.wt(), Some(Decide::Delete), WAIT)
             .await
             .unwrap()
         else {
@@ -653,17 +785,16 @@ mod tests {
 
     #[tokio::test]
     async fn two_retires_of_one_tree_one_removes_it_and_the_other_finds_it_gone() {
-        let f = fx();
-        // SAFETY of the env write: tests in this module do not read HOOK_SLEEP concurrently
-        // with other env writers; the hook reads it through its own environment.
-        unsafe { std::env::set_var("HOOK_SLEEP", "1") };
+        let f = fx_hook("sleep 1");
         let (p1, p2) = (f.plan(), f.plan());
         let both = tokio::time::timeout(Duration::from_secs(30), async {
-            tokio::join!(guarded(&p1, f.wt(), None), guarded(&p2, f.wt(), None))
+            tokio::join!(
+                guarded(&p1, f.wt(), None, WAIT),
+                guarded(&p2, f.wt(), None, WAIT)
+            )
         })
         .await
         .expect("a retire hung");
-        unsafe { std::env::remove_var("HOOK_SLEEP") };
         let mut got = vec![both.0.unwrap(), both.1.unwrap()];
         got.sort_by_key(|o| format!("{o:?}"));
         assert_eq!(got, vec![Outcome::Gone, Outcome::Retired]);
@@ -671,13 +802,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_hook_child_left_running_with_the_inherited_fd_does_not_keep_the_lock() {
+        // The fd is the held open file; unlocking it (Held's drop) releases the flock for every
+        // process sharing it, so a background child the hook leaves behind holds nothing.
+        let f = fx_hook("sleep 5 &");
+        assert_eq!(
+            guarded(&f.plan(), f.wt(), None, WAIT).await.unwrap(),
+            Outcome::Retired
+        );
+        let common = f.co.join(".git");
+        lock_file(&common.join(REPO_LOCK), Duration::ZERO, "test")
+            .await
+            .expect("the repository lock is still held");
+    }
+
+    #[tokio::test]
+    async fn stash_keeps_bytes_that_are_not_utf8_and_ignores_colour_and_prefix_config() {
+        let f = fx();
+        sh(&f.co, &["config", "color.ui", "always"]);
+        sh(&f.co, &["config", "diff.noprefix", "true"]);
+        let latin1 = b"caf\xe9, na\xefve\n".to_vec();
+        std::fs::write(f.wt.join("a.txt"), &latin1).unwrap();
+        std::fs::write(f.wt.join("l1.txt"), &latin1).unwrap();
+        assert_eq!(
+            guarded(&f.plan(), f.wt(), Some(Decide::Stash), WAIT)
+                .await
+                .unwrap(),
+            Outcome::Retired
+        );
+        let p = std::fs::read_dir(&f.patches)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        sh(&f.co, &["switch", "-q", "feat"]);
+        sh(&f.co, &["apply", p.to_str().unwrap()]);
+        assert_eq!(std::fs::read(f.co.join("a.txt")).unwrap(), latin1);
+        assert_eq!(std::fs::read(f.co.join("l1.txt")).unwrap(), latin1);
+    }
+
+    #[tokio::test]
     async fn a_tree_already_gone_runs_no_hook() {
         let f = fx();
         sh(&f.co, &["worktree", "remove", f.wt()]);
         assert_eq!(
-            guarded(&f.plan(), f.wt(), None).await.unwrap(),
+            guarded(&f.plan(), f.wt(), None, WAIT).await.unwrap(),
             Outcome::Gone
         );
         assert_eq!(f.read("hook-args"), "");
+    }
+
+    #[test]
+    fn checkout_for_takes_the_connected_one_else_only_a_checkout_of_the_same_repo() {
+        let f = fx();
+        sh(
+            &f.co,
+            &["remote", "add", "origin", "git@github.com:o/r.git"],
+        );
+        let other = PathBuf::from("/elsewhere");
+        assert_eq!(
+            checkout_for("o/r", Some(other.clone()), Some(f.co.clone())).unwrap(),
+            other
+        );
+        assert_eq!(checkout_for("o/r", None, Some(f.co.clone())).unwrap(), f.co);
+        let e = checkout_for("o/other", None, Some(f.co.clone()))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not a checkout of o/other"), "{e}");
+        assert!(checkout_for("o/r", None, None).is_err());
+    }
+
+    #[test]
+    fn patches_dir_is_absolute_home_relative_or_the_data_dir() {
+        let (home, data) = (Path::new("/h"), Path::new("/d"));
+        assert_eq!(
+            patches_dir(None, Some(home), data).unwrap(),
+            PathBuf::from("/d/retired-patches")
+        );
+        assert_eq!(
+            patches_dir(Some("~/p"), Some(home), data).unwrap(),
+            PathBuf::from("/h/p")
+        );
+        assert_eq!(
+            patches_dir(Some("/abs"), Some(home), data).unwrap(),
+            PathBuf::from("/abs")
+        );
+        assert!(patches_dir(Some("rel"), Some(home), data).is_err());
+        assert!(patches_dir(Some("~/p"), None, data).is_err());
     }
 }

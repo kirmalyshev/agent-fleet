@@ -1852,20 +1852,31 @@ async fn main() -> Result<()> {
             let Some(sp) = spawn::find_spawn(&state, agent).cloned() else {
                 bail!("{agent} has no spawn record; it was not spawned by the fleet");
             };
-            let Some(wt) = sp.result.as_ref().and_then(|r| r.worktree.clone()) else {
-                bail!("{agent} has no worktree on record");
+            let host = ctx.host_name();
+            // The host's own rule: only a tree the fleet made, on THIS host, that no newer spawn
+            // handed to another agent — never a main checkout, never another agent's tree.
+            let Some((repo, wt, issue)) = state.retire_target(&sp.request.agent, &host) else {
+                bail!(
+                    "{agent}: no worktree to retire on {host} (a main checkout, a tree handed to another agent, or another host's agent)"
+                );
             };
-            let repo = sp.request.repo.clone();
+            // keep = leave it: the pane too, so the host's own close-retire never starts.
+            if *decide == Some(retire::Decide::Keep) {
+                println!("kept {wt}: decided keep; pane and tree untouched");
+                return Ok(());
+            }
+            if !Path::new(&wt).exists() {
+                println!("{wt} was already retired");
+                return Ok(());
+            }
             let machine = spawn::machine_dir(&ctx.cli.instance);
-            let checkout = match machine
+            let registered = machine
                 .as_deref()
                 .map(setup::registered)
                 .transpose()?
-                .and_then(|mut r| r.remove(&repo))
-            {
-                Some(c) => c,
-                None => PathBuf::from(git_toplevel()?),
-            };
+                .and_then(|mut r| r.remove(&repo));
+            let checkout =
+                retire::checkout_for(&repo, registered, git_toplevel().ok().map(PathBuf::from))?;
             let (cfg, _) = spawn::load_in(&checkout, machine.as_deref())?;
             let Some(script) = cfg.retire.clone() else {
                 bail!(
@@ -1873,16 +1884,12 @@ async fn main() -> Result<()> {
                     checkout.display()
                 );
             };
-            let patches = match cfg.retire_patches.as_deref() {
-                Some(p) => match p.strip_prefix("~/") {
-                    Some(rest) => directories::BaseDirs::new()
-                        .context("no home dir")?
-                        .home_dir()
-                        .join(rest),
-                    None => PathBuf::from(p),
-                },
-                None => ctx.paths.dir.join("retired-patches"),
-            };
+            let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
+            let patches = retire::patches_dir(
+                cfg.retire_patches.as_deref(),
+                home.as_deref(),
+                &ctx.paths.dir,
+            )?;
             let cmd = format!("agent-fleet retire {}", spawn::short(&sp.request.agent));
             let plan = retire::Plan {
                 checkout: &checkout,
@@ -1891,42 +1898,52 @@ async fn main() -> Result<()> {
                 patches: &patches,
                 decide_cmd: &cmd,
             };
-            // Locked BEFORE the pane closes: the host's own retire of that close then waits, and
-            // finds the tree gone instead of reading it half-removed.
-            let held = retire::locks(&checkout, Path::new(&wt), retire::WAIT).await?;
-            if let (Some(pane), Some(sock)) = (
-                sp.result.as_ref().and_then(|r| r.pane.clone()),
-                std::env::var_os("HERDR_SOCKET_PATH"),
-            ) && let Err(e) = host::herdr_call(
-                Path::new(&sock),
-                "pane.close",
-                serde_json::json!({ "pane_id": pane }),
-            )
-            .await
-            {
-                eprintln!("pane {pane} not closed: {e:#}");
-            }
-            match retire::guarded_with(&plan, &wt, *decide, held).await? {
+            // Locked, then read, all BEFORE the pane closes: a refusal leaves the agent up and
+            // starts no host retire; the host's retire of the close that does follow waits on
+            // these locks and finds the tree gone.
+            let (_a, b) = retire::locks(Path::new(&wt), retire::WAIT).await?;
+            let outcome = match retire::assess(&plan, &wt, *decide) {
+                retire::Ready::Gone => retire::Outcome::Gone,
+                retire::Ready::Kept => retire::Outcome::Kept,
+                retire::Ready::Refused(why) => retire::Outcome::Refused(why),
+                retire::Ready::Go => {
+                    if state.agents.contains_key(&sp.request.agent) {
+                        let pane = sp.result.as_ref().and_then(|r| r.pane.clone());
+                        let sock = std::env::var_os("HERDR_SOCKET_PATH");
+                        let closed = match (&pane, &sock) {
+                            (Some(p), Some(s)) => host::herdr_call(
+                                Path::new(s),
+                                "pane.close",
+                                json!({ "pane_id": p }),
+                            )
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| format!("{e:#}")),
+                            _ => Err(
+                                "no herdr here (HERDR_SOCKET_PATH unset) or no pane on record"
+                                    .to_string(),
+                            ),
+                        };
+                        if let Err(e) = closed {
+                            bail!(
+                                "refusing to retire {wt}: {agent} is still up and its pane was not closed ({e}); nothing removed"
+                            );
+                        }
+                    }
+                    retire::finish(&plan, &wt, *decide, &b).await?
+                }
+            };
+            match outcome {
                 retire::Outcome::Retired => println!("retired {wt}"),
                 retire::Outcome::Kept => println!("kept {wt}: decided keep, nothing removed"),
                 retire::Outcome::Gone => println!("{wt} was already retired"),
                 retire::Outcome::Refused(why) => {
-                    let to = sp
-                        .request
-                        .lead
-                        .clone()
-                        .filter(|l| is_agent_id(l))
-                        .or_else(|| is_agent_id(&sp.by).then(|| sp.by.clone()))
-                        .unwrap_or_else(|| COORDINATOR.into());
-                    let reference = sp
-                        .request
-                        .issue
-                        .map(|n| format!("{repo}#{n}"))
-                        .unwrap_or_else(|| repo.clone());
                     let body = MsgSent {
-                        to,
+                        to: spawn::lead_of(&sp),
                         kind: "BLOCKED".into(),
-                        reference,
+                        reference: issue
+                            .map(|n| format!("{repo}#{n}"))
+                            .unwrap_or_else(|| repo.clone()),
                         text: why.clone(),
                     };
                     if let Err(e) = ctx
