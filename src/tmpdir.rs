@@ -55,6 +55,8 @@ pub fn plain_tempdir() -> tempfile::TempDir {
         .arg("-C")
         .arg(&tmp)
         .args(["rev-parse", "--git-dir"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
         .output()
         .is_ok_and(|o| o.status.success());
     let base = if in_checkout { "/tmp".into() } else { tmp };
