@@ -1249,18 +1249,17 @@ async fn run_spawn(
         .await
         .with_context(|| format!("env scrub: unset {var}"))?;
     }
-    // Scratch inside the worktree: retire takes it with the tree; failing to set it up only
-    // costs the isolation, never the spawn.
-    if let Err(e) = crate::tmpdir::exclude(Path::new(&wt)) {
-        eprintln!("agent-fleet host: spawn {}: .tmp exclude: {e}", r.name);
-    }
-    pane_run(
+    // Scratch inside the worktree: retire takes it with the tree. Best effort: a pane that
+    // refuses the line costs the isolation, not the spawn.
+    if let Err(e) = pane_run(
         &host.cfg.herdr_socket,
         made.pane.as_deref().unwrap_or_default(),
         &crate::tmpdir::export_line(Path::new(&wt)),
     )
     .await
-    .context("TMPDIR export")?;
+    {
+        eprintln!("agent-fleet host: spawn {}: TMPDIR export: {e:#}", r.name);
+    }
     agent_start(
         host,
         &r.name,
@@ -2693,6 +2692,25 @@ profile = "devin"
     /// `run` with `--stuck-act` on: the host may type into agents and hand work off.
     async fn run_act(dir: &Path, script: &[(&str, Vec<Value>)]) -> (Arc<Host>, Arc<Stub>) {
         run_with(dir, script, true).await
+    }
+
+    #[tokio::test]
+    async fn a_pane_that_refuses_the_tmpdir_line_costs_the_isolation_not_the_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        let wt = co.join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let (host, stub) = run(
+            dir.path(),
+            &[
+                ("worktree.create", vec![created(wt.to_str().unwrap())]),
+                ("pane.send_text", vec![err("agent_pane_busy")]),
+            ],
+        )
+        .await;
+        execute(&host, "req1", &spawn_of(req(None)), &State::default()).await;
+        assert!(stub.calls().contains(&"agent.start".to_string()));
+        assert!(result(&host).unwrap().ok);
     }
 
     #[tokio::test]
