@@ -7,9 +7,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::event::{
-    ActorKind, AgentState, Body, COORDINATOR, Event, Known, Level, MsgSent, ProcessHung,
-    QuotaWindow, ResourceHold, ResourceLimit, RetireRequested, RetireResult, SpawnRequested,
-    SpawnResult, StuckCause, TYPE_VERSION, TaskState, UpdateResult, WorktreeProcs, WorktreeState,
+    ActorKind, AgentState, Body, COORDINATOR, Event, Known, Level, MergeRequested, MergeResult,
+    MsgSent, ProcessHung, QuotaWindow, ResourceHold, ResourceLimit, RetireRequested, RetireResult,
+    SpawnRequested, SpawnResult, StuckCause, TYPE_VERSION, TaskState, UpdateResult, WorktreeProcs,
+    WorktreeState,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -67,6 +68,9 @@ pub struct State {
     /// Retire requests by their `retire.requested` id, kept for 24 h.
     #[serde(default)]
     pub retires: BTreeMap<String, Retire>,
+    /// Merge requests by their `merge.requested` id, kept for 24 h.
+    #[serde(default)]
+    pub merges: BTreeMap<String, Merge>,
     /// Self-update requests by their `update.requested` id, kept for 24 h.
     #[serde(default)]
     pub updates: BTreeMap<String, Update>,
@@ -395,6 +399,19 @@ pub struct Retire {
     pub project: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<RetireResult>,
+    /// The request's `ts`.
+    pub since: DateTime<Utc>,
+}
+
+/// A `merge.requested` and the `merge.result` that answered it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Merge {
+    pub request: MergeRequested,
+    /// Who asked (the request's actor id).
+    pub by: String,
+    pub project: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<MergeResult>,
     /// The request's `ts`.
     pub since: DateTime<Utc>,
 }
@@ -1278,6 +1295,30 @@ impl State {
                     r.result = Some(d.clone());
                 }
             }
+            Known::MergeRequested(d) => {
+                self.merges.insert(
+                    e.id.clone(),
+                    Merge {
+                        request: d.clone(),
+                        by: e.actor.id.clone(),
+                        project: e.project.clone(),
+                        result: None,
+                        since: ts,
+                    },
+                );
+            }
+            // Only the host it names may answer, and only once.
+            Known::MergeResult(d) => {
+                if let Some(re) = &e.re
+                    && let Some(m) = self.merges.get_mut(re)
+                    && m.result.is_none()
+                    && e.actor.id == format!("host:{}", m.request.host)
+                {
+                    m.result = Some(d.clone());
+                }
+            }
+            // A record in the log for the views and `stats`; nothing in the state depends on it.
+            Known::MergeDone(_) => {}
             Known::UpdateRequested(d) => {
                 self.updates.insert(
                     e.id.clone(),
@@ -1330,6 +1371,7 @@ impl State {
         // SPAWN_KEPT past its answer (or its request, when it was never answered) — but never
         // while its agent is still up, so cap counting cannot lose sight of it.
         self.retires.retain(|_, r| e.ts - r.since <= SPAWN_KEPT);
+        self.merges.retain(|_, m| e.ts - m.since <= SPAWN_KEPT);
         let agents = &self.agents;
         self.spawns.retain(|_, s| {
             agents.contains_key(&s.request.agent)
@@ -2986,6 +3028,62 @@ mod tests {
         assert!(
             !r.ok && r.text == "from host:kir",
             "the first answer stands"
+        );
+    }
+
+    #[test]
+    fn a_merge_is_answered_once_and_only_by_the_host_it_names() {
+        use crate::event::{MergeDone, MergeRequested, MergeResult};
+        let mut s = State::default();
+        let req = by(
+            "agent:mac/s/me",
+            Known::MergeRequested(MergeRequested {
+                repo: "o/r".into(),
+                pr: 7,
+                sha: "abcdef1".into(),
+                host: "box".into(),
+                allow_pin_rewind: None,
+            }),
+        );
+        let id = req.id.clone();
+        s.apply(&req.into_event());
+        assert_eq!(s.merges[&id].by, "agent:mac/s/me");
+        let answer = |host: &str, ok: bool| {
+            by(
+                host,
+                Known::MergeResult(MergeResult {
+                    ok,
+                    text: format!("from {host}"),
+                }),
+            )
+            .re(&id)
+            .into_event()
+        };
+        s.apply(&answer("host:mac", true));
+        assert!(s.merges[&id].result.is_none(), "another host cannot answer");
+        s.apply(&answer("host:box", false));
+        s.apply(&answer("host:box", true));
+        let r = s.merges[&id].result.as_ref().unwrap();
+        assert!(
+            !r.ok && r.text == "from host:box",
+            "the first answer stands"
+        );
+        let before = s.clone();
+        s.apply(
+            &by(
+                "host:box",
+                Known::MergeDone(MergeDone {
+                    repo: "o/r".into(),
+                    pr: 7,
+                    sha: "a".repeat(40),
+                    commit: None,
+                }),
+            )
+            .into_event(),
+        );
+        assert_eq!(
+            s.merges, before.merges,
+            "merge.done is a record in the log only"
         );
     }
 

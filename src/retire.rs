@@ -284,7 +284,7 @@ pub fn save_patch(wt: &Path, dir: &Path, name: &str, changes: &[Change]) -> Resu
 }
 
 /// An exclusive flock on `path`, waiting up to `wait`. `what` names the holder in the refusal.
-async fn lock_file(path: &Path, wait: Duration, what: &str) -> Result<Held> {
+pub(crate) async fn lock_file(path: &Path, wait: Duration, what: &str) -> Result<Held> {
     let f = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -558,9 +558,16 @@ pub async fn finish(
         }
         extra.push("--decide=delete");
     }
+    // A pane that just closed leaves its own hooks (a statusline script) running a second or
+    // so; the repository's hook refuses a tree with processes in it. What stays past this wait
+    // is the hook's to judge.
+    crate::scan::wait_free(tree, LINGER).await;
     run_hook(plan.checkout, wt, plan.script, &extra, b).await?;
     Ok(stashed.map_or(Outcome::Retired, Outcome::Stashed))
 }
+
+/// How long a retire waits for a closed pane's processes to leave the tree.
+const LINGER: Duration = Duration::from_secs(5);
 
 /// The guarded retire in one call, for a caller with nothing to do between the read and the
 /// removal (the host's close-retire, a failed spawn): locks up to `wait`, `assess`, `finish`.
@@ -1050,6 +1057,27 @@ mod tests {
         assert_eq!(f.read("hook-args").trim(), f.wt());
         assert_eq!(f.read("hook-fd").trim(), "inherited");
         assert!(!f.wt.exists());
+    }
+
+    #[tokio::test]
+    async fn the_hook_runs_once_a_closed_panes_lingering_process_has_left_the_tree() {
+        // The hook refuses while the lingering process lives, as a repository's hook refuses a
+        // tree with processes in it.
+        let f = fx_hook(
+            "kill -0 $(cat \"$1/../linger.pid\") 2>/dev/null && { echo \"still has processes\" >&2; exit 1; }",
+        );
+        // Detached, so init reaps it the moment it ends: a pane's statusline hook outliving it.
+        let ok = std::process::Command::new("sh")
+            .args(["-c", "(sleep 2 & echo $! > ../linger.pid)"])
+            .current_dir(&f.wt)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        assert_eq!(
+            guarded(&f.plan(), f.wt(), None, WAIT).await.unwrap(),
+            Outcome::Retired
+        );
     }
 
     #[tokio::test]

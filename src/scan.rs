@@ -852,6 +852,65 @@ fn pick_lsof(exists: impl Fn(&str) -> bool) -> &'static str {
         .unwrap_or("lsof")
 }
 
+/// Pids in lsof `-Fpn` output whose cwd is `dir` or under it.
+pub fn rooted_in_lsof(out: &str, dir: &str) -> Vec<u32> {
+    let mut pid = None;
+    let mut found = vec![];
+    for l in out.lines() {
+        if let Some(p) = l.strip_prefix('p') {
+            pid = p.parse().ok();
+        } else if let (Some(n), Some(p)) = (l.strip_prefix('n'), pid)
+            && (n == dir || n.starts_with(&format!("{dir}/")))
+        {
+            found.push(p);
+        }
+    }
+    found
+}
+
+/// Processes on this machine, other than this one, whose cwd is `dir` or under it.
+pub fn rooted_in(dir: &Path) -> Vec<u32> {
+    // lsof and /proc report physical paths.
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let dir = dir.to_string_lossy();
+    let me = std::process::id();
+    let mut pids = if cfg!(target_os = "linux") {
+        let inside = |c: &str| c == dir || c.starts_with(&format!("{dir}/"));
+        Procs::read()
+            .0
+            .into_iter()
+            .filter(|(_, p)| !p.deleted && p.cwd.as_deref().is_some_and(inside))
+            .map(|(pid, _)| pid)
+            .collect()
+    } else {
+        std::process::Command::new(lsof_path())
+            .args(["-a", "-d", "cwd", "-Fpn"])
+            .output()
+            .map(|o| rooted_in_lsof(&String::from_utf8_lossy(&o.stdout), &dir))
+            .unwrap_or_default()
+    };
+    pids.retain(|&p| p != me);
+    pids.sort_unstable();
+    pids
+}
+
+/// Waits up to `max` for every process rooted in `dir` to leave; what is still there after.
+/// A pane's own hooks (a statusline script) outlive the pane by a second or so: a retire hook
+/// that refuses a tree with processes in it would refuse a tree that is about to be free.
+pub async fn wait_free(dir: &Path, max: std::time::Duration) -> Vec<u32> {
+    let end = tokio::time::Instant::now() + max;
+    loop {
+        let d = dir.to_path_buf();
+        let left = tokio::task::spawn_blocking(move || rooted_in(&d))
+            .await
+            .unwrap_or_default();
+        if left.is_empty() || tokio::time::Instant::now() >= end {
+            return left;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
 /// The working directory of a live process on this machine.
 pub fn cwd_of(pid: u32) -> Option<String> {
     if cfg!(target_os = "linux") {
@@ -1493,6 +1552,41 @@ mod tests {
         let infra: HashSet<u32> = [1].into_iter().collect();
         assert!(t.under_any(3, &infra));
         assert!(!t.under_any(3, &HashSet::new()));
+    }
+
+    #[test]
+    fn lsof_cwds_under_a_dir_name_their_pids() {
+        let out = "p10\nfcwd\nn/w/a\np11\nfcwd\nn/w/a/sub\np12\nfcwd\nn/w/ab\np13\nfcwd\nn/x\n";
+        assert_eq!(rooted_in_lsof(out, "/w/a"), vec![10, 11]);
+    }
+
+    #[tokio::test]
+    async fn wait_free_returns_once_the_trees_processes_are_gone_and_names_those_that_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = |secs: &str| {
+            tokio::process::Command::new("sleep")
+                .arg(secs)
+                .current_dir(dir.path())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap()
+        };
+        let quick = start("1");
+        let t = std::time::Instant::now();
+        assert!(
+            wait_free(dir.path(), std::time::Duration::from_secs(8))
+                .await
+                .is_empty()
+        );
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(6),
+            "{:?}",
+            t.elapsed()
+        );
+        drop(quick);
+        let stays = start("30");
+        let left = wait_free(dir.path(), std::time::Duration::from_millis(600)).await;
+        assert_eq!(left, vec![stays.id().unwrap()]);
     }
 
     #[test]

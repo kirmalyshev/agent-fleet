@@ -266,6 +266,12 @@ pub enum Known {
     RetireRequested(RetireRequested),
     #[serde(rename = "retire.result")]
     RetireResult(RetireResult),
+    #[serde(rename = "merge.requested")]
+    MergeRequested(MergeRequested),
+    #[serde(rename = "merge.result")]
+    MergeResult(MergeResult),
+    #[serde(rename = "merge.done")]
+    MergeDone(MergeDone),
     #[serde(rename = "agent.unmanaged")]
     AgentUnmanaged(AgentUnmanaged),
     #[serde(rename = "proc.orphaned")]
@@ -848,6 +854,47 @@ pub struct RetireResult {
     pub text: String,
 }
 
+/// `agent-fleet merge` for a repository whose fleet.toml `[merge] host` names another host asks
+/// that host to run the whole merge: the verdict, pin and head checks, its gate, `gh pr merge`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MergeRequested {
+    /// `owner/repo`.
+    pub repo: String,
+    pub pr: u64,
+    /// The approved head sha, or a prefix of it (7 to 40 hex digits).
+    pub sha: String,
+    /// The host that runs it.
+    pub host: String,
+    /// `--allow-pin-rewind`: the reason a submodule pin may move backwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_pin_rewind: Option<String>,
+}
+
+/// The `merge.requested` named by `re`, answered by the host that ran it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MergeResult {
+    /// False when nothing was merged: a refusal, a failed gate, an expired request, or an error.
+    pub ok: bool,
+    /// What `agent-fleet merge` prints on that host: its last 4 KiB.
+    pub text: String,
+}
+
+/// A PR merged by `agent-fleet merge`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MergeDone {
+    /// `owner/repo`.
+    pub repo: String,
+    pub pr: u64,
+    /// The approved head that was merged.
+    pub sha: String,
+    /// The merge commit on the base branch, when `gh` reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+}
+
 /// `agent-fleet self-update` asks every host to pull its clone's `main`, rebuild and restart;
 /// a host's own timer asks only itself, with `host`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -923,6 +970,9 @@ impl Known {
             Self::SpawnResult(_) => "spawn.result",
             Self::RetireRequested(_) => "retire.requested",
             Self::RetireResult(_) => "retire.result",
+            Self::MergeRequested(_) => "merge.requested",
+            Self::MergeResult(_) => "merge.result",
+            Self::MergeDone(_) => "merge.done",
             Self::AgentUnmanaged(_) => "agent.unmanaged",
             Self::ProcessOrphaned(_) => "proc.orphaned",
             Self::ProcessHung(_) => "proc.hung",
@@ -958,6 +1008,7 @@ impl Known {
             Self::MsgDelivered(_)
             | Self::SpawnResult(_)
             | Self::RetireResult(_)
+            | Self::MergeResult(_)
             | Self::UpdateRequested(_)
             | Self::UpdateResult(_) => &[Host],
             Self::AskRaised(_) | Self::Handoff(_) | Self::AgentSignal(_) | Self::MsgRead(_) => {
@@ -993,6 +1044,7 @@ impl Known {
                 | Self::MsgRead(_)
                 | Self::SpawnResult(_)
                 | Self::RetireResult(_)
+                | Self::MergeResult(_)
                 | Self::UpdateResult(_)
         )
     }

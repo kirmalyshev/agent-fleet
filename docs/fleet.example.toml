@@ -76,6 +76,12 @@ profile = "claude"
 # guarded = ["AGENTS.md", "CLAUDE.md", "README.md", "docs/", "schema/"]  # reported, never closed (`dir/` = prefix); setting it replaces this default
 # apply = false                  # true: the host watch loop closes superseded PRs and tells the root coordinator of the rest
 
+# `agent-fleet merge`, in a repository's own .agent-fleet/fleet.toml: read from the PR's base
+# branch, so a PR cannot change its own gate.
+# [merge]
+# gate = "scripts/merge-gate.sh"  # run in this machine's checkout (on the base branch) with the head sha as $1; absent = the required CI checks
+# host = "laptop"                # the fleet host that runs the merge and its gate; absent = where the CLI runs
+
 # Repositories connected on this machine: "owner/repo" = "<checkout>". Edit with
 # `agent-fleet repo add <owner/repo> [<dir>]` and `agent-fleet repo rm <owner/repo>`; the host
 # re-reads this table at each spawn and each scan, so no restart is needed.

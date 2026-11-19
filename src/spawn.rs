@@ -62,6 +62,11 @@ pub struct FleetConfig {
     #[serde(default)]
     #[allow(dead_code)]
     pub repos: BTreeMap<String, PathBuf>,
+    /// `[merge]`: `agent-fleet merge`'s gate and host. `merge` reads it from the PR's base
+    /// branch through `gh`, never from this copy, so a PR cannot change its own gate.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub merge: crate::merge::Config,
 }
 
 fn default_session() -> String {
@@ -137,7 +142,7 @@ fn is_env_name(s: &str) -> bool {
 }
 
 /// A `ready` path is relative and made only of normal components — no `..`, no root.
-fn check_ready(r: &str) -> Result<()> {
+pub(crate) fn check_ready(r: &str) -> Result<()> {
     let p = Path::new(r);
     if r.is_empty()
         || p.components()
@@ -1897,6 +1902,7 @@ pub async fn spawn_loop(host: Arc<Host>) {
     let mut warned: HashSet<String> = HashSet::new();
     let mut stuck_seen = crate::stuck::Seen::default();
     let mut retire_seen: HashSet<String> = HashSet::new();
+    let mut merge_seen: HashSet<String> = HashSet::new();
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
         // A self-update restart is waiting for the work in flight: start none.
@@ -1944,6 +1950,7 @@ pub async fn spawn_loop(host: Arc<Host>) {
             }
         }
         crate::retire::serve(&host, &mut retire_seen).await;
+        crate::merge::serve(&host, &mut merge_seen);
         handoffs(&host, state, events, &mut handed, &mut warned).await;
         stuck(&host, state, events, &mut stuck_seen, &handed).await;
     }
