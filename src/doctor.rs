@@ -160,9 +160,12 @@ pub fn tmp_findings(s: &State, host: &str) -> Vec<Finding> {
         .filter(|(_, a)| a.host == host)
         .filter_map(|(id, a)| {
             let wt = &worktree_of(s, a)?.1.state;
-            let d = crate::tmpdir::dir(std::path::Path::new(&wt.path));
-            let b = crate::tmpdir::size(&d);
-            (b > 0).then(|| finding("tmp", id, format!("{} in {}", mb(b / 1024), d.display())))
+            let w = std::path::Path::new(&wt.path);
+            let b = crate::tmpdir::used(w);
+            (b > 0).then(|| {
+                let d = crate::tmpdir::dir(w);
+                finding("tmp", id, format!("{} in {}", mb(b / 1024), d.display()))
+            })
         })
         .collect()
 }
@@ -1006,6 +1009,7 @@ mod tests {
         std::fs::create_dir_all(a.join(".tmp")).unwrap();
         std::fs::create_dir_all(b.join(".tmp")).unwrap();
         std::fs::write(a.join(".tmp/x"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        std::fs::write(b.join(".tmp/.gitignore"), "*\n").unwrap(); // the export line's own file
         let mut s = State::default();
         for (id, p) in [("agent:h/s/a", &a), ("agent:h/s/b", &b)] {
             let p = p.to_str().unwrap();

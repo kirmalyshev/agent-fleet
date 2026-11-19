@@ -24,6 +24,13 @@ pub fn export_line(worktree: &Path) -> String {
     format!("mkdir -p {q} && echo '*' > {g} && export TMPDIR={q} TMP={q} TEMP={q}")
 }
 
+/// Scratch in use under `<worktree>/.tmp`: `size` less the `.gitignore` the export line writes.
+pub fn used(worktree: &Path) -> u64 {
+    let d = dir(worktree);
+    let own = std::fs::metadata(d.join(".gitignore")).map_or(0, |m| m.len());
+    size(&d).saturating_sub(own)
+}
+
 /// Bytes under `d` (files only, symlinks not followed); 0 when it is missing.
 pub fn size(d: &Path) -> u64 {
     let Ok(rd) = std::fs::read_dir(d) else {
@@ -60,6 +67,16 @@ mod tests {
         for v in ["TMPDIR", "TMP", "TEMP"] {
             assert!(l.contains(&format!("{v}='/w/it'\\''s/.tmp'")), "{l}");
         }
+    }
+
+    #[test]
+    fn used_ignores_the_gitignore_the_export_line_writes() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir(d.path())).unwrap();
+        std::fs::write(dir(d.path()).join(".gitignore"), "*\n").unwrap();
+        assert_eq!(used(d.path()), 0);
+        std::fs::write(dir(d.path()).join("x"), [0u8; 7]).unwrap();
+        assert_eq!(used(d.path()), 7);
     }
 
     #[test]

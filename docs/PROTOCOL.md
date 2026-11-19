@@ -599,7 +599,7 @@ process's directory is known on Linux only), re-sent without `program` once the 
 `agent-fleet doctor` shows them as `unmanaged` findings.
 
 `doctor` also reads the local disk for `tmp` findings: each agent on this host whose worktree's
-`.tmp` holds files gets one finding with that directory's size in MB; an empty or missing one gets none.
+`.tmp` holds files gets one finding with that directory's size in MB; an empty or missing one, or one holding only its `.gitignore`, gets none.
 
 `doctor` also reads GitHub, not the log, for `orphan-pr` findings: for each repository in
 `[orphan_pr] repos` of fleet.toml (absent: the machine's connected `[repos]`; `[]`: off), an open PR whose head branch is no live agent's worktree branch and that has had no
@@ -748,7 +748,7 @@ holds no work — no commit the remotes lack, a clean tree. With `worktree` set 
 handoff), it opens a `workspace.create` there instead and never removes the worktree. Then
 `ready` runs (new worktrees only, 15 min), each `unset_env` is typed into the pane's shell,
 `TMPDIR`, `TMP` and `TEMP` are exported there as `<worktree>/.tmp` (created with its own `.gitignore` of `*`, so `retire` does not count it as work and removes it
-with the worktree; best effort — a pane that refuses the line is logged, the spawn goes on),
+with the worktree; best effort — a pane that refuses the line is logged, the spawn goes on; the host does not check that the line ran),
 `agent.start` retries `agent_pane_busy` for 10 tries 2 s apart, and the brief goes out the way
 that works: `agent.wait` for `idle` (2 min),
 `agent.prompt` waiting for working|blocked|done (30 s), one Enter and another wait (15 s) on a
