@@ -4241,6 +4241,23 @@ profile = "devin"
         );
         let b = blockers(&host);
         assert!(b.len() == 1 && b[0].contains("unpushed"), "{b:?}");
+        // and the lead is told, with the same words, so a refusal never waits on a board read
+        let told: Vec<(String, String)> = host
+            .replica
+            .lock()
+            .unwrap()
+            .all()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.body {
+                Body::Known(Known::MsgSent(m)) => Some((m.kind.clone(), m.text.clone())),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            told.len() == 1 && told[0].0 == "BLOCKED" && told[0].1.contains("unpushed"),
+            "{told:?}"
+        );
     }
     #[tokio::test]
     async fn a_pane_left_by_its_agent_or_a_herdr_gap_retires_nothing() {
