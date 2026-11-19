@@ -994,15 +994,15 @@ pub(crate) async fn retire_in(host: &Host, repo: &str, worktree: &str, agent: &s
         None => Ok(()),
     }
 }
-/// `unset NAME` typed into the pane's shell, retried while the shell is not ready.
-async fn unset_env(sock: &Path, pane: &str, var: &str) -> Result<()> {
+/// `line` typed into the pane's shell, retried while the shell is not ready.
+async fn pane_run(sock: &Path, pane: &str, line: &str) -> Result<()> {
     let mut err = anyhow!("pane.send_text never ran");
     for _ in 0..BUSY_TRIES {
         let send = async {
             herdr_call(
                 sock,
                 "pane.send_text",
-                json!({ "pane_id": pane, "text": format!("unset {var}") }),
+                json!({ "pane_id": pane, "text": line }),
             )
             .await?;
             herdr_call(
@@ -1241,14 +1241,26 @@ async fn run_spawn(
         run_ready(&checkout, &wt, ready).await?;
     }
     for var in &prof.unset_env {
-        unset_env(
+        pane_run(
             &host.cfg.herdr_socket,
             made.pane.as_deref().unwrap_or_default(),
-            var,
+            &format!("unset {var}"),
         )
         .await
         .with_context(|| format!("env scrub: unset {var}"))?;
     }
+    // Scratch inside the worktree: retire takes it with the tree; failing to set it up only
+    // costs the isolation, never the spawn.
+    if let Err(e) = crate::tmpdir::exclude(Path::new(&wt)) {
+        eprintln!("agent-fleet host: spawn {}: .tmp exclude: {e}", r.name);
+    }
+    pane_run(
+        &host.cfg.herdr_socket,
+        made.pane.as_deref().unwrap_or_default(),
+        &crate::tmpdir::export_line(Path::new(&wt)),
+    )
+    .await
+    .context("TMPDIR export")?;
     agent_start(
         host,
         &r.name,
@@ -2699,6 +2711,8 @@ profile = "devin"
             stub.calls(),
             [
                 "worktree.create",
+                "pane.send_text",
+                "pane.send_keys",
                 "agent.start",
                 "agent.wait",
                 "agent.prompt"
@@ -2817,6 +2831,8 @@ profile = "devin"
             stub.calls(),
             [
                 "worktree.create",
+                "pane.send_text",
+                "pane.send_keys",
                 "agent.start",
                 "agent.wait",
                 "agent.prompt",
@@ -3490,12 +3506,27 @@ profile = "devin"
                 "worktree.create",
                 "pane.send_text",
                 "pane.send_keys",
+                "pane.send_text",
+                "pane.send_keys",
                 "agent.start",
                 "agent.wait",
                 "agent.prompt"
             ]
         );
         let got = stub.calls.lock().unwrap().clone();
+        let texts: Vec<String> = got
+            .iter()
+            .filter(|(m, _)| m == "pane.send_text")
+            .map(|(_, p)| p["text"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(texts[0], "unset SCRUB_ME");
+        for v in ["TMPDIR", "TMP", "TEMP"] {
+            assert!(
+                texts[1].contains(&format!("{v}='")) && texts[1].contains(".tmp'"),
+                "{}",
+                texts[1]
+            );
+        }
         let start = got
             .iter()
             .find(|(m, _)| m == "agent.start")
