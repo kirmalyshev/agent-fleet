@@ -565,6 +565,7 @@ impl Host {
             kind: "BLOCKED".into(),
             reference,
             text: text.into(),
+            closes: Vec::new(),
         });
         if !self
             .publish(Envelope::new(
@@ -1306,6 +1307,17 @@ impl Host {
                     );
                 }
             }
+            // Status reports that waited out a reconnect: one digest per pass, never one each.
+            if let Some((ids, digest)) = view.state.report_digest(&self.cfg.host, now) {
+                let mut e = self.presence(Known::MsgSent(digest));
+                e.id = dead_letter_id(&ids[0]);
+                if self.publish(e).await {
+                    eprintln!(
+                        "agent-fleet host: {} stale reports handed to the coordinator in one digest",
+                        ids.len()
+                    );
+                }
+            }
             let dead: HashSet<&String> = dead.iter().map(|(id, _)| id).collect();
             let (pending, unread) = (&view.state.msgs, &view.state.unread);
             let live = |id: &String| pending.contains_key(id) || unread.contains_key(id);
@@ -1333,24 +1345,8 @@ impl Host {
                 let Some(to) = view.state.recipient(&msg.to) else {
                     continue;
                 };
-                // A status report that waited out a reconnect is history: close it unrung.
-                if let Some(why) = msg.stale(now) {
-                    let dropped = MsgDelivered {
-                        to: to.to_string(),
-                        observed: AgentState::Idle,
-                        rung: None,
-                        attempts: Some(0),
-                        ack: false,
-                    };
-                    if self
-                        .publish(self.presence(Known::MsgDelivered(dropped)).re(id))
-                        .await
-                    {
-                        eprintln!(
-                            "agent-fleet host: {id} to {} dropped, not rung: {why}",
-                            msg.to
-                        );
-                    }
+                // A status report that waited out a reconnect went in this pass's digest.
+                if msg.stale(now).is_some() && !again {
                     continue;
                 }
                 let target = {
@@ -1775,6 +1771,7 @@ mod tests {
                 kind: kind.into(),
                 reference: "x".into(),
                 text: "hi".into(),
+                closes: Vec::new(),
             }),
         )
     }
@@ -2004,24 +2001,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_status_report_that_waited_out_a_reconnect_is_dropped_not_rung() {
+    async fn a_status_report_that_waited_out_a_reconnect_goes_to_the_coordinator_in_a_digest() {
         let dir = tempfile::tempdir().unwrap();
         let (host, fake, _) = host_on_fake_msg(dir.path(), "idle", "MERGED", 20).await;
+        let digests = || {
+            host.replica
+                .lock()
+                .unwrap()
+                .all()
+                .unwrap()
+                .into_iter()
+                .filter_map(|e| match e.body {
+                    Body::Known(Known::MsgSent(m)) if m.kind == "DEADLETTER" => Some(m),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
         for _ in 0..200 {
-            if types(&host).contains(&"msg.delivered".to_string()) {
+            if !digests().is_empty() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        for _ in 0..3 {
+            host.wake.notify_one();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let got = digests();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(
+            got[0]
+                .text
+                .starts_with("1 status report unread over 6 h:\n- 20h"),
+            "{}",
+            got[0].text
+        );
+        assert_eq!(got[0].closes.len(), 1);
         assert!(
             fake.prompts.lock().unwrap().is_empty(),
             "a 20 h old MERGED rang"
         );
         assert!(
-            types(&host).contains(&"msg.delivered".to_string()),
-            "dropped, so it leaves the undelivered list"
+            !types(&host).contains(&"msg.delivered".to_string()),
+            "nothing is closed unrung"
         );
     }
+
     #[tokio::test]
     async fn an_expired_tell_goes_to_the_coordinator_once_and_is_never_rung() {
         let dir = tempfile::tempdir().unwrap();

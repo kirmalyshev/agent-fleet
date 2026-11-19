@@ -709,6 +709,13 @@
           "additionalProperties": false,
           "description": "A doorbell: a short prompt pointing at an event or a task.",
           "properties": {
+            "closes": {
+              "description": "A host's `DEADLETTER` digest: the tells it hands over, each taken off its recipient's\nqueue by this one event.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "kind": {
               "description": "What the recipient should do, e.g. `REVIEW`, `FYI`, `UNBLOCKED`.",
               "type": "string"

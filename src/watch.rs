@@ -916,6 +916,7 @@ async fn orphan_prs(host: &Arc<Host>) -> anyhow::Result<()> {
                         kind: "orphan-pr".into(),
                         reference: key,
                         text,
+                        closes: Vec::new(),
                     })))
                     .await;
                 }
@@ -1172,6 +1173,7 @@ async fn tell(
             kind: kind.into(),
             reference: key.into(),
             text: text.clone(),
+            closes: Vec::new(),
         })))
         .await;
     }
@@ -2051,6 +2053,7 @@ mod tests {
                     kind: "HUNG".into(),
                     reference: "h:30".into(),
                     text: String::new(),
+                    closes: Vec::new(),
                 }),
             )
             .into_event();

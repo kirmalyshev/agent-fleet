@@ -508,13 +508,13 @@ impl State {
             .chain(self.unread.iter().map(|(id, u)| (id, &u.msg)))
             .filter(|(_, m)| m.kind != DEADLETTER)
             .filter_map(|(id, m)| {
+                // An undelivered stale report goes in the digest (`report_digest`) instead.
+                if self.msgs.contains_key(id) && m.stale(now).is_some() {
+                    return None;
+                }
                 let to = self.recipient(&m.to)?;
                 let mine = agent_host(to) == Some(host);
-                let coordinator_host = self
-                    .coordinator()
-                    .and_then(|c| self.agents.get(c))
-                    .is_some_and(|c| c.host == host);
-                let why = if m.expired(now) && (mine || coordinator_host) {
+                let why = if m.expired(now) && (mine || self.coordinator_on(host)) {
                     "expired"
                 } else if mine
                     && !self.agents.contains_key(to)
@@ -541,10 +541,68 @@ impl State {
                         kind: DEADLETTER.into(),
                         reference: m.reference.clone(),
                         text,
+                        closes: Vec::new(),
                     },
                 ))
             })
             .collect()
+    }
+
+    /// Whether the agent holding the coordinator role is up on `host`.
+    fn coordinator_on(&self, host: &str) -> bool {
+        self.coordinator()
+            .and_then(|c| self.agents.get(c))
+            .is_some_and(|c| c.host == host)
+    }
+
+    /// Status reports (`Msg::stale`) still undelivered to an agent on `host`, oldest first, as
+    /// one `DEADLETTER` digest to the coordinator: a count, then one line each. `None` with none.
+    /// A long absence costs the coordinator one message per sweep, never one per report.
+    pub fn report_digest(&self, host: &str, now: DateTime<Utc>) -> Option<(Vec<String>, MsgSent)> {
+        let mut stale: Vec<(&String, &Msg)> = self
+            .msgs
+            .iter()
+            .filter(|(_, m)| m.stale(now).is_some())
+            .filter(|(_, m)| {
+                // As `dead_letters`: the recipient's host, and for an expired one the coordinator's.
+                self.recipient(&m.to).is_some_and(|to| {
+                    agent_host(to) == Some(host) || (m.expired(now) && self.coordinator_on(host))
+                })
+            })
+            .collect();
+        if stale.is_empty() {
+            return None;
+        }
+        stale.sort_by_key(|(id, m)| (m.since, *id));
+        let n = stale.len();
+        let mut text = format!(
+            "{n} status report{} unread over 6 h:",
+            if n == 1 { "" } else { "s" }
+        );
+        for (_, m) in &stale {
+            let age = now - m.since;
+            text.push_str(&format!(
+                "\n- {}h{:02}m ago {} → {} {} {}: {}",
+                age.num_hours(),
+                age.num_minutes() % 60,
+                crate::host::short(&m.from),
+                crate::host::short(&m.to),
+                m.kind,
+                m.reference,
+                m.text
+            ));
+        }
+        let ids: Vec<String> = stale.iter().map(|(id, _)| (*id).clone()).collect();
+        Some((
+            ids.clone(),
+            MsgSent {
+                to: COORDINATOR.into(),
+                kind: DEADLETTER.into(),
+                reference: "digest".into(),
+                text,
+                closes: ids,
+            },
+        ))
     }
 
     /// Tells to `me` (by id, or by a role it holds) not read yet and not expired at `now`,
@@ -1033,11 +1091,12 @@ impl State {
             Known::MsgSent(d) => {
                 // A host's dead letter takes the tell it names (`re`) off the recipient's queue.
                 // One for a tell already read or handed over (a host's view lagging) is dropped.
-                if d.kind == DEADLETTER
-                    && e.actor.kind == ActorKind::Host
-                    && let Some(re) = &e.re
-                {
-                    let open = self.msgs.remove(re).is_some() | self.unread.remove(re).is_some();
+                // A digest hands over every tell in `closes`.
+                if d.kind == DEADLETTER && e.actor.kind == ActorKind::Host {
+                    let mut open = false;
+                    for id in e.re.iter().chain(&d.closes) {
+                        open |= self.msgs.remove(id).is_some() | self.unread.remove(id).is_some();
+                    }
                     if !open {
                         return;
                     }
@@ -2006,6 +2065,7 @@ mod tests {
             kind: "ASK".into(),
             reference: "r".into(),
             text: "t".into(),
+            closes: Vec::new(),
         });
         let delivered = || {
             Known::MsgDelivered(MsgDelivered {
@@ -2065,6 +2125,7 @@ mod tests {
                 kind: "FYI".into(),
                 reference: "r".into(),
                 text: "old".into(),
+                closes: Vec::new(),
             }),
         ));
         assert_eq!(s.unread_for(to, t0 + chrono::Duration::hours(23)).len(), 1);
@@ -2082,6 +2143,7 @@ mod tests {
                 kind: "FYI".into(),
                 reference: "r".into(),
                 text: "later".into(),
+                closes: Vec::new(),
             }),
         ));
         assert_eq!(s.mail_status("e0"), None);
@@ -2116,6 +2178,7 @@ mod tests {
                 kind: "DONE".into(),
                 reference: "r".into(),
                 text: "t".into(),
+                closes: Vec::new(),
             })
         };
         let mut s = State::default();
@@ -2279,6 +2342,46 @@ mod tests {
     }
 
     #[test]
+    fn stale_reports_go_to_the_coordinator_as_one_digest_that_closes_them_all() {
+        let now = Utc::now();
+        let mut s = State::default();
+        let msg = |kind: &str, hours: i64, text: &str| Msg {
+            from: "agent:h/s/o-1".into(),
+            to: "agent:h/s/lead".into(),
+            kind: kind.into(),
+            reference: "r#1".into(),
+            text: text.into(),
+            since: now - chrono::Duration::hours(hours),
+        };
+        s.msgs.insert("01B".into(), msg("MERGED", 7, "merged abc"));
+        s.msgs.insert("01A".into(), msg("DONE", 30, "done"));
+        s.msgs.insert("01C".into(), msg("MERGED", 5, "fresh"));
+        s.msgs.insert("01D".into(), msg("ASK", 7, "a question"));
+        let (ids, d) = s.report_digest("h", now).unwrap();
+        assert_eq!(ids, vec!["01A", "01B"], "oldest first, reports only");
+        assert_eq!((d.to.as_str(), d.kind.as_str()), (COORDINATOR, DEADLETTER));
+        let lines: Vec<&str> = d.text.lines().collect();
+        assert_eq!(lines[0], "2 status reports unread over 6 h:");
+        assert_eq!(lines[1], "- 30h00m ago o-1 → lead DONE r#1: done");
+        assert_eq!(lines.len(), 3);
+        assert!(s.report_digest("k", now).is_none(), "another host's");
+        let dl: Vec<String> = s
+            .dead_letters("h", now)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(
+            !dl.contains(&"01A".to_string()),
+            "an expired report goes in the digest only"
+        );
+        let e = ev(ActorKind::Host, Known::MsgSent(d)).into_event();
+        s.apply(&e);
+        assert!(!s.msgs.contains_key("01A") && !s.msgs.contains_key("01B"));
+        assert!(s.msgs.contains_key("01C") && s.msgs.contains_key("01D"));
+        assert!(s.report_digest("h", now).is_none(), "handed over once");
+    }
+
+    #[test]
     fn an_agent_down_is_gone_from_then_and_back_up_is_not() {
         let mut s = State::default();
         let up = Known::AgentUp(AgentUp {
@@ -2340,6 +2443,7 @@ mod tests {
             kind: "DONE".into(),
             reference: "x".into(),
             text: "t".into(),
+            closes: Vec::new(),
         });
         let mut s = State::default();
         s.apply(&at(0, sent));
@@ -2558,6 +2662,7 @@ mod tests {
                 kind: "FYI".into(),
                 reference: "task:p/1".into(),
                 text: "hi".into(),
+                closes: Vec::new(),
             }),
         );
         let mid = m.id.clone();
@@ -2661,6 +2766,7 @@ mod tests {
                 kind: "ANSWER".into(),
                 reference: aid.clone(),
                 text: "b".into(),
+                closes: Vec::new(),
             }),
         );
         msg.actor.id = "human:board".into();

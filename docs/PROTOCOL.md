@@ -92,7 +92,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | blocker | `blocker.raised` | what, owner?, unblocks_when?, pid?, started? (`pid`: a process on the raiser's host it waits on, `started` when that process started) | task | agent, host |
 | | `blocker.resolved` | note? (the raiser's host writes one once the blocker's `pid` is gone or started at another time) | re = the raise | agent, host |
 | question | `ask.raised` | question, options[], recommendation?, context? | task | agent |
-| comms | `msg.sent` | to (an agent id, or `coordinator`), kind, ref, text | | agent, host |
+| comms | `msg.sent` | to (an agent id, or `coordinator`), kind, ref, text, closes? (a host's `DEADLETTER`) | re? (a `DEADLETTER`: the tell) | agent, host |
 | | `ask.answered` | answer, approve?, approves?, msg — **human only**, via `POST /board/answer` | re = the ask | human |
 | | `msg.delivered` | to, observed, rung?, attempts? | re = the send | host |
 | | `msg.read` | — | re = the send | agent (the recipient) |
@@ -320,8 +320,15 @@ one event takes the tell off its recipient's queue (only a host's `DEADLETTER` d
 already read or handed over is ignored), and its id is
 derived from the tell's id, so a retry or a second writer is the same event and the hub keeps it
 once. The coordinator redistributes it. A dead letter never expires itself and waits while no
-agent holds the role; the board counts them. A status report older than 6 h is still closed
-unrung, above. A spooled tell replays with its own actor and `ts`, whichever call drains the
+agent holds the role; the board counts them.
+
+Nothing is closed unrung either. Status reports (`MERGED`, `DONE`, `RETIRE`, `OPEN`, `FIX`) still
+undelivered 6 h after they were sent are not rung (they waited out a reconnect); each pass, the
+host that would hand them over writes them to the coordinator as **one** `DEADLETTER` digest, ref
+`digest`, text `<n> status reports unread over 6 h:` and one line each (`- <age> ago <from> → <to>
+<TYPE> <ref>: <text>`), oldest first. The digest's `closes` lists every report it hands over, and
+that one event takes them all off their queues; its id is derived from the first. A long absence
+costs the coordinator one message per pass, never one per report. A spooled tell replays with its own actor and `ts`, whichever call drains the
 spool, so a tell spooled for days arrives expired and goes to the coordinator, never rung.
 
 ## Presence (herdr)

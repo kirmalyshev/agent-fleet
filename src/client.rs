@@ -754,6 +754,7 @@ mod tests {
                 kind: "REPORT".into(),
                 reference: "x".into(),
                 text: "old news".into(),
+                closes: Vec::new(),
             }),
         );
         tell.ts -= chrono::Duration::days(6);
