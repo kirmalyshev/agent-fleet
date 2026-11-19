@@ -92,7 +92,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | blocker | `blocker.raised` | what, owner?, unblocks_when?, pid?, started? (`pid`: a process on the raiser's host it waits on, `started` when that process started) | task | agent, host |
 | | `blocker.resolved` | note? (the raiser's host writes one once the blocker's `pid` is gone or started at another time) | re = the raise | agent, host |
 | question | `ask.raised` | question, options[], recommendation?, context? | task | agent |
-| comms | `msg.sent` | to (an agent id, or `coordinator`), kind, ref, text | | agent, host |
+| comms | `msg.sent` | to (an agent id, or `coordinator`), kind, ref, text, closes? (a host's `DEADLETTER`) | re? (a `DEADLETTER`: the tell) | agent, host |
 | | `ask.answered` | answer, approve?, approves?, msg — **human only**, via `POST /board/answer` | re = the ask | human |
 | | `msg.delivered` | to, observed, rung?, attempts? | re = the send | host |
 | | `msg.read` | — | re = the send | agent (the recipient) |
@@ -258,7 +258,8 @@ first showed the account out) keyed by `<host>:<kind>`,
 `tasks` (state + since, owner, lead,
 blocked_by, handoffs), open `blockers` and `asks` (with their context link) keyed by their raising event id, undelivered
 `msgs` keyed by their `msg.sent` id, delivered-but-`unread` ones (with the last delivery and
-the ring count, dropped 24 h after the send), `read` ones (kept 24 h after the read), the id of the `last` event folded, and the `unknown` count.
+the ring count, kept until read or handed to the coordinator), `gone` (when each agent not up
+went down, 24 h), `read` ones (kept 24 h after the read), the id of the `last` event folded, and the `unknown` count.
 
 ## Doorbells
 
@@ -309,10 +310,28 @@ its `msg.delivered` has to be written again.
 delivery>`, or `read`; the board lists unread ones the same way. Read tells stay in the state for
 24 h after the read.
 
-Every tell expires 24 h after it was sent (status reports at 6 h, above): undelivered, it is
-closed unrung (`msg.delivered` with `attempts: 0`); unread, it is no longer retransmitted. A
-spooled tell replays with its own actor and `ts`, whichever call drains the spool, so a tell
-spooled for days arrives expired and is never rung.
+Nothing is dropped. A tell still unread (delivered or not) 24 h after it was sent, or to an agent
+down (`agent.down`) for 10 min (a listing flap that comes back up is not), is a **dead letter**:
+the recipient's host (for an expired one, also the coordinator's host, so a tell to an agent whose
+host is gone still arrives) writes one
+`msg.sent` to `coordinator` with kind `DEADLETTER`, `re` = the tell, the tell's ref, and the text
+`[expired|recipient gone, queued <age> ago from <sender> to <recipient>, sent <time>] <text>`. That
+one event takes the tell off its recipient's queue (only a host's `DEADLETTER` does; one for a tell
+already read or handed over is ignored), and its id is
+derived from the tell's id, so a retry or a second writer is the same event and the hub keeps it
+once. The coordinator redistributes it. A dead letter never expires itself and waits while no
+agent holds the role; the board counts them.
+
+Nothing is closed unrung either. Status reports (`MERGED`, `DONE`, `RETIRE`, `OPEN`, `FIX`) still
+undelivered 6 h after they were sent are not rung (they waited out a reconnect); each pass, the
+host that would hand them over writes them to the coordinator as **one** `DEADLETTER` digest, ref
+`digest`, text `<n> status reports unread over 6 h:` and one line each (`- <age> ago <from> → <to>
+<TYPE> <ref>: <text>`), oldest first. The digest's `closes` lists every report it hands over, and
+that one event takes them all off their queues. Every hand-over's id is a ULID derived from the
+whole set it closes (the earliest id's time, an FNV-1a hash of the sorted ids): the same set is the
+same event, and a larger one is a new event. A long absence
+costs the coordinator one message per pass, never one per report. A spooled tell replays with its own actor and `ts`, whichever call drains the
+spool, so a tell spooled for days arrives expired and goes to the coordinator, never rung.
 
 ## Presence (herdr)
 

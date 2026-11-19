@@ -928,6 +928,7 @@ async fn run(
                 kind: "CONTINUE".into(),
                 reference: cause.kind.name().into(),
                 text: "continue where you stopped".into(),
+                closes: Vec::new(),
             })))
             .await;
         }
@@ -946,6 +947,7 @@ async fn run(
                 kind,
                 reference: name.to_string(),
                 text,
+                closes: Vec::new(),
             })))
             .await;
         }

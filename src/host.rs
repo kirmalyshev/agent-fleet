@@ -565,6 +565,7 @@ impl Host {
             kind: "BLOCKED".into(),
             reference,
             text: text.into(),
+            closes: Vec::new(),
         });
         if !self
             .publish(Envelope::new(
@@ -1293,6 +1294,31 @@ impl Host {
                 }
             };
             let now = chrono::Utc::now();
+            // Expired, or its recipient gone: handed to the coordinator, never rung. The dead
+            // letter's id comes from the tell's, so a retry or a second writer is the same event.
+            let dead = view.state.dead_letters(&self.cfg.host, now);
+            for (id, letter) in &dead {
+                let mut e = self.presence(Known::MsgSent(letter.clone())).re(id);
+                e.id = dead_letter_id(std::slice::from_ref(id));
+                if self.publish(e).await {
+                    eprintln!(
+                        "agent-fleet host: {id} handed to the coordinator: {}",
+                        letter.text
+                    );
+                }
+            }
+            // Status reports that waited out a reconnect: one digest per pass, never one each.
+            if let Some((ids, digest)) = view.state.report_digest(&self.cfg.host, now) {
+                let mut e = self.presence(Known::MsgSent(digest));
+                e.id = dead_letter_id(&ids);
+                if self.publish(e).await {
+                    eprintln!(
+                        "agent-fleet host: {} stale reports handed to the coordinator in one digest",
+                        ids.len()
+                    );
+                }
+            }
+            let dead: HashSet<&String> = dead.iter().map(|(id, _)| id).collect();
             let (pending, unread) = (&view.state.msgs, &view.state.unread);
             let live = |id: &String| pending.contains_key(id) || unread.contains_key(id);
             tried.retain(|id, _| live(id));
@@ -1307,33 +1333,20 @@ impl Host {
                 .filter(|(_, u)| {
                     u.rings < MAX_RINGS
                         && now - u.delivered >= retransmit_after(u.rings)
-                        && u.msg.stale(now).is_none()
+                        && !u.msg.expired(now)
                 })
                 .map(|(id, u)| (id, &u.msg, Some(u.rings)));
             for (id, msg, cycle) in pending.iter().map(|(id, m)| (id, m, None)).chain(due) {
                 let again = cycle.is_some();
+                if dead.contains(id) || msg.expired(now) {
+                    continue;
+                }
                 // Resolved per pass: a message to `coordinator` follows the role to its holder now.
                 let Some(to) = view.state.recipient(&msg.to) else {
                     continue;
                 };
-                // A status report that waited out a reconnect, or any tell a day old: close it unrung.
-                if let Some(why) = msg.stale(now) {
-                    let dropped = MsgDelivered {
-                        to: to.to_string(),
-                        observed: AgentState::Idle,
-                        rung: None,
-                        attempts: Some(0),
-                        ack: false,
-                    };
-                    if self
-                        .publish(self.presence(Known::MsgDelivered(dropped)).re(id))
-                        .await
-                    {
-                        eprintln!(
-                            "agent-fleet host: {id} to {} dropped, not rung: {why}",
-                            msg.to
-                        );
-                    }
+                // A status report that waited out a reconnect went in this pass's digest.
+                if msg.stale(now).is_some() && !again {
                     continue;
                 }
                 let target = {
@@ -1515,6 +1528,30 @@ impl Host {
         tokio::time::sleep(QUEUE_CHECK).await;
         crate::stuck::screen(self, to).await.map(|t| has_id(&t, id))
     }
+}
+
+/// The id of the dead letter (or digest) handing over the tells `ids`: a ULID made from the whole
+/// set, the earliest id's time and a stable hash (FNV-1a, the same on every host) of the sorted
+/// ids. The same set handed over twice is the same event, which the hub keeps once; a larger set is
+/// a new one.
+pub(crate) fn dead_letter_id(ids: &[String]) -> String {
+    let mut sorted: Vec<&str> = ids.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let fnv = |seed: u64| {
+        sorted.iter().fold(seed, |h, id| {
+            id.bytes()
+                .chain(*b"\n")
+                .fold(h, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+        })
+    };
+    let random = (u128::from(fnv(0xcbf2_9ce4_8422_2325)) << 64
+        | u128::from(fnv(0x6c62_272e_07bb_0142)))
+        & ((1u128 << 80) - 1);
+    let ms = sorted
+        .first()
+        .and_then(|id| ulid::Ulid::from_string(id).ok())
+        .map_or(0, |u| u.timestamp_ms());
+    ulid::Ulid::from_parts(ms, random).to_string()
 }
 
 /// Deliveries after which an unread tell is rung no more (about 2 h 15 min of retransmits): an
@@ -1749,6 +1786,7 @@ mod tests {
                 kind: kind.into(),
                 reference: "x".into(),
                 text: "hi".into(),
+                closes: Vec::new(),
             }),
         )
     }
@@ -1918,6 +1956,31 @@ mod tests {
     }
 
     #[test]
+    fn a_hand_over_id_is_the_same_for_the_same_set_and_new_for_a_larger_one() {
+        let (a, b, c) = (
+            ulid::Ulid::new().to_string(),
+            ulid::Ulid::new().to_string(),
+            ulid::Ulid::new().to_string(),
+        );
+        let ab = dead_letter_id(&[a.clone(), b.clone()]);
+        assert_eq!(ab, dead_letter_id(&[b.clone(), a.clone()]), "any order");
+        assert_ne!(
+            ab,
+            dead_letter_id(&[a.clone(), b.clone(), c]),
+            "a larger set is a new event"
+        );
+        assert_ne!(ab, dead_letter_id(std::slice::from_ref(&a)));
+        assert!(ulid::Ulid::from_string(&ab).is_ok());
+        let first = ulid::Ulid::from_string(&a).unwrap().timestamp_ms();
+        assert_eq!(ulid::Ulid::from_string(&ab).unwrap().timestamp_ms(), first);
+        // Pinned: every host, every build, computes the same id.
+        assert_eq!(
+            dead_letter_id(&["01M7TX00000000000000000000".into()]),
+            "01M7TX0000HT0BP7S8N0Q4DNT9"
+        );
+    }
+
+    #[test]
     fn retransmits_back_off_from_five_minutes_doubling_to_an_hour() {
         let m = chrono::Duration::minutes;
         let got: Vec<_> = (1..=6).map(retransmit_after).collect();
@@ -1978,24 +2041,96 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_status_report_that_waited_out_a_reconnect_is_dropped_not_rung() {
+    async fn a_status_report_that_waited_out_a_reconnect_goes_to_the_coordinator_in_a_digest() {
         let dir = tempfile::tempdir().unwrap();
         let (host, fake, _) = host_on_fake_msg(dir.path(), "idle", "MERGED", 20).await;
+        let digests = || {
+            host.replica
+                .lock()
+                .unwrap()
+                .all()
+                .unwrap()
+                .into_iter()
+                .filter_map(|e| match e.body {
+                    Body::Known(Known::MsgSent(m)) if m.kind == "DEADLETTER" => Some(m),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
         for _ in 0..200 {
-            if types(&host).contains(&"msg.delivered".to_string()) {
+            if !digests().is_empty() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        for _ in 0..3 {
+            host.wake.notify_one();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let got = digests();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(
+            got[0]
+                .text
+                .starts_with("1 status report unread over 6 h:\n- 20h"),
+            "{}",
+            got[0].text
+        );
+        assert_eq!(got[0].closes.len(), 1);
         assert!(
             fake.prompts.lock().unwrap().is_empty(),
             "a 20 h old MERGED rang"
         );
         assert!(
-            types(&host).contains(&"msg.delivered".to_string()),
-            "dropped, so it leaves the undelivered list"
+            !types(&host).contains(&"msg.delivered".to_string()),
+            "nothing is closed unrung"
         );
     }
+
+    #[tokio::test]
+    async fn an_expired_tell_goes_to_the_coordinator_once_and_is_never_rung() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, fake, _) = host_on_fake_msg(dir.path(), "idle", "ASK", 25).await;
+        let dead = || {
+            let log = host.replica.lock().unwrap().all().unwrap();
+            log.into_iter()
+                .filter(
+                    |e| matches!(&e.body, Body::Known(Known::MsgSent(m)) if m.kind == "DEADLETTER"),
+                )
+                .collect::<Vec<_>>()
+        };
+        for _ in 0..200 {
+            if !dead().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // More passes: it is handed over once, never again.
+        for _ in 0..3 {
+            host.wake.notify_one();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let got = dead();
+        assert_eq!(got.len(), 1, "{got:?}");
+        let Body::Known(Known::MsgSent(m)) = &got[0].body else {
+            unreachable!()
+        };
+        assert_eq!(m.to, "coordinator");
+        assert!(m.text.contains("from agent:h/s/lead to agent:h/s/a") && m.text.ends_with("] hi"));
+        assert!(
+            fake.prompts.lock().unwrap().is_empty(),
+            "an expired tell is never rung"
+        );
+        let view = host.view().unwrap();
+        assert!(
+            view.state.msgs.values().all(|m| m.kind == "DEADLETTER"),
+            "the original is closed"
+        );
+        // A replay of the same hand-over is the same event: the hub keeps one.
+        let orig = got[0].re.clone().unwrap();
+        assert_eq!(dead_letter_id(&[orig]), got[0].id);
+    }
+
     #[tokio::test]
     async fn a_busy_claude_agent_gets_the_tell_queued() {
         let dir = tempfile::tempdir().unwrap();

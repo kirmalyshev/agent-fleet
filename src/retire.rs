@@ -715,6 +715,7 @@ async fn try_here(h: &Here<'_>) -> Result<Done> {
                     .map(|n| format!("{repo}#{n}"))
                     .unwrap_or_else(|| repo.clone()),
                 text: why.clone(),
+                closes: Vec::new(),
             }),
             text: why,
         },

@@ -638,6 +638,10 @@ pub struct MsgSent {
     #[serde(rename = "ref")]
     pub reference: String,
     pub text: String,
+    /// A host's `DEADLETTER` digest: the tells it hands over, each taken off its recipient's
+    /// queue by this one event.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub closes: Vec<String>,
 }
 
 /// The `msg.sent` named by `re` reached the agent, which then turned `observed`.
@@ -1207,6 +1211,7 @@ mod tests {
                     kind: "ANSWER".into(),
                     reference: "x".into(),
                     text: "t".into(),
+                    closes: Vec::new(),
                 }),
             );
             parse_strict(&serde_json::to_value(e).unwrap())

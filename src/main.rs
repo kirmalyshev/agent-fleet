@@ -387,6 +387,7 @@ impl tui::Fleet for Ctx {
             kind: "NOTE".into(),
             reference: "tui".into(),
             text: text.to_string(),
+            closes: Vec::new(),
         };
         self.write(Envelope::new(
             self.me().await?,
@@ -1976,6 +1977,7 @@ async fn main() -> Result<()> {
                 kind: kind.clone(),
                 reference: reference.clone(),
                 text: text.join(" "),
+                closes: Vec::new(),
             };
             ctx.write(Envelope::new(
                 ctx.me().await?,
@@ -2073,6 +2075,7 @@ async fn tell_root(ctx: &Ctx, s: &state::State, key: &str, text: &str) -> String
             kind: "orphan-pr".into(),
             reference: key.into(),
             text: format!("{key} has no live agent: {text}"),
+            closes: Vec::new(),
         };
         ctx.write(Envelope::new(
             ctx.me().await?,
@@ -2144,6 +2147,7 @@ mod tests {
                     kind: "ASK".into(),
                     reference: "r".into(),
                     text: id.into(),
+                    closes: Vec::new(),
                 }),
             )
         };

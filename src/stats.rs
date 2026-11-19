@@ -283,6 +283,7 @@ mod tests {
                     kind: "FYI".into(),
                     reference: "x".into(),
                     text: "t".into(),
+                    closes: Vec::new(),
                 }),
             )
         };

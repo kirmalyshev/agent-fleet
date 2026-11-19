@@ -194,6 +194,7 @@ impl Hub {
                 } else {
                     answer.into()
                 },
+                closes: Vec::new(),
             }),
         );
         let mut answered = event::Envelope::new(
@@ -1190,6 +1191,7 @@ mod tests {
                 kind: "NOTE".into(),
                 reference: "r".into(),
                 text: "hi".into(),
+                closes: Vec::new(),
             }),
         );
         serde_json::to_value(e).unwrap()
