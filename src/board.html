@@ -595,8 +595,14 @@ function doorbellsTab(s) {
   return cards + `<h2>Undelivered <span class="dim">· waiting for the recipient to be free</span></h2>` +
     table([["Waiting", "r"], ["From"], ["To"], ["Kind"], ["Ref", "hide-sm"], ["Text"]], rows.map(([, m]) =>
       `<tr><td class="r num">${ago(m.since)}</td><td class="mono">${esc(short(m.from))}</td><td class="mono">${esc(short(m.to))}</td>
-       <td>${esc(m.kind)}</td><td class="mono hide-sm">${esc(m.reference)}</td><td class="wrap">${esc(m.text)}</td></tr>`),
-      ["Every doorbell is delivered", "A message waits here only while its recipient is busy or its host is out of reach."]);
+       <td>${esc(m.kind)}</td><td class="mono hide-sm">${esc(m.ref)}</td><td class="wrap">${esc(m.text)}</td></tr>`),
+      ["Every doorbell is delivered", "A message waits here only while its recipient is busy or its host is out of reach."]) +
+    `<h2>Unread <span class="dim">· delivered, not read with <code>agent-fleet read</code>; rung again with backoff</span></h2>` +
+    table([["Unread", "r"], ["From"], ["To"], ["Kind"], ["Rings", "r hide-sm"], ["Text"]],
+      Object.values(s.unread || {}).filter(u => match(u.from, u.to, u.kind, u.text)).sort((a, b) => Date.parse(a.delivered) - Date.parse(b.delivered)).map(u =>
+      `<tr><td class="r num">unread ${ago(u.delivered)}</td><td class="mono">${esc(short(u.from))}</td><td class="mono">${esc(short(u.to))}</td>
+       <td>${esc(u.kind)}</td><td class="r num hide-sm">${u.rings}</td><td class="wrap">${esc(u.text)}</td></tr>`),
+      ["Every delivered doorbell is read", "A message waits here from its delivery until its recipient runs agent-fleet read."]);
 }
 
 function hostsTab(s) {

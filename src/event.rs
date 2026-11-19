@@ -254,6 +254,8 @@ pub enum Known {
     MsgSent(MsgSent),
     #[serde(rename = "msg.delivered")]
     MsgDelivered(MsgDelivered),
+    #[serde(rename = "msg.read")]
+    MsgRead(MsgRead),
     #[serde(rename = "handoff")]
     Handoff(Handoff),
     #[serde(rename = "spawn.requested")]
@@ -651,7 +653,17 @@ pub struct MsgDelivered {
     // `Some(0)`: closed unrung, a stale status report (host.rs delivery_loop).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempts: Option<u32>,
+    /// The ring asked for an ack (`(ack: agent-fleet read)`): the tell stays unread, and is rung
+    /// again, until its recipient's `msg.read`. Absent on rings older than the ack.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ack: bool,
 }
+
+/// The recipient read the `msg.sent` named by `re` itself (`agent-fleet read`): its ack. Only
+/// the agent the message reached counts; anyone else's `msg.read` is ignored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MsgRead {}
 
 /// An agent program running outside every herdr pane tree on `host`, reported by the host's
 /// process scan. `procs: 0`-style clearing: the next scan without it sends the same event minus
@@ -901,6 +913,7 @@ impl Known {
             Self::AskAnswered(_) => "ask.answered",
             Self::MsgSent(_) => "msg.sent",
             Self::MsgDelivered(_) => "msg.delivered",
+            Self::MsgRead(_) => "msg.read",
             Self::Handoff(_) => "handoff",
             Self::SpawnRequested(_) => "spawn.requested",
             Self::SpawnResult(_) => "spawn.result",
@@ -943,7 +956,9 @@ impl Known {
             | Self::RetireResult(_)
             | Self::UpdateRequested(_)
             | Self::UpdateResult(_) => &[Host],
-            Self::AskRaised(_) | Self::Handoff(_) | Self::AgentSignal(_) => &[Agent],
+            Self::AskRaised(_) | Self::Handoff(_) | Self::AgentSignal(_) | Self::MsgRead(_) => {
+                &[Agent]
+            }
             Self::AskAnswered(_) => &[Human],
             Self::MsgSent(_) => &[Agent, Host, Human],
             _ => &[Agent, Host],
@@ -971,6 +986,7 @@ impl Known {
             Self::BlockerResolved(_)
                 | Self::AskAnswered(_)
                 | Self::MsgDelivered(_)
+                | Self::MsgRead(_)
                 | Self::SpawnResult(_)
                 | Self::RetireResult(_)
                 | Self::UpdateResult(_)

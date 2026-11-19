@@ -462,7 +462,9 @@ From `agent-fleet --help`; every command has its own `--help`.
 | `spawn` | Spawn an agent on an issue, or with `--title` on work that has none: the machine's fleet.toml (`agent-fleet init`), or the project's own `.agent-fleet/fleet.toml`, picks the profile and host, the host agent runs it (worktree, env scrub, agent start, the brief) and answers `spawn.result`. Follows the hub until the result arrives (10 min) |
 | `handoff` | Hand an agent's issue, branch and existing worktree to a new agent of `--to` (default: its profile's fallback), then close the replaced agent's pane and workspace |
 | `retire` | Close a spawned agent and retire its worktree, locked: real uncommitted changes stop the retire and are shown to you and the agent's lead until `--decide` says delete, keep, or stash (a patch first). Run it on any host: from another host it asks the agent's host (through the hub) to run it there |
-| `tell` | Ring an agent's doorbell: `[agent-fleet <from>→<to>] TYPE ref: text (event <id>)` |
+| `tell` | Ring an agent's doorbell: `[agent-fleet <from>→<to>] TYPE ref: text (event <id>; ack: agent-fleet read)` |
+| `read` | Read your own tells: every one sent to you (or to a role you hold) not read yet, delivered or not, oldest first with its original sender and time; each is then acked (`msg.read`), so it stops being rung again. Run it at every turn start |
+| `sent` | Your tells and where each is: `sent` (waiting for a ring), `unread <age>` (delivered, not read yet), or `read` |
 | `stats` | Numbers about the fleet: doorbell latency and loss, event lag, host and hub vitals |
 | `proc` | What the log says of a process on this host: `hung`, `orphan`, `waiting` (in a lock's queue), `no report` (not hung, or not watched), or `gone` |
 | `doctor` | What needs a look: stale, hung or heavy agents, duplicate work, forgotten worktrees, unpushed commits |

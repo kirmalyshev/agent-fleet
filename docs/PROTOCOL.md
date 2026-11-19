@@ -95,6 +95,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | comms | `msg.sent` | to (an agent id, or `coordinator`), kind, ref, text | | agent, host |
 | | `ask.answered` | answer, approve?, approves?, msg — **human only**, via `POST /board/answer` | re = the ask | human |
 | | `msg.delivered` | to, observed, rung?, attempts? | re = the send | host |
+| | `msg.read` | — | re = the send | agent (the recipient) |
 | | `handoff` | to, next, done?, evidence[], learned? | task | agent |
 | spawn | `spawn.requested` | name, agent, host, session, repo, issue?, branch, profile, brief, level?, lead?, worktree?, replaces?, why | | agent, host |
 | | `spawn.result` | agent, ok, pane?, worktree?, error? | re = the request | host |
@@ -256,7 +257,8 @@ kept for 24 h — `quotas` (windows, plan, exhausted, read_at, exhausted_since �
 first showed the account out) keyed by `<host>:<kind>`,
 `tasks` (state + since, owner, lead,
 blocked_by, handoffs), open `blockers` and `asks` (with their context link) keyed by their raising event id, undelivered
-`msgs` keyed by their `msg.sent` id, the id of the `last` event folded, and the `unknown` count.
+`msgs` keyed by their `msg.sent` id, delivered-but-`unread` ones (with the last delivery and
+the ring count, dropped 24 h after the send), `read` ones (kept 24 h after the read), the id of the `last` event folded, and the `unknown` count.
 
 ## Doorbells
 
@@ -269,7 +271,7 @@ so a message already queued follows a coordinator that restarts in another pane 
 The host agent of the recipient's machine types it into the agent as
 
 ```
-[agent-fleet <from>→<to>] <TYPE> <ref>: <text> (event <id>)
+[agent-fleet <from>→<to>] <TYPE> <ref>: <text> (event <id>; ack: agent-fleet read)
 ```
 
 The `[fleet` prefix marks the turn as machine-sent, so it is never mistaken for a human
@@ -284,6 +286,33 @@ after 2 s (or whose screen cannot be read) is logged as an alert and left pendin
 second time, and is acknowledged if the text later shows. An unreadable screen blocks a queued ring like a dialog. Any other busy agent waits. A failed ring is retried at most once a
 minute; if `msg.delivered` itself cannot be written, the message stays pending. `agent-fleet doctor`
 raises `undelivered` for an up recipient whose tell has waited 10 minutes.
+
+### Read and retransmit
+
+A ring is not proof the agent saw it: Claude Code can drop queued input. So every tell goes
+**sent → delivered → read**. The doorbell ends `(event <id>; ack: agent-fleet read)`, and the
+recipient pulls its own mail with `agent-fleet read` at every turn start: it prints each tell sent
+to it (or to a role it holds) that it has not read and that has not expired, delivered or not, oldest first with the
+**original** sender and send time, then writes one `msg.read` per tell (`re` = the send). Only the
+recipient's own `msg.read` counts; one from any other actor is ignored. A tell read before its
+ring is never rung.
+
+A ring that asks for the ack writes `msg.delivered` with `ack: true`; only such a delivery leaves
+the tell unread (a `msg.delivered` without it, from a host older than the ack, delivers for good,
+so an upgrade never re-rings the day's tells). A delivered tell with no `msg.read` is rung again (a
+retransmit, written as another `msg.delivered`) 5 min after its delivery, then 10, 20, 40 and
+60 min after each further one, at most 6 deliveries in all; then it stays unread on the board. A
+retransmit follows the rules of a first ring, except that its old ring on the screen proves
+nothing: once typed it counts as rung, and it is typed at most once per backoff step, even when
+its `msg.delivered` has to be written again.
+`agent-fleet sent` shows the sender each of its tells as `sent`, `unread <age since the last
+delivery>`, or `read`; the board lists unread ones the same way. Read tells stay in the state for
+24 h after the read.
+
+Every tell expires 24 h after it was sent (status reports at 6 h, above): undelivered, it is
+closed unrung (`msg.delivered` with `attempts: 0`); unread, it is no longer retransmitted. A
+spooled tell replays with its own actor and `ts`, whichever call drains the spool, so a tell
+spooled for days arrives expired and is never rung.
 
 ## Presence (herdr)
 

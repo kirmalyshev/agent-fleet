@@ -309,7 +309,7 @@ enum Cmd {
         #[arg(long)]
         decide: Option<retire::Decide>,
     },
-    /// Ring an agent's doorbell: `[agent-fleet <from>→<to>] TYPE ref: text (event <id>)`.
+    /// Ring an agent's doorbell: `[agent-fleet <from>→<to>] TYPE ref: text (event <id>; ack: agent-fleet read)`.
     Tell {
         /// An agent that is up (full id or short name), or `coordinator`: the root coordinator,
         /// whoever holds the role when the message is delivered.
@@ -321,6 +321,13 @@ enum Cmd {
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         text: Vec<String>,
     },
+    /// Read your own tells: every one sent to you (or to a role you hold) not read yet, delivered
+    /// or not, oldest first with its original sender and time; each is then acked (`msg.read`),
+    /// so it stops being rung again. Run it at every turn start.
+    Read,
+    /// Your tells and where each is: `sent` (waiting for a ring), `unread <age>` (delivered, not
+    /// read yet), or `read`.
+    Sent,
     /// Numbers about the fleet: doorbell latency and loss, event lag, host and hub vitals.
     Stats {
         /// Window back from now: `90s`, `30m`, `24h`, `7d`.
@@ -1925,6 +1932,26 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Cmd::Read => {
+            let me = ctx.me().await?;
+            let state = ctx.state().await?;
+            let now = chrono::Utc::now();
+            let mail = state.unread_for(&me.id, now);
+            if mail.is_empty() {
+                println!("no unread tells");
+            }
+            for (id, m) in &mail {
+                println!("{}", ui::mail_line(id, m));
+            }
+            for ack in read_acks(&state, &me, &ctx.cli.project, now) {
+                ctx.write(ack).await?;
+            }
+        }
+        Cmd::Sent => {
+            let me = ctx.me().await?;
+            let state = ctx.state().await?;
+            print!("{}", ui::outbox(&state, &me.id, chrono::Utc::now()));
+        }
         Cmd::Tell {
             agent,
             kind,
@@ -1967,6 +1994,19 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `agent-fleet read`'s acks: one `msg.read` from `me` per tell `unread_for` shows it.
+fn read_acks(
+    s: &State,
+    me: &Actor,
+    project: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<Envelope<Known>> {
+    s.unread_for(&me.id, now)
+        .into_iter()
+        .map(|(id, _)| Envelope::new(me.clone(), project, Known::MsgRead(MsgRead {})).re(id))
+        .collect()
 }
 
 /// The top of the git checkout holding the current directory.
@@ -2070,6 +2110,77 @@ fn write_script(path: &std::path::Path, body: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Kirill's test for #126: a busy Claude agent gets a tell; at its next turn `agent-fleet read`
+    /// acks it, so it is read and never rung again; one left unacked is due for a retransmit.
+    #[test]
+    fn a_tell_read_at_the_next_turn_is_acked_and_an_unacked_one_comes_due() {
+        let now = chrono::Utc::now();
+        let ev = |id: &str, actor: Actor, re: Option<&str>, mins: i64, body| {
+            let mut e = Envelope::new(actor, "p", body);
+            e.id = id.into();
+            e.re = re.map(str::to_string);
+            let mut e = e.into_event();
+            e.ts = now - chrono::Duration::minutes(mins);
+            e
+        };
+        let agent = |id: &str| Actor {
+            kind: ActorKind::Agent,
+            id: id.into(),
+        };
+        let host = Actor {
+            kind: ActorKind::Host,
+            id: "host:h".into(),
+        };
+        let b = "agent:h/s/b";
+        let tell = |id: &str, mins| {
+            ev(
+                id,
+                agent("agent:h/s/a"),
+                None,
+                mins,
+                Known::MsgSent(MsgSent {
+                    to: b.into(),
+                    kind: "ASK".into(),
+                    reference: "r".into(),
+                    text: id.into(),
+                }),
+            )
+        };
+        // Queued into b's busy pane: delivered, with an ack asked for.
+        let delivered = |id: &str, re: &str, mins| {
+            ev(
+                id,
+                host.clone(),
+                Some(re),
+                mins,
+                Known::MsgDelivered(MsgDelivered {
+                    to: b.into(),
+                    observed: AgentState::Working,
+                    rung: None,
+                    attempts: Some(1),
+                    ack: true,
+                }),
+            )
+        };
+        let mut s = State::fold(&[tell("t1", 20), delivered("d1", "t1", 19)]);
+        let acks = read_acks(&s, &agent(b), "p", now);
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].re.as_deref(), Some("t1"));
+        assert_eq!(acks[0].actor.id, b);
+        for a in acks {
+            s.apply(&a.into_event());
+        }
+        assert!(s.unread.is_empty() && s.read.contains_key("t1"));
+        assert!(read_acks(&s, &agent(b), "p", now).is_empty(), "read once");
+        // Never read: due for a retransmit once its backoff is up.
+        s.apply(&tell("t2", 10));
+        s.apply(&delivered("d2", "t2", 6));
+        let u = &s.unread["t2"];
+        assert!(now - u.delivered >= host::retransmit_after(u.rings));
+        // Another agent's read acks nothing of b's.
+        assert!(read_acks(&s, &agent("agent:h/s/c"), "p", now).is_empty());
+    }
 
     #[tokio::test]
     async fn tui_all_reads_each_instance_from_its_own_dir_hub_and_token() {

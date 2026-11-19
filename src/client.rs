@@ -740,6 +740,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_spooled_tell_drained_by_anyone_keeps_its_sender_and_time_and_expires_unrung() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("spool.jsonl");
+        let mut tell = Envelope::new(
+            Actor {
+                kind: ActorKind::Agent,
+                id: "agent:h/s/batch".into(),
+            },
+            "p",
+            Known::MsgSent(MsgSent {
+                to: "coordinator".into(),
+                kind: "REPORT".into(),
+                reference: "x".into(),
+                text: "old news".into(),
+            }),
+        );
+        tell.ts -= chrono::Duration::days(6);
+        let down = Client::new("http://127.0.0.1:1", "tok".into(), spool.clone());
+        assert!(matches!(down.write(&tell).await.unwrap(), Sent::Spooled(_)));
+
+        // Days later another agent's call on the same machine drains the shared spool.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hub = start_hub(listener, &dir.path().join("hub.db")).await;
+        let c = Client::new(&base, "tok".into(), spool);
+        let mut other = block(1);
+        other.actor.id = "agent:h/s/o-3196".into();
+        c.write(&other).await.unwrap();
+        let events = c.events_after(None).await.unwrap();
+        let got = events.iter().find(|e| e.id == tell.id).expect("replayed");
+        assert_eq!(
+            got.actor.id, "agent:h/s/batch",
+            "never relabelled as the drainer"
+        );
+        assert_eq!(got.ts, tell.ts, "the original time");
+        let s = crate::state::State::fold(&events);
+        let why = s.msgs[&tell.id].stale(chrono::Utc::now());
+        assert!(why.is_some_and(|w| w.contains("expired")), "closed unrung");
+        hub.abort();
+    }
+
+    #[tokio::test]
     async fn spool_replays_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
         let spool = dir.path().join("spool.jsonl");
