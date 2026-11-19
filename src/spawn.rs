@@ -1882,6 +1882,7 @@ pub async fn spawn_loop(host: Arc<Host>) {
     let mut handed: HashSet<String> = HashSet::new();
     let mut warned: HashSet<String> = HashSet::new();
     let mut stuck_seen = crate::stuck::Seen::default();
+    let mut retire_seen: HashSet<String> = HashSet::new();
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
         // A self-update restart is waiting for the work in flight: start none.
@@ -1928,6 +1929,7 @@ pub async fn spawn_loop(host: Arc<Host>) {
                 execute(&host, &id, sp, state).await;
             }
         }
+        crate::retire::serve(&host, &mut retire_seen).await;
         handoffs(&host, state, events, &mut handed, &mut warned).await;
         stuck(&host, state, events, &mut stuck_seen, &handed).await;
     }

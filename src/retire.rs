@@ -17,6 +17,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::client::Held;
+use crate::event::Envelope;
 
 /// The repository-wide lock file, in the git common dir. A repo's own retire may take it too.
 pub const REPO_LOCK: &str = "agent-fleet-retire.lock";
@@ -47,6 +48,16 @@ impl std::str::FromStr for Decide {
     }
 }
 
+impl std::fmt::Display for Decide {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Decide::Delete => "delete",
+            Decide::Keep => "keep",
+            Decide::Stash => "stash",
+        })
+    }
+}
+
 /// One uncommitted change and where its content already lives: `in main` (the base ref holds
 /// the same bytes at that path, or both lack it), `in its PR` (the same against
 /// `origin/<branch>`), else `work`.
@@ -61,6 +72,8 @@ pub struct Change {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Retired,
+    /// Retired after the uncommitted changes were saved as this patch.
+    Stashed(PathBuf),
     /// `keep`: nothing removed.
     Kept,
     /// The tree was already gone when the locks were held (another retire removed it).
@@ -517,6 +530,7 @@ pub async fn finish(
         Err(e) => return Ok(Outcome::Refused(format!("{e:#}; nothing removed"))),
     };
     let mut extra: Vec<&str> = vec![];
+    let mut stashed = None;
     if !found.is_empty() {
         match decide {
             None => return Ok(Outcome::Refused(report(tree, &found, plan.decide_cmd))),
@@ -532,7 +546,7 @@ pub async fn finish(
                     b
                 };
                 match save_patch(tree, plan.patches, &name, &found) {
-                    Ok(f) => println!("stashed {wt}'s uncommitted changes in {}", f.display()),
+                    Ok(f) => stashed = Some(f),
                     Err(e) => {
                         return Ok(Outcome::Refused(format!(
                             "could not stash {wt}: {e:#}; nothing removed"
@@ -545,7 +559,7 @@ pub async fn finish(
         extra.push("--decide=delete");
     }
     run_hook(plan.checkout, wt, plan.script, &extra, b).await?;
-    Ok(Outcome::Retired)
+    Ok(stashed.map_or(Outcome::Retired, Outcome::Stashed))
 }
 
 /// The guarded retire in one call, for a caller with nothing to do between the read and the
@@ -569,8 +583,352 @@ pub async fn guarded(
     }
 }
 
+// ---------- `agent-fleet retire`, on the agent's host ----------
+
+/// What a retire on this host needs: the CLI fills it from its own process, the host from its
+/// config (its herdr socket, not an environment variable a request cannot carry).
+pub struct Here<'a> {
+    pub state: &'a crate::state::State,
+    pub sp: &'a crate::state::Spawn,
+    pub host: &'a str,
+    pub decide: Option<Decide>,
+    pub machine: Option<PathBuf>,
+    /// The checkout to use when the repo is not registered: the CLI's own, if it is in one.
+    pub cwd_checkout: Option<PathBuf>,
+    pub data_dir: &'a Path,
+    pub sock: Option<PathBuf>,
+}
+
+/// What `run_here` did: the text to print (stdout when `ok`, stderr when not), and the BLOCKED
+/// message for the agent's lead when the retire was refused over uncommitted changes.
+pub struct Done {
+    pub ok: bool,
+    pub text: String,
+    pub blocked: Option<crate::event::MsgSent>,
+}
+
+fn done(ok: bool, text: impl Into<String>) -> Done {
+    Done {
+        ok,
+        text: text.into(),
+        blocked: None,
+    }
+}
+
+/// The guarded retire of `h.sp`'s agent, here: only a tree the fleet made on THIS host, locked,
+/// read, the pane closed, the repository's hook run. Never an error: whatever went wrong is the
+/// text of a not-ok `Done`.
+pub async fn run_here(h: &Here<'_>) -> Done {
+    match try_here(h).await {
+        Ok(d) => d,
+        Err(e) => done(false, format!("{e:#}")),
+    }
+}
+
+async fn try_here(h: &Here<'_>) -> Result<Done> {
+    let sp = h.sp;
+    let agent = crate::spawn::short(&sp.request.agent);
+    // The host's own rule: only a tree the fleet made, on THIS host, that no newer spawn handed
+    // to another agent — never a main checkout, never another agent's tree.
+    let Some((repo, wt, issue)) = h.state.retire_target(&sp.request.agent, h.host) else {
+        bail!(
+            "{agent}: no worktree to retire on {} (a main checkout, a tree handed to another agent, or another host's agent)",
+            h.host
+        );
+    };
+    // keep = leave it: the pane too, so the host's own close-retire never starts.
+    if h.decide == Some(Decide::Keep) {
+        return Ok(done(
+            true,
+            format!("kept {wt}: decided keep; pane and tree untouched"),
+        ));
+    }
+    if !Path::new(&wt).exists() {
+        return Ok(done(true, format!("{wt} was already retired")));
+    }
+    let registered = h
+        .machine
+        .as_deref()
+        .map(crate::setup::registered)
+        .transpose()?
+        .and_then(|mut r| r.remove(&repo));
+    let checkout = checkout_for(&repo, registered, h.cwd_checkout.clone())?;
+    let (cfg, _) = crate::spawn::load_in(&checkout, h.machine.as_deref())?;
+    let Some(script) = cfg.retire.clone() else {
+        bail!(
+            "{}'s fleet.toml has no `retire` hook; nothing would retire {wt}",
+            checkout.display()
+        );
+    };
+    let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
+    let patches = patches_dir(cfg.retire_patches.as_deref(), home.as_deref(), h.data_dir)?;
+    let cmd = format!("agent-fleet retire {agent}");
+    let plan = Plan {
+        checkout: &checkout,
+        script: &script,
+        base: &cfg.base,
+        patches: &patches,
+        decide_cmd: &cmd,
+    };
+    // Locked, then read, all BEFORE the pane closes: a refusal leaves the agent up and starts no
+    // host retire; the host's retire of the close that does follow waits on these locks and finds
+    // the tree gone.
+    let (_a, b) = locks(&checkout, Path::new(&wt), WAIT).await?;
+    let outcome = match assess(&plan, &wt, h.decide) {
+        Ready::Gone => Outcome::Gone,
+        Ready::Kept => Outcome::Kept,
+        Ready::Refused(why) => Outcome::Refused(why),
+        Ready::Go => {
+            let pane = sp.result.as_ref().and_then(|r| r.pane.clone());
+            let up = h.state.agents.contains_key(&sp.request.agent);
+            let step = pane_step(up, pane.as_deref(), h.sock.as_deref())
+                .map_err(|e| anyhow::anyhow!("refusing to retire {wt}: {e}; nothing removed"))?;
+            if let Some((p, s)) = step
+                && let Err(e) =
+                    crate::host::herdr_call(s, "pane.close", serde_json::json!({ "pane_id": p }))
+                        .await
+            {
+                bail!(
+                    "refusing to retire {wt}: {agent} is up and its pane {p} did not close ({e:#}); nothing removed"
+                );
+            }
+            finish(&plan, &wt, h.decide, &b).await?
+        }
+    };
+    Ok(match outcome {
+        Outcome::Retired => done(true, format!("retired {wt}")),
+        Outcome::Stashed(f) => done(
+            true,
+            format!(
+                "stashed {wt}'s uncommitted changes in {} (on this host)\nretired {wt}",
+                f.display()
+            ),
+        ),
+        Outcome::Kept => done(true, format!("kept {wt}: decided keep, nothing removed")),
+        Outcome::Gone => done(true, format!("{wt} was already retired")),
+        Outcome::Refused(why) => Done {
+            ok: false,
+            blocked: Some(crate::event::MsgSent {
+                to: crate::spawn::lead_of(sp),
+                kind: "BLOCKED".into(),
+                reference: issue
+                    .map(|n| format!("{repo}#{n}"))
+                    .unwrap_or_else(|| repo.clone()),
+                text: why.clone(),
+            }),
+            text: why,
+        },
+    })
+}
+
+/// Follows the hub until the request's `retire.result` arrives. A retire waits on locks (90 s)
+/// and the repository's hook, so the wait is longer than a spawn's poll interval suggests.
+pub async fn wait_result(
+    client: &crate::client::Client,
+    id: &str,
+) -> Result<crate::event::RetireResult> {
+    let deadline = tokio::time::Instant::now()
+        + crate::spawn::REQUEST_MAX_AGE
+            .to_std()
+            .unwrap_or(Duration::from_secs(900));
+    loop {
+        match client.state().await {
+            Ok(s) => {
+                if let Some(r) = s.retires.get(id).and_then(|r| r.result.clone()) {
+                    return Ok(r);
+                }
+            }
+            Err(e) if e.downcast_ref::<crate::client::Refused>().is_some() => {
+                bail!("waiting for the retire result: {e:#}");
+            }
+            Err(_) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "no retire.result for {id} within 15 min — the agent's host may be down (or too old an agent-fleet to answer retire requests)"
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// The `retire.requested` ids this host should run: its own, unanswered, not seen before, and
+/// younger than a spawn request may be.
+pub fn due(
+    state: &crate::state::State,
+    host: &str,
+    session: &str,
+    seen: &mut std::collections::HashSet<String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    seen.retain(|id| state.retires.get(id).is_some_and(|r| r.result.is_none()));
+    state
+        .retires
+        .iter()
+        .filter(|(id, r)| {
+            r.request.host == host
+                // One host agent per herdr session: pane ids repeat across sessions, so only the
+                // session the agent runs in may close its pane.
+                && crate::spawn::find_spawn(state, &r.request.agent)
+                    .is_some_and(|sp| sp.request.session == session)
+                && r.result.is_none()
+                && now - r.since <= crate::spawn::REQUEST_MAX_AGE
+                && seen.insert((*id).clone())
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// The host's side: run each retire asked of this host and answer it. Runs on the spawn loop's
+/// tick, one at a time, so a retire never overlaps another on this host.
+pub async fn serve(host: &crate::host::Host, seen: &mut std::collections::HashSet<String>) {
+    let Ok(view) = host.view() else { return };
+    let state = &view.state;
+    for id in due(
+        state,
+        &host.cfg.host,
+        &host.cfg.session,
+        seen,
+        chrono::Utc::now(),
+    ) {
+        let Some(req) = state.retires.get(&id) else {
+            continue;
+        };
+        // A self-update drain waits for this: a restart mid-hook would kill it half done.
+        let Some(_busy) = host.busy_guard(format!("retire of {}", req.request.agent)) else {
+            continue;
+        };
+        let (done, project) = match crate::spawn::find_spawn(state, &req.request.agent) {
+            None => (
+                done(false, format!("{} has no spawn record", req.request.agent)),
+                req.project.clone(),
+            ),
+            Some(sp) => {
+                let decide = req
+                    .request
+                    .decide
+                    .as_deref()
+                    .and_then(|d| d.parse::<Decide>().ok());
+                let here = Here {
+                    state,
+                    sp,
+                    host: &host.cfg.host,
+                    decide,
+                    machine: host.cfg.config_dir.clone(),
+                    // The host's `--repo` flags too, as a spawn resolves its checkout.
+                    cwd_checkout: host
+                        .cfg
+                        .checkouts_now()
+                        .ok()
+                        .and_then(|mut c| c.remove(&sp.request.repo)),
+                    data_dir: &host.cfg.data_dir,
+                    sock: Some(host.cfg.herdr_socket.clone()),
+                };
+                (run_here(&here).await, req.project.clone())
+            }
+        };
+        if let Some(body) = done.blocked {
+            host.publish(Envelope::new(
+                host.actor(),
+                &project,
+                crate::event::Known::MsgSent(body),
+            ))
+            .await;
+        }
+        host.publish(
+            host.presence(crate::event::Known::RetireResult(
+                crate::event::RetireResult {
+                    agent: req.request.agent.clone(),
+                    ok: done.ok,
+                    text: done.text,
+                },
+            ))
+            .re(&id),
+        )
+        .await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_host_runs_only_its_own_unanswered_retires_once() {
+        use crate::event::RetireRequested;
+        use crate::state::{Retire, State};
+        let now = chrono::Utc::now();
+        let mut state = State::default();
+        let mut add = |id: &str, host: &str, age_min: i64, answered: bool| {
+            state.retires.insert(
+                id.into(),
+                Retire {
+                    request: RetireRequested {
+                        agent: "agent:kir/s/a".into(),
+                        host: host.into(),
+                        decide: None,
+                    },
+                    by: "agent:mac/s/me".into(),
+                    project: "p".into(),
+                    result: answered.then(|| crate::event::RetireResult {
+                        agent: "agent:kir/s/a".into(),
+                        ok: true,
+                        text: String::new(),
+                    }),
+                    since: now - chrono::Duration::minutes(age_min),
+                },
+            );
+        };
+        add("mine", "kir", 1, false);
+        add("theirs", "mac", 1, false);
+        add("done", "kir", 1, true);
+        add("old", "kir", 60, false);
+        state.spawns.insert(
+            "sp".into(),
+            crate::state::Spawn {
+                request: crate::event::SpawnRequested {
+                    name: "a".into(),
+                    agent: "agent:kir/s/a".into(),
+                    host: "kir".into(),
+                    session: "s".into(),
+                    repo: "o/r".into(),
+                    issue: None,
+                    branch: "b".into(),
+                    profile: "p".into(),
+                    brief: String::new(),
+                    level: None,
+                    lead: None,
+                    worktree: None,
+                    replaces: None,
+                    why: String::new(),
+                },
+                by: "x".into(),
+                project: "p".into(),
+                result: None,
+                since: now,
+                answered: None,
+            },
+        );
+        let mut seen = std::collections::HashSet::new();
+        assert_eq!(
+            due(&state, "kir", "s", &mut seen, now),
+            vec!["mine".to_string()]
+        );
+        assert!(
+            due(&state, "kir", "s", &mut seen, now).is_empty(),
+            "not twice"
+        );
+        assert!(
+            due(
+                &state,
+                "kir",
+                "other",
+                &mut std::collections::HashSet::new(),
+                now
+            )
+            .is_empty(),
+            "another session's host leaves it alone"
+        );
+    }
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
@@ -747,12 +1105,12 @@ mod tests {
         let f = fx();
         f.dirty();
         std::fs::write(f.wt.join("bin.dat"), [0u8, 1, 0, 255]).unwrap();
-        assert_eq!(
+        assert!(matches!(
             guarded(&f.plan(), f.wt(), Some(Decide::Stash), WAIT)
                 .await
                 .unwrap(),
-            Outcome::Retired
-        );
+            Outcome::Stashed(_)
+        ));
         assert_eq!(
             f.read("hook-args").trim(),
             format!("{} --decide=delete", f.wt())
@@ -852,12 +1210,12 @@ mod tests {
         let latin1 = b"caf\xe9, na\xefve\n".to_vec();
         std::fs::write(f.wt.join("a.txt"), &latin1).unwrap();
         std::fs::write(f.wt.join("l1.txt"), &latin1).unwrap();
-        assert_eq!(
+        assert!(matches!(
             guarded(&f.plan(), f.wt(), Some(Decide::Stash), WAIT)
                 .await
                 .unwrap(),
-            Outcome::Retired
-        );
+            Outcome::Stashed(_)
+        ));
         let p = std::fs::read_dir(&f.patches)
             .unwrap()
             .next()

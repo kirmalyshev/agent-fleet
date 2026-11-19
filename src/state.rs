@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::event::{
     AgentState, Body, COORDINATOR, Event, Known, Level, ProcessHung, QuotaWindow, ResourceHold,
-    ResourceLimit, SpawnRequested, SpawnResult, StuckCause, TYPE_VERSION, TaskState, UpdateResult,
-    WorktreeProcs, WorktreeState,
+    ResourceLimit, RetireRequested, RetireResult, SpawnRequested, SpawnResult, StuckCause,
+    TYPE_VERSION, TaskState, UpdateResult, WorktreeProcs, WorktreeState,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -54,6 +54,9 @@ pub struct State {
     /// Spawn requests by their `spawn.requested` id; answered ones are kept for 24 h.
     #[serde(default)]
     pub spawns: BTreeMap<String, Spawn>,
+    /// Retire requests by their `retire.requested` id, kept for 24 h.
+    #[serde(default)]
+    pub retires: BTreeMap<String, Retire>,
     /// Self-update requests by their `update.requested` id, kept for 24 h.
     #[serde(default)]
     pub updates: BTreeMap<String, Update>,
@@ -371,6 +374,19 @@ pub struct Spawn {
     /// The answering event's `ts`; finished spawns are pruned 24 h after it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answered: Option<DateTime<Utc>>,
+}
+
+/// A `retire.requested` and the `retire.result` that answered it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Retire {
+    pub request: RetireRequested,
+    /// Who asked (the request's actor id).
+    pub by: String,
+    pub project: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<RetireResult>,
+    /// The request's `ts`.
+    pub since: DateTime<Utc>,
 }
 
 /// How long an answered spawn stays in the state, measured against later events' `ts` (the
@@ -969,6 +985,28 @@ impl State {
                     s.answered = Some(ts);
                 }
             }
+            Known::RetireRequested(d) => {
+                self.retires.insert(
+                    e.id.clone(),
+                    Retire {
+                        request: d.clone(),
+                        by: e.actor.id.clone(),
+                        project: e.project.clone(),
+                        result: None,
+                        since: ts,
+                    },
+                );
+            }
+            // Only the host it names may answer, and only once.
+            Known::RetireResult(d) => {
+                if let Some(re) = &e.re
+                    && let Some(r) = self.retires.get_mut(re)
+                    && r.result.is_none()
+                    && e.actor.id == format!("host:{}", r.request.host)
+                {
+                    r.result = Some(d.clone());
+                }
+            }
             Known::UpdateRequested(d) => {
                 self.updates.insert(
                     e.id.clone(),
@@ -1018,6 +1056,7 @@ impl State {
         // The reducer has no clock: a spawn is pruned once a later event's `ts` is more than
         // SPAWN_KEPT past its answer (or its request, when it was never answered) — but never
         // while its agent is still up, so cap counting cannot lose sight of it.
+        self.retires.retain(|_, r| e.ts - r.since <= SPAWN_KEPT);
         let agents = &self.agents;
         self.spawns.retain(|_, s| {
             agents.contains_key(&s.request.agent)
@@ -2245,6 +2284,47 @@ mod tests {
             })
             .collect();
         assert_eq!(State::fold(&events).tasks["task:p/1"].blocked_by.len(), 20);
+    }
+
+    #[test]
+    fn a_retire_is_answered_once_and_only_by_the_host_it_names() {
+        use crate::event::{RetireRequested, RetireResult};
+        let mut s = State::default();
+        let req = by(
+            "agent:mac/s/me",
+            Known::RetireRequested(RetireRequested {
+                agent: "agent:kir/s/dv-1".into(),
+                host: "kir".into(),
+                decide: None,
+            }),
+        );
+        let id = req.id.clone();
+        s.apply(&req.into_event());
+        assert!(s.retires[&id].result.is_none());
+        let answer = |host: &str, ok: bool| {
+            by(
+                host,
+                Known::RetireResult(RetireResult {
+                    agent: "agent:kir/s/dv-1".into(),
+                    ok,
+                    text: format!("from {host}"),
+                }),
+            )
+            .re(&id)
+            .into_event()
+        };
+        s.apply(&answer("host:mac", true));
+        assert!(
+            s.retires[&id].result.is_none(),
+            "another host cannot answer"
+        );
+        s.apply(&answer("host:kir", false));
+        s.apply(&answer("host:kir", true));
+        let r = s.retires[&id].result.as_ref().unwrap();
+        assert!(
+            !r.ok && r.text == "from host:kir",
+            "the first answer stands"
+        );
     }
 
     fn by(id: &str, body: Known) -> Envelope<Known> {

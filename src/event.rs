@@ -260,6 +260,10 @@ pub enum Known {
     SpawnRequested(Box<SpawnRequested>),
     #[serde(rename = "spawn.result")]
     SpawnResult(SpawnResult),
+    #[serde(rename = "retire.requested")]
+    RetireRequested(RetireRequested),
+    #[serde(rename = "retire.result")]
+    RetireResult(RetireResult),
     #[serde(rename = "agent.unmanaged")]
     AgentUnmanaged(AgentUnmanaged),
     #[serde(rename = "proc.orphaned")]
@@ -803,6 +807,31 @@ pub struct SpawnResult {
     pub error: Option<String>,
 }
 
+/// `agent-fleet retire` run on a host that is not the agent's asks the agent's host to run the
+/// retire itself: the pane, the locks and the repository's hook are all that host's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RetireRequested {
+    /// The agent's full id: `agent:<host>/<session>/<name>`.
+    pub agent: String,
+    /// The host that runs it: the agent's.
+    pub host: String,
+    /// `delete`, `keep` or `stash`: what to do with real uncommitted changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decide: Option<String>,
+}
+
+/// The `retire.requested` named by `re`, answered by the host that ran it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RetireResult {
+    pub agent: String,
+    /// False when nothing was retired: refused over uncommitted changes, or an error.
+    pub ok: bool,
+    /// What `agent-fleet retire` prints on that host.
+    pub text: String,
+}
+
 /// `agent-fleet self-update` asks every host to pull its clone's `main`, rebuild and restart;
 /// a host's own timer asks only itself, with `host`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -875,6 +904,8 @@ impl Known {
             Self::Handoff(_) => "handoff",
             Self::SpawnRequested(_) => "spawn.requested",
             Self::SpawnResult(_) => "spawn.result",
+            Self::RetireRequested(_) => "retire.requested",
+            Self::RetireResult(_) => "retire.result",
             Self::AgentUnmanaged(_) => "agent.unmanaged",
             Self::ProcessOrphaned(_) => "proc.orphaned",
             Self::ProcessHung(_) => "proc.hung",
@@ -909,6 +940,7 @@ impl Known {
             | Self::AgentStuck(_) => &[Host],
             Self::MsgDelivered(_)
             | Self::SpawnResult(_)
+            | Self::RetireResult(_)
             | Self::UpdateRequested(_)
             | Self::UpdateResult(_) => &[Host],
             Self::AskRaised(_) | Self::Handoff(_) | Self::AgentSignal(_) => &[Agent],
@@ -940,6 +972,7 @@ impl Known {
                 | Self::AskAnswered(_)
                 | Self::MsgDelivered(_)
                 | Self::SpawnResult(_)
+                | Self::RetireResult(_)
                 | Self::UpdateResult(_)
         )
     }
