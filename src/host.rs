@@ -1282,8 +1282,14 @@ impl Host {
                 let Some((pane, state, before)) = target else {
                     continue;
                 };
-                // Never type into a busy or blocked agent; retry a failed ring at most once a minute.
-                if !matches!(state, AgentState::Idle | AgentState::Done) {
+                // Never type into a blocked agent, or a busy one that cannot queue input; retry a
+                // failed ring at most once a minute.
+                let queue = state == AgentState::Working
+                    && msg.queueable(
+                        view.state.agents.get(to).and_then(|a| a.kind.as_deref()),
+                        chrono::Utc::now(),
+                    );
+                if !queue && !matches!(state, AgentState::Idle | AgentState::Done) {
                     if waiting.insert(id.clone()) {
                         eprintln!("agent-fleet host: {id} waits: {} is {state:?}", msg.to);
                     }
@@ -1297,14 +1303,19 @@ impl Host {
                 }
                 tried.insert(id.clone(), Instant::now());
                 let text = doorbell(&msg.from, &msg.to, &msg.kind, &msg.reference, &msg.text, id);
-                let params = json!({ "target": pane, "text": text, "wait": { "until": ["working"], "timeout_ms": 20000 } });
+                // A queued ring is already `working`: there is no new turn to wait for.
+                let params = if queue {
+                    json!({ "target": pane, "text": text })
+                } else {
+                    json!({ "target": pane, "text": text, "wait": { "until": ["working"], "timeout_ms": 20000 } })
+                };
                 let attempt = attempts.entry(id.clone()).or_default();
                 *attempt += 1;
                 let attempt = *attempt;
                 bump(&self.n.rings);
                 let rung = chrono::Utc::now();
                 match herdr_call(&self.cfg.herdr_socket, "agent.prompt", params).await {
-                    Ok(_) if self.saw_working(&pane, before).await => {
+                    Ok(_) if queue || self.saw_working(&pane, before).await => {
                         let delivered = MsgDelivered {
                             to: to.to_string(),
                             observed: AgentState::Working,
@@ -1635,6 +1646,20 @@ mod tests {
             "dropped, so it leaves the undelivered list"
         );
     }
+    #[tokio::test]
+    async fn a_busy_claude_agent_is_rung_once_the_tell_has_waited() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, fake, _) = host_on_fake_msg(dir.path(), "working", "OK", 1).await;
+        for _ in 0..200 {
+            if types(&host).contains(&"msg.delivered".to_string()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(fake.prompts.lock().unwrap().len(), 1);
+        assert!(types(&host).contains(&"msg.delivered".to_string()));
+    }
+
     #[tokio::test]
     async fn a_busy_agent_is_not_rung() {
         let dir = tempfile::tempdir().unwrap();

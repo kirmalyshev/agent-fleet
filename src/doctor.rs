@@ -29,6 +29,8 @@ pub const LEFTOVER: Duration = Duration::minutes(10);
 pub const REFUSED: Duration = Duration::hours(1);
 /// Queued this long for a resource: worth a look at who holds it.
 pub const QUEUED: Duration = Duration::minutes(10);
+/// A tell still undelivered this long: its recipient is busy, blocked, or has no host ringing.
+pub const UNDELIVERED: Duration = Duration::minutes(5);
 /// A quota window this full with its reset still ahead: slow down or it will run out.
 pub const QUOTA_PCT: f64 = 90.0;
 /// A spawn request unanswered this long means its host is not listening.
@@ -67,7 +69,7 @@ const SHARED_BY_ALL: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Finding {
     /// `stale`, `hung`, `heavy`, `duplicate`, `forgotten`, `unpushed`, `orphan`, `breach`,
-    /// `queued`, `refused`, `role`, `quota`, `spawn`, `unmanaged`, `stalled`, `build`, `update`, `orphan-pr`
+    /// `queued`, `undelivered`, `refused`, `role`, `quota`, `spawn`, `unmanaged`, `stalled`, `build`, `update`, `orphan-pr`
     /// (added by `main`).
     pub kind: &'static str,
     /// The agent id or `<host>:<path>` it is about.
@@ -900,6 +902,30 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
                 format!("{}, behind {behind}", hold(now, w)),
             ));
         }
+    }
+    // Per recipient: how many tells wait, the oldest, and what the recipient is doing.
+    let mut waiting: BTreeMap<&str, (usize, DateTime<Utc>)> = BTreeMap::new();
+    for m in s.msgs.values().filter(|m| now - m.since >= UNDELIVERED) {
+        let w = waiting.entry(&m.to).or_insert((0, m.since));
+        w.0 += 1;
+        w.1 = w.1.min(m.since);
+    }
+    for (to, (n, since)) in waiting {
+        let doing =
+            s.recipient(to)
+                .and_then(|r| s.agents.get(r))
+                .map_or("not up".to_string(), |a| {
+                    let st = serde_json::to_value(a.state).unwrap_or_default();
+                    format!("{} for {}", st.as_str().unwrap_or("?"), ago(now, a.since))
+                });
+        out.push(finding(
+            "undelivered",
+            to,
+            format!(
+                "{n} tell(s) waiting, oldest {}; recipient is {doing}",
+                ago(now, since)
+            ),
+        ));
     }
     out
 }
@@ -2190,5 +2216,41 @@ mod tests {
         );
         s.spawns.insert("e2".into(), spawn(true, now));
         assert_eq!(kinds(&findings(&s, now)), [], "a later spawn succeeded");
+    }
+
+    #[test]
+    fn a_tell_waiting_on_a_busy_agent_is_an_undelivered_finding() {
+        let now = Utc::now();
+        let id = "agent:h/s/a";
+        let msg = |since| crate::state::Msg {
+            from: "agent:h/s/c".into(),
+            to: id.into(),
+            kind: "OK".into(),
+            reference: "r".into(),
+            text: "go".into(),
+            since,
+        };
+        let mut s = State::default();
+        s.agents
+            .insert(id.into(), agent(AgentState::Working, now, "/w/a", 0, 0));
+        s.msgs
+            .insert("m1".into(), msg(now - UNDELIVERED + Duration::minutes(1)));
+        assert_eq!(kinds(&findings(&s, now)), [], "fresh tell is not late yet");
+        s.msgs
+            .insert("m2".into(), msg(now - UNDELIVERED - Duration::minutes(3)));
+        s.msgs
+            .insert("m3".into(), msg(now - UNDELIVERED - Duration::minutes(1)));
+        let f = findings(&s, now);
+        assert_eq!(
+            kinds(&f),
+            [("undelivered", id)],
+            "one finding per recipient"
+        );
+        assert!(
+            f[0].detail.starts_with("2 tell(s) waiting"),
+            "{}",
+            f[0].detail
+        );
+        assert!(f[0].detail.contains("working"), "{}", f[0].detail);
     }
 }

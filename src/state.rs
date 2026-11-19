@@ -392,7 +392,17 @@ pub struct Msg {
 /// after it was sent is history: its host was away, and what it announced has long been acted on.
 pub const MSG_FRESH: chrono::Duration = chrono::Duration::hours(6);
 
+/// A tell this old waits no longer for a busy Claude agent's idle turn: Claude Code queues a
+/// prompt typed mid-turn and reads it at the next step, so ringing then is safe.
+pub const MSG_QUEUE_AFTER: chrono::Duration = chrono::Duration::minutes(2);
+
 impl Msg {
+    /// Whether this tell may be typed into an agent that is `working` now: only a Claude agent
+    /// (it queues the input) and only once the tell has waited out `MSG_QUEUE_AFTER`.
+    pub fn queueable(&self, kind: Option<&str>, now: DateTime<Utc>) -> bool {
+        kind == Some("claude") && now - self.since >= MSG_QUEUE_AFTER
+    }
+
     /// Why ringing this doorbell now would be a false alarm, if it would: a status report that
     /// waited out a host reconnect. Questions and instructions (`ASK`, `BLOCKED`, ...) never go stale.
     pub fn stale(&self, now: DateTime<Utc>) -> Option<String> {
