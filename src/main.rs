@@ -9,6 +9,7 @@ mod kill;
 mod orphanpr;
 mod prs;
 mod quota;
+mod retire;
 mod scan;
 mod setup;
 mod signal;
@@ -25,7 +26,7 @@ mod worktree;
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -296,6 +297,16 @@ enum Cmd {
         /// Added to the handoff note.
         #[arg(long)]
         note: Option<String>,
+    },
+    /// Close a spawned agent and retire its worktree, locked: real uncommitted changes stop the
+    /// retire and are shown to you and the agent's lead until `--decide` says delete, keep, or
+    /// stash (a patch first). Run it in the agent's repository, on the agent's host.
+    Retire {
+        /// The agent: a name or full id with a spawn record.
+        agent: String,
+        /// What to do with real uncommitted changes: delete, keep, or stash.
+        #[arg(long)]
+        decide: Option<retire::Decide>,
     },
     /// Ring an agent's doorbell: `[agent-fleet <from>→<to>] TYPE ref: text (event <id>)`.
     Tell {
@@ -1836,6 +1847,112 @@ async fn main() -> Result<()> {
                 .await?;
             spawn::wait_result(&ctx.client()?, &id).await?;
         }
+        Cmd::Retire { agent, decide } => {
+            let state = ctx.state().await?;
+            let Some(sp) = spawn::find_spawn(&state, agent).cloned() else {
+                bail!("{agent} has no spawn record; it was not spawned by the fleet");
+            };
+            let host = ctx.host_name();
+            // The host's own rule: only a tree the fleet made, on THIS host, that no newer spawn
+            // handed to another agent — never a main checkout, never another agent's tree.
+            let Some((repo, wt, issue)) = state.retire_target(&sp.request.agent, &host) else {
+                bail!(
+                    "{agent}: no worktree to retire on {host} (a main checkout, a tree handed to another agent, or another host's agent)"
+                );
+            };
+            // keep = leave it: the pane too, so the host's own close-retire never starts.
+            if *decide == Some(retire::Decide::Keep) {
+                println!("kept {wt}: decided keep; pane and tree untouched");
+                return Ok(());
+            }
+            if !Path::new(&wt).exists() {
+                println!("{wt} was already retired");
+                return Ok(());
+            }
+            let machine = spawn::machine_dir(&ctx.cli.instance);
+            let registered = machine
+                .as_deref()
+                .map(setup::registered)
+                .transpose()?
+                .and_then(|mut r| r.remove(&repo));
+            let checkout =
+                retire::checkout_for(&repo, registered, git_toplevel().ok().map(PathBuf::from))?;
+            let (cfg, _) = spawn::load_in(&checkout, machine.as_deref())?;
+            let Some(script) = cfg.retire.clone() else {
+                bail!(
+                    "{}'s fleet.toml has no `retire` hook; nothing would retire {wt}",
+                    checkout.display()
+                );
+            };
+            let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
+            let patches = retire::patches_dir(
+                cfg.retire_patches.as_deref(),
+                home.as_deref(),
+                &ctx.paths.dir,
+            )?;
+            let cmd = format!("agent-fleet retire {}", spawn::short(&sp.request.agent));
+            let plan = retire::Plan {
+                checkout: &checkout,
+                script: &script,
+                base: &cfg.base,
+                patches: &patches,
+                decide_cmd: &cmd,
+            };
+            // Locked, then read, all BEFORE the pane closes: a refusal leaves the agent up and
+            // starts no host retire; the host's retire of the close that does follow waits on
+            // these locks and finds the tree gone.
+            let (_a, b) = retire::locks(&checkout, Path::new(&wt), retire::WAIT).await?;
+            let outcome = match retire::assess(&plan, &wt, *decide) {
+                retire::Ready::Gone => retire::Outcome::Gone,
+                retire::Ready::Kept => retire::Outcome::Kept,
+                retire::Ready::Refused(why) => retire::Outcome::Refused(why),
+                retire::Ready::Go => {
+                    let pane = sp.result.as_ref().and_then(|r| r.pane.clone());
+                    let sock = std::env::var_os("HERDR_SOCKET_PATH").map(PathBuf::from);
+                    let up = state.agents.contains_key(&sp.request.agent);
+                    let step =
+                        retire::pane_step(up, pane.as_deref(), sock.as_deref()).map_err(|e| {
+                            anyhow::anyhow!("refusing to retire {wt}: {e}; nothing removed")
+                        })?;
+                    if let Some((p, s)) = step
+                        && let Err(e) =
+                            host::herdr_call(s, "pane.close", json!({ "pane_id": p })).await
+                    {
+                        bail!(
+                            "refusing to retire {wt}: {agent} is up and its pane {p} did not close ({e:#}); nothing removed"
+                        );
+                    }
+                    retire::finish(&plan, &wt, *decide, &b).await?
+                }
+            };
+            match outcome {
+                retire::Outcome::Retired => println!("retired {wt}"),
+                retire::Outcome::Kept => println!("kept {wt}: decided keep, nothing removed"),
+                retire::Outcome::Gone => println!("{wt} was already retired"),
+                retire::Outcome::Refused(why) => {
+                    let body = MsgSent {
+                        to: spawn::lead_of(&sp),
+                        kind: "BLOCKED".into(),
+                        reference: issue
+                            .map(|n| format!("{repo}#{n}"))
+                            .unwrap_or_else(|| repo.clone()),
+                        text: why.clone(),
+                    };
+                    if let Err(e) = ctx
+                        .write(Envelope::new(
+                            ctx.me().await?,
+                            &ctx.cli.project,
+                            Known::MsgSent(body),
+                        ))
+                        .await
+                    {
+                        eprintln!("the lead was not told: {e:#}");
+                    }
+                    eprintln!("{why}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Cmd::Tell {
             agent,
             kind,
@@ -1878,6 +1995,20 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The top of the git checkout holding the current directory.
+fn git_toplevel() -> Result<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .context("run git rev-parse --show-toplevel")?;
+    if !out.status.success() {
+        bail!(
+            "not in a git checkout, and the agent's repository is not connected (`agent-fleet repo add`)"
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// The up agent whose short name is `name`.

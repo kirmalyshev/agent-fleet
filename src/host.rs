@@ -505,14 +505,15 @@ impl Host {
     ) {
         let host = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::spawn::retire_in(&host, &repo, &wt).await {
+            if let Err(e) = crate::spawn::retire_in(&host, &repo, &wt, &agent).await {
                 host.retire_refused(&agent, &repo, issue, &wt, &e).await;
             }
         });
     }
 
-    /// Say a retire did not happen: stderr, and a blocker on the spawn's issue naming the agent
-    /// (a blocker needs a task, so a spawn with no issue is stderr only).
+    /// Say a retire did not happen: stderr, a `BLOCKED` message to the agent's lead, and a
+    /// blocker on the spawn's issue naming the agent (a blocker needs a task, so a spawn with no
+    /// issue gets the message only).
     pub(crate) async fn retire_refused(
         &self,
         agent: &str,
@@ -522,6 +523,13 @@ impl Host {
         e: &anyhow::Error,
     ) {
         eprintln!("agent-fleet host: retire {wt}: {e:#}");
+        self.tell_lead(
+            agent,
+            repo,
+            issue,
+            &format!("retire of {wt} not done: {e:#}"),
+        )
+        .await;
         let Some(issue) = issue else { return };
         let b = Known::BlockerRaised(BlockerRaised {
             what: format!(
@@ -537,6 +545,36 @@ impl Host {
             .task(crate::spawn::task_id(repo, issue));
         if !self.publish(env).await {
             eprintln!("agent-fleet host: the blocker for {wt} was not written");
+        }
+    }
+
+    /// A refused retire, told to the closed agent's lead (its spawn's `lead`, else whoever
+    /// spawned it, else the root coordinator): the changes it found and the command that decides
+    /// are in `text`, so the lead can act on the message alone.
+    async fn tell_lead(&self, agent: &str, repo: &str, issue: Option<u64>, text: &str) {
+        let lead = self
+            .view()
+            .ok()
+            .and_then(|v| crate::spawn::find_spawn(&v.state, agent).map(crate::spawn::lead_of));
+        let reference = match issue {
+            Some(n) => format!("{repo}#{n}"),
+            None => repo.to_string(),
+        };
+        let m = Known::MsgSent(crate::event::MsgSent {
+            to: lead.unwrap_or_else(|| crate::event::COORDINATOR.into()),
+            kind: "BLOCKED".into(),
+            reference,
+            text: text.into(),
+        });
+        if !self
+            .publish(Envelope::new(
+                self.actor(),
+                crate::spawn::task_project(repo),
+                m,
+            ))
+            .await
+        {
+            eprintln!("agent-fleet host: the lead was not told about {agent}'s retire");
         }
     }
 

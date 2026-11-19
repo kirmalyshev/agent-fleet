@@ -40,6 +40,11 @@ pub struct FleetConfig {
     /// what it must keep (a dirty tree, unpushed commits); the host reports that, never forces.
     #[serde(default)]
     pub retire: Option<String>,
+    /// Where `agent-fleet retire --decide=stash` writes a closed worktree's uncommitted changes
+    /// as a patch before retiring it: an absolute path or `~/…`; default `retired-patches` in
+    /// the instance's data dir.
+    #[serde(default)]
+    pub retire_patches: Option<String>,
     /// Extra brief tokens.
     #[serde(default)]
     pub vars: BTreeMap<String, String>,
@@ -712,8 +717,19 @@ pub fn handoff_request(
     })
 }
 
-fn short(id: &str) -> &str {
+pub(crate) fn short(id: &str) -> &str {
     id.rsplit('/').next().unwrap_or(id)
+}
+
+/// Who hears about an agent's retire: its spawn's `lead`, else the agent that spawned it, else
+/// the root coordinator.
+pub fn lead_of(sp: &Spawn) -> String {
+    sp.request
+        .lead
+        .clone()
+        .filter(|l| is_agent_id(l))
+        .or_else(|| is_agent_id(&sp.by).then(|| sp.by.clone()))
+        .unwrap_or_else(|| COORDINATOR.into())
 }
 
 /// The latest fleet spawn of an agent: by full id or by its name in the session.
@@ -942,43 +958,39 @@ async fn run_ready(checkout: &Path, worktree: &str, ready: &str) -> Result<()> {
 }
 
 /// `retire` runs with the closed agent's worktree as $1 (the script is the host checkout's copy,
-/// as for `ready`). Err carries the script's own words: a refusal is a finding, not a retry.
-pub(crate) async fn run_retire(checkout: &Path, worktree: &str, retire: &str) -> Result<()> {
-    let script = checkout.join(retire);
-    if !script.is_file() {
-        bail!("retire script {retire:?} is not in {}", checkout.display());
+/// as for `ready`), through `retire::guarded`: locked, and stopped before the script over real
+/// uncommitted changes. Err carries the reason — the changes and how to decide, or the script's
+/// own words: a refusal is a finding, not a retry. `agent` names the closed agent in that text.
+pub(crate) async fn run_retire(
+    checkout: &Path,
+    worktree: &str,
+    retire: &str,
+    base: &str,
+    agent: &str,
+) -> Result<()> {
+    let patches = PathBuf::new(); // unused: no decision is made on a close
+    let cmd = format!("agent-fleet retire {}", short(agent));
+    let plan = crate::retire::Plan {
+        checkout,
+        script: retire,
+        base,
+        patches: &patches,
+        decide_cmd: &cmd,
+    };
+    match crate::retire::guarded(&plan, worktree, None, crate::retire::HOST_WAIT).await? {
+        crate::retire::Outcome::Refused(why) => bail!("{why}"),
+        _ => Ok(()),
     }
-    let out = tokio::time::timeout(
-        Duration::from_secs(5 * 60),
-        tokio::process::Command::new(&script)
-            .arg(worktree)
-            .current_dir(checkout)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .context("retire script timed out (5m) and was killed")?
-    .with_context(|| format!("retire script {retire} did not start"))?;
-    if !out.status.success() {
-        let said = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
-        let (err, o) = (said(&out.stderr), said(&out.stdout));
-        bail!(
-            "retire script {retire} refused {worktree} ({}): {}",
-            out.status,
-            tail(if err.is_empty() { &o } else { &err })
-        );
-    }
-    Ok(())
 }
 /// Retire `worktree` of `repo` with the HOST checkout's `retire` script. Ok and silent when the
-/// repo's fleet.toml has none; Err names a refusal in the script's own words.
-pub(crate) async fn retire_in(host: &Host, repo: &str, worktree: &str) -> Result<()> {
+/// repo's fleet.toml has none; Err names a refusal.
+pub(crate) async fn retire_in(host: &Host, repo: &str, worktree: &str, agent: &str) -> Result<()> {
     let Some(checkout) = host.cfg.checkouts_now()?.remove(repo) else {
         return Err(no_checkout(repo));
     };
     let (cfg, _) = load_in(&checkout, host.cfg.config_dir.as_deref())?;
     match &cfg.retire {
-        Some(r) => run_retire(&checkout, worktree, r).await,
+        Some(r) => run_retire(&checkout, worktree, r, &cfg.base, agent).await,
         None => Ok(()),
     }
 }
@@ -1260,7 +1272,7 @@ async fn undo(host: &Host, r: &SpawnRequested, made: &Made) {
     }
     if made.fresh {
         if let Some(wt) = &made.worktree
-            && let Err(e) = retire_in(host, &r.repo, wt).await
+            && let Err(e) = retire_in(host, &r.repo, wt, &r.agent).await
         {
             // Refused (or no script runnable): the tree may hold work, so it and its branch stay.
             host.retire_refused(&r.agent, &r.repo, r.issue, wt, &e)
@@ -2481,25 +2493,52 @@ profile = "devin"
         let sh = d.path().join("r.sh");
         std::fs::write(&sh, "#!/bin/sh\necho \"$1\" > \"$1/seen\"\n[ -e \"$1/dirty\" ] && { echo 'has uncommitted work' >&2; exit 1; }\nexit 0\n").unwrap();
         std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The checkout is a git repository: the retire locks live in its common dir.
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(d.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         let wt = d.path().join("wt");
         std::fs::create_dir(&wt).unwrap();
-        run_retire(d.path(), wt.to_str().unwrap(), "r.sh")
-            .await
-            .unwrap();
+        run_retire(
+            d.path(),
+            wt.to_str().unwrap(),
+            "r.sh",
+            "origin/main",
+            "agent:h/s/a",
+        )
+        .await
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(wt.join("seen")).unwrap().trim(),
             wt.to_str().unwrap()
         );
         std::fs::write(wt.join("dirty"), "").unwrap();
-        let e = run_retire(d.path(), wt.to_str().unwrap(), "r.sh")
-            .await
-            .unwrap_err()
-            .to_string();
+        let e = run_retire(
+            d.path(),
+            wt.to_str().unwrap(),
+            "r.sh",
+            "origin/main",
+            "agent:h/s/a",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("uncommitted"), "{e}");
-        let e = run_retire(d.path(), wt.to_str().unwrap(), "missing.sh")
-            .await
-            .unwrap_err()
-            .to_string();
+        let e = run_retire(
+            d.path(),
+            wt.to_str().unwrap(),
+            "missing.sh",
+            "origin/main",
+            "agent:h/s/a",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("not in"), "{e}");
     }
     fn answered(mut r: SpawnRequested, agent: &str, wt: &str, secs: i64) -> Spawn {
@@ -4100,15 +4139,19 @@ profile = "devin"
         let dir = tempfile::tempdir().unwrap();
         let co = checkout(dir.path());
         let (host, _stub) = run(dir.path(), &[]).await;
-        retire_in(&host, "o/r", "/nowhere").await.unwrap(); // no `retire` in fleet.toml
+        let a = "agent:h/s/a";
+        retire_in(&host, "o/r", "/nowhere", a).await.unwrap(); // no `retire` in fleet.toml
         retire_cfg(
             &co,
             "#!/bin/sh\ntouch \"$(dirname \"$0\")/retired-$(basename \"$1\")\"\n",
         );
-        retire_in(&host, "o/r", "/some/wt").await.unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let wt = wt.to_str().unwrap();
+        retire_in(&host, "o/r", wt, a).await.unwrap();
         assert!(co.join("retired-wt").exists());
         retire_cfg(&co, "#!/bin/sh\necho dirty >&2\nexit 1\n");
-        let e = retire_in(&host, "o/r", "/some/wt")
+        let e = retire_in(&host, "o/r", wt, a)
             .await
             .unwrap_err()
             .to_string();
@@ -4209,6 +4252,23 @@ profile = "devin"
         );
         let b = blockers(&host);
         assert!(b.len() == 1 && b[0].contains("unpushed"), "{b:?}");
+        // and the lead is told, with the same words, so a refusal never waits on a board read
+        let told: Vec<(String, String)> = host
+            .replica
+            .lock()
+            .unwrap()
+            .all()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.body {
+                Body::Known(Known::MsgSent(m)) => Some((m.kind.clone(), m.text.clone())),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            told.len() == 1 && told[0].0 == "BLOCKED" && told[0].1.contains("unpushed"),
+            "{told:?}"
+        );
     }
     #[tokio::test]
     async fn a_pane_left_by_its_agent_or_a_herdr_gap_retires_nothing() {
