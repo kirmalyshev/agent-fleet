@@ -1842,9 +1842,21 @@ async fn main() -> Result<()> {
             reference,
             text,
         } => {
-            let to = tell_to(&ctx.state().await?, agent)?;
+            let state = ctx.state().await?;
+            let to = tell_to(&state, agent)?;
+            let busy = state
+                .recipient(&to)
+                .and_then(|r| state.agents.get(r))
+                .is_some_and(|a| !matches!(a.state, AgentState::Idle | AgentState::Done));
+            let recipient_queues = state
+                .recipient(&to)
+                .and_then(|r| state.agents.get(r))
+                .is_some_and(|a| {
+                    a.state == AgentState::Working && state::queues_input(a.kind.as_deref())
+                });
+            let waiting = state.pending_for(&to).0 + 1;
             let body = MsgSent {
-                to,
+                to: to.clone(),
                 kind: kind.clone(),
                 reference: reference.clone(),
                 text: text.join(" "),
@@ -1855,6 +1867,14 @@ async fn main() -> Result<()> {
                 Known::MsgSent(body),
             ))
             .await?;
+            if busy {
+                let how = if recipient_queues {
+                    "queued, read at its next turn boundary"
+                } else {
+                    "delivers when idle"
+                };
+                println!("queued: {} busy, {how} ({waiting} pending)", short(agent));
+            }
         }
     }
     Ok(())

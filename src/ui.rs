@@ -122,8 +122,8 @@ pub fn kind_profile(s: &State, id: &str, kind: Option<&str>) -> String {
 
 pub fn ps(s: &State, now: DateTime<Utc>) -> String {
     let mut out = format!(
-        "{:<44} {:<8} {:<13} {:>7}  {:<14} {:<9} {:<12} TASK\n",
-        "AGENT", "STATE", "STUCK", "FOR", "KIND", "ROLE", "LEAD"
+        "{:<44} {:<8} {:<13} {:>7}  {:<14} {:<9} {:<12} {:<10} TASK\n",
+        "AGENT", "STATE", "STUCK", "FOR", "KIND", "ROLE", "LEAD", "PENDING"
     );
     for (id, a) in &s.agents {
         let task = s
@@ -136,7 +136,7 @@ pub fn ps(s: &State, now: DateTime<Utc>) -> String {
         let role = s.roles.get(id);
         let _ = writeln!(
             out,
-            "{id:<44} {:<8} {:<13} {:>7}  {:<14} {:<9} {:<12} {}",
+            "{id:<44} {:<8} {:<13} {:>7}  {:<14} {:<9} {:<12} {:<10} {}",
             state_name(a.state),
             s.stuck.get(id).map(|st| st.cause.name()).unwrap_or(""),
             ago(now, a.since),
@@ -145,6 +145,10 @@ pub fn ps(s: &State, now: DateTime<Utc>) -> String {
             role.and_then(|r| r.lead.as_deref())
                 .map(short)
                 .unwrap_or(""),
+            match s.pending_for(id) {
+                (0, _) => String::new(),
+                (n, old) => format!("{n} ({})", old.map_or(String::new(), |o| ago(now, o))),
+            },
             if task.is_empty() { "-" } else { &task }
         );
     }
@@ -766,5 +770,42 @@ mod tests {
         }
         let old = out.lines().find(|l| l.contains("h:old")).unwrap();
         assert!(!old.contains("until"), "{old}");
+    }
+
+    #[test]
+    fn ps_shows_pending_tells_and_their_oldest_age() {
+        use crate::state::{Agent, Msg};
+        let now = Utc::now();
+        let id = "agent:h/s/a";
+        let mut s = State::default();
+        s.agents.insert(
+            id.into(),
+            Agent {
+                host: "h".into(),
+                kind: None,
+                pane: None,
+                state: crate::event::AgentState::Working,
+                since: now,
+                worked: None,
+                finished: None,
+                usage: None,
+            },
+        );
+        for m in [3, 7] {
+            s.msgs.insert(
+                format!("m{m}"),
+                Msg {
+                    from: "agent:h/s/c".into(),
+                    to: id.into(),
+                    kind: "OK".into(),
+                    reference: "r".into(),
+                    text: "t".into(),
+                    since: now - chrono::Duration::minutes(m),
+                },
+            );
+        }
+        assert_eq!(s.pending_for(id).0, 2);
+        let out = ps(&s, now);
+        assert!(out.contains("PENDING") && out.contains("2 (7m)"), "{out}");
     }
 }

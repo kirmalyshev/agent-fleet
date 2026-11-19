@@ -392,6 +392,12 @@ pub struct Msg {
 /// after it was sent is history: its host was away, and what it announced has long been acted on.
 pub const MSG_FRESH: chrono::Duration = chrono::Duration::hours(6);
 
+/// Whether an agent of this program takes a prompt typed mid-turn: Claude Code queues it and
+/// reads it at the next turn boundary. Any other program is never typed into while busy.
+pub fn queues_input(kind: Option<&str>) -> bool {
+    kind == Some("claude")
+}
+
 impl Msg {
     /// Why ringing this doorbell now would be a false alarm, if it would: a status report that
     /// waited out a host reconnect. Questions and instructions (`ASK`, `BLOCKED`, ...) never go stale.
@@ -408,6 +414,21 @@ impl Msg {
 }
 
 impl State {
+    /// Tells still undelivered to `to` (`coordinator` follows its holder): how many, and the oldest.
+    pub fn pending_for(&self, to: &str) -> (usize, Option<DateTime<Utc>>) {
+        let who = self.recipient(to);
+        let mine = self
+            .msgs
+            .values()
+            .filter(|m| m.to == to || (who.is_some() && self.recipient(&m.to) == who));
+        mine.fold((0, None), |(n, old), m| {
+            (
+                n + 1,
+                Some(old.map_or(m.since, |o: DateTime<Utc>| o.min(m.since))),
+            )
+        })
+    }
+
     pub fn fold<'a>(events: impl IntoIterator<Item = &'a Event>) -> Self {
         let mut s = Self::default();
         for e in events {
