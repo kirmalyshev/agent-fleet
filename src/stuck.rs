@@ -694,7 +694,7 @@ pub struct Seen {
 }
 
 /// The agent's visible screen, or `None` when herdr cannot read it.
-async fn screen(host: &Host, id: &str) -> Option<String> {
+pub(crate) async fn screen(host: &Host, id: &str) -> Option<String> {
     let name = crate::host::short(id);
     herdr_call(
         &host.cfg.herdr_socket,
@@ -705,6 +705,37 @@ async fn screen(host: &Host, id: &str) -> Option<String> {
     .ok()?["text"]
         .as_str()
         .map(str::to_string)
+}
+
+/// Whether the bottom of `screen` shows a selection dialog (a permission prompt, an
+/// `AskUserQuestion` menu, a plan approval): an Enter typed there would pick an option on
+/// the agent's behalf. Only the last lines count, so prose higher up cannot trip it.
+pub(crate) fn dialog_open(screen: &str) -> bool {
+    let tail: Vec<&str> = screen.lines().rev().take(25).collect();
+    let option = |l: &&str| {
+        let t = l
+            .trim_start()
+            .trim_start_matches(['❯', '>', '❭', '›'])
+            .trim_start();
+        t.starts_with("1.") || t.starts_with("1)")
+    };
+    // The program's own lines open with the phrase (maybe behind a box border); an agent's
+    // prose quoting it does not.
+    let phrase = |l: &&str| {
+        let t = l.trim_start_matches([' ', '│', '┃']);
+        [
+            "Do you want to",
+            "Would you like to proceed",
+            "Esc to cancel",
+            "Enter to select",
+        ]
+        .iter()
+        .any(|p| t.starts_with(p))
+    };
+    tail.iter().any(phrase)
+        || tail
+            .iter()
+            .any(|l| l.trim_start().starts_with('❯') && option(l))
 }
 
 /// `minute` precision is enough for `until`: a countdown re-parses to the same instant.

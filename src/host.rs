@@ -184,6 +184,8 @@ const LOCKS_EVERY: Duration = Duration::from_secs(5);
 /// How often the host samples agents' processes and the worktrees.
 const SCAN_EVERY: Duration = Duration::from_secs(300);
 
+/// How long after a queued ring the host waits before it looks for the text on the screen.
+const QUEUE_CHECK: Duration = Duration::from_secs(2);
 /// How often the host reads each agent program's usage quota.
 const QUOTA_EVERY: Duration = Duration::from_secs(60);
 
@@ -1302,16 +1304,28 @@ impl Host {
                     continue;
                 }
                 tried.insert(id.clone(), Instant::now());
-                // A queued ring types into a pane that may have turned blocked since the snapshot.
-                if queue
-                    && self
+                // A queued ring types into a pane that may have turned blocked since the snapshot,
+                // and herdr's state lags a dialog: read the screen, and never ring over one.
+                if queue {
+                    if self
                         .panes
                         .lock()
                         .unwrap()
                         .get(&pane)
                         .is_none_or(|l| l.state != AgentState::Working)
-                {
-                    continue;
+                    {
+                        continue;
+                    }
+                    let shown = crate::stuck::screen(&self, to).await;
+                    if shown.as_deref().is_none_or(crate::stuck::dialog_open) {
+                        if waiting.insert(id.clone()) {
+                            eprintln!(
+                                "agent-fleet host: {id} to {}: blocked on a dialog (or screen unreadable); not rung",
+                                msg.to
+                            );
+                        }
+                        continue;
+                    }
                 }
                 let text = doorbell(&msg.from, &msg.to, &msg.kind, &msg.reference, &msg.text, id);
                 // A queued ring is already `working`: there is no new turn to wait for.
@@ -1326,6 +1340,14 @@ impl Host {
                 bump(&self.n.rings);
                 let rung = chrono::Utc::now();
                 match herdr_call(&self.cfg.herdr_socket, "agent.prompt", params).await {
+                    Ok(_) if queue && !self.queued_visible(to, id).await => {
+                        bump(&self.n.ring_failures);
+                        eprintln!(
+                            "agent-fleet host: ALERT {id} to {}: typed into a busy pane but not visible in its input after {}s; left undelivered",
+                            msg.to,
+                            QUEUE_CHECK.as_secs()
+                        );
+                    }
                     Ok(_) if queue || self.saw_working(&pane, before).await => {
                         let delivered = MsgDelivered {
                             to: to.to_string(),
@@ -1358,6 +1380,15 @@ impl Host {
                 }
             }
         }
+    }
+
+    /// After a queued ring: whether the doorbell's event id shows on the agent's screen (its
+    /// input or queue area) `QUEUE_CHECK` later. Whitespace is dropped: the screen wraps lines.
+    async fn queued_visible(&self, to: &str, id: &str) -> bool {
+        tokio::time::sleep(QUEUE_CHECK).await;
+        crate::stuck::screen(self, to)
+            .await
+            .is_some_and(|t| t.split_whitespace().collect::<String>().contains(id))
     }
 
     /// Waits up to 20 s for this host to log the agent in `pane` turning `working` again.
@@ -1462,6 +1493,9 @@ mod tests {
     struct FakeHerdr {
         status: Mutex<String>,
         prompts: Mutex<Vec<String>>,
+        /// What `agent.read` shows; a prompt is appended to it when `echo` is set.
+        screen: Mutex<String>,
+        echo: Mutex<bool>,
         subs: tokio::sync::Mutex<Vec<OwnedWriteHalf>>,
     }
 
@@ -1503,11 +1537,18 @@ mod tests {
                                 .await
                                 .unwrap();
                         }
+                        "agent.read" => {
+                            let text = fake.screen.lock().unwrap().clone();
+                            wr.write_all(reply(json!({ "text": text })).as_bytes())
+                                .await
+                                .unwrap();
+                        }
                         "agent.prompt" => {
-                            fake.prompts
-                                .lock()
-                                .unwrap()
-                                .push(req["params"]["text"].as_str().unwrap().into());
+                            let text: String = req["params"]["text"].as_str().unwrap().into();
+                            if *fake.echo.lock().unwrap() {
+                                fake.screen.lock().unwrap().push_str(&format!("\n> {text}"));
+                            }
+                            fake.prompts.lock().unwrap().push(text);
                             wr.write_all(
                                 reply(json!({ "agent": { "agent_status": "working" } })).as_bytes(),
                             )
@@ -1532,7 +1573,7 @@ mod tests {
         kind: &str,
         age_h: i64,
     ) -> (Arc<Host>, Arc<FakeHerdr>, u64) {
-        host_on_fake_prog(dir, status, kind, age_h, "claude").await
+        host_on_fake_prog(dir, status, kind, age_h, "claude", ("> ", true)).await
     }
     /// As `host_on_fake_msg`, the agent being a `program` (`claude`, `devin`).
     async fn host_on_fake_prog(
@@ -1541,10 +1582,13 @@ mod tests {
         kind: &str,
         age_h: i64,
         program: &str,
+        (screen, echo): (&str, bool),
     ) -> (Arc<Host>, Arc<FakeHerdr>, u64) {
         let sock = dir.join("herdr.sock");
         let fake = Arc::new(FakeHerdr::default());
         *fake.status.lock().unwrap() = status.into();
+        *fake.screen.lock().unwrap() = screen.into();
+        *fake.echo.lock().unwrap() = echo;
         tokio::spawn(fake.clone().serve(UnixListener::bind(&sock).unwrap()));
         let cfg = Config {
             host: "h".into(),
@@ -1681,10 +1725,50 @@ mod tests {
         assert!(types(&host).contains(&"msg.delivered".to_string()));
     }
 
+    const DIALOG: &str = "Bash command\n  rm -rf build\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No, and tell Claude what to do differently\n\nEsc to cancel";
+
+    #[test]
+    fn dialog_open_sees_a_permission_menu_and_not_prose() {
+        assert!(crate::stuck::dialog_open(DIALOG));
+        assert!(crate::stuck::dialog_open("Which?\n❯ 1. A\n  2. B"));
+        assert!(!crate::stuck::dialog_open(
+            "⏺ I will ask: Do you want to proceed? later\n\n────────────\n❯ \n────────────"
+        ));
+        let old = format!("{DIALOG}{}", "\nfiller".repeat(40));
+        assert!(
+            !crate::stuck::dialog_open(&old),
+            "a dialog scrolled far up is history"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_busy_claude_agent_on_a_dialog_is_not_rung() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, fake, _) =
+            host_on_fake_prog(dir.path(), "working", "OK", 0, "claude", (DIALOG, true)).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            fake.prompts.lock().unwrap().is_empty(),
+            "typed over a dialog"
+        );
+        assert!(!types(&host).contains(&"msg.delivered".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_queued_ring_that_never_shows_in_the_input_is_left_undelivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, fake, _) =
+            host_on_fake_prog(dir.path(), "working", "OK", 0, "claude", ("> ", false)).await;
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        assert_eq!(fake.prompts.lock().unwrap().len(), 1, "it was typed once");
+        assert!(!types(&host).contains(&"msg.delivered".to_string()));
+    }
+
     #[tokio::test]
     async fn a_busy_agent_is_not_rung() {
         let dir = tempfile::tempdir().unwrap();
-        let (host, fake, _) = host_on_fake_prog(dir.path(), "working", "OK", 1, "devin").await;
+        let (host, fake, _) =
+            host_on_fake_prog(dir.path(), "working", "OK", 1, "devin", ("> ", true)).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(fake.prompts.lock().unwrap().is_empty());
         assert!(!types(&host).contains(&"msg.delivered".to_string()));

@@ -274,9 +274,11 @@ The `[fleet` prefix marks the turn as machine-sent, so it is never mistaken for 
 instruction. The host agent rings an `idle` or `done` agent, never a blocked one, and writes `msg.delivered`
 only after it has itself observed and logged the agent turning `working` after the prompt: a prompt
 that was merely submitted proves nothing. A busy `claude` agent is the one exception. It queues input
-typed mid-turn, so it is rung at once (its pane re-read as `working` first) and `msg.delivered` is
-written on submission, with no later proof; a ring that lands in a permission dialog herdr has not
-yet noticed is a known risk. Any other busy agent waits. A failed ring is retried at most once a
+typed mid-turn, so it is rung at once (its pane re-read as `working`) and `msg.delivered` is
+written once the doorbell's event id shows on its screen 2 s later. It is never rung while its
+screen shows a selection dialog (`Do you want to…`, a `❯ 1.` option list, `Esc to cancel`): the tell
+stays pending, since an Enter there would answer the dialog. A ring whose text is not on the screen
+after 2 s is logged as an alert and left undelivered. Any other busy agent waits. A failed ring is retried at most once a
 minute; if `msg.delivered` itself cannot be written, the message stays pending. `agent-fleet doctor`
 raises `undelivered` for an up recipient whose tell has waited 10 minutes.
 
