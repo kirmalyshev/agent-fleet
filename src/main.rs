@@ -1857,40 +1857,86 @@ async fn main() -> Result<()> {
             };
             let repo = sp.request.repo.clone();
             let machine = spawn::machine_dir(&ctx.cli.instance);
-            let checkout = match machine.as_deref().map(setup::registered).transpose()?.and_then(|mut r| r.remove(&repo)) {
+            let checkout = match machine
+                .as_deref()
+                .map(setup::registered)
+                .transpose()?
+                .and_then(|mut r| r.remove(&repo))
+            {
                 Some(c) => c,
                 None => PathBuf::from(git_toplevel()?),
             };
             let (cfg, _) = spawn::load_in(&checkout, machine.as_deref())?;
             let Some(script) = cfg.retire.clone() else {
-                bail!("{}'s fleet.toml has no `retire` hook; nothing would retire {wt}", checkout.display());
+                bail!(
+                    "{}'s fleet.toml has no `retire` hook; nothing would retire {wt}",
+                    checkout.display()
+                );
             };
             let patches = match cfg.retire_patches.as_deref() {
                 Some(p) => match p.strip_prefix("~/") {
-                    Some(rest) => directories::BaseDirs::new().context("no home dir")?.home_dir().join(rest),
+                    Some(rest) => directories::BaseDirs::new()
+                        .context("no home dir")?
+                        .home_dir()
+                        .join(rest),
                     None => PathBuf::from(p),
                 },
                 None => ctx.paths.dir.join("retired-patches"),
             };
             let cmd = format!("agent-fleet retire {}", spawn::short(&sp.request.agent));
-            let plan = retire::Plan { checkout: &checkout, script: &script, base: &cfg.base, patches: &patches, decide_cmd: &cmd };
+            let plan = retire::Plan {
+                checkout: &checkout,
+                script: &script,
+                base: &cfg.base,
+                patches: &patches,
+                decide_cmd: &cmd,
+            };
             // Locked BEFORE the pane closes: the host's own retire of that close then waits, and
             // finds the tree gone instead of reading it half-removed.
             let held = retire::locks(&checkout, Path::new(&wt), retire::WAIT).await?;
-            if let (Some(pane), Some(sock)) = (sp.result.as_ref().and_then(|r| r.pane.clone()), std::env::var_os("HERDR_SOCKET_PATH")) {
-                if let Err(e) = host::herdr_call(Path::new(&sock), "pane.close", serde_json::json!({ "pane_id": pane })).await {
-                    eprintln!("pane {pane} not closed: {e:#}");
-                }
+            if let (Some(pane), Some(sock)) = (
+                sp.result.as_ref().and_then(|r| r.pane.clone()),
+                std::env::var_os("HERDR_SOCKET_PATH"),
+            ) && let Err(e) = host::herdr_call(
+                Path::new(&sock),
+                "pane.close",
+                serde_json::json!({ "pane_id": pane }),
+            )
+            .await
+            {
+                eprintln!("pane {pane} not closed: {e:#}");
             }
             match retire::guarded_with(&plan, &wt, *decide, held).await? {
                 retire::Outcome::Retired => println!("retired {wt}"),
                 retire::Outcome::Kept => println!("kept {wt}: decided keep, nothing removed"),
                 retire::Outcome::Gone => println!("{wt} was already retired"),
                 retire::Outcome::Refused(why) => {
-                    let to = sp.request.lead.clone().filter(|l| is_agent_id(l)).or_else(|| is_agent_id(&sp.by).then(|| sp.by.clone())).unwrap_or_else(|| COORDINATOR.into());
-                    let reference = sp.request.issue.map(|n| format!("{repo}#{n}")).unwrap_or_else(|| repo.clone());
-                    let body = MsgSent { to, kind: "BLOCKED".into(), reference, text: why.clone() };
-                    if let Err(e) = ctx.write(Envelope::new(ctx.me().await?, &ctx.cli.project, Known::MsgSent(body))).await {
+                    let to = sp
+                        .request
+                        .lead
+                        .clone()
+                        .filter(|l| is_agent_id(l))
+                        .or_else(|| is_agent_id(&sp.by).then(|| sp.by.clone()))
+                        .unwrap_or_else(|| COORDINATOR.into());
+                    let reference = sp
+                        .request
+                        .issue
+                        .map(|n| format!("{repo}#{n}"))
+                        .unwrap_or_else(|| repo.clone());
+                    let body = MsgSent {
+                        to,
+                        kind: "BLOCKED".into(),
+                        reference,
+                        text: why.clone(),
+                    };
+                    if let Err(e) = ctx
+                        .write(Envelope::new(
+                            ctx.me().await?,
+                            &ctx.cli.project,
+                            Known::MsgSent(body),
+                        ))
+                        .await
+                    {
                         eprintln!("the lead was not told: {e:#}");
                     }
                     eprintln!("{why}");
@@ -1949,7 +1995,9 @@ fn git_toplevel() -> Result<String> {
         .output()
         .context("run git rev-parse --show-toplevel")?;
     if !out.status.success() {
-        bail!("not in a git checkout, and the agent's repository is not connected (`agent-fleet repo add`)");
+        bail!(
+            "not in a git checkout, and the agent's repository is not connected (`agent-fleet repo add`)"
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }

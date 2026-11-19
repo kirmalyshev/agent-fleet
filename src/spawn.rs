@@ -950,10 +950,22 @@ async fn run_ready(checkout: &Path, worktree: &str, ready: &str) -> Result<()> {
 /// as for `ready`), through `retire::guarded`: locked, and stopped before the script over real
 /// uncommitted changes. Err carries the reason — the changes and how to decide, or the script's
 /// own words: a refusal is a finding, not a retry. `agent` names the closed agent in that text.
-pub(crate) async fn run_retire(checkout: &Path, worktree: &str, retire: &str, base: &str, agent: &str) -> Result<()> {
+pub(crate) async fn run_retire(
+    checkout: &Path,
+    worktree: &str,
+    retire: &str,
+    base: &str,
+    agent: &str,
+) -> Result<()> {
     let patches = PathBuf::new(); // unused: no decision is made on a close
     let cmd = format!("agent-fleet retire {}", short(agent));
-    let plan = crate::retire::Plan { checkout, script: retire, base, patches: &patches, decide_cmd: &cmd };
+    let plan = crate::retire::Plan {
+        checkout,
+        script: retire,
+        base,
+        patches: &patches,
+        decide_cmd: &cmd,
+    };
     match crate::retire::guarded(&plan, worktree, None).await? {
         crate::retire::Outcome::Refused(why) => bail!("{why}"),
         _ => Ok(()),
@@ -2471,26 +2483,51 @@ profile = "devin"
         std::fs::write(&sh, "#!/bin/sh\necho \"$1\" > \"$1/seen\"\n[ -e \"$1/dirty\" ] && { echo 'has uncommitted work' >&2; exit 1; }\nexit 0\n").unwrap();
         std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o755)).unwrap();
         // The checkout is a git repository: the retire locks live in its common dir.
-        assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(d.path()).status().unwrap().success());
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(d.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         let wt = d.path().join("wt");
         std::fs::create_dir(&wt).unwrap();
-        run_retire(d.path(), wt.to_str().unwrap(), "r.sh", "origin/main", "agent:h/s/a")
-            .await
-            .unwrap();
+        run_retire(
+            d.path(),
+            wt.to_str().unwrap(),
+            "r.sh",
+            "origin/main",
+            "agent:h/s/a",
+        )
+        .await
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(wt.join("seen")).unwrap().trim(),
             wt.to_str().unwrap()
         );
         std::fs::write(wt.join("dirty"), "").unwrap();
-        let e = run_retire(d.path(), wt.to_str().unwrap(), "r.sh", "origin/main", "agent:h/s/a")
-            .await
-            .unwrap_err()
-            .to_string();
+        let e = run_retire(
+            d.path(),
+            wt.to_str().unwrap(),
+            "r.sh",
+            "origin/main",
+            "agent:h/s/a",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("uncommitted"), "{e}");
-        let e = run_retire(d.path(), wt.to_str().unwrap(), "missing.sh", "origin/main", "agent:h/s/a")
-            .await
-            .unwrap_err()
-            .to_string();
+        let e = run_retire(
+            d.path(),
+            wt.to_str().unwrap(),
+            "missing.sh",
+            "origin/main",
+            "agent:h/s/a",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("not in"), "{e}");
     }
     fn answered(mut r: SpawnRequested, agent: &str, wt: &str, secs: i64) -> Spawn {

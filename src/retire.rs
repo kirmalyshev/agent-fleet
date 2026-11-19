@@ -110,14 +110,18 @@ fn clean_pointer(wt: &Path, line: &str) -> bool {
     let inner = wt.join(sub);
     is_gitlink(wt, sub)
         && status(&inner).is_some_and(|s| s.trim().is_empty())
-        && git(&inner, &["rev-list", "--count", "--all", "--not", "--remotes"])
-            .is_some_and(|n| n.trim() == "0")
+        && git(
+            &inner,
+            &["rev-list", "--count", "--all", "--not", "--remotes"],
+        )
+        .is_some_and(|n| n.trim() == "0")
 }
 
 /// Every uncommitted change in `wt` that is work, labelled against `base` and `origin/<branch>`.
 /// Err when git cannot answer — which is never a clean tree.
 pub fn changes(wt: &Path, base: &str, branch: &str) -> Result<Vec<Change>> {
-    let out = status(wt).with_context(|| format!("git status of {} could not be read", wt.display()))?;
+    let out =
+        status(wt).with_context(|| format!("git status of {} could not be read", wt.display()))?;
     let pr = format!("origin/{branch}");
     let has = |r: &str| git(wt, &["rev-parse", "-q", "--verify", r]).is_some();
     let (base_ok, pr_ok) = (has(base), !branch.is_empty() && has(&pr));
@@ -131,7 +135,12 @@ pub fn changes(wt: &Path, base: &str, branch: &str) -> Result<Vec<Change>> {
         .map(|l| {
             let status = l.get(..2).unwrap_or("").to_string();
             let rest = l.get(3..).unwrap_or("");
-            let p = rest.rsplit(" -> ").next().unwrap_or(rest).trim_matches('"').to_string();
+            let p = rest
+                .rsplit(" -> ")
+                .next()
+                .unwrap_or(rest)
+                .trim_matches('"')
+                .to_string();
             let mine = here(&p);
             // "Absent here" is a fact only for a deletion; a directory or anything git cannot
             // hash is absent to hash-object too and must not match a ref that lacks the path.
@@ -144,7 +153,11 @@ pub fn changes(wt: &Path, base: &str, branch: &str) -> Result<Vec<Change>> {
             } else {
                 "work"
             };
-            Change { status, path: p, kind: kind.into() }
+            Change {
+                status,
+                path: p,
+                kind: kind.into(),
+            }
         })
         .collect())
 }
@@ -160,7 +173,10 @@ pub fn report(wt: &Path, changes: &[Change], decide_cmd: &str) -> String {
     for c in changes {
         s += &format!("  {} {} — {}\n", c.status, c.path, c.kind);
     }
-    for l in git(wt, &["diff", "--no-ext-diff", "HEAD", "--stat"]).unwrap_or_default().lines() {
+    for l in git(wt, &["diff", "--no-ext-diff", "HEAD", "--stat"])
+        .unwrap_or_default()
+        .lines()
+    {
         s += &format!("  {l}\n");
     }
     s += &format!("decide: {decide_cmd} --decide=delete|keep|stash");
@@ -173,10 +189,16 @@ pub fn report(wt: &Path, changes: &[Change], decide_cmd: &str) -> String {
 /// untracked file git cannot diff. A stash that leaves work out is a delete.
 pub fn save_patch(wt: &Path, dir: &Path, name: &str, changes: &[Change]) -> Result<PathBuf> {
     if let Some(c) = changes.iter().find(|c| is_gitlink(wt, &c.path)) {
-        bail!("{} holds work inside the submodule, which a patch cannot carry", c.path);
+        bail!(
+            "{} holds work inside the submodule, which a patch cannot carry",
+            c.path
+        );
     }
-    let mut patch = git(wt, &["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--binary"])
-        .context("git diff HEAD failed")?;
+    let mut patch = git(
+        wt,
+        &["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--binary"],
+    )
+    .context("git diff HEAD failed")?;
     let others = git(wt, &["ls-files", "--others", "--exclude-standard", "-z"])
         .context("git ls-files failed")?;
     for f in others.split('\0').filter(|f| !f.is_empty()) {
@@ -187,7 +209,16 @@ pub fn save_patch(wt: &Path, dir: &Path, name: &str, changes: &[Change]) -> Resu
         let o = Command::new("git")
             .arg("-C")
             .arg(wt)
-            .args(["diff", "--no-ext-diff", "--no-textconv", "--binary", "--no-index", "--", "/dev/null", f])
+            .args([
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--binary",
+                "--no-index",
+                "--",
+                "/dev/null",
+                f,
+            ])
             .output()
             .with_context(|| format!("diff {f}"))?;
         if o.status.code() != Some(1) || o.stdout.is_empty() {
@@ -219,7 +250,11 @@ async fn lock_file(path: &Path, wait: Duration, what: &str) -> Result<Held> {
             Ok(()) => return Ok(Held(f)),
             Err(e) if e == rustix::io::Errno::WOULDBLOCK => {
                 if tokio::time::Instant::now() >= deadline {
-                    bail!("{what} still holds {} after {}s", path.display(), wait.as_secs());
+                    bail!(
+                        "{what} still holds {} after {}s",
+                        path.display(),
+                        wait.as_secs()
+                    );
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -231,31 +266,52 @@ async fn lock_file(path: &Path, wait: Duration, what: &str) -> Result<Held> {
 /// (A) this worktree's lock, then (B) the repository's. Never the other order, and nothing takes
 /// A while holding B, so no two retires can wait on each other.
 pub async fn locks(checkout: &Path, wt: &Path, wait: Duration) -> Result<(Held, Held)> {
-    let common = git(checkout, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .context("git could not name the common dir, where the retire locks live")?;
+    let common = git(
+        checkout,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .context("git could not name the common dir, where the retire locks live")?;
     let common = PathBuf::from(common.trim());
-    let tree = wt.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tree = wt
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let a = lock_file(
         &common.join(format!("agent-fleet-retire-{tree}.lock")),
         wait,
         "another fleet retire of this worktree",
     )
     .await?;
-    let b = lock_file(&common.join(REPO_LOCK), wait, "another retire in this repository").await?;
+    let b = lock_file(
+        &common.join(REPO_LOCK),
+        wait,
+        "another retire in this repository",
+    )
+    .await?;
     Ok((a, b))
 }
 
 /// The `retire` hook with the worktree as $1 and B's open file inherited by THIS child only:
 /// close-on-exec is cleared between fork and exec, so no other process the caller starts holds
 /// the lock. Err carries the script's own words.
-pub async fn run_hook(checkout: &Path, wt: &str, script: &str, extra: &[&str], held: &Held) -> Result<()> {
+pub async fn run_hook(
+    checkout: &Path,
+    wt: &str,
+    script: &str,
+    extra: &[&str],
+    held: &Held,
+) -> Result<()> {
     let path = checkout.join(script);
     if !path.is_file() {
         bail!("retire script {script:?} is not in {}", checkout.display());
     }
     let fd = held.0.as_raw_fd();
     let mut cmd = tokio::process::Command::new(&path);
-    cmd.arg(wt).args(extra).current_dir(checkout).env(LOCK_FD_ENV, fd.to_string()).kill_on_drop(true);
+    cmd.arg(wt)
+        .args(extra)
+        .current_dir(checkout)
+        .env(LOCK_FD_ENV, fd.to_string())
+        .kill_on_drop(true);
     // SAFETY: only fcntl runs between fork and exec, which is async-signal-safe.
     unsafe {
         cmd.pre_exec(move || {
@@ -301,13 +357,20 @@ pub async fn guarded(plan: &Plan<'_>, wt: &str, decide: Option<Decide>) -> Resul
 
 /// `guarded` for a caller that took the locks itself, to do something under them first —
 /// `agent-fleet retire` closes the agent's pane there, so the host's own close-retire waits.
-pub async fn guarded_with(plan: &Plan<'_>, wt: &str, decide: Option<Decide>, held: (Held, Held)) -> Result<Outcome> {
+pub async fn guarded_with(
+    plan: &Plan<'_>,
+    wt: &str,
+    decide: Option<Decide>,
+    held: (Held, Held),
+) -> Result<Outcome> {
     let tree = Path::new(wt);
     let (_a, b) = held;
     if !tree.exists() {
         return Ok(Outcome::Gone);
     }
-    let branch = git(tree, &["symbolic-ref", "-q", "--short", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();
+    let branch = git(tree, &["symbolic-ref", "-q", "--short", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
     // A tree with its own `.git` is a worktree and is read, and one git cannot read is refused;
     // a directory without one holds no git work to lose, and the hook alone decides it.
     let found = if tree.join(".git").exists() {
@@ -326,10 +389,21 @@ pub async fn guarded_with(plan: &Plan<'_>, wt: &str, decide: Option<Decide>, hel
         match decide {
             None => return Ok(Outcome::Refused(report(tree, &found, plan.decide_cmd))),
             Some(Decide::Stash) => {
-                let name = if branch.is_empty() { tree.file_name().unwrap_or_default().to_string_lossy().into_owned() } else { branch.clone() };
+                let name = if branch.is_empty() {
+                    tree.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    branch.clone()
+                };
                 match save_patch(tree, plan.patches, &name, &found) {
                     Ok(f) => println!("stashed {}'s uncommitted changes in {}", wt, f.display()),
-                    Err(e) => return Ok(Outcome::Refused(format!("could not stash {wt}: {e:#}; nothing removed"))),
+                    Err(e) => {
+                        return Ok(Outcome::Refused(format!(
+                            "could not stash {wt}: {e:#}; nothing removed"
+                        )));
+                    }
                 }
             }
             Some(Decide::Delete) | Some(Decide::Keep) => {}
@@ -374,7 +448,10 @@ mod tests {
         std::fs::write(co.join("a.txt"), "a\n").unwrap();
         sh(&co, &["add", "a.txt"]);
         sh(&co, &["commit", "-qm", "init"]);
-        sh(&co, &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "feat"]);
+        sh(
+            &co,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "feat"],
+        );
         let hook = co.join("x.sh");
         std::fs::write(
             &hook,
@@ -386,11 +463,22 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         let patches = root.join("patches");
-        Fx { _d: d, co, wt, patches }
+        Fx {
+            _d: d,
+            co,
+            wt,
+            patches,
+        }
     }
     impl Fx {
         fn plan(&self) -> Plan<'_> {
-            Plan { checkout: &self.co, script: "x.sh", base: "main", patches: &self.patches, decide_cmd: "agent-fleet retire dv-1" }
+            Plan {
+                checkout: &self.co,
+                script: "x.sh",
+                base: "main",
+                patches: &self.patches,
+                decide_cmd: "agent-fleet retire dv-1",
+            }
         }
         fn wt(&self) -> &str {
             self.wt.to_str().unwrap()
@@ -415,16 +503,31 @@ mod tests {
         f.dirty();
         std::fs::create_dir(f.wt.join("dir")).unwrap();
         std::fs::write(f.wt.join("dir/x"), "x\n").unwrap();
-        let mut got: Vec<(String, String)> = changes(&f.wt, "main", "feat").unwrap().into_iter().map(|c| (c.path, c.kind)).collect();
+        let mut got: Vec<(String, String)> = changes(&f.wt, "main", "feat")
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.path, c.kind))
+            .collect();
         got.sort();
         let w = |p: &str, k: &str| (p.to_string(), k.to_string());
-        assert_eq!(got, vec![w("a.txt", "work"), w("b.txt", "in main"), w("dir/", "work"), w("new.txt", "work")]);
+        assert_eq!(
+            got,
+            vec![
+                w("a.txt", "work"),
+                w("b.txt", "in main"),
+                w("dir/", "work"),
+                w("new.txt", "work")
+            ]
+        );
     }
 
     #[tokio::test]
     async fn a_clean_tree_is_retired_by_the_hook_with_no_decision_and_the_lock_fd() {
         let f = fx();
-        assert_eq!(guarded(&f.plan(), f.wt(), None).await.unwrap(), Outcome::Retired);
+        assert_eq!(
+            guarded(&f.plan(), f.wt(), None).await.unwrap(),
+            Outcome::Retired
+        );
         assert_eq!(f.read("hook-args").trim(), f.wt());
         assert_eq!(f.read("hook-fd").trim(), "inherited");
         assert!(!f.wt.exists());
@@ -434,8 +537,15 @@ mod tests {
     async fn real_changes_stop_the_retire_before_the_hook_and_say_what_they_are() {
         let f = fx();
         f.dirty();
-        let Outcome::Refused(why) = guarded(&f.plan(), f.wt(), None).await.unwrap() else { panic!("not refused") };
-        for want in ["a.txt — work", "new.txt — work", "1 file changed", "decide: agent-fleet retire dv-1 --decide=delete|keep|stash"] {
+        let Outcome::Refused(why) = guarded(&f.plan(), f.wt(), None).await.unwrap() else {
+            panic!("not refused")
+        };
+        for want in [
+            "a.txt — work",
+            "new.txt — work",
+            "1 file changed",
+            "decide: agent-fleet retire dv-1 --decide=delete|keep|stash",
+        ] {
             assert!(why.contains(want), "missing {want:?} in:\n{why}");
         }
         assert_eq!(f.read("hook-args"), "", "the hook ran");
@@ -446,7 +556,12 @@ mod tests {
     async fn keep_removes_nothing_and_runs_no_hook() {
         let f = fx();
         f.dirty();
-        assert_eq!(guarded(&f.plan(), f.wt(), Some(Decide::Keep)).await.unwrap(), Outcome::Kept);
+        assert_eq!(
+            guarded(&f.plan(), f.wt(), Some(Decide::Keep))
+                .await
+                .unwrap(),
+            Outcome::Kept
+        );
         assert_eq!(f.read("hook-args"), "");
         assert!(f.wt.join("new.txt").exists());
     }
@@ -455,8 +570,16 @@ mod tests {
     async fn delete_tells_the_hook_the_dirt_was_accepted() {
         let f = fx();
         f.dirty();
-        assert_eq!(guarded(&f.plan(), f.wt(), Some(Decide::Delete)).await.unwrap(), Outcome::Retired);
-        assert_eq!(f.read("hook-args").trim(), format!("{} --decide=delete", f.wt()));
+        assert_eq!(
+            guarded(&f.plan(), f.wt(), Some(Decide::Delete))
+                .await
+                .unwrap(),
+            Outcome::Retired
+        );
+        assert_eq!(
+            f.read("hook-args").trim(),
+            format!("{} --decide=delete", f.wt())
+        );
     }
 
     #[tokio::test]
@@ -464,15 +587,37 @@ mod tests {
         let f = fx();
         f.dirty();
         std::fs::write(f.wt.join("bin.dat"), [0u8, 1, 0, 255]).unwrap();
-        assert_eq!(guarded(&f.plan(), f.wt(), Some(Decide::Stash)).await.unwrap(), Outcome::Retired);
-        assert_eq!(f.read("hook-args").trim(), format!("{} --decide=delete", f.wt()));
-        let p: Vec<PathBuf> = std::fs::read_dir(&f.patches).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(
+            guarded(&f.plan(), f.wt(), Some(Decide::Stash))
+                .await
+                .unwrap(),
+            Outcome::Retired
+        );
+        assert_eq!(
+            f.read("hook-args").trim(),
+            format!("{} --decide=delete", f.wt())
+        );
+        let p: Vec<PathBuf> = std::fs::read_dir(&f.patches)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
         assert_eq!(p.len(), 1);
-        assert!(p[0].file_name().unwrap().to_string_lossy().starts_with("feat-"));
+        assert!(
+            p[0].file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("feat-")
+        );
         sh(&f.co, &["switch", "-q", "feat"]);
         sh(&f.co, &["apply", p[0].to_str().unwrap()]);
-        assert_eq!(std::fs::read_to_string(f.co.join("a.txt")).unwrap(), "edited, nowhere else\n");
-        assert_eq!(std::fs::read(f.co.join("bin.dat")).unwrap(), vec![0u8, 1, 0, 255]);
+        assert_eq!(
+            std::fs::read_to_string(f.co.join("a.txt")).unwrap(),
+            "edited, nowhere else\n"
+        );
+        assert_eq!(
+            std::fs::read(f.co.join("bin.dat")).unwrap(),
+            vec![0u8, 1, 0, 255]
+        );
     }
 
     #[tokio::test]
@@ -480,7 +625,12 @@ mod tests {
         let f = fx();
         sh(&f.wt, &["init", "-q", "nested"]);
         std::fs::write(f.wt.join("nested/w.txt"), "w\n").unwrap();
-        let Outcome::Refused(why) = guarded(&f.plan(), f.wt(), Some(Decide::Stash)).await.unwrap() else { panic!("not refused") };
+        let Outcome::Refused(why) = guarded(&f.plan(), f.wt(), Some(Decide::Stash))
+            .await
+            .unwrap()
+        else {
+            panic!("not refused")
+        };
         assert!(why.contains("nested/"), "{why}");
         assert!(!f.patches.exists());
         assert_eq!(f.read("hook-args"), "");
@@ -491,7 +641,12 @@ mod tests {
         let f = fx();
         let gd = git(&f.wt, &["rev-parse", "--absolute-git-dir"]).unwrap();
         std::fs::write(Path::new(gd.trim()).join("index"), "junk").unwrap();
-        let Outcome::Refused(why) = guarded(&f.plan(), f.wt(), Some(Decide::Delete)).await.unwrap() else { panic!("not refused") };
+        let Outcome::Refused(why) = guarded(&f.plan(), f.wt(), Some(Decide::Delete))
+            .await
+            .unwrap()
+        else {
+            panic!("not refused")
+        };
         assert!(why.contains("could not be read"), "{why}");
         assert_eq!(f.read("hook-args"), "");
     }
@@ -519,7 +674,10 @@ mod tests {
     async fn a_tree_already_gone_runs_no_hook() {
         let f = fx();
         sh(&f.co, &["worktree", "remove", f.wt()]);
-        assert_eq!(guarded(&f.plan(), f.wt(), None).await.unwrap(), Outcome::Gone);
+        assert_eq!(
+            guarded(&f.plan(), f.wt(), None).await.unwrap(),
+            Outcome::Gone
+        );
         assert_eq!(f.read("hook-args"), "");
     }
 }

@@ -522,8 +522,13 @@ impl Host {
         e: &anyhow::Error,
     ) {
         eprintln!("agent-fleet host: retire {wt}: {e:#}");
-        self.tell_lead(agent, repo, issue, &format!("retire of {wt} not done: {e:#}"))
-            .await;
+        self.tell_lead(
+            agent,
+            repo,
+            issue,
+            &format!("retire of {wt} not done: {e:#}"),
+        )
+        .await;
         let Some(issue) = issue else { return };
         let b = Known::BlockerRaised(BlockerRaised {
             what: format!(
@@ -565,7 +570,14 @@ impl Host {
             reference,
             text: text.into(),
         });
-        if !self.publish(Envelope::new(self.actor(), crate::spawn::task_project(repo), m)).await {
+        if !self
+            .publish(Envelope::new(
+                self.actor(),
+                crate::spawn::task_project(repo),
+                m,
+            ))
+            .await
+        {
             eprintln!("agent-fleet host: the lead was not told about {agent}'s retire");
         }
     }
