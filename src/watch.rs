@@ -297,27 +297,52 @@ impl<'a> Tick<'a> {
         }
     }
 
-    /// A command whose only hung members are `tail -f` followers is not hung: a follower
-    /// waits for more of another process's log by design. Any other lone filter blocked on a
-    /// pipe nobody writes is a real hang and is reported.
-    fn spare_followers(&mut self, start: usize) {
-        let follower = |t: &Self, c: &Classified| {
-            let p = &t.now.0[&c.pid];
-            p.name == "tail"
-                && p.args.as_deref().is_some_and(|a| {
-                    a.split_whitespace().any(|w| {
-                        w.starts_with('-') && !w.starts_with("--") && w.contains(['f', 'F'])
-                            || w == "--follow"
-                            || w.starts_with("--follow=")
-                    })
-                })
+    /// Idle by design, never HUNG: a follower of a file (`tail -f/-F/--follow`, `less +F`,
+    /// `journalctl -f/--follow`) has no producer process to wait on, and Xcode's simulator
+    /// service daemons sit idle for as long as their device is booted.
+    // ponytail: daemons are spared by name without asking whether a device is booted; add the
+    // `simctl list` check if one is ever seen hung with its device shut down.
+    fn idle_by_design(p: &Proc) -> bool {
+        let words = || p.args.as_deref().unwrap_or("").split_whitespace();
+        let flag = |w: &str, long: &str, short: &[char]| {
+            w == long
+                || w.starts_with(&format!("{long}="))
+                || (w.starts_with('-') && !w.starts_with("--") && w.contains(short))
         };
+        match p.name.as_str() {
+            "tail" => words().any(|w| flag(w, "--follow", &['f', 'F'])),
+            "journalctl" => words().any(|w| flag(w, "--follow", &['f'])),
+            "less" => words().any(|w| w == "+F" || w == "--follow-name"),
+            "DTServiceHub" | "launchd_sim" | "SimulatorTrampoline" => true,
+            n => n.starts_with("CoreSimulator"),
+        }
+    }
+
+    /// A command whose hung members are all idle by design is not hung. A wrapper (`bash -c
+    /// 'tail -f x'`) is hung beside its follower and is spared with it, when every hung process
+    /// under it is one. Any other lone filter blocked on a pipe nobody writes is a real hang.
+    fn spare_followers(&mut self, start: usize) {
         let hung = |c: &Classified| matches!(c.verdict, Verdict::Hung(_));
-        if self.out[start..]
+        let members: HashSet<u32> = self.out[start..]
             .iter()
             .filter(|c| hung(c))
-            .all(|c| follower(self, c))
-        {
+            .map(|c| c.pid)
+            .collect();
+        let spared = |pid: u32| {
+            Self::idle_by_design(&self.now.0[&pid])
+                || self
+                    .now
+                    .tree(pid)
+                    .into_iter()
+                    .filter(|q| *q != pid && members.contains(q))
+                    .all(|q| Self::idle_by_design(&self.now.0[&q]))
+                    && self
+                        .now
+                        .tree(pid)
+                        .into_iter()
+                        .any(|q| q != pid && members.contains(&q))
+        };
+        if members.iter().all(|&p| spared(p)) {
             for c in &mut self.out[start..] {
                 if hung(c) {
                     c.verdict = Verdict::Idle;
@@ -1315,6 +1340,87 @@ mod tests {
         w.step(only(), at(2), &seen());
         let v = w.step(only(), at(4), &seen());
         assert!(!matches!(verdict(&v, 40), Some(Verdict::Hung(_))), "{v:#?}");
+    }
+
+    #[test]
+    fn the_exact_follower_command_of_3138_is_not_hung() {
+        // 19 Nov o-3131: `tail -n +1 -f /tmp/o-3131/all.log`, alone and beside a quiet sibling.
+        for args in [
+            "tail -n +1 -f /tmp/o-3131/all.log",
+            "/usr/bin/tail -n +1 -f /tmp/o-3131/all.log",
+            "tail -n+1 -F /tmp/o-3131/all.log",
+            "less +F /tmp/o-3131/all.log",
+            "journalctl -f -u eait",
+        ] {
+            let name = args
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap();
+            let mut w = Watch::default();
+            let only = || tree(&[(40, SHELL, name, args, 0, 20)]);
+            w.step(only(), at(0), &seen());
+            w.step(only(), at(2), &seen());
+            let v = w.step(only(), at(4), &seen());
+            assert!(
+                !matches!(verdict(&v, 40), Some(Verdict::Hung(_))),
+                "{args}: {v:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_follower_under_a_wrapper_shell_is_not_hung() {
+        let mut w = Watch::default();
+        let t = || {
+            tree(&[
+                (
+                    30,
+                    SHELL,
+                    "bash",
+                    "bash -c tail -n +1 -f /tmp/o-3131/all.log",
+                    0,
+                    20,
+                ),
+                (31, 30, "tail", "tail -n +1 -f /tmp/o-3131/all.log", 0, 20),
+            ])
+        };
+        w.step(t(), at(0), &seen());
+        w.step(t(), at(2), &seen());
+        let v = w.step(t(), at(4), &seen());
+        assert!(
+            v.iter().all(|c| !matches!(c.verdict, Verdict::Hung(_))),
+            "{v:#?}"
+        );
+    }
+
+    #[test]
+    fn a_booted_simulators_service_daemon_is_never_hung() {
+        // 19 Nov 07:07 o-3131: DTServiceHub idle by design inside a live sim session.
+        for (name, args) in [
+            (
+                "DTServiceHub",
+                "/Applications/Xcode.app/Contents/Developer/Library/PrivateFrameworks/DTDeviceKitBase.framework/Versions/A/Resources/DTServiceHub",
+            ),
+            (
+                "launchd_sim",
+                "launchd_sim /Users/k/Library/Developer/CoreSimulator/Devices/ABC/data/var/run/launchd_bootstrap.plist",
+            ),
+            ("SimulatorTrampoline", "SimulatorTrampoline"),
+            ("CoreSimulatorService", "CoreSimulatorService"),
+        ] {
+            let mut w = Watch::default();
+            let only = || tree(&[(40, SHELL, name, args, 0, 20)]);
+            w.step(only(), at(0), &seen());
+            w.step(only(), at(2), &seen());
+            let v = w.step(only(), at(4), &seen());
+            assert!(
+                !matches!(verdict(&v, 40), Some(Verdict::Hung(_))),
+                "{name}: {v:#?}"
+            );
+        }
     }
 
     #[test]
