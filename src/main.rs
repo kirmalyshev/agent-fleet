@@ -302,8 +302,8 @@ enum Cmd {
     },
     /// Close a spawned agent and retire its worktree, locked: real uncommitted changes stop the
     /// retire and are shown to you and the agent's lead until `--decide` says delete, keep, or
-    /// stash (a patch first). The repository's `retire` hook removes the tree, else `git worktree remove`
-    /// (build output such as `target/` goes with it). Run it on any host: from another host it asks the agent's host (through the hub) to run it there.
+    /// stash (a patch first). fleet.toml's `retire` hook removes the tree, else `git worktree remove`
+    /// (ignored files such as `target/` go with it). Run it on any host: from another host it asks the agent's host (through the hub) to run it there.
     Retire {
         /// The agent: a name or full id with a spawn record.
         agent: String,
