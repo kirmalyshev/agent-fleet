@@ -975,14 +975,15 @@ pub(crate) async fn run_retire(
 ) -> Result<()> {
     let patches = PathBuf::new(); // unused: no decision is made on a close
     let cmd = format!("agent-fleet retire {}", short(agent));
-    let scratch = crate::tmpdir::dir(agent);
     let plan = crate::retire::Plan {
         checkout,
         script: retire,
         base,
         patches: &patches,
         decide_cmd: &cmd,
-        scratch: scratch.as_deref(),
+        // Not here: this retire can end minutes after the close, when a respawn of the same
+        // name may use the dir. The pane close (`agent_down`) or the failed spawn removes it.
+        scratch: None,
     };
     match crate::retire::guarded(&plan, worktree, None, crate::retire::HOST_WAIT).await? {
         crate::retire::Outcome::Refused(why) => bail!("{why}"),
@@ -1297,6 +1298,10 @@ async fn undo(host: &Host, r: &SpawnRequested, made: &Made) {
         let _ = herdr_call(sock, "pane.close", json!({ "pane_id": p })).await;
     }
     if made.fresh {
+        // The failed agent never ran, so nothing uses its scratch dir.
+        if let Some(d) = crate::tmpdir::dir(&r.agent) {
+            crate::tmpdir::remove_logged(&d);
+        }
         if let Some(wt) = &made.worktree
             && let Err(e) = retire_in(host, &r.repo, wt, &r.agent).await
         {
@@ -2552,11 +2557,12 @@ profile = "devin"
             std::fs::read_to_string(wt.join("seen")).unwrap().trim(),
             wt.to_str().unwrap()
         );
+        // A close-retire can end minutes after the pane closed, when a respawn of the same
+        // name may already use the dir: the pane close removed it, the retire leaves it be.
         assert!(
-            !scratch.exists(),
-            "the agent's scratch goes with its retire"
+            scratch.exists(),
+            "the close-retire leaves the scratch alone"
         );
-        std::fs::create_dir_all(&scratch).unwrap();
         std::fs::write(wt.join("dirty"), "").unwrap();
         let e = run_retire(
             d.path(),
@@ -2569,7 +2575,6 @@ profile = "devin"
         .unwrap_err()
         .to_string();
         assert!(e.contains("uncommitted"), "{e}");
-        assert!(scratch.exists(), "a refused retire keeps it");
         let e = run_retire(
             d.path(),
             wt.to_str().unwrap(),
@@ -4258,8 +4263,11 @@ profile = "devin"
             &[("worktree.create", vec![created(wt.to_str().unwrap())])],
         )
         .await;
+        let scratch = crate::tmpdir::dir(&req(None).agent).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
         execute(&host, "req1", &spawn_of(req(None)), &State::default()).await; // ready exits 1
         assert!(!result(&host).unwrap().ok);
+        assert!(!scratch.exists(), "a failed spawn's scratch goes with it");
         assert!(
             co.join("retired-wt").exists(),
             "retire ran for the failed spawn"
