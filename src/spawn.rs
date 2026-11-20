@@ -981,9 +981,6 @@ pub(crate) async fn run_retire(
         base,
         patches: &patches,
         decide_cmd: &cmd,
-        // Not here: this retire can end minutes after the close, when a respawn of the same
-        // name may use the dir. The pane close (`agent_down`) or the failed spawn removes it.
-        scratch: None,
     };
     match crate::retire::guarded(&plan, worktree, None, crate::retire::HOST_WAIT).await? {
         crate::retire::Outcome::Refused(why) => bail!("{why}"),

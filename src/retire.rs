@@ -465,15 +465,6 @@ pub struct Plan<'a> {
     pub base: &'a str,
     pub patches: &'a Path,
     pub decide_cmd: &'a str,
-    /// The agent's scratch dir (`tmpdir`), removed once its tree is: retired, or already gone.
-    pub scratch: Option<&'a Path>,
-}
-
-/// Removes the plan's scratch dir, if it has one.
-fn drop_scratch(plan: &Plan<'_>) {
-    if let Some(d) = plan.scratch {
-        crate::tmpdir::remove_logged(d);
-    }
 }
 
 /// Under the locks, before anything irreversible: may this retire go on?
@@ -532,7 +523,6 @@ pub async fn finish(
 ) -> Result<Outcome> {
     let tree = Path::new(wt);
     if !tree.exists() {
-        drop_scratch(plan);
         return Ok(Outcome::Gone);
     }
     let found = match read(plan, tree) {
@@ -573,7 +563,6 @@ pub async fn finish(
     // is the hook's to judge.
     crate::scan::wait_free(tree, LINGER).await;
     run_hook(plan.checkout, wt, plan.script, &extra, b).await?;
-    drop_scratch(plan);
     Ok(stashed.map_or(Outcome::Retired, Outcome::Stashed))
 }
 
@@ -590,15 +579,11 @@ pub async fn guarded(
 ) -> Result<Outcome> {
     let tree = Path::new(wt);
     if !tree.exists() {
-        drop_scratch(plan);
         return Ok(Outcome::Gone);
     }
     let (_a, b) = locks(plan.checkout, tree, wait).await?;
     match assess(plan, wt, decide) {
-        Ready::Gone => {
-            drop_scratch(plan);
-            Ok(Outcome::Gone)
-        }
+        Ready::Gone => Ok(Outcome::Gone),
         Ready::Kept => Ok(Outcome::Kept),
         Ready::Refused(why) => Ok(Outcome::Refused(why)),
         Ready::Go => finish(plan, wt, decide, &b).await,
@@ -665,11 +650,7 @@ async fn try_here(h: &Here<'_>) -> Result<Done> {
             format!("kept {wt}: decided keep; pane and tree untouched"),
         ));
     }
-    let scratch = crate::tmpdir::dir(&sp.request.agent);
     if !Path::new(&wt).exists() {
-        if let Some(d) = &scratch {
-            crate::tmpdir::remove_logged(d);
-        }
         return Ok(done(true, format!("{wt} was already retired")));
     }
     let registered = h
@@ -695,17 +676,13 @@ async fn try_here(h: &Here<'_>) -> Result<Done> {
         base: &cfg.base,
         patches: &patches,
         decide_cmd: &cmd,
-        scratch: scratch.as_deref(),
     };
     // Locked, then read, all BEFORE the pane closes: a refusal leaves the agent up and starts no
     // host retire; the host's retire of the close that does follow waits on these locks and finds
     // the tree gone.
     let (_a, b) = locks(&checkout, Path::new(&wt), WAIT).await?;
     let outcome = match assess(&plan, &wt, h.decide) {
-        Ready::Gone => {
-            drop_scratch(&plan);
-            Outcome::Gone
-        }
+        Ready::Gone => Outcome::Gone,
         Ready::Kept => Outcome::Kept,
         Ready::Refused(why) => Outcome::Refused(why),
         Ready::Go => {
@@ -982,8 +959,6 @@ mod tests {
         co: PathBuf,
         wt: PathBuf,
         patches: PathBuf,
-        /// The agent's scratch dir, outside the tree, holding one file.
-        scratch: PathBuf,
     }
     fn fx() -> Fx {
         fx_hook("")
@@ -1014,15 +989,11 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         let patches = root.join("patches");
-        let scratch = root.join("scratch/s/dv-1");
-        std::fs::create_dir_all(&scratch).unwrap();
-        std::fs::write(scratch.join("mktemp.x"), "x").unwrap();
         Fx {
             _d: d,
             co,
             wt,
             patches,
-            scratch,
         }
     }
     impl Fx {
@@ -1033,7 +1004,6 @@ mod tests {
                 base: "main",
                 patches: &self.patches,
                 decide_cmd: "agent-fleet retire dv-1",
-                scratch: Some(&self.scratch),
             }
         }
         fn wt(&self) -> &str {
@@ -1087,7 +1057,6 @@ mod tests {
         assert_eq!(f.read("hook-args").trim(), f.wt());
         assert_eq!(f.read("hook-fd").trim(), "inherited");
         assert!(!f.wt.exists());
-        assert!(!f.scratch.exists(), "the scratch dir goes with the tree");
     }
 
     #[tokio::test]
@@ -1128,7 +1097,6 @@ mod tests {
         }
         assert_eq!(f.read("hook-args"), "", "the hook ran");
         assert!(f.wt.join("new.txt").exists());
-        assert!(f.scratch.exists(), "a refused retire keeps the scratch too");
     }
 
     #[tokio::test]
@@ -1143,7 +1111,6 @@ mod tests {
         );
         assert_eq!(f.read("hook-args"), "");
         assert!(f.wt.join("new.txt").exists());
-        assert!(f.scratch.exists());
     }
 
     #[tokio::test]
@@ -1299,56 +1266,6 @@ mod tests {
             Outcome::Gone
         );
         assert_eq!(f.read("hook-args"), "");
-        assert!(
-            !f.scratch.exists(),
-            "the agent is retired: its scratch goes"
-        );
-    }
-
-    #[tokio::test]
-    async fn retire_of_a_tree_already_gone_still_removes_the_agents_scratch() {
-        let d = tempfile::tempdir().unwrap();
-        let id = "agent:h/s/gone-1";
-        let wt = d.path().join("wt-gone");
-        let sp = crate::state::Spawn {
-            request: serde_json::from_value(serde_json::json!({
-                "name": "gone-1", "agent": id, "host": "h", "session": "s", "repo": "o/r",
-                "branch": "b", "profile": "p", "brief": "x", "why": "t"
-            }))
-            .unwrap(),
-            by: "x".into(),
-            project: "p".into(),
-            result: Some(crate::event::SpawnResult {
-                agent: id.into(),
-                ok: true,
-                pane: None,
-                worktree: Some(wt.to_str().unwrap().into()),
-                error: None,
-            }),
-            since: chrono::Utc::now(),
-            answered: None,
-        };
-        let mut state = crate::state::State::default();
-        state.spawns.insert("e1".into(), sp.clone());
-        let scratch = crate::tmpdir::dir(id).unwrap();
-        std::fs::create_dir_all(&scratch).unwrap();
-        let done = run_here(&Here {
-            state: &state,
-            sp: &sp,
-            host: "h",
-            decide: None,
-            machine: None,
-            cwd_checkout: None,
-            data_dir: d.path(),
-            sock: None,
-        })
-        .await;
-        assert!(
-            done.ok && done.text.contains("already retired"),
-            "{}",
-            done.text
-        );
-        assert!(!scratch.exists());
     }
 
     #[test]

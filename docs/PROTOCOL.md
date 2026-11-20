@@ -803,9 +803,9 @@ handoff), it opens a `workspace.create` there instead and never removes the work
 `TMPDIR`, `TMP` and `TEMP` are exported there as the agent's scratch dir, outside any checkout:
 `<cache dir>/agent-fleet/tmp/<session>/<name>` (`~/.cache/agent-fleet/tmp/...` on Linux,
 `~/Library/Caches/agent-fleet/tmp/...` on macOS), created by the same line. The host removes it when the agent's pane or workspace closes (not when
-the agent only leaves its pane), and when its spawn fails; `agent-fleet retire` removes it too once
-the worktree is removed or found already gone. The close-retire itself leaves it alone: it may end
-minutes later, when a respawn under the same name already uses the dir. Best effort — a pane that
+the agent only leaves its pane), so `agent-fleet retire`, which closes the pane, removes it too;
+and when its spawn fails. A retire itself never touches it: it may end minutes after the close,
+when a respawn under the same name already uses the dir. Best effort — a pane that
 refuses the line, or a machine with no home directory, is logged, the spawn goes on; the host does
 not check that the line ran),
 `agent.start` retries `agent_pane_busy` for 10 tries 2 s apart, and the brief goes out the way
