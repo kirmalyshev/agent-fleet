@@ -152,9 +152,10 @@ fn mb(kb: u64) -> String {
     format!("{:.0} MB", kb as f64 / 1024.0)
 }
 
-/// `tmp`: each scratch dir on this machine's disk (`base/<session>/<name>`, see `tmpdir`) that
-/// holds files, with its size, named as `host`'s agent; one whose agent is not up says so — a
-/// dir nothing removed (a handoff's old agent, a tree removed by hand).
+/// `tmp`: each scratch dir on this machine's disk (`base/<session>/<name>`, see `tmpdir`), in a
+/// session `host`'s agents or spawns use, that holds files, with its size, named as `host`'s
+/// agent. One whose agent is not up says so: nothing removed it (a pane closed while no host ran,
+/// or one its agent had left before).
 pub fn tmp_findings(s: &State, host: &str, base: &std::path::Path) -> Vec<Finding> {
     let subdirs = |d: &std::path::Path| -> Vec<std::fs::DirEntry> {
         let mut v: Vec<_> = std::fs::read_dir(d)
@@ -166,8 +167,25 @@ pub fn tmp_findings(s: &State, host: &str, base: &std::path::Path) -> Vec<Findin
         v.sort_by_key(|e| e.file_name());
         v
     };
+    // Only the sessions this host's agents or spawns use: the base is the machine's, shared with
+    // every other instance, whose agents this state cannot see.
+    let ours: std::collections::BTreeSet<&str> = s
+        .agents
+        .iter()
+        .filter(|(_, a)| a.host == host)
+        .filter_map(|(id, _)| id.rsplit('/').nth(1))
+        .chain(
+            s.spawns
+                .values()
+                .filter(|sp| sp.request.host == host)
+                .map(|sp| sp.request.session.as_str()),
+        )
+        .collect();
     let mut out = Vec::new();
     for se in subdirs(base) {
+        if !ours.contains(se.file_name().to_string_lossy().as_ref()) {
+            continue;
+        }
         for ae in subdirs(&se.path()) {
             let id = format!(
                 "agent:{host}/{}/{}",
@@ -1035,7 +1053,8 @@ mod tests {
         // a: up, 3 MB; b: up, empty; c: no agent, left behind
         put("agent:h/s/a", 3 << 20);
         put("agent:h/s/b", 0);
-        put("agent:h/t/c", 1 << 20);
+        put("agent:h/s/c", 1 << 20);
+        put("agent:h/other/d", 1 << 20); // another instance's session: not ours to judge
         std::fs::write(base.join("stray"), "not a session dir").unwrap();
         let mut s = State::default();
         for id in ["agent:h/s/a", "agent:h/s/b"] {
@@ -1043,7 +1062,7 @@ mod tests {
                 .insert(id.into(), agent(AgentState::Idle, now, "/w", 0, 0));
         }
         let f = tmp_findings(&s, "h", base);
-        assert_eq!(kinds(&f), [("tmp", "agent:h/s/a"), ("tmp", "agent:h/t/c")]);
+        assert_eq!(kinds(&f), [("tmp", "agent:h/s/a"), ("tmp", "agent:h/s/c")]);
         assert!(f[0].detail.starts_with("3 MB in "), "{}", f[0].detail);
         assert!(f[0].detail.ends_with("s/a"), "{}", f[0].detail);
         assert!(f[1].detail.contains("no agent up"), "{}", f[1].detail);

@@ -1,5 +1,6 @@
 //! Per-agent scratch dir, outside any checkout: `<cache dir>/agent-fleet/tmp/<session>/<name>`,
-//! exported as TMPDIR/TMP/TEMP into the agent's pane at spawn. Retire removes it; doctor sizes it.
+//! exported as TMPDIR/TMP/TEMP into the agent's pane at spawn. The host removes it when the pane
+//! closes or the spawn fails; doctor sizes it.
 //! Outside the worktree so a tool that walks the repository never meets the agent's mktemps.
 
 use std::path::{Path, PathBuf};

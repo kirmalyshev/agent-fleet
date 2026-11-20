@@ -650,7 +650,7 @@ process's directory is known on Linux only), re-sent without `program` once the 
 `agent-fleet doctor` shows them as `unmanaged` findings.
 
 `doctor` also reads the local disk for `tmp` findings: each agent scratch dir on this machine (see
-spawn below) that holds files gets one finding, subject `agent:<this host>/<session>/<name>`, with
+spawn below), in a session this host's agents or spawns use, that holds files gets one finding, subject `agent:<this host>/<session>/<name>`, with
 the directory's size in MB, and `no agent up` when that agent is not up; an empty one gets none.
 
 `doctor` also reads GitHub, not the log, for `orphan-pr` findings: for each repository in
@@ -803,8 +803,8 @@ handoff), it opens a `workspace.create` there instead and never removes the work
 `TMPDIR`, `TMP` and `TEMP` are exported there as the agent's scratch dir, outside any checkout:
 `<cache dir>/agent-fleet/tmp/<session>/<name>` (`~/.cache/agent-fleet/tmp/...` on Linux,
 `~/Library/Caches/agent-fleet/tmp/...` on macOS), created by the same line. The host removes it when the agent's pane or workspace closes (not when
-the agent only leaves its pane), so `agent-fleet retire`, which closes the pane, removes it too;
-and when its spawn fails. A retire itself never touches it: it may end minutes after the close,
+the agent only leaves its pane, nor when a pane it left closes later), so `agent-fleet retire`,
+which closes the pane, removes it too; and when its spawn fails. A retire itself never touches it: it may end minutes after the close,
 when a respawn under the same name already uses the dir. Best effort — a pane that
 refuses the line, or a machine with no home directory, is logged, the spawn goes on; the host does
 not check that the line ran),

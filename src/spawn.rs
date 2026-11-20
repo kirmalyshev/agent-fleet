@@ -1254,7 +1254,8 @@ async fn run_spawn(
         .await
         .with_context(|| format!("env scrub: unset {var}"))?;
     }
-    // Scratch outside any checkout, so nothing that walks the repo meets it; retire removes it.
+    // Scratch outside any checkout, so nothing that walks the repo meets it; the pane close
+    // (`Host::agent_down`) or a failed spawn removes it.
     // Best effort: a pane that refuses the line costs the isolation, not the spawn.
     match crate::tmpdir::dir(&r.agent) {
         Some(d) => {
