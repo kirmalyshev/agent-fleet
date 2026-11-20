@@ -122,6 +122,24 @@ async fn send(
     signal: &str,
     detail: Option<String>,
 ) {
+    let body = Known::AgentSignal(AgentSignal {
+        agent: agent.clone(),
+        program,
+        signal: signal.to_string(),
+        detail,
+    });
+    write(paths, hub, token, project, agent, body).await;
+}
+
+/// Spool `body` as `agent`, then flush.
+async fn write(
+    paths: &Paths,
+    hub: Option<&str>,
+    token: String,
+    project: &str,
+    agent: String,
+    body: Known,
+) {
     let client = crate::client::Client::new(
         hub.map(str::to_string)
             .unwrap_or_else(|| paths.hub_url())
@@ -132,19 +150,33 @@ async fn send(
     let e = Envelope::new(
         Actor {
             kind: ActorKind::Agent,
-            id: agent.clone(),
+            id: agent,
         },
         project,
-        Known::AgentSignal(AgentSignal {
-            agent,
-            program,
-            signal: signal.to_string(),
-            detail,
-        }),
+        body,
     );
     if client.queue(&e).is_ok() {
         let _ = client.flush_spool().await;
     }
+}
+
+/// Write `body` as the hooked agent, within the hook's budget. Never fails.
+pub async fn log(
+    paths: &Paths,
+    hub: Option<&str>,
+    token_file: Option<&Path>,
+    project: &str,
+    host: &str,
+    body: Known,
+) {
+    let _ = tokio::time::timeout(HOOK_BUDGET, async {
+        let (Some((agent, _)), Some(token)) = (who(host).await, cli_token(paths, token_file))
+        else {
+            return;
+        };
+        write(paths, hub, token, project, agent, body).await;
+    })
+    .await;
 }
 
 fn cli_token(paths: &Paths, token_file: Option<&Path>) -> Option<String> {

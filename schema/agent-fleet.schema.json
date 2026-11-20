@@ -828,6 +828,31 @@
           ],
           "type": "object"
         },
+        "PaneRefused": {
+          "additionalProperties": false,
+          "description": "`agent-fleet hook bash` refused `command`: it types into `pane` on `host`, which `agent` holds.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "command": {
+              "type": "string"
+            },
+            "host": {
+              "type": "string"
+            },
+            "pane": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "host",
+            "pane",
+            "agent",
+            "command"
+          ],
+          "type": "object"
+        },
         "ProcessHung": {
           "additionalProperties": false,
           "description": "A process an agent started that the watch tick found hung: at most 1% CPU, no change to a\nstdout/stderr file, and no new or working child for two ticks in a row. `pid` is the\ntopmost hung process, `pids` it and every hung process under it. `evidence` absent clears\nit (see `watch::to_clear`).",
@@ -1813,6 +1838,22 @@
             },
             "type": {
               "const": "kill.refused",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/PaneRefused"
+            },
+            "type": {
+              "const": "pane.refused",
               "type": "string"
             }
           },
@@ -3011,6 +3052,38 @@
           ],
           "type": "object"
         },
+        "RefusedPane": {
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "by": {
+              "type": "string"
+            },
+            "command": {
+              "type": "string"
+            },
+            "host": {
+              "type": "string"
+            },
+            "pane": {
+              "type": "string"
+            },
+            "ts": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "by",
+            "host",
+            "pane",
+            "agent",
+            "command",
+            "ts"
+          ],
+          "type": "object"
+        },
         "Resource": {
           "properties": {
             "holder": {
@@ -4023,6 +4096,14 @@
           "description": "The latest kills `agent-fleet kill` refused, oldest first; at most `MAX_REFUSED`.",
           "items": {
             "$ref": "#/$defs/RefusedKill"
+          },
+          "type": "array"
+        },
+        "refused_panes": {
+          "default": [],
+          "description": "The latest herdr writes into another agent's pane `hook bash` refused, oldest first; at\nmost `MAX_REFUSED`.",
+          "items": {
+            "$ref": "#/$defs/RefusedPane"
           },
           "type": "array"
         },

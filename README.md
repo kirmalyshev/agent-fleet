@@ -308,7 +308,9 @@ file) or to `~/.claude/settings.json`:
 ```
 
 - `hook bash` refuses a raw `kill`, `pkill` or `killall` (use `agent-fleet kill`, which will not
-  kill another agent's work) and an agent started outside herdr (use `agent-fleet spawn`).
+  kill another agent's work), an agent started outside herdr (use `agent-fleet spawn`) and a
+  `herdr pane send-text|send-keys|run` or `herdr agent prompt|send-keys` into another agent's
+  pane (use `agent-fleet tell`).
 - `hook signal` reports rate limits, permission prompts, questions and turn ends as
   `agent.signal`, so `ps` and `doctor` can say why an agent is stuck.
 - `hook statusline` records Claude's rate limits for the host to publish as the agent's quota.
