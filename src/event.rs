@@ -230,6 +230,8 @@ pub enum Known {
     ResourceLimit(ResourceLimit),
     #[serde(rename = "kill.refused")]
     KillRefused(KillRefused),
+    #[serde(rename = "pane.refused")]
+    PaneRefused(PaneRefused),
     #[serde(rename = "task.created")]
     TaskCreated(TaskCreated),
     #[serde(rename = "task.assigned")]
@@ -529,6 +531,17 @@ pub struct KillRefused {
     pub pid: u32,
     pub name: String,
     pub reason: String,
+}
+
+/// `agent-fleet hook bash` refused `command` (the herdr argv it found, joined): it types into
+/// `pane` on `host`, which `agent` holds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PaneRefused {
+    pub host: String,
+    pub pane: String,
+    pub agent: String,
+    pub command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -952,6 +965,7 @@ impl Known {
             Self::ResourceReleased(_) => "resource.released",
             Self::ResourceLimit(_) => "resource.limit",
             Self::KillRefused(_) => "kill.refused",
+            Self::PaneRefused(_) => "pane.refused",
             Self::TaskCreated(_) => "task.created",
             Self::TaskAssigned(_) => "task.assigned",
             Self::TaskUnassigned(_) => "task.unassigned",

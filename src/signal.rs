@@ -1,7 +1,8 @@
 //! `agent-fleet hook signal`: a harness's own hook events become `agent.signal` events —
 //! the structured channel the fleet may act on. It must never fail or slow the program it
 //! hooks: any error exits 0, the write goes through the normal client (it spools when the
-//! hub is down), and the whole pass is capped at a second.
+//! hub is down), and the whole pass is capped at a second. `log` writes any other event as the
+//! hooked agent the same way (`hook bash` logs `pane.refused` with it).
 
 use std::path::Path;
 use std::time::Duration;
@@ -13,7 +14,7 @@ use crate::event::*;
 use crate::host::herdr_call;
 use crate::state::State;
 
-/// The cap on the whole hook, stdin read aside: a hook never slows the program.
+/// The cap on one hook write, stdin read aside: a hook never slows the program.
 const HOOK_BUDGET: Duration = Duration::from_secs(1);
 
 /// The Claude Code statusline's context fullness that names `context_full`.
@@ -122,6 +123,24 @@ async fn send(
     signal: &str,
     detail: Option<String>,
 ) {
+    let body = Known::AgentSignal(AgentSignal {
+        agent: agent.clone(),
+        program,
+        signal: signal.to_string(),
+        detail,
+    });
+    write(paths, hub, token, project, agent, body).await;
+}
+
+/// Spool `body` as `agent`, then flush.
+async fn write(
+    paths: &Paths,
+    hub: Option<&str>,
+    token: String,
+    project: &str,
+    agent: String,
+    body: Known,
+) {
     let client = crate::client::Client::new(
         hub.map(str::to_string)
             .unwrap_or_else(|| paths.hub_url())
@@ -132,19 +151,34 @@ async fn send(
     let e = Envelope::new(
         Actor {
             kind: ActorKind::Agent,
-            id: agent.clone(),
+            id: agent,
         },
         project,
-        Known::AgentSignal(AgentSignal {
-            agent,
-            program,
-            signal: signal.to_string(),
-            detail,
-        }),
+        body,
     );
     if client.queue(&e).is_ok() {
         let _ = client.flush_spool().await;
     }
+}
+
+/// Write `body` as the hooked agent, capped at `HOOK_BUDGET`. Never fails; outside a named
+/// herdr session (`HERDR_SESSION` unset) it writes nothing, as `who` finds nobody.
+pub async fn log(
+    paths: &Paths,
+    hub: Option<&str>,
+    token_file: Option<&Path>,
+    project: &str,
+    host: &str,
+    body: Known,
+) {
+    let _ = tokio::time::timeout(HOOK_BUDGET, async {
+        let (Some((agent, _)), Some(token)) = (who(host).await, cli_token(paths, token_file))
+        else {
+            return;
+        };
+        write(paths, hub, token, project, agent, body).await;
+    })
+    .await;
 }
 
 fn cli_token(paths: &Paths, token_file: Option<&Path>) -> Option<String> {
