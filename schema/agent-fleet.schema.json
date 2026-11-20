@@ -830,7 +830,7 @@
         },
         "PaneRefused": {
           "additionalProperties": false,
-          "description": "`agent-fleet hook bash` refused `command`: it types into `pane` on `host`, which `agent` holds.",
+          "description": "`agent-fleet hook bash` refused `command` (the herdr argv it found, joined): it types into\n`pane` on `host`, which `agent` holds.",
           "properties": {
             "agent": {
               "type": "string"

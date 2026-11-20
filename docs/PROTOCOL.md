@@ -84,7 +84,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `resource.released` | host, resource, pid? (without `pid`: nobody holds or waits) | | host |
 | | `resource.limit` | host, name, resources[], max, until? (empty `resources` removes it) | | agent, host |
 | safety | `kill.refused` | host, pid, name, reason | | agent, host |
-| | `pane.refused` | host, pane, agent, command (its first 300 characters) | | agent, host |
+| | `pane.refused` | host, pane, agent, command (the herdr argv found, joined; its first 300 characters) | | agent, host |
 | task | `task.created` | title, url? | task | agent, host |
 | | `task.assigned` | agent, lead? — **exclusive** | task | agent, host |
 | | `task.unassigned` | reason? | task | agent, host |
@@ -622,12 +622,16 @@ another agent's tree or not. TERM, then KILL after `--grace` seconds. Each refus
 running a raw `kill`, `pkill` or `killall`, also behind `sudo`, `xargs`, `timeout`, `sh -c`,
 `eval`, `find -exec` or `ssh <host>`. `kill -0` and `kill -l` pass. It also refuses a herdr
 write (`herdr pane send-text|send-keys|run`, `herdr agent prompt|send-keys`) whose target pane
-another agent holds, as the caller's herdr answers `agent.get` within a second (`--session
-<name>` asks that session's socket, next to the caller's), and points at `agent-fleet tell`; each
-such refusal is logged as `pane.refused` as the caller. The caller's own pane (by id, or
-`--current`) passes, and so does a pane no agent holds, a `--machine` target and any write the
-hook cannot check (no `HERDR_SOCKET_PATH`, no answer). A spawn's first prompt comes from the
-host, not from Bash. It guards against a slip, not against an agent set on evading it.
+another agent holds, as herdr answers `agent.get` (every write in the line, all lookups within a
+second; `--session <name>` asks that session's socket: `<root>/herdr.sock` for `default`,
+`<root>/sessions/<name>/herdr.sock` otherwise; a caller without `HERDR_SESSION` is in
+`default`), and points at `agent-fleet tell`. Each such refusal is logged, best effort, as
+`pane.refused` as the caller (nothing is logged from herdr's default session, where the caller
+has no agent id). The caller's own pane (any target herdr resolves to it, or `--current`)
+passes, and so does a pane no agent holds, a write to another machine (`--machine`, `--remote`,
+`ssh <host> herdr …`) and any write the hook cannot check (no `HERDR_SOCKET_PATH`, no answer, a
+target in a shell variable). A spawn's first prompt comes from the host, not from Bash. It
+guards against a slip, not against an agent set on evading it.
 
 ```json
 { "hooks": { "PreToolUse": [ { "matcher": "Bash|exec",

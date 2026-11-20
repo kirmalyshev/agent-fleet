@@ -846,7 +846,7 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
             "refused",
             &p.by,
             format!(
-                "typed into {}'s pane {} on {} {} ago instead of `agent-fleet tell`: {}",
+                "tried to type into {}'s pane {} on {} {} ago instead of `agent-fleet tell`: {}",
                 p.agent,
                 p.pane,
                 p.host,

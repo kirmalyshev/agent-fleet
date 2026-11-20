@@ -533,7 +533,8 @@ pub struct KillRefused {
     pub reason: String,
 }
 
-/// `agent-fleet hook bash` refused `command`: it types into `pane` on `host`, which `agent` holds.
+/// `agent-fleet hook bash` refused `command` (the herdr argv it found, joined): it types into
+/// `pane` on `host`, which `agent` holds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PaneRefused {
