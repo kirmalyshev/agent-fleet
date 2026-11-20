@@ -469,12 +469,10 @@ pub struct Plan<'a> {
     pub scratch: Option<&'a Path>,
 }
 
-/// Removes the plan's scratch dir. A failure is logged, not the retire's: the tree is gone.
+/// Removes the plan's scratch dir, if it has one.
 fn drop_scratch(plan: &Plan<'_>) {
-    if let Some(d) = plan.scratch
-        && let Err(e) = crate::tmpdir::remove(d)
-    {
-        eprintln!("agent-fleet retire: scratch {}: {e}", d.display());
+    if let Some(d) = plan.scratch {
+        crate::tmpdir::remove_logged(d);
     }
 }
 
@@ -667,7 +665,11 @@ async fn try_here(h: &Here<'_>) -> Result<Done> {
             format!("kept {wt}: decided keep; pane and tree untouched"),
         ));
     }
+    let scratch = crate::tmpdir::dir(&sp.request.agent);
     if !Path::new(&wt).exists() {
+        if let Some(d) = &scratch {
+            crate::tmpdir::remove_logged(d);
+        }
         return Ok(done(true, format!("{wt} was already retired")));
     }
     let registered = h
@@ -687,7 +689,6 @@ async fn try_here(h: &Here<'_>) -> Result<Done> {
     let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
     let patches = patches_dir(cfg.retire_patches.as_deref(), home.as_deref(), h.data_dir)?;
     let cmd = format!("agent-fleet retire {agent}");
-    let scratch = crate::tmpdir::dir(&sp.request.agent);
     let plan = Plan {
         checkout: &checkout,
         script: &script,
@@ -701,7 +702,10 @@ async fn try_here(h: &Here<'_>) -> Result<Done> {
     // the tree gone.
     let (_a, b) = locks(&checkout, Path::new(&wt), WAIT).await?;
     let outcome = match assess(&plan, &wt, h.decide) {
-        Ready::Gone => Outcome::Gone,
+        Ready::Gone => {
+            drop_scratch(&plan);
+            Outcome::Gone
+        }
         Ready::Kept => Outcome::Kept,
         Ready::Refused(why) => Outcome::Refused(why),
         Ready::Go => {
@@ -1299,6 +1303,52 @@ mod tests {
             !f.scratch.exists(),
             "the agent is retired: its scratch goes"
         );
+    }
+
+    #[tokio::test]
+    async fn retire_of_a_tree_already_gone_still_removes_the_agents_scratch() {
+        let d = tempfile::tempdir().unwrap();
+        let id = "agent:h/s/gone-1";
+        let wt = d.path().join("wt-gone");
+        let sp = crate::state::Spawn {
+            request: serde_json::from_value(serde_json::json!({
+                "name": "gone-1", "agent": id, "host": "h", "session": "s", "repo": "o/r",
+                "branch": "b", "profile": "p", "brief": "x", "why": "t"
+            }))
+            .unwrap(),
+            by: "x".into(),
+            project: "p".into(),
+            result: Some(crate::event::SpawnResult {
+                agent: id.into(),
+                ok: true,
+                pane: None,
+                worktree: Some(wt.to_str().unwrap().into()),
+                error: None,
+            }),
+            since: chrono::Utc::now(),
+            answered: None,
+        };
+        let mut state = crate::state::State::default();
+        state.spawns.insert("e1".into(), sp.clone());
+        let scratch = crate::tmpdir::dir(id).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let done = run_here(&Here {
+            state: &state,
+            sp: &sp,
+            host: "h",
+            decide: None,
+            machine: None,
+            cwd_checkout: None,
+            data_dir: d.path(),
+            sock: None,
+        })
+        .await;
+        assert!(
+            done.ok && done.text.contains("already retired"),
+            "{}",
+            done.text
+        );
+        assert!(!scratch.exists());
     }
 
     #[test]

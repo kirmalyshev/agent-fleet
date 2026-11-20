@@ -152,28 +152,41 @@ fn mb(kb: u64) -> String {
     format!("{:.0} MB", kb as f64 / 1024.0)
 }
 
-/// `tmp`: each agent of `host` this state knows, up or retired, whose scratch dir under `base`
-/// (see `tmpdir`) holds files, with its size. Reads the local disk, so only this host's agents.
+/// `tmp`: each scratch dir on this machine's disk (`base/<session>/<name>`, see `tmpdir`) that
+/// holds files, with its size, named as `host`'s agent; one whose agent is not up says so — a
+/// dir nothing removed (a handoff's old agent, a tree removed by hand).
 pub fn tmp_findings(s: &State, host: &str, base: &std::path::Path) -> Vec<Finding> {
-    let ids: std::collections::BTreeSet<&String> = s
-        .agents
-        .iter()
-        .filter(|(_, a)| a.host == host)
-        .map(|(id, _)| id)
-        .chain(
-            s.spawns
-                .values()
-                .filter(|sp| sp.request.host == host)
-                .map(|sp| &sp.request.agent),
-        )
-        .collect();
-    ids.into_iter()
-        .filter_map(|id| {
-            let d = crate::tmpdir::dir_in(base, id)?;
-            let b = crate::tmpdir::size(&d);
-            (b > 0).then(|| finding("tmp", id, format!("{} in {}", mb(b / 1024), d.display())))
-        })
-        .collect()
+    let subdirs = |d: &std::path::Path| -> Vec<std::fs::DirEntry> {
+        let mut v: Vec<_> = std::fs::read_dir(d)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .collect();
+        v.sort_by_key(|e| e.file_name());
+        v
+    };
+    let mut out = Vec::new();
+    for se in subdirs(base) {
+        for ae in subdirs(&se.path()) {
+            let id = format!(
+                "agent:{host}/{}/{}",
+                se.file_name().to_string_lossy(),
+                ae.file_name().to_string_lossy()
+            );
+            let b = crate::tmpdir::size(&ae.path());
+            if b > 0 {
+                let up = if s.agents.contains_key(&id) {
+                    ""
+                } else {
+                    "; no agent up"
+                };
+                let detail = format!("{} in {}{up}", mb(b / 1024), ae.path().display());
+                out.push(finding("tmp", &id, detail));
+            }
+        }
+    }
+    out
 }
 
 fn files(v: &[&String]) -> String {
@@ -1008,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn tmp_reports_the_size_of_each_local_agents_scratch_dir_and_skips_empty_ones() {
+    fn tmp_reports_each_non_empty_scratch_dir_on_disk_up_agent_or_not() {
         let now = Utc::now();
         let d = tempfile::tempdir().unwrap();
         let base = d.path();
@@ -1019,37 +1032,22 @@ mod tests {
                 std::fs::write(s.join("x"), vec![0u8; bytes]).unwrap();
             }
         };
+        // a: up, 3 MB; b: up, empty; c: no agent, left behind
+        put("agent:h/s/a", 3 << 20);
+        put("agent:h/s/b", 0);
+        put("agent:h/t/c", 1 << 20);
+        std::fs::write(base.join("stray"), "not a session dir").unwrap();
         let mut s = State::default();
-        // a: up, 3 MB; b: up, empty; c: retired, its scratch left behind; e: another host's
-        for (id, bytes) in [("agent:h/s/a", 3 << 20), ("agent:h/s/b", 0)] {
-            put(id, bytes);
+        for id in ["agent:h/s/a", "agent:h/s/b"] {
             s.agents
                 .insert(id.into(), agent(AgentState::Idle, now, "/w", 0, 0));
         }
-        put("agent:h/s/c", 1 << 20);
-        s.spawns.insert(
-            "e1".into(),
-            crate::state::Spawn {
-                request: serde_json::from_value(serde_json::json!({
-                    "name": "c", "agent": "agent:h/s/c", "host": "h", "session": "s", "repo": "r",
-                    "branch": "b", "profile": "p", "brief": "x", "why": "t"
-                }))
-                .unwrap(),
-                by: "x".into(),
-                project: "p".into(),
-                result: None,
-                since: now,
-                answered: None,
-            },
-        );
-        put("agent:e/z/d", 1 << 20);
-        let mut other = agent(AgentState::Idle, now, "/w", 0, 0);
-        other.host = "elsewhere".into();
-        s.agents.insert("agent:e/z/d".into(), other);
         let f = tmp_findings(&s, "h", base);
-        assert_eq!(kinds(&f), [("tmp", "agent:h/s/a"), ("tmp", "agent:h/s/c")]);
+        assert_eq!(kinds(&f), [("tmp", "agent:h/s/a"), ("tmp", "agent:h/t/c")]);
         assert!(f[0].detail.starts_with("3 MB in "), "{}", f[0].detail);
         assert!(f[0].detail.ends_with("s/a"), "{}", f[0].detail);
+        assert!(f[1].detail.contains("no agent up"), "{}", f[1].detail);
+        assert!(!f[0].detail.contains("no agent up"), "{}", f[0].detail);
     }
 
     fn kinds(f: &[Finding]) -> Vec<(&str, &str)> {

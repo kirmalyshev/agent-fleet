@@ -2537,6 +2537,8 @@ profile = "devin"
         );
         let wt = d.path().join("wt");
         std::fs::create_dir(&wt).unwrap();
+        let scratch = crate::tmpdir::dir("agent:h/s/a").unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
         run_retire(
             d.path(),
             wt.to_str().unwrap(),
@@ -2550,6 +2552,11 @@ profile = "devin"
             std::fs::read_to_string(wt.join("seen")).unwrap().trim(),
             wt.to_str().unwrap()
         );
+        assert!(
+            !scratch.exists(),
+            "the agent's scratch goes with its retire"
+        );
+        std::fs::create_dir_all(&scratch).unwrap();
         std::fs::write(wt.join("dirty"), "").unwrap();
         let e = run_retire(
             d.path(),
@@ -2562,6 +2569,7 @@ profile = "devin"
         .unwrap_err()
         .to_string();
         assert!(e.contains("uncommitted"), "{e}");
+        assert!(scratch.exists(), "a refused retire keeps it");
         let e = run_retire(
             d.path(),
             wt.to_str().unwrap(),

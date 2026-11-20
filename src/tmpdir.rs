@@ -9,7 +9,11 @@ use std::path::{Path, PathBuf};
 pub fn base() -> Option<PathBuf> {
     if cfg!(test) {
         // A test's spawn or retire never makes or removes a real agent's scratch.
-        return Some(std::env::temp_dir().join(format!("agent-fleet-test-{}", std::process::id())));
+        // Per test thread: parallel tests use the same agent ids.
+        let t = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        return Some(
+            std::env::temp_dir().join(format!("agent-fleet-test-{}-{t}", std::process::id())),
+        );
     }
     cache_base()
 }
@@ -44,6 +48,13 @@ pub fn remove(dir: &Path) -> std::io::Result<()> {
     match std::fs::remove_dir_all(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         r => r,
+    }
+}
+
+/// `remove`, a failure logged: the caller's step (a retire, a closed pane) is done regardless.
+pub fn remove_logged(dir: &Path) {
+    if let Err(e) = remove(dir) {
+        eprintln!("agent-fleet: scratch dir {}: {e}", dir.display());
     }
 }
 
