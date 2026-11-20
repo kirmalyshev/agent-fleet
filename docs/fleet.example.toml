@@ -15,7 +15,9 @@ brief = "brief.md"               # brief template next to this file; @@KEY@@ pla
 # ready = "scripts/worktree-ready.sh"   # run inside a NEW worktree with its path as $1, before the agent starts
 # retire = "scripts/worktree-retire.sh" # run with a closed agent's worktree as $1, under the retire locks;
 #                                       # `--decide=delete` follows when uncommitted changes were accepted,
-#                                       # and AGENT_FLEET_RETIRE_LOCK_FD names the repo lock it may re-enter
+#                                       # and AGENT_FLEET_RETIRE_LOCK_FD names the repo lock it may re-enter;
+#                                       # absent: `agent-fleet retire` runs `git worktree remove`, and a
+#                                       # closed pane leaves its tree
 # retire_patches = "~/retired-patches"  # where `agent-fleet retire --decide=stash` writes (default: data dir)
 
 # [vars]                         # extra brief tokens: @@ORG@@ renders "example"

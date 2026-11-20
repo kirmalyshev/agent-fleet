@@ -977,7 +977,7 @@ pub(crate) async fn run_retire(
     let cmd = format!("agent-fleet retire {}", short(agent));
     let plan = crate::retire::Plan {
         checkout,
-        script: retire,
+        script: Some(retire),
         base,
         patches: &patches,
         decide_cmd: &cmd,

@@ -731,7 +731,9 @@ commented reference, and the template `agent-fleet init` writes): a `session` (a
 in, from `HERDR_SESSION`), a `base` ref (default `origin/main`), a
 `brief` template next to the file with `@@KEY@@` placeholders, an optional `ready` script run
 inside a new worktree before the agent starts, an optional `retire` script (same path rules) run
-with a closed agent's worktree as `$1`, `[merge]` for `agent-fleet merge` (see Merging),
+with a closed agent's worktree as `$1` (absent: `agent-fleet retire` runs `git worktree remove`,
+`--force` only after `--decide=delete`, which takes ignored build output such as `target/` along;
+the host's retire of a closed pane runs nothing), `[merge]` for `agent-fleet merge` (see Merging),
 `[vars]` for extra tokens, `[profiles]` —
 a `kind` (the `agent.start`/`agent.quota` program), `args`, `unset_env`, a `prefix` for agent
 names, an optional per-repo `cap`, a `fallback`, and `handoff_min` — and `[[rules]]`, first

@@ -354,23 +354,38 @@ pub async fn locks(checkout: &Path, wt: &Path, wait: Duration) -> Result<(Held, 
 
 /// The `retire` hook with the worktree as $1 and B's open file inherited by THIS child only:
 /// close-on-exec is cleared between fork and exec, so no other process the caller starts holds
-/// the lock. Err carries the script's own words.
+/// the lock. Err carries the script's own words. No hook: `git worktree remove`, which takes the
+/// ignored build output (`target/`) with the tree and still refuses a locked tree or files the
+/// agent wrote since the read; `--force` only when changes were accepted (`--decide=delete`).
 pub async fn run_hook(
     checkout: &Path,
     wt: &str,
-    script: &str,
+    script: Option<&str>,
     extra: &[&str],
     held: &Held,
 ) -> Result<()> {
-    let path = checkout.join(script);
-    if !path.is_file() {
-        bail!("retire script {script:?} is not in {}", checkout.display());
-    }
+    let (mut cmd, script) = match script {
+        Some(script) => {
+            let path = checkout.join(script);
+            if !path.is_file() {
+                bail!("retire script {script:?} is not in {}", checkout.display());
+            }
+            let mut cmd = tokio::process::Command::new(&path);
+            cmd.arg(wt).args(extra);
+            (cmd, script)
+        }
+        None => {
+            let mut cmd = tokio::process::Command::new("git");
+            cmd.args(["worktree", "remove"]);
+            if extra.contains(&"--decide=delete") {
+                cmd.arg("--force");
+            }
+            cmd.arg(wt);
+            (cmd, "`git worktree remove` (no `retire` hook)")
+        }
+    };
     let fd = held.0.as_raw_fd();
-    let mut cmd = tokio::process::Command::new(&path);
-    cmd.arg(wt)
-        .args(extra)
-        .current_dir(checkout)
+    cmd.current_dir(checkout)
         .env(LOCK_FD_ENV, fd.to_string())
         .kill_on_drop(true);
     // SAFETY: only fcntl runs between fork and exec, which is async-signal-safe.
@@ -461,7 +476,8 @@ pub fn patches_dir(configured: Option<&str>, home: Option<&Path>, data: &Path) -
 /// base ref, where stash writes, and the command a refusal tells its reader to run.
 pub struct Plan<'a> {
     pub checkout: &'a Path,
-    pub script: &'a str,
+    /// The repository's `retire` hook; None: `git worktree remove`.
+    pub script: Option<&'a str>,
     pub base: &'a str,
     pub patches: &'a Path,
     pub decide_cmd: &'a str,
@@ -661,18 +677,12 @@ async fn try_here(h: &Here<'_>) -> Result<Done> {
         .and_then(|mut r| r.remove(&repo));
     let checkout = checkout_for(&repo, registered, h.cwd_checkout.clone())?;
     let (cfg, _) = crate::spawn::load_in(&checkout, h.machine.as_deref())?;
-    let Some(script) = cfg.retire.clone() else {
-        bail!(
-            "{}'s fleet.toml has no `retire` hook; nothing would retire {wt}",
-            checkout.display()
-        );
-    };
     let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
     let patches = patches_dir(cfg.retire_patches.as_deref(), home.as_deref(), h.data_dir)?;
     let cmd = format!("agent-fleet retire {agent}");
     let plan = Plan {
         checkout: &checkout,
-        script: &script,
+        script: cfg.retire.as_deref(),
         base: &cfg.base,
         patches: &patches,
         decide_cmd: &cmd,
@@ -1000,7 +1010,7 @@ mod tests {
         fn plan(&self) -> Plan<'_> {
             Plan {
                 checkout: &self.co,
-                script: "x.sh",
+                script: Some("x.sh"),
                 base: "main",
                 patches: &self.patches,
                 decide_cmd: "agent-fleet retire dv-1",
@@ -1097,6 +1107,49 @@ mod tests {
         }
         assert_eq!(f.read("hook-args"), "", "the hook ran");
         assert!(f.wt.join("new.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn no_retire_hook_removes_the_worktree_with_git_build_output_and_all() {
+        let f = fx();
+        // Build output git ignores goes with the tree: `target/` is what a cargo repo leaves.
+        std::fs::write(f.wt.join(".gitignore"), "target/\n").unwrap();
+        sh(&f.wt, &["add", ".gitignore"]);
+        sh(&f.wt, &["commit", "-qm", "ignore"]);
+        std::fs::create_dir(f.wt.join("target")).unwrap();
+        std::fs::write(f.wt.join("target/bin"), "built\n").unwrap();
+        let plan = Plan {
+            script: None,
+            ..f.plan()
+        };
+        assert_eq!(
+            guarded(&plan, f.wt(), None, WAIT).await.unwrap(),
+            Outcome::Retired
+        );
+        assert!(!f.wt.exists());
+        assert_eq!(f.read("hook-args"), "", "the configured hook ran");
+    }
+
+    #[tokio::test]
+    async fn no_retire_hook_still_stops_on_changes_and_forces_only_after_delete() {
+        let f = fx();
+        f.dirty();
+        let plan = Plan {
+            script: None,
+            ..f.plan()
+        };
+        assert!(matches!(
+            guarded(&plan, f.wt(), None, WAIT).await.unwrap(),
+            Outcome::Refused(_)
+        ));
+        assert!(f.wt.join("new.txt").exists());
+        assert_eq!(
+            guarded(&plan, f.wt(), Some(Decide::Delete), WAIT)
+                .await
+                .unwrap(),
+            Outcome::Retired
+        );
+        assert!(!f.wt.exists());
     }
 
     #[tokio::test]
