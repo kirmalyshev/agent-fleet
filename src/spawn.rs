@@ -975,12 +975,14 @@ pub(crate) async fn run_retire(
 ) -> Result<()> {
     let patches = PathBuf::new(); // unused: no decision is made on a close
     let cmd = format!("agent-fleet retire {}", short(agent));
+    let scratch = crate::tmpdir::dir(agent);
     let plan = crate::retire::Plan {
         checkout,
         script: retire,
         base,
         patches: &patches,
         decide_cmd: &cmd,
+        scratch: scratch.as_deref(),
     };
     match crate::retire::guarded(&plan, worktree, None, crate::retire::HOST_WAIT).await? {
         crate::retire::Outcome::Refused(why) => bail!("{why}"),
@@ -1254,16 +1256,24 @@ async fn run_spawn(
         .await
         .with_context(|| format!("env scrub: unset {var}"))?;
     }
-    // Scratch inside the worktree: retire takes it with the tree. Best effort: a pane that
-    // refuses the line costs the isolation, not the spawn.
-    if let Err(e) = pane_run(
-        &host.cfg.herdr_socket,
-        made.pane.as_deref().unwrap_or_default(),
-        &crate::tmpdir::export_line(Path::new(&wt)),
-    )
-    .await
-    {
-        eprintln!("agent-fleet host: spawn {}: TMPDIR export: {e:#}", r.name);
+    // Scratch outside any checkout, so nothing that walks the repo meets it; retire removes it.
+    // Best effort: a pane that refuses the line costs the isolation, not the spawn.
+    match crate::tmpdir::dir(&r.agent) {
+        Some(d) => {
+            if let Err(e) = pane_run(
+                &host.cfg.herdr_socket,
+                made.pane.as_deref().unwrap_or_default(),
+                &crate::tmpdir::export_line(&d),
+            )
+            .await
+            {
+                eprintln!("agent-fleet host: spawn {}: TMPDIR export: {e:#}", r.name);
+            }
+        }
+        None => eprintln!(
+            "agent-fleet host: spawn {}: no scratch dir for {} (no home directory?); TMPDIR left as is",
+            r.name, r.agent
+        ),
     }
     agent_start(
         host,
@@ -3550,7 +3560,12 @@ profile = "devin"
         assert_eq!(texts[0], "unset SCRUB_ME");
         for v in ["TMPDIR", "TMP", "TEMP"] {
             assert!(
-                texts[1].contains(&format!("{v}='")) && texts[1].contains(".tmp'"),
+                texts[1].contains(&format!("{v}='"))
+                    && texts[1].contains(&format!(
+                        "{}/s/s-7'",
+                        crate::tmpdir::base().unwrap().display()
+                    ))
+                    && !texts[1].contains(wt.to_str().unwrap()),
                 "{}",
                 texts[1]
             );

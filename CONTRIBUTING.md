@@ -67,7 +67,7 @@ One crate, one binary. `docs/PROTOCOL.md` is the spec, `schema/` the generated J
 | `src/scan.rs` | Processes and worktrees on this machine. |
 | `src/watch.rs` | The watch tick: classifies agent-started processes as working, waiting, idle, hung or orphan. |
 | `src/stuck.rs` | Why a stuck agent is stuck, read off its screen, and the once-per-episode actions. |
-| `src/tmpdir.rs` | The per-agent scratch dir `<worktree>/.tmp`: TMPDIR export line (with its own `.gitignore`), size. |
+| `src/tmpdir.rs` | The per-agent scratch dir outside any checkout (`<cache dir>/agent-fleet/tmp/<session>/<name>`): TMPDIR export line, removal, size. |
 | `src/signal.rs` | `hook signal`: harness hook events become `agent.signal`. |
 | `src/quota.rs` | Each agent program's usage quota and `hook statusline`. |
 | `src/spawn.rs` | `fleet.toml` routing, briefs, the host's spawn executor. |

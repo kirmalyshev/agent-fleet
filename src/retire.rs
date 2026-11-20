@@ -465,6 +465,17 @@ pub struct Plan<'a> {
     pub base: &'a str,
     pub patches: &'a Path,
     pub decide_cmd: &'a str,
+    /// The agent's scratch dir (`tmpdir`), removed once its tree is: retired, or already gone.
+    pub scratch: Option<&'a Path>,
+}
+
+/// Removes the plan's scratch dir. A failure is logged, not the retire's: the tree is gone.
+fn drop_scratch(plan: &Plan<'_>) {
+    if let Some(d) = plan.scratch
+        && let Err(e) = crate::tmpdir::remove(d)
+    {
+        eprintln!("agent-fleet retire: scratch {}: {e}", d.display());
+    }
 }
 
 /// Under the locks, before anything irreversible: may this retire go on?
@@ -523,6 +534,7 @@ pub async fn finish(
 ) -> Result<Outcome> {
     let tree = Path::new(wt);
     if !tree.exists() {
+        drop_scratch(plan);
         return Ok(Outcome::Gone);
     }
     let found = match read(plan, tree) {
@@ -563,6 +575,7 @@ pub async fn finish(
     // is the hook's to judge.
     crate::scan::wait_free(tree, LINGER).await;
     run_hook(plan.checkout, wt, plan.script, &extra, b).await?;
+    drop_scratch(plan);
     Ok(stashed.map_or(Outcome::Retired, Outcome::Stashed))
 }
 
@@ -579,11 +592,15 @@ pub async fn guarded(
 ) -> Result<Outcome> {
     let tree = Path::new(wt);
     if !tree.exists() {
+        drop_scratch(plan);
         return Ok(Outcome::Gone);
     }
     let (_a, b) = locks(plan.checkout, tree, wait).await?;
     match assess(plan, wt, decide) {
-        Ready::Gone => Ok(Outcome::Gone),
+        Ready::Gone => {
+            drop_scratch(plan);
+            Ok(Outcome::Gone)
+        }
         Ready::Kept => Ok(Outcome::Kept),
         Ready::Refused(why) => Ok(Outcome::Refused(why)),
         Ready::Go => finish(plan, wt, decide, &b).await,
@@ -670,12 +687,14 @@ async fn try_here(h: &Here<'_>) -> Result<Done> {
     let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
     let patches = patches_dir(cfg.retire_patches.as_deref(), home.as_deref(), h.data_dir)?;
     let cmd = format!("agent-fleet retire {agent}");
+    let scratch = crate::tmpdir::dir(&sp.request.agent);
     let plan = Plan {
         checkout: &checkout,
         script: &script,
         base: &cfg.base,
         patches: &patches,
         decide_cmd: &cmd,
+        scratch: scratch.as_deref(),
     };
     // Locked, then read, all BEFORE the pane closes: a refusal leaves the agent up and starts no
     // host retire; the host's retire of the close that does follow waits on these locks and finds
@@ -959,6 +978,8 @@ mod tests {
         co: PathBuf,
         wt: PathBuf,
         patches: PathBuf,
+        /// The agent's scratch dir, outside the tree, holding one file.
+        scratch: PathBuf,
     }
     fn fx() -> Fx {
         fx_hook("")
@@ -989,11 +1010,15 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         let patches = root.join("patches");
+        let scratch = root.join("scratch/s/dv-1");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("mktemp.x"), "x").unwrap();
         Fx {
             _d: d,
             co,
             wt,
             patches,
+            scratch,
         }
     }
     impl Fx {
@@ -1004,6 +1029,7 @@ mod tests {
                 base: "main",
                 patches: &self.patches,
                 decide_cmd: "agent-fleet retire dv-1",
+                scratch: Some(&self.scratch),
             }
         }
         fn wt(&self) -> &str {
@@ -1057,6 +1083,7 @@ mod tests {
         assert_eq!(f.read("hook-args").trim(), f.wt());
         assert_eq!(f.read("hook-fd").trim(), "inherited");
         assert!(!f.wt.exists());
+        assert!(!f.scratch.exists(), "the scratch dir goes with the tree");
     }
 
     #[tokio::test]
@@ -1097,6 +1124,7 @@ mod tests {
         }
         assert_eq!(f.read("hook-args"), "", "the hook ran");
         assert!(f.wt.join("new.txt").exists());
+        assert!(f.scratch.exists(), "a refused retire keeps the scratch too");
     }
 
     #[tokio::test]
@@ -1111,6 +1139,7 @@ mod tests {
         );
         assert_eq!(f.read("hook-args"), "");
         assert!(f.wt.join("new.txt").exists());
+        assert!(f.scratch.exists());
     }
 
     #[tokio::test]
@@ -1266,6 +1295,10 @@ mod tests {
             Outcome::Gone
         );
         assert_eq!(f.read("hook-args"), "");
+        assert!(
+            !f.scratch.exists(),
+            "the agent is retired: its scratch goes"
+        );
     }
 
     #[test]

@@ -1,34 +1,50 @@
-//! Per-agent scratch dir: `<worktree>/.tmp`, exported as TMPDIR/TMP/TEMP into the agent's pane at
-//! spawn so test mktemps and tool scratch land inside the worktree and go with it on retire.
+//! Per-agent scratch dir, outside any checkout: `<cache dir>/agent-fleet/tmp/<session>/<name>`,
+//! exported as TMPDIR/TMP/TEMP into the agent's pane at spawn. Retire removes it; doctor sizes it.
+//! Outside the worktree so a tool that walks the repository never meets the agent's mktemps.
 
 use std::path::{Path, PathBuf};
 
-/// The agent's scratch dir inside `worktree`.
-pub fn dir(worktree: &Path) -> PathBuf {
-    worktree.join(".tmp")
+/// Where every agent's scratch dir on this machine lives: the platform cache dir's
+/// `agent-fleet/tmp` (`~/.cache/agent-fleet/tmp` on Linux). `None` without a home directory.
+pub fn base() -> Option<PathBuf> {
+    if cfg!(test) {
+        // A test's spawn or retire never makes or removes a real agent's scratch.
+        return Some(std::env::temp_dir().join(format!("agent-fleet-test-{}", std::process::id())));
+    }
+    cache_base()
 }
 
-/// Shell line for the agent's pane: make the dir, ignore everything in it for git (its own
-/// `.gitignore`, so `retire` does not count scratch as work), and point TMPDIR/TMP/TEMP at it.
-pub fn export_line(worktree: &Path) -> String {
-    let d = dir(worktree).display().to_string();
-    let q = format!("'{}'", d.replace('\'', r"'\''"));
-    let g = format!(
-        "'{}'",
-        dir(worktree)
-            .join(".gitignore")
-            .display()
-            .to_string()
-            .replace('\'', r"'\''")
-    );
-    format!("mkdir -p {q} && echo '*' > {g} && export TMPDIR={q} TMP={q} TEMP={q}")
+fn cache_base() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|b| b.cache_dir().join("agent-fleet").join("tmp"))
 }
 
-/// Scratch in use under `<worktree>/.tmp`: `size` less the `.gitignore` the export line writes.
-pub fn used(worktree: &Path) -> u64 {
-    let d = dir(worktree);
-    let own = std::fs::metadata(d.join(".gitignore")).map_or(0, |m| m.len());
-    size(&d).saturating_sub(own)
+/// The scratch dir of `agent` (`agent:<host>/<session>/<name>`) under `base`: `base/<session>/<name>`.
+/// `None` for an id without all three parts, or a session or name that would leave `base`.
+pub fn dir_in(base: &Path, agent: &str) -> Option<PathBuf> {
+    let mut it = agent.rsplit('/');
+    let (name, session) = (it.next()?, it.next()?);
+    it.next()?;
+    let ok = |s: &str| !s.is_empty() && s != "." && s != "..";
+    (ok(name) && ok(session)).then(|| base.join(session).join(name))
+}
+
+/// `dir_in` under `base()`.
+pub fn dir(agent: &str) -> Option<PathBuf> {
+    dir_in(&base()?, agent)
+}
+
+/// Shell line for the agent's pane: make `dir` and point TMPDIR/TMP/TEMP at it.
+pub fn export_line(dir: &Path) -> String {
+    let q = format!("'{}'", dir.display().to_string().replace('\'', r"'\''"));
+    format!("mkdir -p {q} && export TMPDIR={q} TMP={q} TEMP={q}")
+}
+
+/// Removes `dir` and everything in it; a missing one is already removed.
+pub fn remove(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        r => r,
+    }
 }
 
 /// Bytes under `d` (files only, symlinks not followed); 0 when it is missing.
@@ -45,24 +61,6 @@ pub fn size(d: &Path) -> u64 {
         .sum()
 }
 
-/// A test temp dir git cannot walk up from into a checkout. An agent's TMPDIR is
-/// `<worktree>/.tmp`, so a bare `tempdir()` there sits inside one; then fall back to `/tmp`
-/// (short, so unix-socket paths under it still fit).
-#[cfg(test)]
-pub fn plain_tempdir() -> tempfile::TempDir {
-    let tmp = std::env::temp_dir();
-    let in_checkout = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&tmp)
-        .args(["rev-parse", "--git-dir"])
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .output()
-        .is_ok_and(|o| o.status.success());
-    let base = if in_checkout { "/tmp".into() } else { tmp };
-    tempfile::tempdir_in(base).unwrap()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +71,8 @@ mod tests {
             .arg("-C")
             .arg(d)
             .args(a)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
             .output()
             .unwrap()
             .status
@@ -80,31 +80,40 @@ mod tests {
     }
 
     #[test]
-    fn export_line_points_all_three_vars_into_the_worktree_and_quotes() {
-        let l = export_line(Path::new("/w/it's"));
-        for v in ["TMPDIR", "TMP", "TEMP"] {
-            assert!(l.contains(&format!("{v}='/w/it'\\''s/.tmp'")), "{l}");
+    fn the_dir_is_session_then_name_under_the_base_and_never_leaves_it() {
+        let b = Path::new("/c/agent-fleet/tmp");
+        assert_eq!(
+            dir_in(b, "agent:h/eait/o-139"),
+            Some(b.join("eait").join("o-139"))
+        );
+        for bad in [
+            "o-139",
+            "agent:h/o-139",
+            "agent:h/s/",
+            "agent:h/../x",
+            "agent:h/s/..",
+        ] {
+            assert_eq!(dir_in(b, bad), None, "{bad}");
         }
     }
 
     #[test]
-    fn used_ignores_the_gitignore_the_export_line_writes() {
-        let d = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir(d.path())).unwrap();
-        std::fs::write(dir(d.path()).join(".gitignore"), "*\n").unwrap();
-        assert_eq!(used(d.path()), 0);
-        std::fs::write(dir(d.path()).join("x"), [0u8; 7]).unwrap();
-        assert_eq!(used(d.path()), 7);
+    fn the_base_is_the_cache_dir_not_a_checkout() {
+        let b = cache_base().unwrap();
+        assert!(b.ends_with("agent-fleet/tmp"), "{}", b.display());
+        let home = directories::BaseDirs::new()
+            .unwrap()
+            .home_dir()
+            .to_path_buf();
+        assert!(b.starts_with(home), "{}", b.display());
     }
 
     #[test]
-    fn a_plain_tempdir_is_outside_any_checkout() {
-        let d = plain_tempdir();
-        assert!(
-            !git(d.path(), &["rev-parse", "--git-dir"]),
-            "{}",
-            d.path().display()
-        );
+    fn export_line_points_all_three_vars_at_the_dir_and_quotes() {
+        let l = export_line(Path::new("/c/it's/o-1"));
+        for v in ["TMPDIR", "TMP", "TEMP"] {
+            assert!(l.contains(&format!("{v}='/c/it'\\''s/o-1'")), "{l}");
+        }
     }
 
     #[test]
@@ -118,52 +127,48 @@ mod tests {
     }
 
     #[test]
-    fn the_export_line_makes_a_shell_mktemp_land_in_tmp_and_retire_removes_it() {
+    fn remove_takes_the_dir_and_its_files_and_a_missing_one_is_fine() {
         let d = tempfile::tempdir().unwrap();
-        let main = d.path().join("main");
+        let s = d.path().join("s/o-1");
+        std::fs::create_dir_all(s.join("deep")).unwrap();
+        std::fs::write(s.join("deep/x"), "x").unwrap();
+        remove(&s).unwrap();
+        assert!(!s.exists());
+        remove(&s).unwrap();
+    }
+
+    /// The agent's case end to end: a shell mktemp after the export line lands in the scratch
+    /// dir, and the worktree it ran in shows nothing for git or a tree walk to see.
+    #[test]
+    fn the_export_line_makes_a_shell_mktemp_land_outside_the_worktree() {
+        let d = tempfile::tempdir().unwrap();
         let wt = d.path().join("wt");
-        std::fs::create_dir(&main).unwrap();
-        assert!(git(&main, &["init", "-q"]));
-        assert!(git(
-            &main,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                "i"
-            ]
-        ));
-        assert!(git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]));
+        std::fs::create_dir(&wt).unwrap();
+        assert!(git(&wt, &["init", "-q"]));
+        let scratch = dir_in(&d.path().join("cache"), "agent:h/s/o-1").unwrap();
         let out = Command::new("sh")
             .arg("-c")
             .arg(format!(
                 "{} && mktemp \"$TMPDIR/x.XXXXXX\"",
-                export_line(&wt)
+                export_line(&scratch)
             ))
+            .current_dir(&wt)
             .env_remove("TMPDIR")
             .output()
             .unwrap();
+        assert!(out.status.success(), "{out:?}");
         let made = String::from_utf8(out.stdout).unwrap();
-        assert!(Path::new(made.trim()).starts_with(dir(&wt)), "{made}");
-        // scratch is not work to retire
-        let st = Command::new("git")
-            .arg("-C")
-            .arg(&wt)
-            .args(["status", "--porcelain"])
-            .output()
-            .unwrap();
-        assert!(
-            st.stdout.is_empty(),
-            "{}",
-            String::from_utf8_lossy(&st.stdout)
+        for p in made.lines() {
+            assert!(Path::new(p).starts_with(&scratch), "{made}");
+        }
+        assert_eq!(
+            std::fs::read_dir(&wt)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>(),
+            [".git"],
+            "the worktree holds only its .git"
         );
-        // removing the worktree removes the scratch with it
-        assert!(git(&main, &["worktree", "remove", wt.to_str().unwrap()]));
-        assert!(!dir(&wt).exists());
     }
 }

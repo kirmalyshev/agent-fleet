@@ -1208,7 +1208,9 @@ async fn main() -> Result<()> {
         Cmd::Doctor { json, apply } => {
             let state = ctx.state().await?;
             let mut f = doctor::findings(&state, now);
-            f.extend(doctor::tmp_findings(&state, &ctx.host_name()));
+            if let Some(base) = tmpdir::base() {
+                f.extend(doctor::tmp_findings(&state, &ctx.host_name(), &base));
+            }
             let (cfg, cfg_err) =
                 match orphanpr::config(std::path::Path::new("."), &ctx.cli.instance) {
                     Ok(c) => (c.unwrap_or_default(), None),
