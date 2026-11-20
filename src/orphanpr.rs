@@ -698,7 +698,7 @@ mod tests {
             .context("read fleet.toml");
         assert!(missing(&gone));
         assert!(!missing(&anyhow::anyhow!("fleet.toml: bad")));
-        let dir = crate::tmpdir::plain_tempdir();
+        let dir = tempfile::tempdir().unwrap();
         let c = dir.path().join(".agent-fleet");
         std::fs::create_dir(&c).unwrap();
         std::fs::write(
@@ -736,7 +736,7 @@ mod tests {
 
     #[test]
     fn the_watch_reads_each_checkouts_fleet_toml_not_the_working_directory() {
-        let dir = crate::tmpdir::plain_tempdir();
+        let dir = tempfile::tempdir().unwrap();
         let mk = |name: &str, apply: bool| {
             let c = dir.path().join(name).join(".agent-fleet");
             std::fs::create_dir_all(&c).unwrap();

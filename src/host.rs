@@ -466,14 +466,20 @@ impl Host {
             // Read before `agent.down` is applied: it drops the agent, and its spawn record with it
             // once that is 24 h old. Only a real close retires; a pane its agent merely left, or a
             // herdr listing gap, leaves a live shell in the tree.
-            let target = matches!(reason, "pane closed" | "workspace closed")
-                .then(|| self.retire_target(&l.agent))
-                .flatten();
+            let closed = matches!(reason, "pane closed" | "workspace closed");
+            let target = closed.then(|| self.retire_target(&l.agent)).flatten();
             self.publish(self.presence(Known::AgentDown(AgentDown {
                 agent: l.agent.clone(),
                 reason: Some(reason.into()),
             })))
             .await;
+            // A closed pane's agent is gone, so is any use of its scratch dir: remove it now,
+            // not in the retire that may follow. That one can end minutes later, when a respawn
+            // under the same name already uses the dir; and none follows for a handoff's old
+            // agent, a tree already removed or a repo without a `retire` hook.
+            if closed && let Some(d) = crate::tmpdir::dir(&l.agent) {
+                crate::tmpdir::remove_logged(&d);
+            }
             if let Some((repo, wt, issue)) = target {
                 self.retire_closed(l.agent, repo, wt, issue);
             }
@@ -2258,6 +2264,21 @@ mod tests {
         );
         host.agent_down("w:2", "pane closed").await;
         assert!(types(&host).contains(&"agent.down".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_closed_pane_takes_its_agents_scratch_dir_and_a_left_one_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, _fake, _) = host_on_fake(dir.path(), "working").await;
+        let scratch = crate::tmpdir::dir("agent:h/s/a").unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("x"), "x").unwrap();
+        host.agent_down("w:1", "agent left the pane").await;
+        assert!(scratch.exists(), "a live shell may still use it");
+        let info = json!({ "name": "a", "agent": "claude", "agent_status": "idle" });
+        host.agent_up("w:1", &info).await;
+        host.agent_down("w:1", "pane closed").await;
+        assert!(!scratch.exists());
     }
 
     /// `view` folds the log once, then only applies what arrived: a quiet log hands back the

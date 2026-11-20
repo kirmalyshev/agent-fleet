@@ -23,8 +23,7 @@ jobs:
     - name: Build
       run: cargo build --verbose
     - name: Run tests
-      # TMPDIR inside the checkout, as an agent's `<worktree>/.tmp` is (#134)
-      run: mkdir -p .tmp && echo '*' > .tmp/.gitignore && TMPDIR=$PWD/.tmp cargo test --verbose
+      run: cargo test --verbose
 
   build-macos:
 

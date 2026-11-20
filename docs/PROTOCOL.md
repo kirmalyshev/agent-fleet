@@ -649,8 +649,9 @@ daemon` or `claude daemon`, and everything under such a process; the
 process's directory is known on Linux only), re-sent without `program` once the process is gone;
 `agent-fleet doctor` shows them as `unmanaged` findings.
 
-`doctor` also reads the local disk for `tmp` findings: each agent on this host whose worktree's
-`.tmp` holds files gets one finding with that directory's size in MB; an empty or missing one, or one holding only its `.gitignore`, gets none.
+`doctor` also reads the local disk for `tmp` findings: each agent scratch dir on this machine (see
+spawn below), in a session this host's agents or spawns use, that holds files gets one finding, subject `agent:<this host>/<session>/<name>`, with
+the directory's size in MB, and `no agent up` when that agent is not up; an empty one gets none.
 
 `doctor` also reads GitHub, not the log, for `orphan-pr` findings: for each repository in
 `[orphan_pr] repos` of fleet.toml (absent: the machine's connected `[repos]`; `[]`: off), an open PR whose head branch is no live agent's worktree branch and that has had no
@@ -799,8 +800,14 @@ create that fails on an existing branch is retried once after reclaiming it, and
 holds no work — no commit the remotes lack, a clean tree. With `worktree` set on the request (a
 handoff), it opens a `workspace.create` there instead and never removes the worktree. Then
 `ready` runs (new worktrees only, 15 min), each `unset_env` is typed into the pane's shell,
-`TMPDIR`, `TMP` and `TEMP` are exported there as `<worktree>/.tmp` (created with its own `.gitignore` of `*`, so `retire` does not count it as work and removes it
-with the worktree; best effort — a pane that refuses the line is logged, the spawn goes on; the host does not check that the line ran),
+`TMPDIR`, `TMP` and `TEMP` are exported there as the agent's scratch dir, outside any checkout:
+`<cache dir>/agent-fleet/tmp/<session>/<name>` (`~/.cache/agent-fleet/tmp/...` on Linux,
+`~/Library/Caches/agent-fleet/tmp/...` on macOS), created by the same line. The host removes it when the agent's pane or workspace closes (not when
+the agent only leaves its pane, nor when a pane it left closes later), so `agent-fleet retire`,
+which closes the pane, removes it too; and when its spawn fails. A retire itself never touches it: it may end minutes after the close,
+when a respawn under the same name already uses the dir. Best effort — a pane that
+refuses the line, or a machine with no home directory, is logged, the spawn goes on; the host does
+not check that the line ran),
 `agent.start` retries `agent_pane_busy` for 10 tries 2 s apart, and the brief goes out the way
 that works: `agent.wait` for `idle` (2 min),
 `agent.prompt` waiting for working|blocked|done (30 s), one Enter and another wait (15 s) on a

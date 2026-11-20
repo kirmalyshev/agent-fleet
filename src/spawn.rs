@@ -1254,16 +1254,25 @@ async fn run_spawn(
         .await
         .with_context(|| format!("env scrub: unset {var}"))?;
     }
-    // Scratch inside the worktree: retire takes it with the tree. Best effort: a pane that
-    // refuses the line costs the isolation, not the spawn.
-    if let Err(e) = pane_run(
-        &host.cfg.herdr_socket,
-        made.pane.as_deref().unwrap_or_default(),
-        &crate::tmpdir::export_line(Path::new(&wt)),
-    )
-    .await
-    {
-        eprintln!("agent-fleet host: spawn {}: TMPDIR export: {e:#}", r.name);
+    // Scratch outside any checkout, so nothing that walks the repo meets it; the pane close
+    // (`Host::agent_down`) or a failed spawn removes it.
+    // Best effort: a pane that refuses the line costs the isolation, not the spawn.
+    match crate::tmpdir::dir(&r.agent) {
+        Some(d) => {
+            if let Err(e) = pane_run(
+                &host.cfg.herdr_socket,
+                made.pane.as_deref().unwrap_or_default(),
+                &crate::tmpdir::export_line(&d),
+            )
+            .await
+            {
+                eprintln!("agent-fleet host: spawn {}: TMPDIR export: {e:#}", r.name);
+            }
+        }
+        None => eprintln!(
+            "agent-fleet host: spawn {}: no scratch dir for {} (no home directory?); TMPDIR left as is",
+            r.name, r.agent
+        ),
     }
     agent_start(
         host,
@@ -1287,6 +1296,10 @@ async fn undo(host: &Host, r: &SpawnRequested, made: &Made) {
         let _ = herdr_call(sock, "pane.close", json!({ "pane_id": p })).await;
     }
     if made.fresh {
+        // The failed agent never ran, so nothing uses its scratch dir.
+        if let Some(d) = crate::tmpdir::dir(&r.agent) {
+            crate::tmpdir::remove_logged(&d);
+        }
         if let Some(wt) = &made.worktree
             && let Err(e) = retire_in(host, &r.repo, wt, &r.agent).await
         {
@@ -2527,6 +2540,8 @@ profile = "devin"
         );
         let wt = d.path().join("wt");
         std::fs::create_dir(&wt).unwrap();
+        let scratch = crate::tmpdir::dir("agent:h/s/a").unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
         run_retire(
             d.path(),
             wt.to_str().unwrap(),
@@ -2539,6 +2554,12 @@ profile = "devin"
         assert_eq!(
             std::fs::read_to_string(wt.join("seen")).unwrap().trim(),
             wt.to_str().unwrap()
+        );
+        // A close-retire can end minutes after the pane closed, when a respawn of the same
+        // name may already use the dir: the pane close removed it, the retire leaves it be.
+        assert!(
+            scratch.exists(),
+            "the close-retire leaves the scratch alone"
         );
         std::fs::write(wt.join("dirty"), "").unwrap();
         let e = run_retire(
@@ -3550,7 +3571,12 @@ profile = "devin"
         assert_eq!(texts[0], "unset SCRUB_ME");
         for v in ["TMPDIR", "TMP", "TEMP"] {
             assert!(
-                texts[1].contains(&format!("{v}='")) && texts[1].contains(".tmp'"),
+                texts[1].contains(&format!("{v}='"))
+                    && texts[1].contains(&format!(
+                        "{}/s/s-7'",
+                        crate::tmpdir::base().unwrap().display()
+                    ))
+                    && !texts[1].contains(wt.to_str().unwrap()),
                 "{}",
                 texts[1]
             );
@@ -4235,8 +4261,11 @@ profile = "devin"
             &[("worktree.create", vec![created(wt.to_str().unwrap())])],
         )
         .await;
+        let scratch = crate::tmpdir::dir(&req(None).agent).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
         execute(&host, "req1", &spawn_of(req(None)), &State::default()).await; // ready exits 1
         assert!(!result(&host).unwrap().ok);
+        assert!(!scratch.exists(), "a failed spawn's scratch goes with it");
         assert!(
             co.join("retired-wt").exists(),
             "retire ran for the failed spawn"

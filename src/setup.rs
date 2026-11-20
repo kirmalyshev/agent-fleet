@@ -475,7 +475,7 @@ mod tests {
         assert!(e.contains("agent-fleet init"), "{e}");
         init(cfg.path(), &[]).unwrap();
 
-        let plain = crate::tmpdir::plain_tempdir();
+        let plain = tempfile::tempdir().unwrap();
         let e = add(cfg.path(), "o/r", plain.path())
             .unwrap_err()
             .to_string();
