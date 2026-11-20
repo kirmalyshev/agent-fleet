@@ -289,8 +289,8 @@ screen shows a selection dialog (`Do you want to…`, a `❯ 1.` option list, `E
 stays pending, since an Enter there would answer the dialog. A ring whose text is not on the screen
 after 2 s (or whose screen cannot be read) is logged as an alert and left pending; it is never typed a
 second time, and is acknowledged if the text later shows. An unreadable screen blocks a queued ring like a dialog. Any other `working` agent (Devin CLI,
-Codex: they take no typed input mid-turn) gets the doorbell in its pane's **mailbox** instead, a
-file in the host's data dir (`mail/<pane>/<event id>`), and `agent-fleet hook mail`, its harness's
+Codex: they take no typed input mid-turn) gets the doorbell in its **mailbox** instead, a
+file in the host's data dir (`mail/<pane>/<agent name>/<event id>`, cleared when the host starts), and `agent-fleet hook mail`, its harness's
 `PostToolUse` hook, hands it to the agent at its next tool call as `additionalContext`; a turn
 made of tool calls never goes idle, so this is its turn boundary. A doorbell gone from the mailbox
 was taken, and the host then writes `msg.delivered` (`ack: true`). One still there when the agent
@@ -581,9 +581,12 @@ the `|| true` keeps an old binary from blocking the program it hooks.
 ```
 
 `agent-fleet hook mail` is a `PostToolUse` hook (every tool) for Claude Code and Devin CLI: it
-takes the doorbells in its pane's mailbox (`HERDR_PANE_ID`) and prints them as
-`hookSpecificOutput.additionalContext`, which both harnesses add to the agent's context. With none,
-outside herdr or on any error it prints nothing and exits 0.
+takes the doorbells in its own mailbox and prints them as
+`hookSpecificOutput.additionalContext`, which both harnesses add to the agent's context. Only when
+its pane (`HERDR_PANE_ID`) has mail does it ask herdr for the pane's agent (within 1 s), so a
+pane's next agent never gets the last one's. Under Claude Code (`CLAUDECODE` set), which needs no
+mailbox, it takes nothing: a `claude -p` a busy Devin runs would otherwise take the Devin's mail. With
+none, outside herdr or on any error it prints nothing and exits 0.
 
 ```json
 { "hooks": { "PostToolUse": [ { "hooks": [ { "type": "command",

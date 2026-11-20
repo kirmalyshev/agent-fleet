@@ -1016,15 +1016,14 @@ async fn main() -> Result<()> {
             HookCmd::Mail { .. } => {
                 let mut input = String::new();
                 let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
-                if let (Some(paths), Ok("1"), Ok(pane)) = (
-                    &paths,
-                    std::env::var("HERDR_ENV").as_deref(),
-                    std::env::var("HERDR_PANE_ID"),
-                ) && let Some(text) = host::take_mail(&paths.mailbox(&pane))
+                if let Some(paths) = &paths
+                    && let Some(out) = host::mail_hook(paths, |k| std::env::var(k).ok()).await
                 {
-                    let out = json!({ "hookSpecificOutput": {
-                        "hookEventName": "PostToolUse", "additionalContext": text } });
-                    println!("{out}");
+                    // A closed stdout must not panic the hook: exit 0 whatever happens.
+                    let _ = std::io::Write::write_all(
+                        &mut std::io::stdout().lock(),
+                        format!("{out}\n").as_bytes(),
+                    );
                 }
                 std::process::exit(0);
             }
