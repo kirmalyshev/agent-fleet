@@ -3933,6 +3933,15 @@
           "description": "Open blockers by the id of their `blocker.raised`.",
           "type": "object"
         },
+        "escalated": {
+          "default": [],
+          "description": "Tells handed back to their sender as `UNREAD` (`escalations`), kept while they are queued.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
         "first_cwd": {
           "additionalProperties": {
             "type": "string"

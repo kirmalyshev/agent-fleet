@@ -1287,6 +1287,18 @@ impl Host {
         // Retransmits typed, by the ring count they answer: one typing per backoff cycle, even when
         // its `msg.delivered` fails to write (the next pass writes it, never types again).
         let mut retyped: HashMap<String, u32> = HashMap::new();
+        // Doorbells left in a pane's mailbox, with when; and those `hook mail` took, by the ring
+        // count they answer, so a lagging view never posts or rings them again.
+        let mut posted: HashMap<String, (PathBuf, chrono::DateTime<chrono::Utc>)> = HashMap::new();
+        let mut mailed: HashMap<String, Option<u32>> = HashMap::new();
+        // `posted` starts empty: a doorbell a previous run left would never be taken back, and
+        // could reach the pane's next agent or one already read. Pending tells are posted anew.
+        let root = self.paths().mail_root();
+        if let Err(err) = std::fs::remove_dir_all(&root)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("agent-fleet host: clearing {}: {err}", root.display());
+        }
         loop {
             tokio::select! {
                 _ = self.wake.notified() => {}
@@ -1324,6 +1336,14 @@ impl Host {
                     );
                 }
             }
+            // Unread 10 min by a working agent: its sender is told, once; the tell stays queued.
+            for (id, letter) in view.state.escalations(&self.cfg.host, now) {
+                let mut e = self.presence(Known::MsgSent(letter)).re(&id);
+                e.id = dead_letter_id(&[id.clone(), crate::state::UNREAD.into()]);
+                if self.publish(e).await {
+                    eprintln!("agent-fleet host: {id} unread by a working agent; its sender told");
+                }
+            }
             let dead: HashSet<&String> = dead.iter().map(|(id, _)| id).collect();
             let (pending, unread) = (&view.state.msgs, &view.state.unread);
             let live = |id: &String| pending.contains_key(id) || unread.contains_key(id);
@@ -1332,6 +1352,17 @@ impl Host {
             waiting.retain(live);
             typed.retain(live);
             retyped.retain(|id, _| unread.contains_key(id));
+            posted.retain(|id, (file, _)| {
+                live(id) || {
+                    if let Err(err) = std::fs::remove_file(&*file)
+                        && err.kind() != std::io::ErrorKind::NotFound
+                    {
+                        eprintln!("agent-fleet host: {id}: mailbox: {err}");
+                    }
+                    false
+                }
+            });
+            mailed.retain(|id, _| live(id));
             // Delivered and not read (`msg.read`) once its backoff is up: rung again, like a first
             // ring, except that its old ring on the screen proves nothing. An expired one rests.
             let due = unread
@@ -1362,6 +1393,89 @@ impl Host {
                         .find(|(_, l)| l.agent == to)
                         .map(|(p, l)| (p.clone(), l.state, l.working))
                 };
+                if mailed.get(id) == Some(&cycle) {
+                    continue;
+                }
+                // A busy agent that cannot take typed input finds its doorbell in its pane's
+                // mailbox, which `hook mail` hands it at its next tool call: taken (gone from
+                // there) is the delivery. Not taken while the agent is working in that pane, it
+                // is taken back and rung as usual.
+                // A retransmit already typed this backoff step is never posted too.
+                let typed_now = cycle.is_some() && retyped.get(id) == cycle.as_ref();
+                let mailbox = target
+                    .as_ref()
+                    .filter(|(_, state, _)| {
+                        !typed_now
+                            && *state == AgentState::Working
+                            && !crate::state::queues_input(
+                                view.state.agents.get(to).and_then(|a| a.kind.as_deref()),
+                            )
+                    })
+                    .map(|(pane, ..)| self.paths().mailbox(pane, short(to)).join(id));
+                if let Some((file, at)) = posted.get(id).cloned() {
+                    let waits = mailbox.as_ref() == Some(&file);
+                    // Only NotFound is a take: any other error (an unreadable dir) proves nothing.
+                    let res = if waits {
+                        file.try_exists().map(|there| !there)
+                    } else {
+                        match std::fs::remove_file(&file) {
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+                            r => r.map(|()| false),
+                        }
+                    };
+                    let taken = res.unwrap_or_else(|err| {
+                        eprintln!("agent-fleet host: {id}: mailbox: {err}; will retry");
+                        false
+                    });
+                    if !taken && !waits && file.exists() {
+                        continue;
+                    }
+                    if taken {
+                        let delivered = MsgDelivered {
+                            to: to.to_string(),
+                            observed: AgentState::Working,
+                            rung: Some(at),
+                            attempts: attempts.get(id).copied(),
+                            ack: true,
+                        };
+                        if self
+                            .publish(self.presence(Known::MsgDelivered(delivered)).re(id))
+                            .await
+                        {
+                            posted.remove(id);
+                            mailed.insert(id.clone(), cycle);
+                            let how = if again { "retransmitted" } else { "delivered" };
+                            eprintln!("agent-fleet host: {how} {id} to {} at a tool call", msg.to);
+                        } else {
+                            eprintln!(
+                                "agent-fleet host: {id} taken by {} but msg.delivered was not written; will retry",
+                                msg.to
+                            );
+                        }
+                        continue;
+                    }
+                    if waits {
+                        continue;
+                    }
+                    posted.remove(id);
+                }
+                if let Some(file) = mailbox {
+                    let text =
+                        doorbell(&msg.from, &msg.to, &msg.kind, &msg.reference, &msg.text, id);
+                    match post_mail(&file, &text) {
+                        Ok(()) => {
+                            posted.insert(id.clone(), (file, chrono::Utc::now()));
+                            *attempts.entry(id.clone()).or_default() += 1;
+                            bump(&self.n.rings);
+                            eprintln!(
+                                "agent-fleet host: {id} to {}: working, left in its mailbox for its next tool call",
+                                msg.to
+                            );
+                        }
+                        Err(err) => eprintln!("agent-fleet host: {id}: mailbox: {err}; will retry"),
+                    }
+                    continue;
+                }
                 let Some((pane, state, before)) = target else {
                     continue;
                 };
@@ -1530,6 +1644,13 @@ impl Host {
         }
     }
 
+    /// This host's data dir.
+    fn paths(&self) -> crate::client::Paths {
+        crate::client::Paths {
+            dir: self.cfg.data_dir.clone(),
+        }
+    }
+
     async fn queued_visible(&self, to: &str, id: &str) -> Option<bool> {
         tokio::time::sleep(QUEUE_CHECK).await;
         crate::stuck::screen(self, to).await.map(|t| has_id(&t, id))
@@ -1558,6 +1679,92 @@ pub(crate) fn dead_letter_id(ids: &[String]) -> String {
         .and_then(|id| ulid::Ulid::from_string(id).ok())
         .map_or(0, |u| u.timestamp_ms());
     ulid::Ulid::from_parts(ms, random).to_string()
+}
+
+/// Leaves a doorbell at `file` in a pane's mailbox, whole or not at all: written aside, then renamed.
+fn post_mail(file: &Path, text: &str) -> std::io::Result<()> {
+    let (Some(dir), Some(name)) = (file.parent(), file.file_name()) else {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    };
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(".{}.tmp", name.to_string_lossy()));
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, file)
+}
+
+/// `hook mail`: takes every doorbell in `mailbox`, oldest first (ids are ULIDs), as the text the
+/// agent is given; `None` with none. Each is renamed before it is read, so this and the host taking
+/// it back (`remove_file`) never both have it: whichever moves it first does.
+pub(crate) fn take_mail(mailbox: &Path) -> Option<String> {
+    let mut names: Vec<String> = std::fs::read_dir(mailbox)
+        .ok()?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| !n.starts_with('.'))
+        .collect();
+    names.sort();
+    let rings: Vec<String> = names
+        .iter()
+        .filter_map(|n| {
+            let (file, taken) = (mailbox.join(n), mailbox.join(format!(".{n}.taken")));
+            std::fs::rename(&file, &taken).ok()?;
+            match std::fs::read_to_string(&taken) {
+                Ok(text) => {
+                    let _ = std::fs::remove_file(&taken);
+                    Some(text)
+                }
+                // Put back: the host sees it still there and does not count it delivered.
+                Err(err) => {
+                    eprintln!("agent-fleet: mailbox {n}: {err}");
+                    let _ = std::fs::rename(&taken, &file);
+                    None
+                }
+            }
+        })
+        .collect();
+    (!rings.is_empty()).then(|| {
+        format!(
+            "agent-fleet: tells sent to you while you worked. Run `agent-fleet read` now and act on them:\n{}",
+            rings.join("\n")
+        )
+    })
+}
+
+/// `hook mail`'s output, the JSON line for the harness, from the environment `var` reads: only in a
+/// herdr pane, and never under Claude Code (`CLAUDECODE`), which no mailbox is for (a `claude -p`
+/// a busy Devin runs inherits its pane). herdr is asked for the pane's agent only when the pane
+/// has mail, within a second, so a tool call without mail costs two directory reads.
+pub(crate) async fn mail_hook(
+    paths: &crate::client::Paths,
+    var: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if var("HERDR_ENV").as_deref() != Some("1") || var("CLAUDECODE").is_some_and(|v| !v.is_empty())
+    {
+        return None;
+    }
+    let pane = var("HERDR_PANE_ID")?;
+    let any = paths.mailbox(&pane, "x");
+    let has_mail = std::fs::read_dir(any.parent()?).ok()?.flatten().any(|d| {
+        std::fs::read_dir(d.path()).is_ok_and(|mut f| {
+            f.any(|e| e.is_ok_and(|e| !e.file_name().to_string_lossy().starts_with('.')))
+        })
+    });
+    if !has_mail {
+        return None;
+    }
+    let sock = var("HERDR_SOCKET_PATH")?;
+    let got = tokio::time::timeout(
+        Duration::from_secs(1),
+        herdr_call(sock.as_ref(), "agent.get", json!({ "target": pane })),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    // Named as the host names it (`agent_up`): herdr's name, else the pane id.
+    let name = got["agent"]["name"].as_str().unwrap_or(&pane);
+    let text = take_mail(&paths.mailbox(&pane, name))?;
+    let out = json!({ "hookSpecificOutput": {
+        "hookEventName": "PostToolUse", "additionalContext": text } });
+    Some(out.to_string())
 }
 
 /// Deliveries after which an unread tell is rung no more (about 2 h 15 min of retransmits): an
@@ -1850,7 +2057,18 @@ mod tests {
         rings: u32,
         read: bool,
     ) -> (Arc<Host>, Arc<FakeHerdr>) {
-        let (host, fake, _) = fake_host(dir, status, "claude", ("> ", true)).await;
+        host_with_delivered_prog(dir, status, ago_min, rings, read, "claude").await
+    }
+    /// As `host_with_delivered`, the agent being a `program`.
+    async fn host_with_delivered_prog(
+        dir: &Path,
+        status: &str,
+        ago_min: i64,
+        rings: u32,
+        read: bool,
+        program: &str,
+    ) -> (Arc<Host>, Arc<FakeHerdr>) {
+        let (host, fake, _) = fake_host(dir, status, program, ("> ", true)).await;
         let now = chrono::Utc::now();
         let mut sent = tell("ASK").into_event();
         sent.ts = now - chrono::Duration::hours(1);
@@ -2238,6 +2456,255 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(fake.prompts.lock().unwrap().is_empty());
         assert!(!types(&host).contains(&"msg.delivered".to_string()));
+    }
+
+    /// Polls `f` for up to 4 s.
+    async fn until(mut f: impl FnMut() -> bool) -> bool {
+        for _ in 0..400 {
+            if f() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_busy_agent_that_cannot_queue_gets_the_tell_at_its_next_tool_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, fake, _) =
+            host_on_fake_prog(dir.path(), "working", "OK", 0, "devin", ("> ", true)).await;
+        let mailbox = crate::client::Paths {
+            dir: dir.path().into(),
+        }
+        .mailbox("w:1", "a");
+        let posted = || std::fs::read_dir(&mailbox).is_ok_and(|d| d.count() > 0);
+        assert!(until(posted).await, "posted to the pane's mailbox");
+        assert!(fake.prompts.lock().unwrap().is_empty(), "never typed");
+        assert_eq!(delivered_count(&host), 0, "not delivered until taken");
+        // `hook mail` at the agent's next tool call takes it: that is the delivery.
+        let got = take_mail(&mailbox).unwrap();
+        assert!(
+            got.contains("[agent-fleet lead→a] OK x: hi") && got.contains("ack: agent-fleet read"),
+            "{got}"
+        );
+        assert!(take_mail(&mailbox).is_none(), "taken once");
+        host.wake.notify_one();
+        assert!(until(|| delivered_count(&host) == 1).await);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        host.wake.notify_one();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(delivered_count(&host), 1, "delivered once");
+        assert!(take_mail(&mailbox).is_none(), "never posted again");
+        assert!(fake.prompts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mailbox_tell_not_taken_is_rung_once_the_agent_turns_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, fake, _) =
+            host_on_fake_prog(dir.path(), "working", "OK", 0, "devin", ("> ", true)).await;
+        let mailbox = crate::client::Paths {
+            dir: dir.path().into(),
+        }
+        .mailbox("w:1", "a");
+        assert!(until(|| std::fs::read_dir(&mailbox).is_ok_and(|d| d.count() > 0)).await);
+        fake.set("idle").await;
+        host.wake.notify_one();
+        assert!(
+            until(|| !fake.prompts.lock().unwrap().is_empty()).await,
+            "rung"
+        );
+        assert!(take_mail(&mailbox).is_none(), "taken back from the mailbox");
+        assert_eq!(fake.prompts.lock().unwrap().len(), 1);
+    }
+
+    fn mail_of(dir: &Path) -> PathBuf {
+        crate::client::Paths { dir: dir.into() }.mailbox("w:1", "a")
+    }
+    fn has_mail(dir: &Path) -> bool {
+        std::fs::read_dir(mail_of(dir)).is_ok_and(|d| d.count() > 0)
+    }
+
+    #[tokio::test]
+    async fn a_retransmit_to_a_working_devin_goes_through_its_mailbox_once_per_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, fake) =
+            host_with_delivered_prog(dir.path(), "working", 6, 1, false, "devin").await;
+        assert!(
+            until(|| has_mail(dir.path())).await,
+            "the retransmit is posted"
+        );
+        assert!(take_mail(&mail_of(dir.path())).is_some());
+        host.wake.notify_one();
+        assert!(until(|| delivered_count(&host) == 2).await);
+        for _ in 0..2 {
+            host.wake.notify_one();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        assert_eq!(delivered_count(&host), 2, "one delivery for the step");
+        assert!(take_mail(&mail_of(dir.path())).is_none(), "posted once");
+        assert!(fake.prompts.lock().unwrap().is_empty(), "never typed");
+    }
+
+    #[tokio::test]
+    async fn a_mailbox_tell_is_taken_back_when_the_agent_blocks_or_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, fake, _) =
+            host_on_fake_prog(dir.path(), "working", "OK", 0, "devin", ("> ", true)).await;
+        assert!(until(|| has_mail(dir.path())).await);
+        // Blocked on a dialog: taken back, nothing typed; working again, posted again.
+        fake.set("blocked").await;
+        host.wake.notify_one();
+        assert!(until(|| !has_mail(dir.path())).await, "taken back");
+        assert!(fake.prompts.lock().unwrap().is_empty() && delivered_count(&host) == 0);
+        fake.set("working").await;
+        host.wake.notify_one();
+        assert!(until(|| has_mail(dir.path())).await, "posted again");
+        // Read meanwhile (`agent-fleet read`): gone from the mailbox, never handed over.
+        let id = host
+            .view()
+            .unwrap()
+            .state
+            .msgs
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let read = Envelope::new(
+            Actor {
+                kind: ActorKind::Agent,
+                id: "agent:h/s/a".into(),
+            },
+            "p",
+            Known::MsgRead(MsgRead {}),
+        )
+        .re(&id)
+        .into_event();
+        host.replica.lock().unwrap().append(&read).unwrap();
+        host.wake.notify_one();
+        assert!(until(|| !has_mail(dir.path())).await, "removed once read");
+        assert_eq!(delivered_count(&host), 0);
+    }
+
+    #[tokio::test]
+    async fn a_doorbell_a_previous_run_left_is_cleared_at_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = crate::client::Paths {
+            dir: dir.path().into(),
+        }
+        .mailbox("w:9", "gone");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("01OLD"), "old ring").unwrap();
+        let (_host, _fake, _) =
+            host_on_fake_prog(dir.path(), "idle", "OK", 0, "devin", ("> ", true)).await;
+        assert!(until(|| !stale.join("01OLD").exists()).await);
+    }
+
+    #[tokio::test]
+    async fn an_unread_tell_goes_back_to_its_sender_once_and_stays_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, _fake, _) = fake_host(dir.path(), "working", "devin", ("> ", true)).await;
+        let lead = json!({ "name": "lead", "agent": "claude", "agent_status": "idle" });
+        host.agent_up("w:2", &lead).await;
+        let mut msg = tell("ASK").into_event();
+        msg.ts -= chrono::Duration::minutes(11);
+        host.replica.lock().unwrap().append(&msg).unwrap();
+        tokio::spawn(host.clone().delivery_loop());
+        host.wake.notify_one();
+        assert!(until(|| host.view().unwrap().state.escalated.contains(&msg.id)).await);
+        for _ in 0..2 {
+            host.wake.notify_one();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        let v = host.view().unwrap();
+        let letter = dead_letter_id(&[msg.id.clone(), crate::state::UNREAD.into()]);
+        let back: Vec<&crate::state::Msg> = v
+            .state
+            .msgs
+            .iter()
+            .chain(v.state.unread.iter().map(|(id, u)| (id, &u.msg)))
+            .filter(|(_, m)| m.kind == crate::state::UNREAD)
+            .map(|(id, m)| {
+                assert_eq!(id, &letter, "a stable id");
+                m
+            })
+            .collect();
+        assert_eq!(back.len(), 1, "once");
+        assert_eq!(back[0].to, "agent:h/s/lead");
+        assert!(v.state.msgs.contains_key(&msg.id), "the tell stays queued");
+    }
+
+    #[tokio::test]
+    async fn hook_mail_hands_its_own_agent_its_mail_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_host, _fake, _) = fake_host(dir.path(), "working", "devin", ("> ", true)).await;
+        let paths = crate::client::Paths {
+            dir: dir.path().into(),
+        };
+        let post = |name: &str, id: &str| {
+            post_mail(
+                &paths.mailbox("w:1", name).join(id),
+                &format!("ring for {name}"),
+            )
+            .unwrap()
+        };
+        let sock = dir.path().join("herdr.sock").to_string_lossy().to_string();
+        let env = |extra: &'static [(&'static str, &'static str)]| {
+            let sock = sock.clone();
+            move |k: &str| {
+                let base = [("HERDR_ENV", "1"), ("HERDR_PANE_ID", "w:1")];
+                if k == "HERDR_SOCKET_PATH" {
+                    return Some(sock.clone());
+                }
+                base.iter()
+                    .chain(extra)
+                    .rev()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert!(mail_hook(&paths, env(&[])).await.is_none(), "no mail");
+        // The pane's previous agent's mail is not this one's (herdr names it `a`).
+        post("b", "01B");
+        assert!(mail_hook(&paths, env(&[])).await.is_none());
+        post("a", "01A");
+        assert!(
+            mail_hook(&paths, env(&[("HERDR_ENV", "0")]))
+                .await
+                .is_none()
+        );
+        assert!(
+            mail_hook(&paths, env(&[("CLAUDECODE", "1")]))
+                .await
+                .is_none()
+        );
+        let out: Value = serde_json::from_str(&mail_hook(&paths, env(&[])).await.unwrap()).unwrap();
+        assert_eq!(out["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+        let text = out["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(
+            text.contains("ring for a") && !text.contains("ring for b"),
+            "{text}"
+        );
+        assert!(paths.mailbox("w:1", "b").join("01B").exists());
+    }
+
+    #[test]
+    fn take_mail_hands_over_each_doorbell_once_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let mailbox = dir.path().join("w_1");
+        assert!(take_mail(&mailbox).is_none(), "no mailbox, no mail");
+        std::fs::create_dir_all(&mailbox).unwrap();
+        std::fs::write(mailbox.join("01B"), "second").unwrap();
+        std::fs::write(mailbox.join("01A"), "first").unwrap();
+        std::fs::write(mailbox.join(".01C.tmp"), "half written").unwrap();
+        let got = take_mail(&mailbox).unwrap();
+        assert!(got.contains("agent-fleet read"), "{got}");
+        assert!(got.find("first").unwrap() < got.find("second").unwrap());
+        assert!(!got.contains("half written"));
+        assert!(take_mail(&mailbox).is_none());
     }
 
     #[tokio::test]

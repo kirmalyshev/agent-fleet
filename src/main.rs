@@ -597,6 +597,13 @@ enum HookCmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// PostToolUse hook for Claude Code and Devin CLI: hands the agent the tells its host left in
+    /// its pane's mailbox while it was busy (`additionalContext`). Always exits 0.
+    Mail {
+        /// Ignored: a hook exits 0 on any error, argument errors included.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1003,6 +1010,20 @@ async fn main() -> Result<()> {
                         &input,
                     )
                     .await;
+                }
+                std::process::exit(0);
+            }
+            HookCmd::Mail { .. } => {
+                let mut input = String::new();
+                let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+                if let Some(paths) = &paths
+                    && let Some(out) = host::mail_hook(paths, |k| std::env::var(k).ok()).await
+                {
+                    // A closed stdout must not panic the hook: exit 0 whatever happens.
+                    let _ = std::io::Write::write_all(
+                        &mut std::io::stdout().lock(),
+                        format!("{out}\n").as_bytes(),
+                    );
                 }
                 std::process::exit(0);
             }
@@ -2055,30 +2076,56 @@ async fn main() -> Result<()> {
                     a.state == AgentState::Working && state::queues_input(a.kind.as_deref())
                 });
             let waiting = state.pending_for(&to).0 + 1;
+            let me = ctx.me().await?;
+            let said = text.join(" ");
+            let text = done_text(&state, &me.id, kind, said.clone(), chrono::Utc::now());
+            if text != said {
+                eprintln!("agent-fleet: you have unread tells; run `agent-fleet read`");
+            }
             let body = MsgSent {
                 to: to.clone(),
                 kind: kind.clone(),
                 reference: reference.clone(),
-                text: text.join(" "),
+                text,
                 closes: Vec::new(),
             };
-            ctx.write(Envelope::new(
-                ctx.me().await?,
-                &ctx.cli.project,
-                Known::MsgSent(body),
-            ))
-            .await?;
+            ctx.write(Envelope::new(me, &ctx.cli.project, Known::MsgSent(body)))
+                .await?;
             if busy {
                 let how = if recipient_queues {
                     "queued, read at its next turn boundary"
                 } else {
-                    "delivers when idle"
+                    "delivers at its next tool call (`hook mail`) or when idle"
                 };
                 println!("queued: {} busy, {how} ({waiting} pending)", short(agent));
             }
         }
     }
     Ok(())
+}
+
+/// A `DONE`'s text, naming the tells `me` has not read: its lead sees it finished without them.
+fn done_text(
+    s: &State,
+    me: &str,
+    kind: &str,
+    text: String,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let mail = s.unread_for(me, now);
+    if kind != "DONE" || mail.is_empty() {
+        return text;
+    }
+    let tells: Vec<String> = mail
+        .iter()
+        .map(|(_, m)| format!("{} {} from {}", m.kind, m.reference, short(&m.from)))
+        .collect();
+    let plural = if tells.len() == 1 { "" } else { "s" };
+    format!(
+        "{text} [had {} unread tell{plural}: {}]",
+        tells.len(),
+        tells.join(", ")
+    )
 }
 
 /// `agent-fleet read`'s acks: one `msg.read` from `me` per tell `unread_for` shows it.
@@ -2381,6 +2428,37 @@ mod tests {
         );
         // The role name stays in the message, so delivery follows the role to its holder.
         assert_eq!(tell_to(&s, COORDINATOR).unwrap(), COORDINATOR);
+    }
+
+    #[test]
+    fn a_done_sent_with_unread_tells_names_them() {
+        let mut s = State::default();
+        let me = "agent:h/s/dv-1";
+        let tell = |kind: &str| state::Msg {
+            from: "agent:h/s/lead".into(),
+            to: me.into(),
+            kind: kind.into(),
+            reference: "o/r#1".into(),
+            text: "rebase first".into(),
+            since: Utc::now(),
+        };
+        let now = Utc::now();
+        assert_eq!(done_text(&s, me, "DONE", "shipped".into(), now), "shipped");
+        s.msgs.insert("01A".into(), tell("ASK"));
+        assert_eq!(
+            done_text(&s, me, "DONE", "shipped".into(), now),
+            "shipped [had 1 unread tell: ASK o/r#1 from lead]"
+        );
+        assert_eq!(
+            done_text(&s, me, "OPEN", "pr".into(), now),
+            "pr",
+            "only a DONE"
+        );
+    }
+
+    #[test]
+    fn hook_mail_eats_any_arguments() {
+        assert!(Cli::try_parse_from(["agent-fleet", "hook", "mail", "--bogus", "x"]).is_ok());
     }
 
     #[test]

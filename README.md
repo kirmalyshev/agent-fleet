@@ -297,6 +297,7 @@ file) or to `~/.claude/settings.json`:
   "hooks": {
     "PreToolUse": [ { "matcher": "Bash|exec", "hooks": [ { "type": "command",
       "command": "command -v agent-fleet >/dev/null 2>&1 || exit 0; agent-fleet hook bash" } ] } ],
+    "PostToolUse":      [ { "hooks": [ { "type": "command", "command": "agent-fleet hook mail || true" } ] } ],
     "Stop":             [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ],
     "StopFailure":      [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ],
     "Notification":     [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ],
@@ -309,6 +310,8 @@ file) or to `~/.claude/settings.json`:
 
 - `hook bash` refuses a raw `kill`, `pkill` or `killall` (use `agent-fleet kill`, which will not
   kill another agent's work) and an agent started outside herdr (use `agent-fleet spawn`).
+- `hook mail` hands a busy agent that takes no typed input (Devin CLI) the tells that arrived
+  while it worked, at its next tool call.
 - `hook signal` reports rate limits, permission prompts, questions and turn ends as
   `agent.signal`, so `ps` and `doctor` can say why an agent is stuck.
 - `hook statusline` records Claude's rate limits for the host to publish as the agent's quota.

@@ -92,7 +92,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | blocker | `blocker.raised` | what, owner?, unblocks_when?, pid?, started? (`pid`: a process on the raiser's host it waits on, `started` when that process started) | task | agent, host |
 | | `blocker.resolved` | note? (the raiser's host writes one once the blocker's `pid` is gone or started at another time) | re = the raise | agent, host |
 | question | `ask.raised` | question, options[], recommendation?, context? | task | agent |
-| comms | `msg.sent` | to (an agent id, or `coordinator`), kind, ref, text, closes? (a host's `DEADLETTER`) | re? (a `DEADLETTER`: the tell) | agent, host |
+| comms | `msg.sent` | to (an agent id, or `coordinator`), kind, ref, text, closes? (a host's `DEADLETTER`) | re? (a `DEADLETTER` or `UNREAD`: the tell) | agent, host |
 | | `ask.answered` | answer, approve?, approves?, msg — **human only**, via `POST /board/answer` | re = the ask | human |
 | | `msg.delivered` | to, observed, rung?, attempts? | re = the send | host |
 | | `msg.read` | — | re = the send | agent (the recipient) |
@@ -261,7 +261,8 @@ first showed the account out) keyed by `<host>:<kind>`,
 `tasks` (state + since, owner, lead,
 blocked_by, handoffs), open `blockers` and `asks` (with their context link) keyed by their raising event id, undelivered
 `msgs` keyed by their `msg.sent` id, delivered-but-`unread` ones (with the last delivery and
-the ring count, kept until read or handed to the coordinator), `gone` (when each agent not up
+the ring count, kept until read or handed to the coordinator), `escalated` (tells handed back to
+their sender as `UNREAD`, while queued), `gone` (when each agent not up
 went down, 24 h), `read` ones (kept 24 h after the read), the id of the `last` event folded, and the `unknown` count.
 
 ## Doorbells
@@ -287,7 +288,14 @@ written once the doorbell's event id shows on its screen 2 s later. It is never 
 screen shows a selection dialog (`Do you want to…`, a `❯ 1.` option list, `Esc to cancel`): the tell
 stays pending, since an Enter there would answer the dialog. A ring whose text is not on the screen
 after 2 s (or whose screen cannot be read) is logged as an alert and left pending; it is never typed a
-second time, and is acknowledged if the text later shows. An unreadable screen blocks a queued ring like a dialog. Any other busy agent waits. A failed ring is retried at most once a
+second time, and is acknowledged if the text later shows. An unreadable screen blocks a queued ring like a dialog. Any other `working` agent (Devin CLI,
+Codex: they take no typed input mid-turn) gets the doorbell in its **mailbox** instead, a
+file in the host's data dir (`mail/<pane>/<agent name>/<event id>`, cleared when the host starts), and `agent-fleet hook mail`, its harness's
+`PostToolUse` hook, hands it to the agent at its next tool call as `additionalContext`; a turn
+made of tool calls never goes idle, so this is its turn boundary. A doorbell gone from the mailbox
+was taken, and the host then writes `msg.delivered` (`ack: true`). One still there when the agent
+stops working or leaves the pane is taken back (the hook renames a file before reading it, so only
+one of the two gets it) and the agent is rung as usual. A blocked agent waits. A failed ring is retried at most once a
 minute; if `msg.delivered` itself cannot be written, the message stays pending. `agent-fleet doctor`
 raises `undelivered` for an up recipient whose tell has waited 10 minutes.
 
@@ -309,6 +317,15 @@ retransmit, written as another `msg.delivered`) 5 min after its delivery, then 1
 retransmit follows the rules of a first ring, except that its old ring on the screen proves
 nothing: once typed it counts as rung, and it is typed at most once per backoff step, even when
 its `msg.delivered` has to be written again.
+A tell (delivered or not) to a `working` agent still unread 10 min after it was sent goes back to
+its sender, if the sender is up: the recipient's host writes, once, a `msg.sent` to the sender with
+kind `UNREAD`, `re` = the tell, the tell's ref, and the text `[unread <age>: <recipient> is working
+and has not read it] <TYPE> <ref>: <text>`. The tell stays queued; that one event only marks it
+(state `escalated`, dropped with the tell), and its id is derived from the tell's id and `UNREAD`,
+so a retry is the same event. Status reports and the fleet's own `DEADLETTER` and `UNREAD` never go
+back. A `DONE` sent while its sender still has unread tells has them appended to its text, `[had
+<n> unread tell(s): <TYPE> <ref> from <sender>, ...]`, and `tell` reminds the sender to run
+`agent-fleet read`.
 `agent-fleet sent` shows the sender each of its tells as `sent`, `unread <age since the last
 delivery>`, or `read`; the board lists unread ones the same way. Read tells stay in the state for
 24 h after the read.
@@ -561,6 +578,19 @@ the `|| true` keeps an old binary from blocking the program it hooks.
   "Notification":     [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ],
   "PreCompact":       [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ],
   "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ] } }
+```
+
+`agent-fleet hook mail` is a `PostToolUse` hook (every tool) for Claude Code and Devin CLI: it
+takes the doorbells in its own mailbox and prints them as
+`hookSpecificOutput.additionalContext`, which both harnesses add to the agent's context. Only when
+its pane (`HERDR_PANE_ID`) has mail does it ask herdr for the pane's agent (within 1 s), so a
+pane's next agent never gets the last one's. Under Claude Code (`CLAUDECODE` set), which needs no
+mailbox, it takes nothing: a `claude -p` a busy Devin runs would otherwise take the Devin's mail. With
+none, outside herdr or on any error it prints nothing and exits 0.
+
+```json
+{ "hooks": { "PostToolUse": [ { "hooks": [ { "type": "command",
+  "command": "agent-fleet hook mail || true" } ] } ] } }
 ```
 
 `agent-fleet hook statusline` stays the status-line wrapper: it stores the `rate_limits`
