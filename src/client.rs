@@ -112,6 +112,19 @@ impl Paths {
             .unwrap_or_else(|| DEFAULT_HUB.into())
     }
 
+    /// A herdr pane's mailbox: doorbells the host leaves for a busy agent that cannot take typed
+    /// input, which `hook mail` hands it at its next tool call.
+    pub fn mailbox(&self, pane: &str) -> PathBuf {
+        let name: String = pane
+            .chars()
+            .map(|c| match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => c,
+                _ => '_',
+            })
+            .collect();
+        self.dir.join("mail").join(name)
+    }
+
     pub fn hub_file(&self) -> PathBuf {
         self.dir.join("hub")
     }

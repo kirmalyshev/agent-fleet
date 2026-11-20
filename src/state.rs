@@ -49,6 +49,9 @@ pub struct State {
     /// Read doorbells by the id of their `msg.sent`, kept for 24 h after the read.
     #[serde(default)]
     pub read: BTreeMap<String, Read>,
+    /// Tells handed back to their sender as `UNREAD` (`escalations`), kept while they are queued.
+    #[serde(default)]
+    pub escalated: BTreeSet<String>,
     /// Git worktrees by `<host>:<path>`.
     pub worktrees: BTreeMap<String, Worktree>,
     /// Processes running in worktrees (or orphaned beside them) by `<host>:<path>`.
@@ -484,8 +487,7 @@ impl Msg {
     /// waited out a host reconnect. Questions and instructions (`ASK`, `BLOCKED`, ...) never go
     /// stale; past `MSG_EXPIRE` every tell goes to the coordinator instead (`dead_letters`).
     pub fn stale(&self, now: DateTime<Utc>) -> Option<String> {
-        let status = ["MERGED", "DONE", "RETIRE", "OPEN", "FIX"];
-        (status.contains(&self.kind.as_str()) && now - self.since > MSG_FRESH).then(|| {
+        (STATUS_KINDS.contains(&self.kind.as_str()) && now - self.since > MSG_FRESH).then(|| {
             format!(
                 "{} sent {}h ago, before this host came back",
                 self.kind,
@@ -505,6 +507,15 @@ impl Msg {
 
 /// The kind of the tell that hands an expired or orphaned tell to the coordinator.
 pub const DEADLETTER: &str = "DEADLETTER";
+
+/// The kind of the tell that tells a sender its tell to a working agent is still unread.
+pub const UNREAD: &str = "UNREAD";
+
+/// A tell to a working agent still unread this long after its send goes back to its sender.
+pub const UNREAD_ESCALATE: chrono::Duration = chrono::Duration::minutes(10);
+
+/// Status reports: nothing for the recipient to act on now, nor for their sender if unread.
+const STATUS_KINDS: [&str; 5] = ["MERGED", "DONE", "RETIRE", "OPEN", "FIX"];
 
 /// A tell whose recipient is not up this long after it was sent goes to the coordinator.
 pub const GONE_AFTER: chrono::Duration = chrono::Duration::minutes(10);
@@ -556,6 +567,50 @@ impl State {
                     MsgSent {
                         to: COORDINATOR.into(),
                         kind: DEADLETTER.into(),
+                        reference: m.reference.clone(),
+                        text,
+                        closes: Vec::new(),
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Tells to a `working` agent on `host` still unread (delivered or not) `UNREAD_ESCALATE` after
+    /// the send, as `(id, letter)`: one `UNREAD` tell back to each sender that is up, once per tell
+    /// (`escalated`). The tell stays queued. Status reports and the fleet's own letters never go back.
+    pub fn escalations(&self, host: &str, now: DateTime<Utc>) -> Vec<(String, MsgSent)> {
+        self.msgs
+            .iter()
+            .chain(self.unread.iter().map(|(id, u)| (id, &u.msg)))
+            .filter(|(id, m)| {
+                !self.escalated.contains(*id)
+                    && ![DEADLETTER, UNREAD].contains(&m.kind.as_str())
+                    && !STATUS_KINDS.contains(&m.kind.as_str())
+                    && now - m.since >= UNREAD_ESCALATE
+                    && !m.expired(now)
+                    && self.agents.contains_key(&m.from)
+            })
+            .filter_map(|(id, m)| {
+                let to = self.recipient(&m.to)?;
+                let a = self.agents.get(to)?;
+                if a.host != host || a.state != AgentState::Working || m.from == to {
+                    return None;
+                }
+                let age = now - m.since;
+                let text = format!(
+                    "[unread {}h{:02}m: {to} is working and has not read it] {} {}: {}",
+                    age.num_hours(),
+                    age.num_minutes() % 60,
+                    m.kind,
+                    m.reference,
+                    m.text
+                );
+                Some((
+                    id.clone(),
+                    MsgSent {
+                        to: m.from.clone(),
+                        kind: UNREAD.into(),
                         reference: m.reference.clone(),
                         text,
                         closes: Vec::new(),
@@ -1118,6 +1173,18 @@ impl State {
                         return;
                     }
                 }
+                // A host's `UNREAD` marks the tell it names as handed back, which stays queued. One
+                // for a tell no longer queued (a host's view lagging) is dropped.
+                if d.kind == UNREAD && e.actor.kind == ActorKind::Host {
+                    let Some(re) = e
+                        .re
+                        .as_ref()
+                        .filter(|re| self.msgs.contains_key(*re) || self.unread.contains_key(*re))
+                    else {
+                        return;
+                    };
+                    self.escalated.insert(re.clone());
+                }
                 self.msgs.insert(
                     e.id.clone(),
                     Msg {
@@ -1366,6 +1433,9 @@ impl State {
         self.answers
             .retain(|_, a| e.ts - a.acked.unwrap_or(a.at) <= ANSWER_KEPT);
         self.read.retain(|_, r| e.ts - r.at <= READ_KEPT);
+        let (msgs, unread) = (&self.msgs, &self.unread);
+        self.escalated
+            .retain(|id| msgs.contains_key(id) || unread.contains_key(id));
         self.gone.retain(|_, at| e.ts - *at <= MSG_EXPIRE);
         // The reducer has no clock: a spawn is pruned once a later event's `ts` is more than
         // SPAWN_KEPT past its answer (or its request, when it was never answered) — but never
@@ -2380,6 +2450,101 @@ mod tests {
         // A second hand-over of a tell already closed (a lagging view) adds nothing.
         let n = s.msgs.len();
         s.apply(&dead(ActorKind::Host, "old"));
+        assert_eq!(s.msgs.len(), n);
+    }
+
+    #[test]
+    fn a_tell_a_working_agent_leaves_unread_goes_back_to_its_sender_once_and_stays_queued() {
+        let now = Utc::now();
+        let mut s = State::default();
+        let msg = |from: &str, kind: &str, mins: i64| Msg {
+            from: from.into(),
+            to: "agent:h/s/a".into(),
+            kind: kind.into(),
+            reference: "x#1".into(),
+            text: "stop and rebase".into(),
+            since: now - chrono::Duration::minutes(mins),
+        };
+        let up = |s: &mut State, id: &str, state: &str| {
+            s.agents.insert(
+                id.into(),
+                serde_json::from_value(serde_json::json!({
+                    "host": agent_host(id), "state": state, "since": now
+                }))
+                .unwrap(),
+            );
+        };
+        up(&mut s, "agent:h/s/a", "working");
+        up(&mut s, "agent:h/s/lead", "idle");
+        s.msgs
+            .insert("old".into(), msg("agent:h/s/lead", "ASK", 11));
+        s.msgs
+            .insert("young".into(), msg("agent:h/s/lead", "ASK", 9));
+        // Nobody to tell: a sender that is not up.
+        s.msgs
+            .insert("orphan".into(), msg("agent:h/s/gone", "ASK", 30));
+        // Nothing for the sender to act on: a status report, or the fleet's own letters.
+        s.msgs
+            .insert("report".into(), msg("agent:h/s/lead", "DONE", 30));
+        s.msgs
+            .insert("dl".into(), msg("agent:h/s/lead", DEADLETTER, 30));
+        s.unread.insert(
+            "rung".into(),
+            Unread {
+                msg: msg("agent:h/s/lead", "FYI", 20),
+                delivered: now - chrono::Duration::minutes(15),
+                rings: 2,
+            },
+        );
+        let got = s.escalations("h", now);
+        let ids: Vec<&str> = got.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["old", "rung"], "{got:?}");
+        let (_, back) = &got[0];
+        assert_eq!(
+            (
+                back.to.as_str(),
+                back.kind.as_str(),
+                back.reference.as_str()
+            ),
+            ("agent:h/s/lead", UNREAD, "x#1")
+        );
+        assert!(
+            back.text
+                .starts_with("[unread 0h11m: agent:h/s/a is working and has not read it")
+                && back.text.ends_with("] ASK x#1: stop and rebase"),
+            "{}",
+            back.text
+        );
+        assert!(
+            s.escalations("k", now).is_empty(),
+            "only the recipient's host"
+        );
+        // Idle, the agent is rung as usual: no escalation.
+        up(&mut s, "agent:h/s/a", "idle");
+        assert!(s.escalations("h", now).is_empty());
+        up(&mut s, "agent:h/s/a", "working");
+
+        // The host's letter marks the tell, which stays queued; an agent's does not.
+        let letter = |actor: ActorKind, re: &str| {
+            ev(actor, Known::MsgSent(got[0].1.clone()))
+                .re(re)
+                .into_event()
+        };
+        s.apply(&letter(ActorKind::Agent, "old"));
+        assert_eq!(s.escalations("h", now).len(), 2);
+        s.apply(&letter(ActorKind::Host, "old"));
+        s.apply(&letter(ActorKind::Host, "rung"));
+        assert!(s.escalations("h", now).is_empty(), "each goes back once");
+        assert!(s.msgs.contains_key("old") && s.unread.contains_key("rung"));
+        // Read: the mark goes with the tell, and a letter for it (a lagging view) adds nothing.
+        s.apply(
+            &ev(ActorKind::Agent, Known::MsgRead(MsgRead {}))
+                .re("old")
+                .into_event(),
+        );
+        assert!(!s.escalated.contains("old"), "pruned with its tell");
+        let n = s.msgs.len();
+        s.apply(&letter(ActorKind::Host, "old"));
         assert_eq!(s.msgs.len(), n);
     }
 
