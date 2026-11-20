@@ -652,6 +652,20 @@ pub fn herdr_writes(line: &str) -> Vec<HerdrWrite> {
     found.into_inner()
 }
 
+/// The keys `send-keys` may press in another agent's pane: they repair its input, typing nothing.
+const REPAIR_KEYS: &[&str] = &[
+    "enter",
+    "return",
+    "esc",
+    "escape",
+    "tab",
+    "backspace",
+    "up",
+    "down",
+    "left",
+    "right",
+];
+
 fn herdr_argv(w: &[String]) -> Option<HerdrWrite> {
     if base(&w[0]) != "herdr" {
         return None;
@@ -689,6 +703,15 @@ fn herdr_argv(w: &[String]) -> Option<HerdrWrite> {
             _ => {}
         }
     };
+    // Repairing a terminal's input (a queued message's Enter, a stray dialog's Esc) sends keys
+    // and no text: it passes.
+    let mut keys = rest.filter(|a| !a.starts_with('-')).peekable();
+    if verb.1 == "send-keys"
+        && keys.peek().is_some()
+        && keys.all(|k| REPAIR_KEYS.contains(&k.to_ascii_lowercase().as_str()))
+    {
+        return None;
+    }
     Some(HerdrWrite {
         session,
         target,
@@ -743,8 +766,10 @@ pub fn pane_refusal(w: &HerdrWrite, agent: &str, pane: &str) -> String {
     format!(
         "agent-fleet: typing into another agent's pane is blocked. Tell it instead: \
 `agent-fleet tell {agent} TYPE ref \"…\"` (queued, rung on its doorbell and acked when read). \
-Your own pane (`--current`) passes; a spawn's first prompt comes from the host.\n\
+Your own pane (`--current`) passes, and so does `send-keys` of named keys only, to repair its \
+input (`herdr agent send-keys {agent} enter`: {}); a spawn's first prompt comes from the host.\n\
 Blocked: {} (agent {agent} holds pane {pane})",
+        REPAIR_KEYS.join(" "),
         w.cmd
     )
 }
@@ -1323,7 +1348,7 @@ mod tests {
             at(Some("s1"), "wY9:p1")
         );
         for (line, target) in [
-            ("herdr pane send-keys w1:p2 enter", "w1:p2"),
+            ("herdr pane send-keys w1:p2 q", "w1:p2"),
             ("herdr pane run w1:p2 'just test'", "w1:p2"),
             (
                 "herdr agent prompt reviewer 'go' --wait --timeout 9",
@@ -1334,7 +1359,9 @@ mod tests {
                 "reviewer",
             ),
             ("herdr agent prompt --until idle reviewer go", "reviewer"),
-            ("herdr agent send-keys reviewer esc", "reviewer"),
+            ("herdr agent send-keys reviewer y", "reviewer"),
+            ("herdr pane send-keys w1:p2 enter h i enter", "w1:p2"),
+            ("herdr agent send-keys reviewer ctrl+c", "reviewer"),
             ("/opt/homebrew/bin/herdr pane send-text p1 x", "p1"),
             ("sleep 1 && sh -c 'herdr pane send-text p1 x'", "p1"),
             ("HERDR_X=1 herdr pane send-text p1 x", "p1"),
@@ -1355,6 +1382,10 @@ mod tests {
             "herdr agent get reviewer",
             "herdr agent start a --kind claude --pane p1",
             "herdr pane send-text --current hi",
+            // repairing a terminal's input: named keys only, no text
+            "herdr agent send-keys reviewer enter",
+            "herdr pane send-keys w1:p2 Esc",
+            "herdr agent send-keys reviewer esc esc up enter",
             "herdr --machine box pane send-text p1 x",
             "herdr --remote box pane send-text p1 x",
             "ssh box herdr agent prompt reviewer go",

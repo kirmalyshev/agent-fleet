@@ -628,7 +628,9 @@ second; `--session <name>` asks that session's socket: `<root>/herdr.sock` for `
 `default`), and points at `agent-fleet tell`. Each such refusal is logged, best effort, as
 `pane.refused` as the caller (nothing is logged from herdr's default session, where the caller
 has no agent id). The caller's own pane (any target herdr resolves to it, or `--current`)
-passes, and so does a pane no agent holds, a write to another machine (`--machine`, `--remote`,
+passes, and so does a `send-keys` of named keys only (`enter`, `return`, `esc`, `escape`, `tab`,
+`backspace`, `up`, `down`, `left`, `right`), which repairs an agent's input and types no text, a
+pane no agent holds, a write to another machine (`--machine`, `--remote`,
 `ssh <host> herdr …`) and any write the hook cannot check (no `HERDR_SOCKET_PATH`, no answer, a
 target in a shell variable). A spawn's first prompt comes from the host, not from Bash. It
 guards against a slip, not against an agent set on evading it.
