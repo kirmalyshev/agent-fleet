@@ -138,14 +138,32 @@ fn clean_pointer(wt: &Path, line: &str) -> bool {
     let Some(sub) = line.strip_prefix(" M ") else {
         return false;
     };
-    let inner = wt.join(sub);
-    is_gitlink(wt, sub)
-        && status(&inner).is_some_and(|s| s.trim().is_empty())
+    is_gitlink(wt, sub) && pushed_clean(&wt.join(sub))
+}
+
+/// A submodule checkout with nothing that lives only there: clean, every commit on a remote.
+fn pushed_clean(inner: &Path) -> bool {
+    status(inner).is_some_and(|s| s.trim().is_empty())
         && git(
-            &inner,
+            inner,
             &["rev-list", "--count", "--all", "--not", "--remotes"],
         )
         .is_some_and(|n| n.trim() == "0")
+}
+
+/// `wt`'s initialized submodules, None when it has none, else whether each is `pushed_clean`:
+/// `git worktree remove` refuses a tree with any unless forced, and forcing deletes their
+/// commits with the tree.
+// ponytail: top-level submodules only; nested ones are read through their parent's status.
+fn submodules_pushed(wt: &Path) -> Option<bool> {
+    let subs: Vec<PathBuf> = git(wt, &["ls-files", "-s"])
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.starts_with("160000"))
+        .filter_map(|l| l.split_once('\t').map(|(_, p)| wt.join(p)))
+        .filter(|p| p.join(".git").exists())
+        .collect();
+    (!subs.is_empty()).then(|| subs.iter().all(|s| pushed_clean(s)))
 }
 
 /// Every uncommitted change in `wt` that is work, labelled against `base` and `origin/<branch>`.
@@ -354,23 +372,53 @@ pub async fn locks(checkout: &Path, wt: &Path, wait: Duration) -> Result<(Held, 
 
 /// The `retire` hook with the worktree as $1 and B's open file inherited by THIS child only:
 /// close-on-exec is cleared between fork and exec, so no other process the caller starts holds
-/// the lock. Err carries the script's own words.
+/// the lock. Err carries the script's own words. No hook: `git worktree remove`, run inside the
+/// tree (so a tree another clone added resolves), which takes ignored build output (`target/`)
+/// with it (ignored `.env` files too) and refuses a locked tree. `--force` only when `finish`'s
+/// re-read found changes that were accepted (`--decide=delete|stash`; a file written after that
+/// re-read goes too), or for initialized submodules, and only when each is clean and pushed.
 pub async fn run_hook(
     checkout: &Path,
     wt: &str,
-    script: &str,
+    script: Option<&str>,
     extra: &[&str],
     held: &Held,
 ) -> Result<()> {
-    let path = checkout.join(script);
-    if !path.is_file() {
-        bail!("retire script {script:?} is not in {}", checkout.display());
-    }
+    let (mut cmd, what) = match script {
+        Some(script) => {
+            let path = checkout.join(script);
+            if !path.is_file() {
+                bail!("retire script {script:?} is not in {}", checkout.display());
+            }
+            let mut cmd = tokio::process::Command::new(&path);
+            cmd.arg(wt).args(extra);
+            (cmd, format!("retire script {script}"))
+        }
+        None => {
+            let mut cmd = tokio::process::Command::new("git");
+            cmd.args(["-C", wt, "worktree", "remove"])
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE");
+            let accepted = extra.contains(&"--decide=delete");
+            match submodules_pushed(Path::new(wt)) {
+                Some(true) => {
+                    cmd.arg("--force");
+                }
+                None if accepted => {
+                    cmd.arg("--force");
+                }
+                Some(false) => bail!(
+                    "{wt} has a submodule with uncommitted or unpushed work, which `git worktree remove --force` would delete; push it, or add a `retire` hook; nothing removed"
+                ),
+                None => {}
+            }
+            cmd.arg(wt);
+            (cmd, "`git worktree remove` (no `retire` hook)".to_string())
+        }
+    };
     let fd = held.0.as_raw_fd();
-    let mut cmd = tokio::process::Command::new(&path);
-    cmd.arg(wt)
-        .args(extra)
-        .current_dir(checkout)
+    cmd.current_dir(checkout)
         .env(LOCK_FD_ENV, fd.to_string())
         .kill_on_drop(true);
     // SAFETY: only fcntl runs between fork and exec, which is async-signal-safe.
@@ -383,13 +431,13 @@ pub async fn run_hook(
     }
     let out = tokio::time::timeout(Duration::from_secs(5 * 60), cmd.output())
         .await
-        .context("retire script timed out (5m) and was killed")?
-        .with_context(|| format!("retire script {script} did not start"))?;
+        .with_context(|| format!("{what} timed out (5m) and was killed"))?
+        .with_context(|| format!("{what} did not start"))?;
     if !out.status.success() {
         let said = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
         let (err, o) = (said(&out.stderr), said(&out.stdout));
         bail!(
-            "retire script {script} refused {wt} ({}): {}",
+            "{what} refused {wt} ({}): {}",
             out.status,
             crate::spawn::tail(if err.is_empty() { &o } else { &err })
         );
@@ -456,12 +504,12 @@ pub fn patches_dir(configured: Option<&str>, home: Option<&Path>, data: &Path) -
     }
 }
 
-/// What a retire needs besides the tree: the checkout whose `retire` hook runs, the hook (a repo
-/// with none is not retired by the fleet at all, as before), the
+/// What a retire needs besides the tree: the checkout whose `retire` hook runs, the hook, the
 /// base ref, where stash writes, and the command a refusal tells its reader to run.
 pub struct Plan<'a> {
     pub checkout: &'a Path,
-    pub script: &'a str,
+    /// fleet.toml's `retire` hook; None: `git worktree remove` (`run_hook`).
+    pub script: Option<&'a str>,
     pub base: &'a str,
     pub patches: &'a Path,
     pub decide_cmd: &'a str,
@@ -486,6 +534,26 @@ fn branch_of(tree: &Path) -> String {
 /// cannot read is an Err; a directory without one holds no git work, and the hook alone decides it.
 fn read(plan: &Plan<'_>, tree: &Path) -> Result<Vec<Change>> {
     if tree.join(".git").exists() {
+        // A hook judges its own trees; `git worktree remove` keeps only what a branch holds.
+        if plan.script.is_none()
+            && git(
+                tree,
+                &[
+                    "rev-list",
+                    "--count",
+                    "HEAD",
+                    "--not",
+                    "--branches",
+                    "--remotes",
+                ],
+            )
+            .is_some_and(|n| n.trim() != "0")
+        {
+            bail!(
+                "{} has commits on no branch (a detached HEAD or a rebase in progress), which `git worktree remove` would lose; branch them, or add a `retire` hook",
+                tree.display()
+            );
+        }
         changes(tree, plan.base, &branch_of(tree))
     } else {
         Ok(vec![])
@@ -561,7 +629,12 @@ pub async fn finish(
     // A pane that just closed leaves its own hooks (a statusline script) running a second or
     // so; the repository's hook refuses a tree with processes in it. What stays past this wait
     // is the hook's to judge.
-    crate::scan::wait_free(tree, LINGER).await;
+    let left = crate::scan::wait_free(tree, LINGER).await;
+    if plan.script.is_none() && !left.is_empty() {
+        return Ok(Outcome::Refused(format!(
+            "{wt} still has processes in it ({left:?}), and no `retire` hook judges them; nothing removed"
+        )));
+    }
     run_hook(plan.checkout, wt, plan.script, &extra, b).await?;
     Ok(stashed.map_or(Outcome::Retired, Outcome::Stashed))
 }
@@ -623,7 +696,7 @@ fn done(ok: bool, text: impl Into<String>) -> Done {
 }
 
 /// The guarded retire of `h.sp`'s agent, here: only a tree the fleet made on THIS host, locked,
-/// read, the pane closed, the repository's hook run. Never an error: whatever went wrong is the
+/// read, the pane closed, the hook (or `git worktree remove`) run. Never an error: whatever went wrong is the
 /// text of a not-ok `Done`.
 pub async fn run_here(h: &Here<'_>) -> Done {
     match try_here(h).await {
@@ -661,18 +734,12 @@ async fn try_here(h: &Here<'_>) -> Result<Done> {
         .and_then(|mut r| r.remove(&repo));
     let checkout = checkout_for(&repo, registered, h.cwd_checkout.clone())?;
     let (cfg, _) = crate::spawn::load_in(&checkout, h.machine.as_deref())?;
-    let Some(script) = cfg.retire.clone() else {
-        bail!(
-            "{}'s fleet.toml has no `retire` hook; nothing would retire {wt}",
-            checkout.display()
-        );
-    };
     let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
     let patches = patches_dir(cfg.retire_patches.as_deref(), home.as_deref(), h.data_dir)?;
     let cmd = format!("agent-fleet retire {agent}");
     let plan = Plan {
         checkout: &checkout,
-        script: &script,
+        script: cfg.retire.as_deref(),
         base: &cfg.base,
         patches: &patches,
         decide_cmd: &cmd,
@@ -1000,7 +1067,7 @@ mod tests {
         fn plan(&self) -> Plan<'_> {
             Plan {
                 checkout: &self.co,
-                script: "x.sh",
+                script: Some("x.sh"),
                 base: "main",
                 patches: &self.patches,
                 decide_cmd: "agent-fleet retire dv-1",
@@ -1097,6 +1164,120 @@ mod tests {
         }
         assert_eq!(f.read("hook-args"), "", "the hook ran");
         assert!(f.wt.join("new.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn no_retire_hook_removes_the_worktree_with_git_build_output_and_all() {
+        let f = fx();
+        // Build output git ignores goes with the tree: `target/` is what a cargo repo leaves.
+        std::fs::write(f.wt.join(".gitignore"), "target/\n").unwrap();
+        sh(&f.wt, &["add", ".gitignore"]);
+        sh(&f.wt, &["commit", "-qm", "ignore"]);
+        std::fs::create_dir(f.wt.join("target")).unwrap();
+        std::fs::write(f.wt.join("target/bin"), "built\n").unwrap();
+        let plan = no_hook(&f);
+        assert_eq!(
+            guarded(&plan, f.wt(), None, WAIT).await.unwrap(),
+            Outcome::Retired
+        );
+        assert!(!f.wt.exists());
+        assert_eq!(f.read("hook-args"), "", "the configured hook ran");
+    }
+
+    #[tokio::test]
+    async fn no_retire_hook_still_stops_on_changes_and_forces_only_after_delete() {
+        let f = fx();
+        f.dirty();
+        let plan = no_hook(&f);
+        assert!(matches!(
+            guarded(&plan, f.wt(), None, WAIT).await.unwrap(),
+            Outcome::Refused(_)
+        ));
+        assert!(f.wt.join("new.txt").exists());
+        assert_eq!(
+            guarded(&plan, f.wt(), Some(Decide::Delete), WAIT)
+                .await
+                .unwrap(),
+            Outcome::Retired
+        );
+        assert!(!f.wt.exists());
+    }
+
+    /// `f`'s tree with a committed, initialized submodule `s` cloned from a sibling repository.
+    fn with_submodule(f: &Fx) {
+        let up = f.co.parent().unwrap().join("up");
+        std::fs::create_dir(&up).unwrap();
+        sh(&up, &["init", "-q", "-b", "main"]);
+        sh(&up, &["commit", "-q", "--allow-empty", "-m", "up"]);
+        let url = up.to_str().unwrap();
+        sh(
+            &f.wt,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                url,
+                "s",
+            ],
+        );
+        sh(&f.wt, &["commit", "-qm", "sub"]);
+    }
+    fn no_hook(f: &Fx) -> Plan<'_> {
+        Plan {
+            script: None,
+            ..f.plan()
+        }
+    }
+
+    #[tokio::test]
+    async fn no_retire_hook_forces_past_clean_pushed_submodules_only() {
+        let f = fx();
+        with_submodule(&f);
+        // git alone refuses any tree with an initialized submodule
+        assert_eq!(
+            guarded(&no_hook(&f), f.wt(), None, WAIT).await.unwrap(),
+            Outcome::Retired
+        );
+        assert!(!f.wt.exists());
+
+        let f = fx();
+        with_submodule(&f);
+        let s = f.wt.join("s");
+        sh(&s, &["checkout", "-qb", "side"]);
+        sh(&s, &["commit", "-q", "--allow-empty", "-m", "only here"]);
+        sh(&s, &["checkout", "-q", "-"]);
+        f.dirty();
+        let e = guarded(&no_hook(&f), f.wt(), Some(Decide::Delete), WAIT)
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("unpushed work"), "{e:#}");
+        assert!(f.wt.join("new.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn no_retire_hook_refuses_a_locked_tree_and_commits_on_no_branch() {
+        let f = fx();
+        sh(&f.co, &["worktree", "lock", f.wt()]);
+        f.dirty();
+        let e = guarded(&no_hook(&f), f.wt(), Some(Decide::Delete), WAIT)
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("locked"), "{e:#}");
+        assert!(f.wt.join("new.txt").exists());
+
+        let f = fx();
+        sh(&f.wt, &["checkout", "-q", "--detach"]);
+        sh(&f.wt, &["commit", "-q", "--allow-empty", "-m", "detached"]);
+        let Outcome::Refused(why) = guarded(&no_hook(&f), f.wt(), Some(Decide::Delete), WAIT)
+            .await
+            .unwrap()
+        else {
+            panic!("not refused")
+        };
+        assert!(why.contains("commits on no branch"), "{why}");
+        assert!(f.wt.exists());
     }
 
     #[tokio::test]

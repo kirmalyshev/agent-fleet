@@ -977,7 +977,7 @@ pub(crate) async fn run_retire(
     let cmd = format!("agent-fleet retire {}", short(agent));
     let plan = crate::retire::Plan {
         checkout,
-        script: retire,
+        script: Some(retire),
         base,
         patches: &patches,
         decide_cmd: &cmd,
@@ -4229,7 +4229,13 @@ profile = "devin"
         let co = checkout(dir.path());
         let (host, _stub) = run(dir.path(), &[]).await;
         let a = "agent:h/s/a";
-        retire_in(&host, "o/r", "/nowhere", a).await.unwrap(); // no `retire` in fleet.toml
+        // No `retire` in fleet.toml: a close leaves the tree, though `agent-fleet retire` would not.
+        let kept = dir.path().join("kept");
+        std::fs::create_dir(&kept).unwrap();
+        retire_in(&host, "o/r", kept.to_str().unwrap(), a)
+            .await
+            .unwrap();
+        assert!(kept.exists());
         retire_cfg(
             &co,
             "#!/bin/sh\ntouch \"$(dirname \"$0\")/retired-$(basename \"$1\")\"\n",

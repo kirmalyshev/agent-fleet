@@ -476,7 +476,7 @@ impl Host {
             // A closed pane's agent is gone, so is any use of its scratch dir: remove it now,
             // not in the retire that may follow. That one can end minutes later, when a respawn
             // under the same name already uses the dir; and none follows for a handoff's old
-            // agent, a tree already removed or a repo without a `retire` hook.
+            // agent, a tree already removed or, on a close alone, a repo without a `retire` hook.
             if closed && let Some(d) = crate::tmpdir::dir(&l.agent) {
                 crate::tmpdir::remove_logged(&d);
             }
