@@ -254,13 +254,19 @@ pub fn issue_sets(s: &State, now: DateTime<Utc>) -> (HashSet<String>, HashSet<St
     (live, pending)
 }
 
-/// The issues whose latest request failed or expired within `COOLDOWN`: not tried again yet.
+/// The issues a request touched in the last `COOLDOWN` and that have no live agent to show for
+/// it: answered (failed, or ok but the agent is gone) or past `REQUEST_MAX_AGE` with nobody
+/// answering. They are not tried again yet, whatever the cause.
 pub fn cooling(s: &State, now: DateTime<Utc>) -> HashSet<String> {
     s.spawns
         .values()
-        .filter(|sp| {
-            sp.result.as_ref().is_some_and(|r| !r.ok)
-                && sp.answered.is_some_and(|t| now - t < COOLDOWN)
+        .filter(|sp| match (&sp.result, sp.answered) {
+            (Some(_), Some(t)) => now - t < COOLDOWN,
+            (None, _) => {
+                let over = now - (sp.since + crate::spawn::REQUEST_MAX_AGE);
+                over >= Duration::zero() && over < COOLDOWN
+            }
+            _ => false,
         })
         .map(target_of)
         .collect()
@@ -640,18 +646,17 @@ async fn queue(
     };
     let (live, pending) = issue_sets(s, now);
     let cold = cooling(s, now);
-    // An entry cooling after a failure gives its seat to the next one.
-    let entries: Vec<Entry> = parse_queue(&text, &cfg.aliases)
-        .into_iter()
-        .filter(|e| {
-            !cold.contains(&e.target)
-                && seen
-                    .failed
-                    .get(&e.target)
-                    .is_none_or(|t| now - *t >= COOLDOWN)
-        })
-        .collect();
-    let plan = pick(&entries, &live, &pending, seats);
+    // An entry in flight or cooling holds its line but not a seat: the next one goes first.
+    let mut hold = pending;
+    hold.extend(cold);
+    hold.extend(
+        seen.failed
+            .iter()
+            .filter(|(_, t)| now - **t < COOLDOWN)
+            .map(|(k, _)| k.clone()),
+    );
+    let entries = parse_queue(&text, &cfg.aliases);
+    let plan = pick(&entries, &live, &hold, seats);
     let mut handled: Vec<String> = Vec::new();
     for e in &plan.drop {
         handled.push(e.line.clone());
@@ -1000,11 +1005,15 @@ mod tests {
             ("old-fail", spawn("b", 2, Some(false), -30)),
             ("ok", spawn("c", 3, Some(true), -3)),
             ("pending", spawn("d", 4, None, -1)),
+            ("expired-silent", spawn("e", 5, None, -20)),
+            ("long-expired", spawn("f", 6, None, -60)),
         ] {
             st.spawns.insert(k.into(), sp);
         }
         let cold = cooling(&st, t(0));
-        assert_eq!(cold, ["o/r#1".to_string()].into());
+        // failed 3 min ago, ok 3 min ago (agent gone), unanswered past 15 min by 5 min
+        let want: HashSet<String> = ["o/r#1", "o/r#3", "o/r#5"].map(String::from).into();
+        assert_eq!(cold, want);
         let (live, pending) = issue_sets(&st, t(0));
         assert!(live.is_empty());
         assert_eq!(pending, ["o/r#4".to_string()].into());
