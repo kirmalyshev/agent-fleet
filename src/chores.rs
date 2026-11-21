@@ -173,6 +173,35 @@ pub fn pick(entries: &[Entry], live: &HashSet<String>, seats: usize) -> Plan {
     plan
 }
 
+/// The spawns that hold a seat and their issue on this host: those of live agents, and requests
+/// for this host and session not yet answered and not past `REQUEST_MAX_AGE` (older ones are
+/// expired by `spawn` itself, so they hold nothing).
+pub fn holders<'a>(
+    s: &'a State,
+    prefix: &str,
+    host: &str,
+    session: &str,
+    now: DateTime<Utc>,
+) -> Vec<&'a crate::state::Spawn> {
+    let mut out: Vec<&crate::state::Spawn> = s
+        .agents
+        .keys()
+        .filter(|id| id.starts_with(prefix))
+        .filter_map(|id| s.spawn_of(id))
+        .collect();
+    for sp in s.spawns.values() {
+        if sp.result.is_none()
+            && sp.request.host == host
+            && sp.request.session == session
+            && now - sp.since <= crate::spawn::REQUEST_MAX_AGE
+            && !out.iter().any(|o| o.request.agent == sp.request.agent)
+        {
+            out.push(sp);
+        }
+    }
+    out
+}
+
 // ---------- nudges ----------
 
 /// What a screen asks of the host.
@@ -527,13 +556,8 @@ async fn queue(
         }
     };
     let prefix = crate::spawn::agent_prefix(&host.cfg.host, &host.cfg.session);
-    let live: HashSet<String> = s
-        .agents
-        .keys()
-        .filter(|id| id.starts_with(&prefix))
-        .filter_map(|id| s.spawn_of(id))
-        // a request not yet answered holds its issue and its seat too
-        .chain(s.spawns.values().filter(|sp| sp.result.is_none()))
+    let live: HashSet<String> = holders(s, &prefix, &host.cfg.host, &host.cfg.session, now)
+        .iter()
         .map(|sp| {
             format!(
                 "{}#{}",
@@ -676,17 +700,12 @@ pub async fn serve(host: &Arc<Host>, s: &State, seen: &mut Seen) {
             let prefix = crate::spawn::agent_prefix(&host.cfg.host, &host.cfg.session);
             // Seats are the profile's cap for THIS repo, as `spawn` counts them: live agents
             // plus requests not yet answered.
-            let used: HashSet<&str> = s
-                .agents
-                .keys()
-                .filter(|id| id.starts_with(&prefix))
-                .filter_map(|id| s.spawn_of(id))
-                .chain(s.spawns.values().filter(|sp| sp.result.is_none()))
+            let used = holders(s, &prefix, &host.cfg.host, &host.cfg.session, now)
+                .iter()
                 .filter(|sp| sp.request.repo == repo && sp.request.profile == q.profile)
-                .map(|sp| sp.request.agent.as_str())
-                .collect();
+                .count();
             // One spawn per pass: a hung `spawn` must not hold the host's loop for long.
-            let seats = cap.saturating_sub(used.len()).min(1);
+            let seats = cap.saturating_sub(used).min(1);
             queue(host, s, q, seats, &dir, seen, now).await;
         }
         if let Some(sw) = &c.sweep {
@@ -752,6 +771,43 @@ mod tests {
         assert_eq!(p.spawn.len(), 1);
         assert_eq!(p.spawn[0].target, "a/b#2");
         assert!(pick(&e, &live, 0).spawn.is_empty());
+    }
+
+    #[test]
+    fn holders_are_live_agents_and_fresh_requests_for_this_host_only() {
+        let req = |agent: &str, host: &str| crate::event::SpawnRequested {
+            name: agent.into(),
+            agent: format!("agent:h/s/{agent}"),
+            host: host.into(),
+            session: "s".into(),
+            repo: "o/r".into(),
+            issue: Some(1),
+            branch: agent.into(),
+            profile: "p".into(),
+            brief: String::new(),
+            level: None,
+            lead: None,
+            worktree: None,
+            replaces: None,
+            why: String::new(),
+        };
+        let mut st = State::default();
+        for (id, host, age) in [("fresh", "h", 1), ("stale", "h", 30), ("other", "x", 1)] {
+            st.spawns.insert(
+                id.into(),
+                crate::state::Spawn {
+                    request: req(id, host),
+                    by: String::new(),
+                    project: String::new(),
+                    result: None,
+                    since: t(-age),
+                    answered: None,
+                },
+            );
+        }
+        let h = holders(&st, "agent:h/s/", "h", "s", t(0));
+        let names: Vec<&str> = h.iter().map(|s| s.request.name.as_str()).collect();
+        assert_eq!(names, ["fresh"]);
     }
 
     #[test]
