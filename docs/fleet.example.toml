@@ -87,6 +87,8 @@ profile = "claude"
 # file = "~/fleet/queue.txt"     #   (as `agent-fleet spawn`, in this checkout) while `profile` has fewer
 # aliases = { "dv-" = "owner/repo" }  # optional: `dv-12` in the file means owner/repo#12
 # profile = "devin"              #   live agents than its `cap`
+# on = "build-box"              # optional: only this host drains the queue (`[chores.sweep]` takes `on` too)
+# spawn_host = "build-box"      # optional: where the queued agent starts
 #                                # (nudges type into agents: only under `host --stuck-act`)
 # [chores.sweep]                 # a command run in this checkout, without a shell
 # run = ["./scripts/clean"]
