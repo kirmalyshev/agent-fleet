@@ -66,6 +66,7 @@ One crate, one binary. `docs/PROTOCOL.md` is the spec, `schema/` the generated J
 | `src/host.rs` | The host agent: herdr presence, replica, doorbells. |
 | `src/scan.rs` | Processes and worktrees on this machine. |
 | `src/watch.rs` | The watch tick: classifies agent-started processes as working, waiting, idle, hung or orphan. |
+| `src/chores.rs` | `[chores]`: nudges for a stuck agent, the spawn queue, the sweep command. |
 | `src/stuck.rs` | Why a stuck agent is stuck, read off its screen, and the once-per-episode actions. |
 | `src/tmpdir.rs` | The per-agent scratch dir outside any checkout (`<cache dir>/agent-fleet/tmp/<session>/<name>`): TMPDIR export line, removal, size. |
 | `src/signal.rs` | `hook signal`: harness hook events become `agent.signal`. |

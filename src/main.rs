@@ -1,4 +1,5 @@
 mod bench;
+mod chores;
 mod client;
 mod dev;
 mod doctor;
