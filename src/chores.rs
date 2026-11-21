@@ -59,8 +59,7 @@ pub struct QueueCfg {
     /// Only the host with this name drains the queue; absent, every host that has the file.
     #[serde(default)]
     pub on: Option<String>,
-    /// Where a queued agent is spawned (`spawn --host`); absent, the routing rules decide only
-    /// when there is no profile, so name it here.
+    /// Where a queued agent is spawned (`spawn --host`); absent, on the host that drains the queue.
     #[serde(default)]
     pub spawn_host: Option<String>,
 }
@@ -205,26 +204,14 @@ pub fn pick(entries: &[Entry], live: &HashSet<String>, seats: usize) -> Plan {
     plan
 }
 
-/// The spawns that hold a seat and their issue on this host: those of live agents, and requests
-/// for this host and session not yet answered and not past `REQUEST_MAX_AGE` (older ones are
-/// expired by `spawn` itself, so they hold nothing).
-pub fn holders<'a>(
-    s: &'a State,
-    prefix: &str,
-    host: &str,
-    session: &str,
-    now: DateTime<Utc>,
-) -> Vec<&'a crate::state::Spawn> {
-    let mut out: Vec<&crate::state::Spawn> = s
-        .agents
-        .keys()
-        .filter(|id| id.starts_with(prefix))
-        .filter_map(|id| s.spawn_of(id))
-        .collect();
+/// The spawns that hold a seat and their issue, fleet-wide as `spawn` counts them: those of
+/// live agents on any host, and requests not yet answered and not past `REQUEST_MAX_AGE` (older
+/// ones are expired by their host, so they hold nothing).
+pub fn holders(s: &State, now: DateTime<Utc>) -> Vec<&crate::state::Spawn> {
+    let mut out: Vec<&crate::state::Spawn> =
+        s.agents.keys().filter_map(|id| s.spawn_of(id)).collect();
     for sp in s.spawns.values() {
         if sp.result.is_none()
-            && sp.request.host == host
-            && sp.request.session == session
             && now - sp.since <= crate::spawn::REQUEST_MAX_AGE
             && !out.iter().any(|o| o.request.agent == sp.request.agent)
         {
@@ -460,6 +447,7 @@ pub struct Seen {
     nudgers: HashMap<String, Nudger>,
     last: Option<DateTime<Utc>>,
     swept: HashMap<String, DateTime<Utc>>,
+    warned: HashSet<String>,
     sweeping: Arc<std::sync::Mutex<HashSet<String>>>,
     failed: HashMap<String, DateTime<Utc>>,
 }
@@ -569,8 +557,24 @@ async fn nudge(
 
 /// Spawn what the queue's free seats allow, by running this binary's own `spawn` in the
 /// project checkout, so the queue goes through the same routing, caps and brief as a person.
+/// The arguments of the `agent-fleet spawn` that takes one queue entry.
+fn spawn_args(e: &Entry, cfg: &QueueCfg) -> Vec<String> {
+    let mut a: Vec<String> = ["spawn", &e.target, "--no-wait", "--profile", &cfg.profile]
+        .map(String::from)
+        .into();
+    if let Some(sc) = &e.scope {
+        a.extend(["--scope".into(), sc.clone()]);
+    }
+    if let Some(n) = &e.name {
+        a.extend(["--name".into(), n.clone(), "--branch".into(), n.clone()]);
+    }
+    if let Some(h) = &cfg.spawn_host {
+        a.extend(["--host".into(), h.clone()]);
+    }
+    a
+}
+
 async fn queue(
-    host: &Arc<Host>,
     s: &State,
     cfg: &QueueCfg,
     seats: usize,
@@ -587,8 +591,7 @@ async fn queue(
             return;
         }
     };
-    let prefix = crate::spawn::agent_prefix(&host.cfg.host, &host.cfg.session);
-    let live: HashSet<String> = holders(s, &prefix, &host.cfg.host, &host.cfg.session, now)
+    let live: HashSet<String> = holders(s, now)
         .iter()
         .map(|sp| {
             format!(
@@ -625,17 +628,7 @@ async fn queue(
             }
         };
         let mut c = tokio::process::Command::new(exe);
-        c.arg("spawn").arg(&e.target).arg("--no-wait");
-        c.args(["--profile", &cfg.profile]);
-        if let Some(sc) = &e.scope {
-            c.args(["--scope", sc]);
-        }
-        if let Some(n) = &e.name {
-            c.args(["--name", n, "--branch", n]);
-        }
-        if let Some(h) = &cfg.spawn_host {
-            c.args(["--host", h]);
-        }
+        c.args(spawn_args(e, cfg));
         c.current_dir(checkout).kill_on_drop(true);
         let done = tokio::time::timeout(Wait::from_secs(60), c.output()).await;
         match done {
@@ -706,6 +699,23 @@ async fn sweep(cfg: SweepCfg, checkout: PathBuf) {
     }
 }
 
+/// Whether an `on = "<host>"` key names this host; a name that is not it is logged once, since
+/// a typo would otherwise stop the queue or the sweep on every host without a word.
+fn on_here(on: &Option<String>, host: &Host, what: &str, repo: &str, seen: &mut Seen) -> bool {
+    match on {
+        Some(h) if *h != host.cfg.host => {
+            if seen.warned.insert(format!("{what}:{repo}")) {
+                eprintln!(
+                    "agent-fleet host: chores {repo}: {what} is for host {h:?}, this one is {:?}: skipped",
+                    host.cfg.host
+                );
+            }
+            false
+        }
+        _ => true,
+    }
+}
+
 /// One pass over every project checkout this host knows. Cheap when nothing is configured.
 pub async fn serve(host: &Arc<Host>, s: &State, seen: &mut Seen) {
     let now = Utc::now();
@@ -736,24 +746,23 @@ pub async fn serve(host: &Arc<Host>, s: &State, seen: &mut Seen) {
         if let Some(q) = c
             .queue
             .as_ref()
-            .filter(|q| q.on.as_ref().is_none_or(|h| *h == host.cfg.host))
+            .filter(|q| on_here(&q.on, host, "queue", &repo, seen))
         {
             let cap = fc.profiles.get(&q.profile).and_then(|p| p.cap).unwrap_or(0) as usize;
-            let prefix = crate::spawn::agent_prefix(&host.cfg.host, &host.cfg.session);
             // Seats are the profile's cap for THIS repo, as `spawn` counts them: live agents
             // plus requests not yet answered.
-            let used = holders(s, &prefix, &host.cfg.host, &host.cfg.session, now)
+            let used = holders(s, now)
                 .iter()
                 .filter(|sp| sp.request.repo == repo && sp.request.profile == q.profile)
                 .count();
             // One spawn per pass: a hung `spawn` must not hold the host's loop for long.
             let seats = cap.saturating_sub(used).min(1);
-            queue(host, s, q, seats, &dir, seen, now).await;
+            queue(s, q, seats, &dir, seen, now).await;
         }
         if let Some(sw) = c
             .sweep
             .as_ref()
-            .filter(|w| w.on.as_ref().is_none_or(|h| *h == host.cfg.host))
+            .filter(|w| on_here(&w.on, host, "sweep", &repo, seen))
         {
             let due = seen
                 .swept
@@ -840,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn holders_are_live_agents_and_fresh_requests_for_this_host_only() {
+    fn holders_are_live_agents_and_fresh_requests_on_any_host() {
         let req = |agent: &str, host: &str| crate::event::SpawnRequested {
             name: agent.into(),
             agent: format!("agent:h/s/{agent}"),
@@ -871,9 +880,37 @@ mod tests {
                 },
             );
         }
-        let h = holders(&st, "agent:h/s/", "h", "s", t(0));
+        let h = holders(&st, t(0));
         let names: Vec<&str> = h.iter().map(|s| s.request.name.as_str()).collect();
-        assert_eq!(names, ["fresh"]);
+        assert_eq!(names, ["fresh", "other"]);
+    }
+
+    #[test]
+    fn spawn_args_carry_scope_short_name_and_host() {
+        let cfg: QueueCfg =
+            toml::from_str("file = \"q\"\nprofile = \"d\"\nspawn_host = \"b\"").unwrap();
+        let a: BTreeMap<String, String> = [("dv-".to_string(), "o/r".to_string())].into();
+        let e = &parse_queue("dv-5 docs only\no/r#6", &a);
+        let want: Vec<String> = [
+            "spawn",
+            "o/r#5",
+            "--no-wait",
+            "--profile",
+            "d",
+            "--scope",
+            "docs only",
+            "--name",
+            "dv-5",
+            "--branch",
+            "dv-5",
+            "--host",
+            "b",
+        ]
+        .map(String::from)
+        .into();
+        assert_eq!(spawn_args(&e[0], &cfg), want);
+        let plain = spawn_args(&e[1], &cfg);
+        assert!(!plain.contains(&"--name".to_string()));
     }
 
     #[test]
