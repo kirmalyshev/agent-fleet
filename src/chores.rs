@@ -56,6 +56,13 @@ pub struct QueueCfg {
     pub aliases: BTreeMap<String, String>,
     /// The profile every entry spawns with; its `cap` is the number of seats.
     pub profile: String,
+    /// Only the host with this name drains the queue; absent, every host that has the file.
+    #[serde(default)]
+    pub on: Option<String>,
+    /// Where a queued agent is spawned (`spawn --host`); absent, the routing rules decide only
+    /// when there is no profile, so name it here.
+    #[serde(default)]
+    pub spawn_host: Option<String>,
 }
 
 /// `[chores.sweep]`: a command run in the project checkout.
@@ -66,6 +73,9 @@ pub struct SweepCfg {
     pub run: Vec<String>,
     #[serde(default = "default_every")]
     pub every_min: u64,
+    /// Only the host with this name runs it; absent, every host that serves the checkout.
+    #[serde(default)]
+    pub on: Option<String>,
 }
 
 fn default_every() -> u64 {
@@ -106,6 +116,9 @@ pub struct Entry {
     /// `owner/repo#N`.
     pub target: String,
     pub scope: Option<String>,
+    /// The word as written when it was a short name (`dv-eait-12`): the agent and its branch
+    /// are named by it, so two repositories' issue 12 never share a name.
+    pub name: Option<String>,
 }
 
 /// `owner/repo#N` — what `agent-fleet spawn` takes.
@@ -144,8 +157,12 @@ pub fn parse_queue(text: &str, aliases: &BTreeMap<String, String>) -> Vec<Entry>
                 return None;
             }
             let (target, rest) = t.split_once(char::is_whitespace).unwrap_or((t, ""));
-            let target = alias_target(target, aliases).unwrap_or_else(|| target.to_string());
+            let word = target;
+            let aliased = alias_target(word, aliases);
+            let name = aliased.is_some().then(|| word.to_string());
+            let target = aliased.unwrap_or_else(|| word.to_string());
             is_target(&target).then(|| Entry {
+                name,
                 line: l.to_string(),
                 target,
                 scope: Some(rest.trim().to_string()).filter(|s| !s.is_empty()),
@@ -613,6 +630,12 @@ async fn queue(
         if let Some(sc) = &e.scope {
             c.args(["--scope", sc]);
         }
+        if let Some(n) = &e.name {
+            c.args(["--name", n, "--branch", n]);
+        }
+        if let Some(h) = &cfg.spawn_host {
+            c.args(["--host", h]);
+        }
         c.current_dir(checkout).kill_on_drop(true);
         let done = tokio::time::timeout(Wait::from_secs(60), c.output()).await;
         match done {
@@ -710,7 +733,11 @@ pub async fn serve(host: &Arc<Host>, s: &State, seen: &mut Seen) {
         if let Some(n) = c.nudge.as_ref().filter(|_| host.cfg.stuck_act) {
             nudge(host, s, &repo, n, seen, now).await;
         }
-        if let Some(q) = &c.queue {
+        if let Some(q) = c
+            .queue
+            .as_ref()
+            .filter(|q| q.on.as_ref().is_none_or(|h| *h == host.cfg.host))
+        {
             let cap = fc.profiles.get(&q.profile).and_then(|p| p.cap).unwrap_or(0) as usize;
             let prefix = crate::spawn::agent_prefix(&host.cfg.host, &host.cfg.session);
             // Seats are the profile's cap for THIS repo, as `spawn` counts them: live agents
@@ -723,7 +750,11 @@ pub async fn serve(host: &Arc<Host>, s: &State, seen: &mut Seen) {
             let seats = cap.saturating_sub(used).min(1);
             queue(host, s, q, seats, &dir, seen, now).await;
         }
-        if let Some(sw) = &c.sweep {
+        if let Some(sw) = c
+            .sweep
+            .as_ref()
+            .filter(|w| w.on.as_ref().is_none_or(|h| *h == host.cfg.host))
+        {
             let due = seen
                 .swept
                 .get(&repo)
@@ -785,6 +816,9 @@ mod tests {
         assert_eq!(got, [("o/app#12", Some("scope")), ("o/other#7", None)]);
         // the line is kept as written, so it can be removed from the file
         assert_eq!(e[0].line, "dv-12 scope");
+        // a short name names the agent and branch; a full ref leaves the default
+        assert_eq!(e[1].name.as_deref(), Some("dv-x-7"));
+        assert_eq!(parse_queue("a/b#1", &a)[0].name, None);
     }
 
     #[test]
@@ -849,6 +883,12 @@ mod tests {
         let s: Config = toml::from_str("[sweep]\nrun = []").unwrap();
         assert!(s.check(&BTreeMap::new()).is_err());
         assert!(toml::from_str::<Config>("[sweep]\nrun = [\"x\"]\nbogus = 1").is_err());
+        let h: Config = toml::from_str(
+            "[queue]\nfile = \"q\"\nprofile = \"d\"\non = \"a\"\nspawn_host = \"b\"\n[sweep]\nrun = [\"x\"]\non = \"a\"",
+        )
+        .unwrap();
+        assert_eq!(h.queue.unwrap().spawn_host.as_deref(), Some("b"));
+        assert_eq!(h.sweep.unwrap().on.as_deref(), Some("a"));
     }
 
     #[test]

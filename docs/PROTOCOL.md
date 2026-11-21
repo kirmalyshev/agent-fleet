@@ -548,12 +548,12 @@ the host re-reads it each minute.
   `continue` once its announced wait is over. "Send a message to continue" or "Something went
   wrong" gets `continue` per 5 min, never while the agent is `working` (its own output may quote them). A spinner whose screen, timers aside, has not changed for 15
   min gets two Escapes and a `continue`. Nothing is typed while a selection dialog is open.
-- `[chores.queue]` (`file`, `profile`, `aliases`: a short prefix for a repository, `"dv-" = "owner/repo"` makes `dv-12` mean `owner/repo#12`): `owner/repo#N [scope]` per line, other lines left alone.
+- `[chores.queue]` (`file`, `profile`, `aliases`: a short prefix for a repository, `"dv-" = "owner/repo"` makes `dv-12` mean `owner/repo#12`; the agent and branch are then named `dv-12`; `on`: only that host drains the queue; `spawn_host`: where it spawns): `owner/repo#N [scope]` per line, other lines left alone.
   While the profile has fewer live or pending agents for this repository than its `cap` (one spawn per minute at most), the host runs
   `agent-fleet spawn <ref> --no-wait --profile <profile>` in the project checkout and removes the
   line; a line whose issue already has an agent is dropped; a failed spawn is retried after 10 min
   and gives its seat to the next line. The file is re-read before it is rewritten.
-- `[chores.sweep]` (`run` as an argument list, no shell; `every_min`, default 5): run in the
+- `[chores.sweep]` (`run` as an argument list, no shell; `every_min`, default 5; `on`: only that host runs it): run in the
   checkout, in the background, with a 15 min limit.
 
 
