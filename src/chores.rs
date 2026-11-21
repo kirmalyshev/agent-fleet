@@ -614,6 +614,27 @@ async fn nudge(
 
 /// Spawn what the queue's free seats allow, by running this binary's own `spawn` in the
 /// project checkout, so the queue goes through the same routing, caps and brief as a person.
+/// Whether `gh issue view --json state` says the issue is closed; `None` when it says nothing
+/// usable (the caller then does not spawn).
+fn closed_in(json: &[u8]) -> Option<bool> {
+    let v: serde_json::Value = serde_json::from_slice(json).ok()?;
+    Some(v["state"].as_str()?.eq_ignore_ascii_case("closed"))
+}
+
+/// Whether the entry's issue is closed, asked of `gh` (`AGENT_FLEET_GH` names it), 20 s at most.
+async fn issue_closed(e: &Entry) -> Option<bool> {
+    let (repo, n) = e.target.split_once('#')?;
+    let gh = std::env::var("AGENT_FLEET_GH").unwrap_or_else(|_| "gh".into());
+    let mut c = tokio::process::Command::new(gh);
+    c.args(["issue", "view", n, "-R", repo, "--json", "state"])
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(Wait::from_secs(20), c.output())
+        .await
+        .ok()?
+        .ok()?;
+    out.status.success().then(|| closed_in(&out.stdout))?
+}
+
 /// The arguments of the `agent-fleet spawn` that takes one queue entry.
 fn spawn_args(e: &Entry, cfg: &QueueCfg) -> Vec<String> {
     let mut a: Vec<String> = ["spawn", &e.target, "--no-wait", "--profile", &cfg.profile]
@@ -673,6 +694,28 @@ async fn queue(
         );
     }
     for e in &plan.spawn {
+        // A line for a closed issue is stale work: it leaves the queue unspawned. An answer
+        // that cannot be had holds the line for the next pass.
+        match issue_closed(e).await {
+            Some(true) => {
+                handled.push(e.line.clone());
+                eprintln!(
+                    "agent-fleet host: queue: dropped {} (issue closed)",
+                    e.target
+                );
+                continue;
+            }
+            Some(false) => {}
+            None => {
+                // cool it like a failed spawn: the next line gets the seat
+                seen.failed.insert(e.target.clone(), now);
+                eprintln!(
+                    "agent-fleet host: queue: {} state unknown, retry in 10m",
+                    e.target
+                );
+                continue;
+            }
+        }
         let exe = match std::env::current_exe() {
             Ok(x) => x,
             Err(e) => {
@@ -942,6 +985,14 @@ mod tests {
         let h = holders(&st, t(0));
         let names: Vec<&str> = h.iter().map(|s| s.request.name.as_str()).collect();
         assert_eq!(names, ["fresh", "other"]);
+    }
+
+    #[test]
+    fn closed_issue_is_read_from_gh_state_and_unknown_is_not_closed() {
+        assert_eq!(closed_in(br#"{"state":"CLOSED"}"#), Some(true));
+        assert_eq!(closed_in(br#"{"state":"OPEN"}"#), Some(false));
+        assert_eq!(closed_in(b"{}"), None);
+        assert_eq!(closed_in(b"not json"), None);
     }
 
     #[test]

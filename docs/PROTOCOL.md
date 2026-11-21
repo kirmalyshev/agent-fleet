@@ -550,7 +550,7 @@ the host re-reads it each minute.
   min gets two Escapes and a `continue`. Nothing is typed while a selection dialog is open.
 - `[chores.queue]` (`file`, `profile`, `aliases`: a short prefix for a repository, `"dv-" = "owner/repo"` makes `dv-12` mean `owner/repo#12`; the agent and branch are then named `dv-12`; `on`: only the host of that `--host-name` drains the queue (another host logs it once); `spawn_host`: where it spawns; `as`: the agent the spawns are written as and so the new agent's lead, `agent:<host>/<session>/<name>`: the host has no identity of its own, so without it `spawn` refuses): `owner/repo#N [scope]` per line, other lines left alone.
   While the profile has fewer live or pending agents for this repository than its `cap` (one spawn per minute at most), the host runs
-  `agent-fleet spawn <ref> --no-wait --profile <profile>` in the project checkout. The line stays while
+  `agent-fleet spawn <ref> --no-wait --profile <profile>` in the project checkout. A line whose issue is closed (`gh issue view`) is dropped unspawned; one whose state cannot be read is held 10 min like a failed spawn and gives its seat to the next line. The line stays while
   the request is in flight and leaves only when its agent is live, so a request nobody answers
   (a host down 15 min) loses nothing; an issue whose request failed, expired unanswered, or whose agent is gone is not tried again for 10
   min and gives its seat to the next line. The file is re-read before it is rewritten.
