@@ -144,7 +144,7 @@ pub fn drop_line(text: &str, line: &str) -> String {
     let mut gone = false;
     let mut out = String::with_capacity(text.len());
     for l in text.split_inclusive('\n') {
-        if !gone && l.trim_end_matches('\n') == line {
+        if !gone && l.trim_end_matches(['\n', '\r']) == line {
             gone = true;
             continue;
         }
@@ -206,7 +206,15 @@ fn reset_minutes(line: &str) -> Option<i64> {
         .trim_start()
         .trim_start_matches('~');
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
+    let n: i64 = digits.parse().ok()?;
+    let unit = rest[digits.len()..].trim_start();
+    Some(if unit.starts_with('h') {
+        n * 60
+    } else if unit.starts_with('s') {
+        1
+    } else {
+        n
+    })
 }
 
 pub fn classify(screen: &str, hints: &[String]) -> Option<Sight> {
@@ -264,6 +272,8 @@ const HUNG: Duration = Duration::minutes(15);
 pub struct Nudger {
     enters: u32,
     last_enter: Option<DateTime<Utc>>,
+    /// The unsent prompt was seen on an earlier pass: a person may still be typing it.
+    waited: bool,
     last_continue: Option<DateTime<Utc>>,
     rate_until: Option<DateTime<Utc>>,
     last_blocked: Option<DateTime<Utc>>,
@@ -293,6 +303,11 @@ impl Nudger {
         if !matches!(sight, Some(Sight::Unsent { .. })) {
             self.enters = 0;
             self.last_enter = None;
+            self.last_blocked = None;
+            self.waited = false;
+        }
+        if sight != Some(Sight::Stopped) {
+            self.last_continue = None;
         }
         if !matches!(sight, Some(Sight::RateLimit(_))) {
             self.rate_until = None;
@@ -312,6 +327,11 @@ impl Nudger {
         }
         match sight? {
             Sight::Unsent { text, busy } => {
+                // First sighting is no proof: a person attached to the pane may be mid-sentence.
+                if !self.waited {
+                    self.waited = true;
+                    return None;
+                }
                 if self.last_enter.is_some_and(|t| now - t < ENTER_EVERY) {
                     return None;
                 }
@@ -404,11 +424,19 @@ async fn prompt(host: &Host, name: &str, text: &str) -> bool {
     .is_ok()
 }
 
-async fn nudge(host: &Arc<Host>, s: &State, cfg: &NudgeCfg, seen: &mut Seen, now: DateTime<Utc>) {
+async fn nudge(
+    host: &Arc<Host>,
+    s: &State,
+    repo: &str,
+    cfg: &NudgeCfg,
+    seen: &mut Seen,
+    now: DateTime<Utc>,
+) {
     let prefix = crate::spawn::agent_prefix(&host.cfg.host, &host.cfg.session);
     seen.nudgers.retain(|id, _| s.agents.contains_key(id));
     for (id, a) in &s.agents {
         if !id.starts_with(&prefix)
+            || s.spawn_of(id).is_none_or(|sp| sp.request.repo != repo)
             || !a
                 .kind
                 .as_deref()
@@ -481,8 +509,13 @@ async fn queue(
     now: DateTime<Utc>,
 ) {
     let file = expand(&cfg.file);
-    let Ok(text) = std::fs::read_to_string(&file) else {
-        return;
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            eprintln!("agent-fleet host: queue: read {}: {e}", file.display());
+            return;
+        }
     };
     let prefix = crate::spawn::agent_prefix(&host.cfg.host, &host.cfg.session);
     let live: HashSet<String> = s
@@ -490,6 +523,8 @@ async fn queue(
         .keys()
         .filter(|id| id.starts_with(&prefix))
         .filter_map(|id| s.spawn_of(id))
+        // a request not yet answered holds its issue and its seat too
+        .chain(s.spawns.values().filter(|sp| sp.result.is_none()))
         .map(|sp| {
             format!(
                 "{}#{}",
@@ -498,23 +533,25 @@ async fn queue(
             )
         })
         .collect();
-    let plan = pick(&parse_queue(&text), &live, seats);
-    let mut left = text.clone();
+    // An entry cooling after a failure gives its seat to the next one.
+    let entries: Vec<Entry> = parse_queue(&text)
+        .into_iter()
+        .filter(|e| {
+            seen.failed
+                .get(&e.target)
+                .is_none_or(|t| now - *t >= Duration::minutes(10))
+        })
+        .collect();
+    let plan = pick(&entries, &live, seats);
+    let mut handled: Vec<String> = Vec::new();
     for e in &plan.drop {
-        left = drop_line(&left, &e.line);
+        handled.push(e.line.clone());
         eprintln!(
             "agent-fleet host: queue: dropped {} (already live)",
             e.target
         );
     }
     for e in &plan.spawn {
-        if seen
-            .failed
-            .get(&e.target)
-            .is_some_and(|t| now - *t < Duration::minutes(10))
-        {
-            continue;
-        }
         let Ok(exe) = std::env::current_exe() else {
             break;
         };
@@ -528,7 +565,7 @@ async fn queue(
         let done = tokio::time::timeout(Wait::from_secs(60), c.output()).await;
         match done {
             Ok(Ok(o)) if o.status.success() => {
-                left = drop_line(&left, &e.line);
+                handled.push(e.line.clone());
                 eprintln!("agent-fleet host: queue: spawn requested {}", e.target);
             }
             other => {
@@ -545,17 +582,31 @@ async fn queue(
             }
         }
     }
-    if left != text
-        && let Err(e) = std::fs::write(&file, left)
-    {
+    rewrite(&file, &handled);
+}
+
+/// Take `handled` lines out of the file as it is NOW (a person may have appended during a
+/// spawn), through a temp file and a rename so a crash never leaves it half written.
+fn rewrite(file: &Path, handled: &[String]) {
+    if handled.is_empty() {
+        return;
+    }
+    let Ok(mut now) = std::fs::read_to_string(file) else {
+        return;
+    };
+    for l in handled {
+        now = drop_line(&now, l);
+    }
+    let tmp = file.with_extension("tmp");
+    if let Err(e) = std::fs::write(&tmp, now).and_then(|_| std::fs::rename(&tmp, file)) {
         eprintln!("agent-fleet host: queue: write {}: {e}", file.display());
     }
 }
 
-async fn sweep(cfg: &SweepCfg, checkout: &Path) {
+async fn sweep(cfg: SweepCfg, checkout: PathBuf) {
     let mut c = tokio::process::Command::new(&cfg.run[0]);
     c.args(&cfg.run[1..])
-        .current_dir(checkout)
+        .current_dir(&checkout)
         .kill_on_drop(true);
     match tokio::time::timeout(Wait::from_secs(15 * 60), c.output()).await {
         Ok(Ok(o)) => {
@@ -587,16 +638,25 @@ pub async fn serve(host: &Arc<Host>, s: &State, seen: &mut Seen) {
         return;
     }
     seen.last = Some(now);
-    let Ok(checkouts) = host.cfg.checkouts_now() else {
-        return;
+    let checkouts = match host.cfg.checkouts_now() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("agent-fleet host: chores: checkouts: {e:#}");
+            return;
+        }
     };
     for (repo, dir) in checkouts {
-        let Ok((fc, _)) = crate::spawn::load_in(&dir, host.cfg.config_dir.as_deref()) else {
-            continue;
+        let fc = match crate::spawn::load_in(&dir, host.cfg.config_dir.as_deref()) {
+            Ok((fc, _)) => fc,
+            Err(e) => {
+                eprintln!("agent-fleet host: chores: {repo}: {e:#}");
+                continue;
+            }
         };
         let c = &fc.chores;
-        if let Some(n) = &c.nudge {
-            nudge(host, s, n, seen, now).await;
+        // Typing into an agent is a stuck action: only under `host --stuck-act`.
+        if let Some(n) = c.nudge.as_ref().filter(|_| host.cfg.stuck_act) {
+            nudge(host, s, &repo, n, seen, now).await;
         }
         if let Some(q) = &c.queue {
             let cap = fc.profiles.get(&q.profile).and_then(|p| p.cap).unwrap_or(0) as usize;
@@ -617,7 +677,7 @@ pub async fn serve(host: &Arc<Host>, s: &State, seen: &mut Seen) {
                 .is_none_or(|t| now - *t >= Duration::minutes(sw.every_min as i64));
             if due {
                 seen.swept.insert(repo.clone(), now);
-                sweep(sw, &dir).await;
+                tokio::spawn(sweep(sw.clone(), dir.clone()));
             }
         }
     }
@@ -699,6 +759,7 @@ mod tests {
     #[test]
     fn enter_twice_then_one_esc_resend_then_blocked() {
         let mut n = Nudger::default();
+        assert_eq!(n.step(BOX, &[], t(-1)), None); // first sighting only waits
         assert_eq!(n.step(BOX, &[], t(0)), Some(Act::Enter));
         // too soon for another Enter
         assert_eq!(n.step(BOX, &[], t(0)), None);
@@ -713,12 +774,44 @@ mod tests {
         assert!(matches!(n.step(BOX, &[], t(14)), Some(Act::Blocked(_))));
         // a clear screen starts over
         assert_eq!(n.step("$ ", &[], t(15)), None);
-        assert_eq!(n.step(BOX, &[], t(16)), Some(Act::Enter));
+        assert_eq!(n.step(BOX, &[], t(16)), None);
+        assert_eq!(n.step(BOX, &[], t(17)), Some(Act::Enter));
+    }
+
+    #[test]
+    fn drop_line_handles_crlf_and_rewrite_keeps_late_appends() {
+        assert_eq!(drop_line("a/b#1\r\na/b#2\r\n", "a/b#1"), "a/b#2\r\n");
+        let f = std::env::temp_dir().join(format!("chores-q-{}", std::process::id()));
+        std::fs::write(&f, "a/b#1\na/b#2\n").unwrap();
+        rewrite(&f, &["a/b#1".to_string()]);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "a/b#2\n");
+        std::fs::remove_file(&f).unwrap();
+    }
+
+    #[test]
+    fn rate_limit_units_and_a_second_block_after_recovery() {
+        assert_eq!(
+            classify("Rate limit, resets in 2 hours", &[]),
+            Some(Sight::RateLimit(Duration::minutes(120)))
+        );
+        let mut n = Nudger::default();
+        n.step(BOX, &[], t(-1)); // first sighting only waits
+        n.step(BOX, &[], t(0));
+        n.step(BOX, &[], t(1));
+        n.step(BOX, &[], t(2));
+        assert!(matches!(n.step(BOX, &[], t(3)), Some(Act::Blocked(_))));
+        n.step("$ ", &[], t(4));
+        n.step(BOX, &[], t(4)); // first sighting waits
+        n.step(BOX, &[], t(5));
+        n.step(BOX, &[], t(6));
+        n.step(BOX, &[], t(7));
+        assert!(matches!(n.step(BOX, &[], t(8)), Some(Act::Blocked(_))));
     }
 
     #[test]
     fn a_busy_queue_never_gets_an_escape() {
         let mut n = Nudger::default();
+        n.step(QUEUED, &[], t(-1)); // first sighting only waits
         n.step(QUEUED, &[], t(0));
         n.step(QUEUED, &[], t(1));
         assert!(matches!(n.step(QUEUED, &[], t(2)), Some(Act::Blocked(_))));
@@ -727,6 +820,7 @@ mod tests {
     #[test]
     fn an_unreadable_prompt_is_blocked_not_retyped() {
         let mut n = Nudger::default();
+        n.step("Never put it anywhere", &["Never put".to_string()], t(-1)); // first sighting only waits
         let hint = vec!["Never put".to_string()];
         let s = "Never put it anywhere";
         n.step(s, &hint, t(0));

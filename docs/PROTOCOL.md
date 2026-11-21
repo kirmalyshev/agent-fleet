@@ -535,6 +535,28 @@ the host sends ONE `ESCALATED` `msg.sent` to the lead's own lead, and so on up t
 `agent.role` chain to an up root-coordinator, never past it. Each hop waits its own
 `--stall-min` and dedupes like every tell: once per episode, by the log.
 
+## Chores
+
+A project's fleet.toml `[chores]` sets the host's housekeeping. Each table is off unless present;
+the host re-reads it each minute.
+
+- `[chores.nudge]` (`kinds`, default `devin`; `unsent_hints`): only under `host --stuck-act`, and
+  only for agents spawned for that project. An unsent prompt is seen on one pass, then gets an
+  Enter each 55 s, twice. If it still stands: one Escape and the same text again, only when the
+  text was read off the input box and no turn is busy behind it (an Escape would interrupt the
+  turn); otherwise one `BLOCKED` tell to the lead per 10 min and nothing typed. A rate limit gets
+  `continue` once its announced wait is over. "Send a message to continue" or "Something went
+  wrong" gets `continue` per 5 min. A spinner whose screen, timers aside, has not changed for 15
+  min gets two Escapes and a `continue`. Nothing is typed while a selection dialog is open.
+- `[chores.queue]` (`file`, `profile`): `owner/repo#N [scope]` per line, other lines left alone.
+  While the profile has fewer live or pending agents than its `cap`, the host runs
+  `agent-fleet spawn <ref> --no-wait --profile <profile>` in the project checkout and removes the
+  line; a line whose issue already has an agent is dropped; a failed spawn is retried after 10 min
+  and gives its seat to the next line. The file is re-read before it is rewritten.
+- `[chores.sweep]` (`run` as an argument list, no shell; `every_min`, default 5): run in the
+  checkout, in the background, with a 15 min limit.
+
+
 ## Signals
 
 `agent.signal` is the structured channel a program speaks through. `agent-fleet hook signal`
