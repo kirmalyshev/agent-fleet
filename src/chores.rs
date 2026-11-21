@@ -50,6 +50,10 @@ pub struct QueueCfg {
     /// One entry per line: `owner/repo#N [scope words]`. `#` starts a comment. A line that is
     /// not an issue reference is left alone. Absolute, or `~/…`.
     pub file: String,
+    /// Short names for a repository: with `"dv-" = "owner/repo"`, the line `dv-12` is
+    /// `owner/repo#12`. The longest matching prefix wins; the rest of the word must be digits.
+    #[serde(default)]
+    pub aliases: BTreeMap<String, String>,
     /// The profile every entry spawns with; its `cap` is the number of seats.
     pub profile: String,
 }
@@ -120,9 +124,19 @@ fn is_target(w: &str) -> bool {
     ok(owner) && ok(name) && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// `dv-12` as `owner/repo#12` under the longest matching alias.
+fn alias_target(word: &str, aliases: &BTreeMap<String, String>) -> Option<String> {
+    let (prefix, repo) = aliases
+        .iter()
+        .filter(|(p, _)| word.starts_with(p.as_str()))
+        .max_by_key(|(p, _)| p.len())?;
+    let n = &word[prefix.len()..];
+    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| format!("{repo}#{n}"))
+}
+
 /// The entries of a queue file, in order. Comments, blanks and other bookkeeping lines are
 /// not entries.
-pub fn parse_queue(text: &str) -> Vec<Entry> {
+pub fn parse_queue(text: &str, aliases: &BTreeMap<String, String>) -> Vec<Entry> {
     text.lines()
         .filter_map(|l| {
             let t = l.trim();
@@ -130,9 +144,10 @@ pub fn parse_queue(text: &str) -> Vec<Entry> {
                 return None;
             }
             let (target, rest) = t.split_once(char::is_whitespace).unwrap_or((t, ""));
-            is_target(target).then(|| Entry {
+            let target = alias_target(target, aliases).unwrap_or_else(|| target.to_string());
+            is_target(&target).then(|| Entry {
                 line: l.to_string(),
-                target: target.to_string(),
+                target,
                 scope: Some(rest.trim().to_string()).filter(|s| !s.is_empty()),
             })
         })
@@ -567,7 +582,7 @@ async fn queue(
         })
         .collect();
     // An entry cooling after a failure gives its seat to the next one.
-    let entries: Vec<Entry> = parse_queue(&text)
+    let entries: Vec<Entry> = parse_queue(&text, &cfg.aliases)
         .into_iter()
         .filter(|e| {
             seen.failed
@@ -747,12 +762,29 @@ mod tests {
     #[test]
     fn queue_lines_are_issue_refs_only() {
         let q = "# waiting\na/b#12\n\nmac/%4\na/b#13 docs only  \nnot a ref\n";
-        let e = parse_queue(q);
+        let e = parse_queue(q, &BTreeMap::new());
         assert_eq!(e.len(), 2);
         assert_eq!(e[0].target, "a/b#12");
         assert_eq!(e[0].scope, None);
         assert_eq!(e[1].target, "a/b#13");
         assert_eq!(e[1].scope.as_deref(), Some("docs only"));
+    }
+
+    #[test]
+    fn aliases_turn_short_names_into_issue_refs_longest_prefix_first() {
+        let a: BTreeMap<String, String> = [
+            ("dv-".to_string(), "o/app".to_string()),
+            ("dv-x-".to_string(), "o/other".to_string()),
+        ]
+        .into();
+        let e = parse_queue("dv-12 scope\ndv-x-7\ndv-x\ndv-1a\nmac/%3\n", &a);
+        let got: Vec<(&str, Option<&str>)> = e
+            .iter()
+            .map(|e| (e.target.as_str(), e.scope.as_deref()))
+            .collect();
+        assert_eq!(got, [("o/app#12", Some("scope")), ("o/other#7", None)]);
+        // the line is kept as written, so it can be removed from the file
+        assert_eq!(e[0].line, "dv-12 scope");
     }
 
     #[test]
@@ -764,7 +796,7 @@ mod tests {
 
     #[test]
     fn pick_spawns_only_free_seats_and_drops_live_issues() {
-        let e = parse_queue("a/b#1\na/b#2\na/b#3\na/b#2\n");
+        let e = parse_queue("a/b#1\na/b#2\na/b#3\na/b#2\n", &BTreeMap::new());
         let live: HashSet<String> = ["a/b#1".to_string()].into();
         let p = pick(&e, &live, 1);
         assert_eq!(p.drop.len(), 1);

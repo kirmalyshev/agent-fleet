@@ -85,6 +85,7 @@ profile = "claude"
 #                                #   esc esc + continue for a spinner frozen 15 min. Never into a dialog.
 # [chores.queue]                 # issues waiting for a seat: `owner/repo#N [scope]` per line; one is spawned
 # file = "~/fleet/queue.txt"     #   (as `agent-fleet spawn`, in this checkout) while `profile` has fewer
+# aliases = { "dv-" = "owner/repo" }  # optional: `dv-12` in the file means owner/repo#12
 # profile = "devin"              #   live agents than its `cap`
 #                                # (nudges type into agents: only under `host --stuck-act`)
 # [chores.sweep]                 # a command run in this checkout, without a shell
