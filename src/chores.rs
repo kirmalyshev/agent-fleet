@@ -62,6 +62,10 @@ pub struct QueueCfg {
     /// Where a queued agent is spawned (`spawn --host`); absent, on the host that drains the queue.
     #[serde(default)]
     pub spawn_host: Option<String>,
+    /// The agent the spawns are written as (`spawn --as`), and so the new agent's lead:
+    /// `agent:<host>/<session>/<name>`. The host has no agent identity of its own.
+    #[serde(default, rename = "as")]
+    pub write_as: Option<String>,
 }
 
 /// `[chores.sweep]`: a command run in the project checkout.
@@ -624,6 +628,9 @@ fn spawn_args(e: &Entry, cfg: &QueueCfg) -> Vec<String> {
     if let Some(h) = &cfg.spawn_host {
         a.extend(["--host".into(), h.clone()]);
     }
+    if let Some(w) = &cfg.write_as {
+        a.extend(["--as".into(), w.clone()]);
+    }
     a
 }
 
@@ -939,8 +946,10 @@ mod tests {
 
     #[test]
     fn spawn_args_carry_scope_short_name_and_host() {
-        let cfg: QueueCfg =
-            toml::from_str("file = \"q\"\nprofile = \"d\"\nspawn_host = \"b\"").unwrap();
+        let cfg: QueueCfg = toml::from_str(
+            "file = \"q\"\nprofile = \"d\"\nspawn_host = \"b\"\nas = \"agent:h/s/lead\"",
+        )
+        .unwrap();
         let a: BTreeMap<String, String> = [("dv-".to_string(), "o/r".to_string())].into();
         let e = &parse_queue("dv-5 docs only\no/r#6", &a);
         let want: Vec<String> = [
@@ -957,12 +966,17 @@ mod tests {
             "dv-5",
             "--host",
             "b",
+            "--as",
+            "agent:h/s/lead",
         ]
         .map(String::from)
         .into();
         assert_eq!(spawn_args(&e[0], &cfg), want);
         let plain = spawn_args(&e[1], &cfg);
         assert!(!plain.contains(&"--name".to_string()));
+        // without `as` no --as is passed (the environment may name the agent)
+        let bare: QueueCfg = toml::from_str("file = \"q\"\nprofile = \"d\"").unwrap();
+        assert!(!spawn_args(&e[1], &bare).contains(&"--as".to_string()));
     }
 
     #[test]

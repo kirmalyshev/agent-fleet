@@ -89,6 +89,7 @@ profile = "claude"
 # profile = "devin"              #   live agents than its `cap`
 # on = "build-box"              # optional: only this host drains the queue (`[chores.sweep]` takes `on` too)
 # spawn_host = "build-box"      # optional: where the queued agent starts
+# as = "agent:build-box/session/lead"  # the agent the spawns are written as (their lead); needed: the host has no identity
 #                                # (nudges type into agents: only under `host --stuck-act`)
 # [chores.sweep]                 # a command run in this checkout, without a shell
 # run = ["./scripts/clean"]
