@@ -185,18 +185,27 @@ pub fn drop_line(text: &str, line: &str) -> String {
 }
 
 /// What a pass does with the queue: entries whose issue already has a live agent leave the
-/// queue, and as many of the rest as there are free seats spawn.
+/// queue, entries with a request in flight wait, and as many of the rest as there are free
+/// seats spawn.
 #[derive(Debug, Default, PartialEq)]
 pub struct Plan {
     pub drop: Vec<Entry>,
     pub spawn: Vec<Entry>,
 }
 
-pub fn pick(entries: &[Entry], live: &HashSet<String>, seats: usize) -> Plan {
+pub fn pick(
+    entries: &[Entry],
+    live: &HashSet<String>,
+    pending: &HashSet<String>,
+    seats: usize,
+) -> Plan {
     let mut plan = Plan::default();
     for e in entries {
         if live.contains(&e.target) {
             plan.drop.push(e.clone());
+        } else if pending.contains(&e.target) {
+            // requested, not answered: the line stays until the agent is up, so a request
+            // that expires unanswered loses nothing
         } else if plan.spawn.len() < seats && !plan.spawn.iter().any(|s| s.target == e.target) {
             plan.spawn.push(e.clone());
         }
@@ -220,6 +229,44 @@ pub fn holders(s: &State, now: DateTime<Utc>) -> Vec<&crate::state::Spawn> {
     }
     out
 }
+
+fn target_of(sp: &crate::state::Spawn) -> String {
+    format!(
+        "{}#{}",
+        sp.request.repo,
+        sp.request.issue.unwrap_or_default()
+    )
+}
+
+/// The issues with a live agent, and those with a request in flight (`holders` less the live).
+pub fn issue_sets(s: &State, now: DateTime<Utc>) -> (HashSet<String>, HashSet<String>) {
+    let live: HashSet<String> = s
+        .agents
+        .keys()
+        .filter_map(|id| s.spawn_of(id))
+        .map(target_of)
+        .collect();
+    let pending = holders(s, now)
+        .iter()
+        .map(|sp| target_of(sp))
+        .filter(|t| !live.contains(t))
+        .collect();
+    (live, pending)
+}
+
+/// The issues whose latest request failed or expired within `COOLDOWN`: not tried again yet.
+pub fn cooling(s: &State, now: DateTime<Utc>) -> HashSet<String> {
+    s.spawns
+        .values()
+        .filter(|sp| {
+            sp.result.as_ref().is_some_and(|r| !r.ok)
+                && sp.answered.is_some_and(|t| now - t < COOLDOWN)
+        })
+        .map(target_of)
+        .collect()
+}
+
+const COOLDOWN: Duration = Duration::minutes(10);
 
 // ---------- nudges ----------
 
@@ -591,26 +638,20 @@ async fn queue(
             return;
         }
     };
-    let live: HashSet<String> = holders(s, now)
-        .iter()
-        .map(|sp| {
-            format!(
-                "{}#{}",
-                sp.request.repo,
-                sp.request.issue.unwrap_or_default()
-            )
-        })
-        .collect();
+    let (live, pending) = issue_sets(s, now);
+    let cold = cooling(s, now);
     // An entry cooling after a failure gives its seat to the next one.
     let entries: Vec<Entry> = parse_queue(&text, &cfg.aliases)
         .into_iter()
         .filter(|e| {
-            seen.failed
-                .get(&e.target)
-                .is_none_or(|t| now - *t >= Duration::minutes(10))
+            !cold.contains(&e.target)
+                && seen
+                    .failed
+                    .get(&e.target)
+                    .is_none_or(|t| now - *t >= COOLDOWN)
         })
         .collect();
-    let plan = pick(&entries, &live, seats);
+    let plan = pick(&entries, &live, &pending, seats);
     let mut handled: Vec<String> = Vec::new();
     for e in &plan.drop {
         handled.push(e.line.clone());
@@ -633,7 +674,7 @@ async fn queue(
         let done = tokio::time::timeout(Wait::from_secs(60), c.output()).await;
         match done {
             Ok(Ok(o)) if o.status.success() => {
-                handled.push(e.line.clone());
+                // The line stays: it leaves when the agent is live (`plan.drop`).
                 eprintln!("agent-fleet host: queue: spawn requested {}", e.target);
             }
             other => {
@@ -841,11 +882,17 @@ mod tests {
     fn pick_spawns_only_free_seats_and_drops_live_issues() {
         let e = parse_queue("a/b#1\na/b#2\na/b#3\na/b#2\n", &BTreeMap::new());
         let live: HashSet<String> = ["a/b#1".to_string()].into();
-        let p = pick(&e, &live, 1);
+        let p = pick(&e, &live, &HashSet::new(), 1);
         assert_eq!(p.drop.len(), 1);
         assert_eq!(p.spawn.len(), 1);
         assert_eq!(p.spawn[0].target, "a/b#2");
-        assert!(pick(&e, &live, 0).spawn.is_empty());
+        assert!(pick(&e, &live, &HashSet::new(), 0).spawn.is_empty());
+        // a request in flight neither spawns again nor leaves the queue
+        let flying: HashSet<String> = ["a/b#2".to_string()].into();
+        let p = pick(&e, &live, &flying, 2);
+        assert_eq!(p.spawn.len(), 1);
+        assert_eq!(p.spawn[0].target, "a/b#3");
+        assert_eq!(p.drop.len(), 1);
     }
 
     #[test]
@@ -911,6 +958,56 @@ mod tests {
         assert_eq!(spawn_args(&e[0], &cfg), want);
         let plain = spawn_args(&e[1], &cfg);
         assert!(!plain.contains(&"--name".to_string()));
+    }
+
+    #[test]
+    fn a_failed_or_expired_request_cools_its_issue_and_a_pending_one_is_not_live() {
+        let spawn = |agent: &str, issue: u64, result: Option<bool>, since: i64| {
+            let req = crate::event::SpawnRequested {
+                name: agent.into(),
+                agent: format!("agent:h/s/{agent}"),
+                host: "h".into(),
+                session: "s".into(),
+                repo: "o/r".into(),
+                issue: Some(issue),
+                branch: agent.into(),
+                profile: "p".into(),
+                brief: String::new(),
+                level: None,
+                lead: None,
+                worktree: None,
+                replaces: None,
+                why: String::new(),
+            };
+            crate::state::Spawn {
+                request: req,
+                by: String::new(),
+                project: String::new(),
+                result: result.map(|ok| crate::event::SpawnResult {
+                    agent: agent.into(),
+                    ok,
+                    pane: None,
+                    worktree: None,
+                    error: None,
+                }),
+                since: t(since),
+                answered: result.map(|_| t(since + 1)),
+            }
+        };
+        let mut st = State::default();
+        for (k, sp) in [
+            ("recent-fail", spawn("a", 1, Some(false), -3)),
+            ("old-fail", spawn("b", 2, Some(false), -30)),
+            ("ok", spawn("c", 3, Some(true), -3)),
+            ("pending", spawn("d", 4, None, -1)),
+        ] {
+            st.spawns.insert(k.into(), sp);
+        }
+        let cold = cooling(&st, t(0));
+        assert_eq!(cold, ["o/r#1".to_string()].into());
+        let (live, pending) = issue_sets(&st, t(0));
+        assert!(live.is_empty());
+        assert_eq!(pending, ["o/r#4".to_string()].into());
     }
 
     #[test]
