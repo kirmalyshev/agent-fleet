@@ -56,6 +56,9 @@ pub struct FleetConfig {
     /// `[orphan_pr]`: which repos `doctor` looks at for PRs no live agent owns.
     #[serde(default)]
     pub orphan_pr: crate::orphanpr::Config,
+    /// `[chores]`: the host's nudges, spawn queue and sweep command for this project.
+    #[serde(default)]
+    pub chores: crate::chores::Config,
     /// `[repos]`: `owner/repo` → this machine's checkout. Read only from the machine's own
     /// fleet.toml (`agent-fleet repo add`); ignored in a checkout's. The host reads it through
     /// `setup::registered`, which needs no valid rules.
@@ -182,6 +185,9 @@ impl FleetConfig {
             check_ready(r)
                 .with_context(|| format!("fleet.toml: retire {r:?}{}", line_of(src, "retire")))?;
         }
+        self.chores
+            .check(&self.profiles)
+            .map_err(|e| anyhow::anyhow!("fleet.toml: {e}"))?;
         let mut by_prefix: BTreeMap<&str, &str> = BTreeMap::new();
         for (name, p) in &self.profiles {
             if let Some(f) = &p.fallback
@@ -1473,7 +1479,7 @@ fn reached_working(events: &[Event], agent: &str, since: DateTime<Utc>) -> bool 
 
 /// The id prefix for this host agent's agents: `agent:<host>/<session>/`. Two `agent-fleet
 /// host` processes on one machine serve different sessions; only mine are mine.
-fn agent_prefix(host: &str, session: &str) -> String {
+pub(crate) fn agent_prefix(host: &str, session: &str) -> String {
     format!("agent:{host}/{session}/")
 }
 
@@ -1916,6 +1922,7 @@ pub async fn spawn_loop(host: Arc<Host>) {
     let mut stuck_seen = crate::stuck::Seen::default();
     let mut retire_seen: HashSet<String> = HashSet::new();
     let mut merge_seen: HashSet<String> = HashSet::new();
+    let mut chores_seen = crate::chores::Seen::default();
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
         // A self-update restart is waiting for the work in flight: start none.
@@ -1966,6 +1973,7 @@ pub async fn spawn_loop(host: Arc<Host>) {
         crate::merge::serve(&host, &mut merge_seen);
         handoffs(&host, state, events, &mut handed, &mut warned).await;
         stuck(&host, state, events, &mut stuck_seen, &handed).await;
+        crate::chores::serve(&host, state, &mut chores_seen).await;
     }
 }
 
@@ -2052,6 +2060,18 @@ profile = "devin"
             title: title.into(),
             labels: labels.iter().map(|l| l.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn chores_parse_and_the_queue_profile_needs_a_cap() {
+        let on = format!(
+            "{CFG}\n[chores.queue]\nfile = \"q\"\nprofile = \"opus\"\n[chores.sweep]\nrun = [\"x\"]\n"
+        );
+        let e = cfg(&on).unwrap_err().to_string();
+        assert!(e.contains("no `cap`"), "{e}");
+        assert!(cfg(&format!("{CFG}\n[chores.sweep]\nrun = [\"x\"]\n")).is_ok());
+        let ok = format!("{CFG}\n[chores.queue]\nfile = \"q\"\nprofile = \"devin\"\n");
+        assert!(cfg(&ok).is_ok());
     }
 
     #[test]

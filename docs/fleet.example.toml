@@ -78,6 +78,19 @@ profile = "claude"
 # guarded = ["AGENTS.md", "CLAUDE.md", "README.md", "docs/", "schema/"]  # reported, never closed (`dir/` = prefix); setting it replaces this default
 # apply = false                  # true: the host watch loop closes superseded PRs and tells the root coordinator of the rest
 
+# The host's housekeeping for this project. Each table is off unless present.
+# [chores.nudge]                 # a stuck agent: Enter for a prompt sitting unsent (twice, then one
+# kinds = ["devin"]              #   esc + the same text if it can be read, else a BLOCKED tell to the
+# unsent_hints = []              #   lead), `continue` after a rate limit lifts or "Something went wrong",
+#                                #   esc esc + continue for a spinner frozen 15 min. Never into a dialog.
+# [chores.queue]                 # issues waiting for a seat: `owner/repo#N [scope]` per line; one is spawned
+# file = "~/fleet/queue.txt"     #   (as `agent-fleet spawn`, in this checkout) while `profile` has fewer
+# profile = "devin"              #   live agents than its `cap`
+#                                # (nudges type into agents: only under `host --stuck-act`)
+# [chores.sweep]                 # a command run in this checkout, without a shell
+# run = ["./scripts/clean"]
+# every_min = 5
+
 # `agent-fleet merge`, in a repository's own .agent-fleet/fleet.toml: read from the PR's base
 # branch, so a PR cannot change its own gate.
 # [merge]
