@@ -546,10 +546,10 @@ the host re-reads it each minute.
   text was read off the input box and no turn is busy behind it (an Escape would interrupt the
   turn); otherwise one `BLOCKED` tell to the lead per 10 min and nothing typed. A rate limit gets
   `continue` once its announced wait is over. "Send a message to continue" or "Something went
-  wrong" gets `continue` per 5 min. A spinner whose screen, timers aside, has not changed for 15
+  wrong" gets `continue` per 5 min, never while the agent is `working` (its own output may quote them). A spinner whose screen, timers aside, has not changed for 15
   min gets two Escapes and a `continue`. Nothing is typed while a selection dialog is open.
 - `[chores.queue]` (`file`, `profile`): `owner/repo#N [scope]` per line, other lines left alone.
-  While the profile has fewer live or pending agents than its `cap`, the host runs
+  While the profile has fewer live or pending agents for this repository than its `cap` (one spawn per minute at most), the host runs
   `agent-fleet spawn <ref> --no-wait --profile <profile>` in the project checkout and removes the
   line; a line whose issue already has an agent is dropped; a failed spawn is retried after 10 min
   and gives its seat to the next line. The file is re-read before it is rewritten.

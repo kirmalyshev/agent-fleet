@@ -210,6 +210,8 @@ fn reset_minutes(line: &str) -> Option<i64> {
     let unit = rest[digits.len()..].trim_start();
     Some(if unit.starts_with('h') {
         n * 60
+    } else if unit.starts_with('d') {
+        n * 1440
     } else if unit.starts_with('s') {
         1
     } else {
@@ -278,6 +280,8 @@ pub struct Nudger {
     rate_until: Option<DateTime<Utc>>,
     last_blocked: Option<DateTime<Utc>>,
     spin: Option<(u64, DateTime<Utc>)>,
+    /// The agent is mid-turn: what its output says about limits or errors is not a stop.
+    pub working: bool,
 }
 
 /// The screen with its timers and spinner glyphs taken out, hashed.
@@ -299,7 +303,10 @@ fn spinner_hash(screen: &str) -> Option<u64> {
 
 impl Nudger {
     pub fn step(&mut self, screen: &str, hints: &[String], now: DateTime<Utc>) -> Option<Act> {
-        let sight = classify(screen, hints);
+        let mut sight = classify(screen, hints);
+        if self.working && matches!(sight, Some(Sight::RateLimit(_) | Sight::Stopped)) {
+            sight = None;
+        }
         if !matches!(sight, Some(Sight::Unsent { .. })) {
             self.enters = 0;
             self.last_enter = None;
@@ -392,6 +399,7 @@ pub struct Seen {
     nudgers: HashMap<String, Nudger>,
     last: Option<DateTime<Utc>>,
     swept: HashMap<String, DateTime<Utc>>,
+    sweeping: Arc<std::sync::Mutex<HashSet<String>>>,
     failed: HashMap<String, DateTime<Utc>>,
 }
 
@@ -456,6 +464,7 @@ async fn nudge(
             continue;
         }
         let n = seen.nudgers.entry(id.clone()).or_default();
+        n.working = a.state == AgentState::Working;
         let Some(act) = n.step(&screen, &cfg.unsent_hints, now) else {
             continue;
         };
@@ -552,8 +561,12 @@ async fn queue(
         );
     }
     for e in &plan.spawn {
-        let Ok(exe) = std::env::current_exe() else {
-            break;
+        let exe = match std::env::current_exe() {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("agent-fleet host: queue: no own binary to spawn with: {e}");
+                break;
+            }
         };
         let mut c = tokio::process::Command::new(exe);
         c.arg("spawn").arg(&e.target).arg("--no-wait");
@@ -661,23 +674,41 @@ pub async fn serve(host: &Arc<Host>, s: &State, seen: &mut Seen) {
         if let Some(q) = &c.queue {
             let cap = fc.profiles.get(&q.profile).and_then(|p| p.cap).unwrap_or(0) as usize;
             let prefix = crate::spawn::agent_prefix(&host.cfg.host, &host.cfg.session);
-            let used = s
+            // Seats are the profile's cap for THIS repo, as `spawn` counts them: live agents
+            // plus requests not yet answered.
+            let used: HashSet<&str> = s
                 .agents
                 .keys()
-                .filter(|id| {
-                    id.starts_with(&prefix) && s.profile_of(id) == Some(q.profile.as_str())
-                })
-                .count();
-            queue(host, s, q, cap.saturating_sub(used), &dir, seen, now).await;
+                .filter(|id| id.starts_with(&prefix))
+                .filter_map(|id| s.spawn_of(id))
+                .chain(s.spawns.values().filter(|sp| sp.result.is_none()))
+                .filter(|sp| sp.request.repo == repo && sp.request.profile == q.profile)
+                .map(|sp| sp.request.agent.as_str())
+                .collect();
+            // One spawn per pass: a hung `spawn` must not hold the host's loop for long.
+            let seats = cap.saturating_sub(used.len()).min(1);
+            queue(host, s, q, seats, &dir, seen, now).await;
         }
         if let Some(sw) = &c.sweep {
             let due = seen
                 .swept
                 .get(&repo)
                 .is_none_or(|t| now - *t >= Duration::minutes(sw.every_min as i64));
-            if due {
+            if due
+                && seen
+                    .sweeping
+                    .lock()
+                    .is_ok_and(|mut r| r.insert(repo.clone()))
+            {
                 seen.swept.insert(repo.clone(), now);
-                tokio::spawn(sweep(sw.clone(), dir.clone()));
+                let (running, key) = (seen.sweeping.clone(), repo.clone());
+                let (sw, dir) = (sw.clone(), dir.clone());
+                tokio::spawn(async move {
+                    sweep(sw, dir).await;
+                    if let Ok(mut r) = running.lock() {
+                        r.remove(&key);
+                    }
+                });
             }
         }
     }
@@ -806,6 +837,21 @@ mod tests {
         n.step(BOX, &[], t(6));
         n.step(BOX, &[], t(7));
         assert!(matches!(n.step(BOX, &[], t(8)), Some(Act::Blocked(_))));
+    }
+
+    #[test]
+    fn limit_or_error_text_on_a_working_agent_is_not_a_stop() {
+        let mut n = Nudger {
+            working: true,
+            ..Nudger::default()
+        };
+        assert_eq!(n.step("Something went wrong", &[], t(0)), None);
+        assert_eq!(n.step("Rate limit, resets in 1 minute", &[], t(9)), None);
+        n.working = false;
+        assert_eq!(
+            n.step("Something went wrong", &[], t(10)),
+            Some(Act::Continue)
+        );
     }
 
     #[test]
