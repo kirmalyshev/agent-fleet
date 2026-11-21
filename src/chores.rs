@@ -707,8 +707,10 @@ async fn queue(
             }
             Some(false) => {}
             None => {
+                // cool it like a failed spawn: the next line gets the seat
+                seen.failed.insert(e.target.clone(), now);
                 eprintln!(
-                    "agent-fleet host: queue: {} state unknown, not spawned",
+                    "agent-fleet host: queue: {} state unknown, retry in 10m",
                     e.target
                 );
                 continue;
