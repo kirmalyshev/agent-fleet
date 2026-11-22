@@ -131,7 +131,9 @@ going down and coming back, and only an `agent.role` without `level` removes it.
 
 `agent.quota` is the usage quota of one agent program on one host — each machine is logged in to
 its own account, so `kind` (`claude`, `codex`, `devin`, `gemini`, or anything new) is scoped per host. `gemini` has no quota
-reader yet, so its kind reports none and counts as unknown.
+reader yet, so its kind reports none and counts as unknown. Gemini is also detected for context-full only (no quota or error banners), and as a node script it
+may show as `node` in `ps`: inside a pane `kill` still refuses it by place, but the unmanaged scan
+cannot name it outside herdr.
 The host samples three sources every minute: the newest session log under
 `~/.codex/sessions` for codex, the machine-wide `claude-rate-limits.json` in the fleet data
 directory root for claude (written by `agent-fleet hook statusline`, the status-line wrapper

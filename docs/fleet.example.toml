@@ -25,7 +25,8 @@ brief = "brief.md"               # brief template next to this file; @@KEY@@ pla
 
 # Profiles: how to start one agent program. One profile per program found on PATH; add more,
 # e.g. one per model. Keys:
-#   kind        the program: claude, codex, devin or gemini (agent.start's kind and agent.quota's kind)
+#   kind        the program: claude, codex, devin or gemini (agent.start's kind and agent.quota's kind;
+#               gemini has no quota reader yet)
 #   args        extra arguments for the program, e.g. ["--model", "opus"]
 #   unset_env   variables cleared in the pane's shell before the agent starts
 #   prefix      the default agent name is prefix + issue number; profiles never share a prefix

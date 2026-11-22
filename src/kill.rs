@@ -685,6 +685,22 @@ mod tests {
     }
 
     #[test]
+    fn a_node_script_agent_in_a_pane_is_refused_by_its_place() {
+        // gemini ships as a node script, so `ps` may show `node`: the pane's shell is what
+        // makes it an agent.
+        let mut t = fleet();
+        t.insert(
+            502,
+            Proc {
+                ppid: 501,
+                name: "node".into(),
+            },
+        );
+        let why = judge(&t, ME, 502, |_| true).unwrap_err();
+        assert!(why.contains("an agent"), "{why}");
+    }
+
+    #[test]
     fn an_ancestor_of_an_agent_is_refused_even_when_it_is_no_ancestor_of_yours() {
         let mut t = fleet();
         // A wrapper script that started another agent: killing it takes the agent down too.

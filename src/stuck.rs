@@ -253,7 +253,8 @@ fn codex_context_pct(line: &str) -> Option<f64> {
 
 /// The line's context fullness, in the program's own anchored shape only: Devin's
 /// `Context: N / M tokens (P%)` is full at ≥90%, Claude's `Context left until
-/// auto-compact: P%` and Codex's and Gemini's `P% context left` at ≤10%.
+/// auto-compact: P%` and Codex's `P% context left` at ≤10%. Gemini is assumed to print Codex's footer
+/// (not checked against a real gemini CLI) and reuses its parser.
 fn context_full(program: Option<&str>, line: &str) -> bool {
     let devin = devin_context_pct(line).is_some_and(|p| p >= 90.0);
     let claude = claude_context_pct(line).is_some_and(|p| p <= 10.0);
@@ -1179,7 +1180,7 @@ mod tests {
         // A codex count-down footer is not full at 96 or 100.
         assert!(stuck_cause(Some("codex"), "96% context left", None, now).is_none());
         assert!(stuck_cause(Some("gemini"), "96% context left", None, now).is_none());
-        // gemini reads only its own shape, not claude's or devin's.
+        // gemini is matched with the codex parser only, not claude's or devin's.
         for other in [
             "Context left until auto-compact: 5%",
             "SWE-2 High · Context: 190,000 / 200,000 tokens (95%)",
