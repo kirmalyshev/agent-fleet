@@ -253,8 +253,7 @@ fn codex_context_pct(line: &str) -> Option<f64> {
 
 /// The line's context fullness, in the program's own anchored shape only: Devin's
 /// `Context: N / M tokens (P%)` is full at ≥90%, Claude's `Context left until
-/// auto-compact: P%` and Codex's `P% context left` at ≤10%. Gemini is assumed to print Codex's footer
-/// (not checked against a real gemini CLI) and reuses its parser.
+/// auto-compact: P%` and Codex's `P% context left` at ≤10%.
 fn context_full(program: Option<&str>, line: &str) -> bool {
     let devin = devin_context_pct(line).is_some_and(|p| p >= 90.0);
     let claude = claude_context_pct(line).is_some_and(|p| p <= 10.0);
@@ -262,7 +261,7 @@ fn context_full(program: Option<&str>, line: &str) -> bool {
     match program {
         Some("devin") => devin,
         Some("claude") => claude,
-        Some("codex" | "gemini") => codex,
+        Some("codex") => codex,
         _ => devin || claude || codex,
     }
 }
@@ -1080,8 +1079,6 @@ mod tests {
         assert_eq!(c.kind, StuckCause::ContextFull);
         let c = stuck_cause(Some("codex"), "8% context left", None, now).unwrap();
         assert_eq!(c.kind, StuckCause::ContextFull);
-        let c = stuck_cause(Some("gemini"), "8% context left", None, now).unwrap();
-        assert_eq!(c.kind, StuckCause::ContextFull);
         // error
         for screen in [
             "Something went wrong. Try again.",
@@ -1179,17 +1176,6 @@ mod tests {
         );
         // A codex count-down footer is not full at 96 or 100.
         assert!(stuck_cause(Some("codex"), "96% context left", None, now).is_none());
-        assert!(stuck_cause(Some("gemini"), "96% context left", None, now).is_none());
-        // gemini is matched with the codex parser only, not claude's or devin's.
-        for other in [
-            "Context left until auto-compact: 5%",
-            "SWE-2 High · Context: 190,000 / 200,000 tokens (95%)",
-        ] {
-            assert!(
-                stuck_cause(Some("gemini"), other, None, now).is_none(),
-                "{other}"
-            );
-        }
         assert!(
             stuck_cause(
                 Some("codex"),
@@ -1693,6 +1679,26 @@ mod tests {
                 Self::Tell { kind, .. } => write!(f, "Tell({kind})"),
                 Self::Handoff { to, .. } => write!(f, "Handoff({to})"),
             }
+        }
+    }
+
+    /// Antigravity CLI (`agy` 1.3.6) screens captured from a live herdr pane: its idle and
+    /// working chrome names no stuck cause. It checkpoints its own context, so it has no
+    /// context footer to read.
+    #[test]
+    fn agy_idle_and_working_screens_are_not_stuck() {
+        let rule = "─".repeat(60);
+        let footer = "? for shortcuts            Gemini 3.8 Flash · high";
+        let idle = format!("Antigravity CLI 1.3.6\n\n{rule}\n>\n{rule}\n{footer}\n");
+        let working = format!(
+            "{rule}\n> Count from 1 to 40\n⣽  Generating...\n{rule}\n>\n{rule}\nesc to cancel            Gemini 3.8 Flash · high\n"
+        );
+        let now = Utc::now();
+        for screen in [idle, working] {
+            assert!(
+                stuck_cause(Some("agy"), &screen, None, now).is_none(),
+                "{screen}"
+            );
         }
     }
 }

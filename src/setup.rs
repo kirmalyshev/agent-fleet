@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 /// The agent programs `agent.start` knows, as profile kinds.
-pub const KINDS: [&str; 4] = ["claude", "codex", "devin", "gemini"];
+pub const KINDS: [&str; 4] = ["claude", "codex", "devin", "agy"];
 
 /// The reference config is the template: what init writes is what the docs explain.
 const FLEET: &str = include_str!("../docs/fleet.example.toml");
@@ -630,9 +630,9 @@ mod tests {
         file(a.path(), "devin", 0o644); // not executable
         std::fs::create_dir(a.path().join("claude")).unwrap(); // a dir, not a program
         file(b.path(), "claude", 0o700);
-        file(b.path(), "gemini", 0o755);
+        file(b.path(), "agy", 0o755);
         let path = std::env::join_paths([a.path(), Path::new("/no/such/dir"), b.path()]).unwrap();
-        assert_eq!(kinds_in(&path), ["claude", "codex", "gemini"]);
+        assert_eq!(kinds_in(&path), ["claude", "codex", "agy"]);
         assert!(kinds_in(std::ffi::OsStr::new("")).is_empty());
     }
 
