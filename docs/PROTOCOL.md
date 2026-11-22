@@ -130,7 +130,8 @@ name or a pane. A role can be declared before the agent's first `agent.up`, surv
 going down and coming back, and only an `agent.role` without `level` removes it.
 
 `agent.quota` is the usage quota of one agent program on one host — each machine is logged in to
-its own account, so `kind` (`claude`, `codex`, `devin`, or anything new) is scoped per host.
+its own account, so `kind` (`claude`, `codex`, `devin`, `gemini`, or anything new) is scoped per host. `gemini` has no quota
+reader yet, so its kind reports none and counts as unknown.
 The host samples three sources every minute: the newest session log under
 `~/.codex/sessions` for codex, the machine-wide `claude-rate-limits.json` in the fleet data
 directory root for claude (written by `agent-fleet hook statusline`, the status-line wrapper
@@ -625,7 +626,7 @@ sits in a herdr pane, and passes the input on to the command it wraps.
 `agent-fleet kill <pid>…` is how an agent stops a process. It reads the process table (`ps`) and
 refuses, killing nothing, when any pid is:
 
-- a terminal multiplexer (`herdr`), a pane's shell, an agent (`claude`, `devin`, `codex`, or what
+- a terminal multiplexer (`herdr`), a pane's shell, an agent (`claude`, `devin`, `codex`, `gemini`, or what
   a pane's shell runs), an `agent-fleet` daemon, or an ancestor of any of them;
 - the caller's own ancestor (its shell, its script's parent, its agent);
 - inside another agent's process tree, unless a `proc.hung` report names it and `kill`'s own
@@ -688,11 +689,11 @@ blocks the tool call when it is there.
 
 Agents are pane processes: the fleet knows an agent only because herdr hosts it. Two guards
 enforce it. `agent-fleet hook bash` (the Claude Code / Devin CLI `PreToolUse` hook) refuses a
-shell command that starts `claude`, `devin` or `codex` for a session — behind `sudo`, `nohup`,
+shell command that starts `claude`, `devin`, `codex` or `gemini` for a session — behind `sudo`, `nohup`,
 `xargs`, `timeout`, `sh -c`, `eval`, `env` or `&` — and points at `agent-fleet spawn` and `herdr
 agent start`; the read-only and admin forms (`--version`, `--help`, `auth status`, `doctor`,
 `models`, `mcp list`/`mcp get`, `update --check`) pass, and so do one-shot runs that answer and
-exit (`claude -p`, `codex exec`) when the caller is itself in herdr (`HERDR_ENV=1`): they run in
+exit (`claude -p`, `codex exec`, `gemini -p`) when the caller is itself in herdr (`HERDR_ENV=1`): they run in
 the caller's pane tree, so the host counts them as managed. And the host's process scan reports every
 agent-program process it finds outside all of herdr's pane trees as `agent.unmanaged` (a process
 is managed when any ancestor is `herdr`, the host's own process tree is excluded, and so is
@@ -801,7 +802,7 @@ The machine's rules are `fleet.toml` and its brief in the instance's config dire
 config directory (`~/.config/agent-fleet` on Linux) for the default instance and `instances/<name>`
 under it for the others; `AGENT_FLEET_CONFIG_DIR` names the directory outright. `agent-fleet init`
 writes both from `docs/fleet.example.toml` and `docs/brief.example.md`, with a profile for each
-agent program on `PATH` (`claude`, `codex`, `devin`; all three when none is found) and a default
+agent program on `PATH` (`claude`, `codex`, `devin`, `gemini`; all four when none is found) and a default
 rule on the first; it never overwrites a file. It also lists the user-level skills
 (`$CLAUDE_CONFIG_DIR` or `~/.claude`, `$CODEX_HOME` or `~/.codex`, each `/skills/*/SKILL.md`)
 that name herdr, tmux or cmux, and warns that in a fleet agents message each other with `tell`
@@ -1098,7 +1099,7 @@ stale, with its `git worktree unlock` command; clean never unlocks or forces. Pr
 is in a worktree clean retires, read live (cwds from `/proc` on Linux, from one `lsof -a -d cwd
 -Fpn` elsewhere; when neither answers, every worktree is kept as "processes unknown"), are stopped before it goes: TERM, then KILL after 5 s, each re-read just before its signal so a
 pid reused by another process (another start time or cwd) is never hit. `ls` and the dry run list
-them, pid and command. A herdr pane, anything under an agent program (`claude`, `codex`, `devin`)
+them, pid and command. A herdr pane, anything under an agent program (`claude`, `codex`, `devin`, `gemini`)
 and the caller and its ancestors are never stopped; one of them in the worktree keeps it. Without
 a hub or replica, no agent is known. `ls` shows each worktree's `dev` slot (`docs/DEV.md`), its
 ports and running services; `clean --execute` runs a worktree's `dev down --release` (its

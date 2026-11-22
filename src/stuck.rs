@@ -253,7 +253,7 @@ fn codex_context_pct(line: &str) -> Option<f64> {
 
 /// The line's context fullness, in the program's own anchored shape only: Devin's
 /// `Context: N / M tokens (P%)` is full at ≥90%, Claude's `Context left until
-/// auto-compact: P%` and Codex's `P% context left` at ≤10%.
+/// auto-compact: P%` and Codex's and Gemini's `P% context left` at ≤10%.
 fn context_full(program: Option<&str>, line: &str) -> bool {
     let devin = devin_context_pct(line).is_some_and(|p| p >= 90.0);
     let claude = claude_context_pct(line).is_some_and(|p| p <= 10.0);
@@ -261,7 +261,7 @@ fn context_full(program: Option<&str>, line: &str) -> bool {
     match program {
         Some("devin") => devin,
         Some("claude") => claude,
-        Some("codex") => codex,
+        Some("codex" | "gemini") => codex,
         _ => devin || claude || codex,
     }
 }
@@ -1079,6 +1079,8 @@ mod tests {
         assert_eq!(c.kind, StuckCause::ContextFull);
         let c = stuck_cause(Some("codex"), "8% context left", None, now).unwrap();
         assert_eq!(c.kind, StuckCause::ContextFull);
+        let c = stuck_cause(Some("gemini"), "8% context left", None, now).unwrap();
+        assert_eq!(c.kind, StuckCause::ContextFull);
         // error
         for screen in [
             "Something went wrong. Try again.",
@@ -1176,6 +1178,7 @@ mod tests {
         );
         // A codex count-down footer is not full at 96 or 100.
         assert!(stuck_cause(Some("codex"), "96% context left", None, now).is_none());
+        assert!(stuck_cause(Some("gemini"), "96% context left", None, now).is_none());
         assert!(
             stuck_cause(
                 Some("codex"),

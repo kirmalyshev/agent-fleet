@@ -85,7 +85,7 @@ agent-fleet init
 (`~/.config/agent-fleet` on Linux, `instances/<name>` under it for an instance other than
 `default`; `AGENT_FLEET_CONFIG_DIR` overrides it). They are the rules
 `spawn` uses for every repository: a profile for each agent program found on `PATH` (claude,
-codex, devin), one default rule, and a comment on every key. It never overwrites a file. It also
+codex, devin, gemini), one default rule, and a comment on every key. It never overwrites a file. It also
 lists your Claude and Codex skills that drive terminals (herdr, tmux, cmux): in a fleet, agents
 talk through `agent-fleet tell` and `spawn`, so check that those skills do not tell them to type
 into each other's panes. Edit the two files, then start the hub and the host as in the quick
