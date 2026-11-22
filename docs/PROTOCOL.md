@@ -554,6 +554,8 @@ remembers (`idle_rung`), so a restart rings once. With `auto_retire`, an agent t
 `retire.requested`, asked once per idle stretch: the same locked retire, which stops on
 uncommitted work and rings the lead. An agent in a pane with no spawn record (started by hand)
 gets one `UNMANAGED` ring and is listed by `doctor` as `unmanaged`; it is never auto-retired.
+`[idle] exempt = ["name"]` lists agents the host never rings or retires, by agent name or by the
+basename of the worktree they work in; for a hand-started agent every project's list applies.
 
 ## Chores
 
