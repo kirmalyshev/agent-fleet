@@ -42,6 +42,13 @@ pub struct State {
     /// Each agent's open `BLOCKED`/`QUESTION` to its lead, until answered (see `Waiting`).
     #[serde(default)]
     pub waiting: BTreeMap<String, Waiting>,
+    /// Each up agent's last `msg.sent`, what `IDLE` quotes and `auto_retire` reads (`DONE`/`MERGED`).
+    #[serde(default)]
+    pub reports: BTreeMap<String, Report>,
+    /// When the host last rang an agent's lead `IDLE`/`HELD` (key: the agent id) or `UNMANAGED`
+    /// (key: the id + `UNMANAGED_KEY`); gone once the agent works or goes down.
+    #[serde(default)]
+    pub idle_rung: BTreeMap<String, DateTime<Utc>>,
     /// Delivered doorbells their recipient has not read (`msg.read`) yet: retransmitted until it does.
     #[serde(default)]
     pub unread: BTreeMap<String, Unread>,
@@ -449,6 +456,27 @@ pub struct Waiting {
     /// The host already re-rang the lead (`STILL-WAITING`).
     #[serde(default)]
     pub rung: bool,
+}
+
+/// An agent's last `msg.sent`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Report {
+    pub kind: String,
+    pub text: String,
+    pub since: DateTime<Utc>,
+}
+
+/// Suffix of the `idle_rung` key of an `UNMANAGED` ring.
+pub const UNMANAGED_KEY: &str = "#unmanaged";
+
+/// An agent that works owes nobody an answer or an idle ring.
+fn clear_asks(
+    waiting: &mut BTreeMap<String, Waiting>,
+    idle_rung: &mut BTreeMap<String, DateTime<Utc>>,
+    agent: &str,
+) {
+    waiting.remove(agent);
+    idle_rung.remove(agent);
 }
 
 /// A delivered doorbell not read yet.
@@ -869,7 +897,7 @@ impl State {
                 let old = self.agents.get(&d.agent);
                 if old.is_none() {
                     // A new incarnation owes nothing to a previous one's ask.
-                    self.waiting.remove(&d.agent);
+                    clear_asks(&mut self.waiting, &mut self.idle_rung, &d.agent);
                 }
                 self.agents.insert(
                     d.agent.clone(),
@@ -885,7 +913,7 @@ impl State {
                         worked: (d.state == AgentState::Working)
                             .then(|| {
                                 self.signals.remove(&d.agent);
-                                self.waiting.remove(&d.agent);
+                                clear_asks(&mut self.waiting, &mut self.idle_rung, &d.agent);
                                 ts
                             })
                             .or_else(|| old.and_then(|a| a.worked)),
@@ -992,7 +1020,7 @@ impl State {
                 // Only `agent.up` brings an agent in: a late state change never revives a downed one.
                 if let Some(a) = self.agents.get_mut(&d.agent) {
                     if d.state == AgentState::Working {
-                        self.waiting.remove(&d.agent);
+                        clear_asks(&mut self.waiting, &mut self.idle_rung, &d.agent);
                         a.worked = Some(ts);
                         a.finished = None;
                         self.signals.remove(&d.agent);
@@ -1007,7 +1035,10 @@ impl State {
                 }
             }
             Known::AgentDown(d) => {
-                self.waiting.remove(&d.agent);
+                clear_asks(&mut self.waiting, &mut self.idle_rung, &d.agent);
+                self.reports.remove(&d.agent);
+                self.idle_rung
+                    .remove(&format!("{}{UNMANAGED_KEY}", d.agent));
                 if self.agents.remove(&d.agent).is_some() {
                     self.gone.insert(d.agent.clone(), ts);
                 }
@@ -1211,6 +1242,16 @@ impl State {
             Known::MsgSent(d) => {
                 match e.actor.kind {
                     ActorKind::Agent => {
+                        if self.agents.contains_key(&e.actor.id) {
+                            self.reports.insert(
+                                e.actor.id.clone(),
+                                Report {
+                                    kind: d.kind.clone(),
+                                    text: d.text.clone(),
+                                    since: ts,
+                                },
+                            );
+                        }
                         if ["BLOCKED", "QUESTION"].contains(&d.kind.as_str())
                             && self.agents.contains_key(&e.actor.id)
                         {
@@ -1244,6 +1285,13 @@ impl State {
                         {
                             w.rung = true;
                         }
+                    }
+                    ActorKind::Host if ["IDLE", "HELD", "UNMANAGED"].contains(&d.kind.as_str()) => {
+                        let key = match d.kind.as_str() {
+                            "UNMANAGED" => format!("{}{UNMANAGED_KEY}", d.reference),
+                            _ => d.reference.clone(),
+                        };
+                        self.idle_rung.insert(key, ts);
                     }
                     _ => {}
                 }
@@ -2232,6 +2280,73 @@ mod tests {
 
         s.apply(&role(None, ActorKind::Agent));
         assert!(s.roles.is_empty());
+    }
+
+    #[test]
+    fn a_report_is_kept_and_an_idle_ring_marked_until_the_agent_works_or_goes_down() {
+        let t0 = Utc::now();
+        let at = |mins: i64, kind: ActorKind, actor: &str, body| {
+            let mut e = Envelope::new(
+                Actor {
+                    kind,
+                    id: actor.into(),
+                },
+                "p",
+                body,
+            )
+            .into_event();
+            e.ts = t0 + chrono::Duration::minutes(mins);
+            e
+        };
+        let a = "agent:h/s/a";
+        let msg = |kind: &str, reference: &str| {
+            Known::MsgSent(MsgSent {
+                to: "agent:h/s/lead".into(),
+                kind: kind.into(),
+                reference: reference.into(),
+                text: "t".into(),
+                closes: Vec::new(),
+            })
+        };
+        let state = |st| {
+            Known::AgentState(AgentStateChanged {
+                agent: a.into(),
+                state: st,
+            })
+        };
+        let mut s = State::default();
+        s.apply(&at(
+            0,
+            ActorKind::Agent,
+            a,
+            Known::AgentUp(AgentUp {
+                agent: a.into(),
+                host: "h".into(),
+                kind: None,
+                pane: None,
+                state: AgentState::Idle,
+            }),
+        ));
+        s.apply(&at(1, ActorKind::Agent, a, msg("DONE", "r")));
+        assert_eq!(s.reports[a].kind, "DONE");
+        s.apply(&at(2, ActorKind::Host, "host:h", msg("IDLE", a)));
+        s.apply(&at(3, ActorKind::Host, "host:h", msg("UNMANAGED", a)));
+        assert!(s.idle_rung.contains_key(a));
+        assert!(s.idle_rung.contains_key(&format!("{a}{UNMANAGED_KEY}")));
+        // working clears the idle ring, not the unmanaged one
+        s.apply(&at(4, ActorKind::Agent, a, state(AgentState::Working)));
+        assert!(!s.idle_rung.contains_key(a));
+        assert!(s.idle_rung.contains_key(&format!("{a}{UNMANAGED_KEY}")));
+        s.apply(&at(
+            5,
+            ActorKind::Host,
+            "host:h",
+            Known::AgentDown(AgentDown {
+                agent: a.into(),
+                reason: None,
+            }),
+        ));
+        assert!(s.reports.is_empty() && s.idle_rung.is_empty());
     }
 
     #[test]

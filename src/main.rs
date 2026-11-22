@@ -6,6 +6,7 @@ mod doctor;
 mod event;
 mod host;
 mod hub;
+mod idle;
 mod kill;
 mod merge;
 mod orphanpr;

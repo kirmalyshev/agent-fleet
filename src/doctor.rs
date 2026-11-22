@@ -861,6 +861,24 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
             ),
         ));
     }
+    // A pane agent no `spawn` made (started by hand): nothing retires or caps it. Listed once
+    // its host rang the lead (`UNMANAGED`), like `unanswered`.
+    for (id, a) in &s.agents {
+        if s.idle_rung
+            .contains_key(&format!("{id}{}", crate::state::UNMANAGED_KEY))
+            && crate::spawn::find_spawn(s, id).is_none()
+        {
+            let wt = worktree_of(s, a)
+                .map(|(_, w)| w.state.path.clone())
+                .or_else(|| s.first_cwd.get(id).cloned())
+                .unwrap_or_else(|| "?".into());
+            out.push(finding(
+                "unmanaged",
+                id,
+                format!("pane agent with no spawn record, in {wt}"),
+            ));
+        }
+    }
     for u in s.unmanaged.values() {
         out.push(finding(
             "unmanaged",
@@ -2111,6 +2129,38 @@ mod tests {
         let subjects: Vec<&str> = f.iter().map(|f| f.subject.as_str()).collect();
         assert_eq!(subjects, ["agent:h/s/root-b", "agent:h/s/root-c"]);
         assert!(f[0].detail.contains("3 root coordinators are up"));
+    }
+
+    #[test]
+    fn a_pane_agent_with_no_spawn_record_is_unmanaged_with_its_worktree() {
+        let mut s = State::default();
+        s.agents.insert(
+            "agent:h/s/a".into(),
+            Agent {
+                host: "h".into(),
+                kind: None,
+                pane: None,
+                state: AgentState::Working,
+                since: Utc::now(),
+                worked: None,
+                finished: None,
+                usage: None,
+            },
+        );
+        s.first_cwd.insert("agent:h/s/a".into(), "/w/x".into());
+        assert!(
+            findings(&s, Utc::now())
+                .iter()
+                .all(|f| f.kind != "unmanaged")
+        );
+        s.idle_rung.insert(
+            format!("agent:h/s/a{}", crate::state::UNMANAGED_KEY),
+            Utc::now(),
+        );
+        let f = findings(&s, Utc::now());
+        let u = f.iter().find(|f| f.kind == "unmanaged").unwrap();
+        assert_eq!(u.subject, "agent:h/s/a");
+        assert!(u.detail.contains("/w/x"), "{}", u.detail);
     }
 
     #[test]

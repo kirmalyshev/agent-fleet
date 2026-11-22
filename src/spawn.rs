@@ -59,6 +59,10 @@ pub struct FleetConfig {
     /// `[chores]`: the host's nudges, spawn queue and sweep command for this project.
     #[serde(default)]
     pub chores: crate::chores::Config,
+    /// `[idle]`: when the host rings a lead about an idle agent, and whether it retires a
+    /// finished one.
+    #[serde(default)]
+    pub idle: crate::idle::Config,
     /// `[repos]`: `owner/repo` → this machine's checkout. Read only from the machine's own
     /// fleet.toml (`agent-fleet repo add`); ignored in a checkout's. The host reads it through
     /// `setup::registered`, which needs no valid rules.
@@ -1795,6 +1799,61 @@ async fn still_waiting(host: &Host, state: &State) {
     }
 }
 
+/// Idle agents are rung to their lead (`IDLE`, `HELD`, `UNMANAGED`); a finished one is retired
+/// when its project's `[idle] auto_retire` says so. The reducer marks each ring, so a restart
+/// does not ring twice.
+async fn idle(host: &Host, state: &State) {
+    let prefix = agent_prefix(&host.cfg.host, &host.cfg.session);
+    let cfgs: BTreeMap<String, crate::idle::Config> = host
+        .cfg
+        .checkouts_now()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(repo, dir)| {
+            let (fc, _) = load_in(&dir, host.cfg.config_dir.as_deref()).ok()?;
+            Some((repo, fc.idle))
+        })
+        .collect();
+    let cfg = |id: &str| {
+        find_spawn(state, id)
+            .and_then(|sp| cfgs.get(&sp.request.repo))
+            .cloned()
+            .unwrap_or_default()
+    };
+    for (agent, act) in crate::idle::due(state, &host.cfg.host, Utc::now(), &cfg) {
+        if !agent.starts_with(&prefix) {
+            continue;
+        }
+        match act {
+            crate::idle::Act::Ring { to, kind, text } => {
+                host.publish(host.presence(Known::MsgSent(MsgSent {
+                    to,
+                    kind: kind.into(),
+                    reference: agent.clone(),
+                    text,
+                    closes: Vec::new(),
+                })))
+                .await;
+            }
+            crate::idle::Act::Retire => {
+                let Some(sp) = find_spawn(state, &agent) else {
+                    continue;
+                };
+                host.publish(Envelope::new(
+                    host.actor(),
+                    &sp.project,
+                    Known::RetireRequested(crate::event::RetireRequested {
+                        agent: agent.clone(),
+                        host: host.cfg.host.clone(),
+                        decide: None,
+                    }),
+                ))
+                .await;
+            }
+        }
+    }
+}
+
 /// The unanswered requests for this host/session, split into `expired` (answered "expired",
 /// not executed) and `todo`. Each request id is attempted at most once per process — a request
 /// whose `spawn.result` could not be published is not retried every scan.
@@ -2024,6 +2083,7 @@ pub async fn spawn_loop(host: Arc<Host>) {
         handoffs(&host, state, events, &mut handed, &mut warned).await;
         stuck(&host, state, events, &mut stuck_seen, &handed).await;
         still_waiting(&host, state).await;
+        idle(&host, state).await;
         crate::chores::serve(&host, state, &mut chores_seen).await;
     }
 }
@@ -5105,6 +5165,121 @@ profile = "devin"
         assert_eq!(got[0].to, "agent:h/s/lead");
         assert_eq!(got[0].reference, "a");
         assert_eq!(got[0].text, "which way?");
+    }
+
+    #[tokio::test]
+    async fn an_idle_agent_and_an_unmanaged_one_ring_their_lead() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run(dir.path(), &[]).await;
+        let prefix = agent_prefix(&host.cfg.host, &host.cfg.session);
+        let (a, lead) = (format!("{prefix}a"), format!("{prefix}lead"));
+        let mut s = State::default();
+        for id in [&a, &lead] {
+            s.agents.insert(id.clone(), live_agent());
+            s.agents.get_mut(id).unwrap().state = AgentState::Idle;
+            s.agents.get_mut(id).unwrap().since = Utc::now() - chrono::Duration::minutes(30);
+            s.agents.get_mut(id).unwrap().host = host.cfg.host.clone();
+        }
+        s.roles.insert(
+            a.clone(),
+            crate::state::Role {
+                level: crate::event::Level::Implementer,
+                lead: Some(lead.clone()),
+                domain: None,
+                by: "x".into(),
+                since: Utc::now(),
+            },
+        );
+        s.first_cwd.insert(a.clone(), "/w/a".into());
+        idle(&host, &s).await;
+        let got: Vec<_> = msgs(&host).into_iter().map(|m| m.kind).collect();
+        assert!(got.contains(&"IDLE".to_string()), "{got:?}");
+        assert!(got.contains(&"UNMANAGED".to_string()), "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn fleet_toml_idle_drives_a_retire_asked_once_and_the_rings_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        let toml = co.join(".agent-fleet/fleet.toml");
+        let body = std::fs::read_to_string(&toml).unwrap();
+        std::fs::write(
+            &toml,
+            format!("{body}\n[idle]\nstale_min = 5\nauto_retire = true\n"),
+        )
+        .unwrap();
+        let (host, _stub) = run(dir.path(), &[]).await;
+        let (a, lead) = ("agent:h/s/a", "agent:h/s/lead");
+        let mut s = State::default();
+        let mut r = req(None);
+        r.agent = a.into();
+        r.name = "a".into();
+        r.issue = None;
+        s.apply(
+            &Envelope::new(
+                Actor {
+                    kind: ActorKind::Agent,
+                    id: lead.into(),
+                },
+                "p",
+                Known::SpawnRequested(Box::new(r)),
+            )
+            .into_event(),
+        );
+        for id in [a, lead] {
+            s.agents.insert(id.into(), live_agent());
+            s.agents.get_mut(id).unwrap().since = Utc::now() - chrono::Duration::minutes(11);
+        }
+        s.roles.insert(
+            a.into(),
+            crate::state::Role {
+                level: Level::Implementer,
+                lead: Some(lead.into()),
+                domain: None,
+                by: "x".into(),
+                since: Utc::now(),
+            },
+        );
+        s.reports.insert(
+            a.into(),
+            crate::state::Report {
+                kind: "DONE".into(),
+                text: "shipped".into(),
+                since: Utc::now() - chrono::Duration::minutes(12),
+            },
+        );
+        let fold = |s: &mut State| {
+            let all = host.replica.lock().unwrap().all().unwrap();
+            for e in all {
+                s.apply(&e);
+            }
+        };
+        let count = |kind: &str| msgs(&host).iter().filter(|m| m.kind == kind).count();
+        let retires = || {
+            host.replica
+                .lock()
+                .unwrap()
+                .all()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(&e.body, Body::Known(Known::RetireRequested(_))))
+                .count()
+        };
+        // finished + 11 min idle: retired (not rung); the agent has no spawn-less ring
+        idle(&host, &s).await;
+        fold(&mut s);
+        idle(&host, &s).await;
+        assert_eq!(retires(), 1);
+        assert_eq!(count("IDLE"), 0);
+        // an agent that asked to be retired is rung once past stale_min when auto_retire finds nothing
+        s.reports.clear();
+        s.retires.clear();
+        idle(&host, &s).await;
+        fold(&mut s);
+        idle(&host, &s).await;
+        assert_eq!(count("IDLE"), 1);
+        assert_eq!(retires(), 1);
     }
 
     #[tokio::test]

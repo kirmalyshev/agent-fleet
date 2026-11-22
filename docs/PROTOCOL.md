@@ -542,6 +542,19 @@ any tell, or the agent works again. Past `--waiting-min` (default 10) with the a
 host re-rings the lead once with `STILL-WAITING <agent>: <original text>` (`re` = the ask), and
 `doctor` lists the agent as `unanswered` once that ring is out, until the lead answers. A `msg.read` ack is not an answer.
 
+## Idle agents
+
+A project's fleet.toml `[idle]` sets `stale_min` (default 20) and `auto_retire` (default false).
+An agent not `working` for `stale_min` gets its lead (else the up root coordinator) one
+`msg.sent` from the host: `IDLE <agent> <for>: <last report or task> — retire?`, or
+`HELD <agent>: <reason>` when its open task is held. The ring repeats every `2 x stale_min` while
+the agent stays idle; `ref` is the agent's full id and the host's ring is what the reducer
+remembers (`idle_rung`), so a restart rings once. With `auto_retire`, an agent that reported
+`DONE`/`MERGED` after it last worked (or whose task ended) and has idled 10 min gets a host
+`retire.requested`, asked once per idle stretch: the same locked retire, which stops on
+uncommitted work and rings the lead. An agent in a pane with no spawn record (started by hand)
+gets one `UNMANAGED` ring and is listed by `doctor` as `unmanaged`; it is never auto-retired.
+
 ## Chores
 
 A project's fleet.toml `[chores]` sets the host's housekeeping. Each table is off unless present;
