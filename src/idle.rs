@@ -19,6 +19,8 @@ pub struct Config {
     pub stale_min: u64,
     /// Retire an agent that reported DONE/MERGED (or whose task ended) and idled `RETIRE_AFTER`.
     pub auto_retire: bool,
+    /// Agents never rung or retired: a name, or the basename of the worktree they work in.
+    pub exempt: Vec<String>,
 }
 
 impl Default for Config {
@@ -26,6 +28,7 @@ impl Default for Config {
         Self {
             stale_min: 20,
             auto_retire: false,
+            exempt: Vec::new(),
         }
     }
 }
@@ -59,16 +62,25 @@ pub fn due(
             continue;
         }
         let c = cfg(id);
+        let wt = worktree_of(s, a)
+            .map(|(_, w)| w.state.path.clone())
+            .or_else(|| s.first_cwd.get(id).cloned());
+        let base = wt
+            .as_deref()
+            .and_then(|p| p.trim_end_matches('/').rsplit('/').next());
+        if c.exempt
+            .iter()
+            .any(|e| e == short(id) || Some(e.as_str()) == base)
+        {
+            continue;
+        }
         let lead = escalate(s, id).map(str::to_string);
         let sp = crate::spawn::find_spawn(s, id);
         if sp.is_none()
             && let Some(to) = &lead
             && !s.idle_rung.contains_key(&format!("{id}{UNMANAGED_KEY}"))
         {
-            let wt = worktree_of(s, a)
-                .map(|(_, w)| w.state.path.clone())
-                .or_else(|| s.first_cwd.get(id).cloned())
-                .unwrap_or_else(|| "?".into());
+            let wt = wt.clone().unwrap_or_else(|| "?".into());
             out.push((
                 id.clone(),
                 Act::Ring {
@@ -348,6 +360,43 @@ mod tests {
         s.tasks
             .insert("t".into(), task(crate::event::TaskState::Completed));
         assert_eq!(acts(&s, 30, on)[0].1, Act::Retire);
+    }
+
+    #[test]
+    fn an_exempt_name_or_worktree_is_never_rung_retired_or_called_unmanaged() {
+        let mut s = state();
+        s.first_cwd
+            .insert("agent:h/s/a".into(), "/w/asa-ads".into());
+        s.reports.insert(
+            "agent:h/s/a".into(),
+            Report {
+                kind: "DONE".into(),
+                text: "x".into(),
+                since: t0(),
+            },
+        );
+        for e in ["a", "asa-ads"] {
+            let c = Config {
+                auto_retire: true,
+                exempt: vec![e.into()],
+                ..Config::default()
+            };
+            assert!(acts(&s, 90, c).is_empty(), "{e}");
+        }
+        // hand-started, not exempt: still called out
+        let c = Config {
+            exempt: vec!["other".into()],
+            ..Config::default()
+        };
+        assert!(!acts(&s, 90, c).is_empty());
+        // spawned and exempt by name
+        spawned(&mut s, "agent:h/s/a");
+        let c = Config {
+            auto_retire: true,
+            exempt: vec!["a".into()],
+            ..Config::default()
+        };
+        assert!(acts(&s, 90, c).is_empty());
     }
 
     #[test]

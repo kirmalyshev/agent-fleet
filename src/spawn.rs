@@ -1814,11 +1814,16 @@ async fn idle(host: &Host, state: &State) {
             Some((repo, fc.idle))
         })
         .collect();
+    // A hand-started agent has no repo: only the projects' `exempt` lists apply to it.
+    let any_exempt: Vec<String> = cfgs.values().flat_map(|c| c.exempt.clone()).collect();
     let cfg = |id: &str| {
         find_spawn(state, id)
             .and_then(|sp| cfgs.get(&sp.request.repo))
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_else(|| crate::idle::Config {
+                exempt: any_exempt.clone(),
+                ..Default::default()
+            })
     };
     for (agent, act) in crate::idle::due(state, &host.cfg.host, Utc::now(), &cfg) {
         if !agent.starts_with(&prefix) {
@@ -5280,6 +5285,37 @@ profile = "devin"
         idle(&host, &s).await;
         assert_eq!(count("IDLE"), 1);
         assert_eq!(retires(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_hand_started_agent_named_in_exempt_is_never_rung() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        let toml = co.join(".agent-fleet/fleet.toml");
+        let body = std::fs::read_to_string(&toml).unwrap();
+        std::fs::write(&toml, format!("{body}\n[idle]\nexempt = [\"asa-ads\"]\n")).unwrap();
+        let (host, _stub) = run(dir.path(), &[]).await;
+        let prefix = agent_prefix(&host.cfg.host, &host.cfg.session);
+        let (a, lead) = (format!("{prefix}a"), format!("{prefix}lead"));
+        let mut s = State::default();
+        for id in [&a, &lead] {
+            s.agents.insert(id.clone(), live_agent());
+            s.agents.get_mut(id).unwrap().since = Utc::now() - chrono::Duration::minutes(60);
+            s.agents.get_mut(id).unwrap().host = host.cfg.host.clone();
+        }
+        s.roles.insert(
+            a.clone(),
+            crate::state::Role {
+                level: Level::Implementer,
+                lead: Some(lead.clone()),
+                domain: None,
+                by: "x".into(),
+                since: Utc::now(),
+            },
+        );
+        s.first_cwd.insert(a.clone(), "/w/asa-ads".into());
+        idle(&host, &s).await;
+        assert!(msgs(&host).is_empty(), "{:?}", msgs(&host));
     }
 
     #[tokio::test]
