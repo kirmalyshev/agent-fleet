@@ -1731,36 +1731,39 @@ async fn handoffs(
             }
         }
         // Everything else is a tell: one per episode, deduped through the log.
-        let Some(to) = crate::doctor::escalate(state, id) else {
-            continue;
+        let sent = |to: &str, kind: &str| {
+            events.iter().any(|e| {
+                e.ts > a.since
+                    && matches!(&e.body,
+                        Body::Known(Known::MsgSent(m))
+                            if m.to == to && m.kind == kind && m.reference == name)
+            })
         };
-        let kind = match cause {
-            StuckCause::Quota => "QUOTA",
-            _ => "NEVER_STARTED",
-        };
-        if events.iter().any(|e| {
-            e.ts > a.since
-                && matches!(&e.body,
-                    Body::Known(Known::MsgSent(m))
-                        if m.to == to && m.kind == kind && m.reference == name)
-        }) {
-            continue;
+        let mut tells: Vec<(String, &str)> = Vec::new();
+        // The requester may be watching nothing (`--no-wait`): a spawn that never worked is its
+        // failure, whether or not the agent has a lead. It gets SPAWN-FAILED instead of the lead's kind.
+        let requester = (cause != StuckCause::Quota && is_agent_id(&sp.by)).then(|| sp.by.clone());
+        if let Some(r) = &requester {
+            tells.push((r.clone(), "SPAWN-FAILED"));
         }
-        host.publish(host.presence(Known::MsgSent(MsgSent {
-            to: to.to_string(),
-            kind: kind.into(),
-            reference: name.to_string(),
-            text: text.clone(),
-            closes: Vec::new(),
-        })))
-        .await;
-        // The requester is not the lead's reader: a spawn that never worked is its failure too.
-        if cause != StuckCause::Quota && is_agent_id(&sp.by) && sp.by != to {
+        if let Some(to) = crate::doctor::escalate(state, id)
+            && requester.as_deref() != Some(to)
+        {
+            let kind = match cause {
+                StuckCause::Quota => "QUOTA",
+                _ => "NEVER_STARTED",
+            };
+            tells.push((to.to_string(), kind));
+        }
+        for (to, kind) in tells {
+            if sent(&to, kind) {
+                continue;
+            }
             host.publish(host.presence(Known::MsgSent(MsgSent {
-                to: sp.by.clone(),
-                kind: "SPAWN-FAILED".into(),
+                to,
+                kind: kind.into(),
                 reference: name.to_string(),
-                text,
+                text: text.clone(),
                 closes: Vec::new(),
             })))
             .await;
@@ -5160,6 +5163,61 @@ profile = "devin"
                 && m.text.contains("never reached working")),
             "the lead is told: {got:?}"
         );
+        assert!(
+            got.iter()
+                .any(|m| m.kind == "SPAWN-FAILED" && m.to == "agent:h/s/x"),
+            "the requester is told too: {got:?}"
+        );
+        // the log dedupes a second pass of the same episode
+        let events: Vec<Event> = host.replica.lock().unwrap().all().unwrap().to_vec();
+        handoffs(&host, &s, &events, &mut handed, &mut HashSet::new()).await;
+        assert_eq!(msgs(&host).len(), got.len());
+    }
+
+    #[tokio::test]
+    async fn a_never_started_agent_with_no_lead_still_rings_its_requester() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run_act(dir.path(), &[]).await;
+        let mut s = stalled_state(None);
+        s.agents.get_mut("agent:h/s/a").unwrap().worked = None;
+        let mut r = req(None);
+        r.agent = "agent:h/s/a".into();
+        r.name = "a".into();
+        let req_ev = Envelope::new(actor(), "p", Known::SpawnRequested(Box::new(r))).into_event();
+        let mut res_ev = Envelope::new(
+            actor(),
+            "p",
+            Known::SpawnResult(SpawnResult {
+                agent: "agent:h/s/a".into(),
+                ok: true,
+                pane: Some("w:1".into()),
+                worktree: Some("/w/a".into()),
+                error: None,
+            }),
+        )
+        .re(&req_ev.id)
+        .into_event();
+        res_ev.ts = Utc::now() - chrono::Duration::minutes(10);
+        let events = [req_ev, res_ev];
+        for e in &events {
+            s.apply(e);
+        }
+        let reqs = |host: &Host| {
+            host.replica
+                .lock()
+                .unwrap()
+                .all()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(&e.body, Body::Known(Known::SpawnRequested(_))))
+                .count()
+        };
+        let mut handed = HashSet::new();
+        handoffs(&host, &s, &events, &mut handed, &mut HashSet::new()).await;
+        assert!(handed.is_empty(), "no automatic handoff");
+        assert_eq!(reqs(&host), 0);
+        let got = msgs(&host);
         assert!(
             got.iter()
                 .any(|m| m.kind == "SPAWN-FAILED" && m.to == "agent:h/s/x"),
