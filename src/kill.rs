@@ -603,7 +603,7 @@ pub const UNMANAGED_REFUSAL: &str = "agent-fleet: every agent runs in herdr. Spa
 `agent-fleet spawn <owner/repo>#<issue>`, or start it in a pane with \
 `herdr agent start <name> --kind <program> --pane <pane>`. The read-only and admin forms \
 (--version, --help, auth status, doctor, models, mcp list|get, update --check) pass, and so \
-do one-shot `claude -p` and `codex exec` from an agent that is itself in herdr.";
+do one-shot `claude -p`, `codex exec` and `gemini -p` from an agent that is itself in herdr.";
 
 /// The PreToolUse hook for Claude Code and Devin CLI (same format): the tool call on stdin,
 /// refused with exit 2 when it is a shell command running a raw kill or starting an agent
