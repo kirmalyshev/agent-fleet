@@ -325,9 +325,12 @@ kind `UNREAD`, `re` = the tell, the tell's ref, and the text `[unread <age>: <re
 and has not read it] <TYPE> <ref>: <text>`. The tell stays queued; that one event only marks it
 (state `escalated`, dropped with the tell), and its id is derived from the tell's id and `UNREAD`,
 so a retry is the same event. Status reports and the fleet's own `DEADLETTER` and `UNREAD` never go
-back. A `DONE` sent while its sender still has unread tells has them appended to its text, `[had
-<n> unread tell(s): <TYPE> <ref> from <sender>, ...]`, and `tell` reminds the sender to run
-`agent-fleet read`.
+back. A `DONE`, `MERGED`, `READY` or `REPORT` sent while its sender still has unread tells is refused:
+`tell` prints those tells to stderr and exits 1, nothing is written, so the agent reads and acts
+first. `tell --force` sends it anyway, with `[forced past <n> unread tell(s): <TYPE> <ref> from
+<sender>, ...]` appended to its text, which is how the override is logged. The gate counts the
+tells `agent-fleet read` shows (expired and stale ones do not count) and is skipped (with a
+note) when the hub is unreachable. `--force` goes before the text.
 `agent-fleet sent` shows the sender each of its tells as `sent`, `unread <age since the last
 delivery>`, or `read`; the board lists unread ones the same way. Read tells stay in the state for
 24 h after the read.

@@ -342,6 +342,10 @@ enum Cmd {
         reference: String,
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         text: Vec<String>,
+        /// Send a DONE, MERGED, READY or REPORT past unread tells (emergency; the text records it).
+        /// Put it before the text: after it, it is part of the text.
+        #[arg(long)]
+        force: bool,
     },
     /// Read your own tells: every one sent to you (or to a role you hold) not read yet, delivered
     /// or not, oldest first with its original sender and time; each is then acked (`msg.read`),
@@ -2069,8 +2073,12 @@ async fn main() -> Result<()> {
             kind,
             reference,
             text,
+            force,
         } => {
-            let state = ctx.state().await?;
+            let (state, replica) = ctx.snapshot_state().await?;
+            if let Some(note) = &replica {
+                eprintln!("agent-fleet: {note}");
+            }
             let to = tell_to(&state, agent)?;
             let busy = state
                 .recipient(&to)
@@ -2085,9 +2093,32 @@ async fn main() -> Result<()> {
             let waiting = state.pending_for(&to).0 + 1;
             let me = ctx.me().await?;
             let said = text.join(" ");
-            let text = done_text(&state, &me.id, kind, said.clone(), chrono::Utc::now());
+            // The replica never sees the acks `read` spooled, so it cannot gate: let it through.
+            let gated = if replica.is_some() {
+                eprintln!("agent-fleet: unread tells not checked (hub unreachable)");
+                Ok(said.clone())
+            } else {
+                report_text(
+                    &state,
+                    &me.id,
+                    kind,
+                    said.clone(),
+                    *force,
+                    chrono::Utc::now(),
+                )
+            };
+            let text = match gated {
+                Ok(t) => t,
+                Err(unread) => {
+                    eprintln!("{unread}");
+                    eprintln!(
+                        "agent-fleet: {kind} refused, you have unread tells above; act on them, run `agent-fleet read`, then tell again (emergency: `agent-fleet tell --force <agent> {kind} <ref> <text>`, flag before the text)"
+                    );
+                    std::process::exit(1);
+                }
+            };
             if text != said {
-                eprintln!("agent-fleet: you have unread tells; run `agent-fleet read`");
+                eprintln!("agent-fleet: sent past unread tells (--force)");
             }
             let body = MsgSent {
                 to: to.clone(),
@@ -2111,28 +2142,41 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// A `DONE`'s text, naming the tells `me` has not read: its lead sees it finished without them.
-fn done_text(
+/// Kinds that report the work finished: the lead must not get one from an agent that skipped its mail.
+const REPORT_KINDS: [&str; 4] = ["DONE", "MERGED", "READY", "REPORT"];
+
+/// The text of a report-kind tell `me` sends. With unread tells it is refused (`Err` holds them,
+/// one per line) unless `force`, which records them in the text so the lead sees it.
+fn report_text(
     s: &State,
     me: &str,
     kind: &str,
     text: String,
+    force: bool,
     now: chrono::DateTime<chrono::Utc>,
-) -> String {
+) -> Result<String, String> {
     let mail = s.unread_for(me, now);
-    if kind != "DONE" || mail.is_empty() {
-        return text;
+    if !REPORT_KINDS
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case(kind.trim()))
+        || mail.is_empty()
+    {
+        return Ok(text);
+    }
+    if !force {
+        let lines: Vec<String> = mail.iter().map(|(id, m)| ui::mail_line(id, m)).collect();
+        return Err(lines.join("\n"));
     }
     let tells: Vec<String> = mail
         .iter()
         .map(|(_, m)| format!("{} {} from {}", m.kind, m.reference, short(&m.from)))
         .collect();
     let plural = if tells.len() == 1 { "" } else { "s" };
-    format!(
-        "{text} [had {} unread tell{plural}: {}]",
+    Ok(format!(
+        "{text} [forced past {} unread tell{plural}: {}]",
         tells.len(),
         tells.join(", ")
-    )
+    ))
 }
 
 /// `agent-fleet read`'s acks: one `msg.read` from `me` per tell `unread_for` shows it.
@@ -2438,29 +2482,67 @@ mod tests {
     }
 
     #[test]
-    fn a_done_sent_with_unread_tells_names_them() {
+    fn a_report_with_unread_tells_is_refused_unless_forced() {
         let mut s = State::default();
         let me = "agent:h/s/dv-1";
-        let tell = |kind: &str| state::Msg {
-            from: "agent:h/s/lead".into(),
-            to: me.into(),
-            kind: kind.into(),
-            reference: "o/r#1".into(),
-            text: "rebase first".into(),
-            since: Utc::now(),
-        };
         let now = Utc::now();
-        assert_eq!(done_text(&s, me, "DONE", "shipped".into(), now), "shipped");
-        s.msgs.insert("01A".into(), tell("ASK"));
-        assert_eq!(
-            done_text(&s, me, "DONE", "shipped".into(), now),
-            "shipped [had 1 unread tell: ASK o/r#1 from lead]"
+        let send =
+            |s: &State, kind: &str, force| report_text(s, me, kind, "shipped".into(), force, now);
+        // Clean path: no unread tells.
+        for k in REPORT_KINDS {
+            assert_eq!(send(&s, k, false).unwrap(), "shipped");
+        }
+        s.msgs.insert(
+            "01A".into(),
+            state::Msg {
+                from: "agent:h/s/lead".into(),
+                to: me.into(),
+                kind: "ASK".into(),
+                reference: "o/r#1".into(),
+                text: "rebase first".into(),
+                since: Utc::now(),
+            },
+        );
+        for k in REPORT_KINDS {
+            let err = send(&s, k, false).unwrap_err();
+            assert!(
+                err.contains("rebase first"),
+                "{k} lists the unread tell: {err}"
+            );
+        }
+        assert!(
+            send(&s, "done", false).is_err(),
+            "kind case does not matter"
         );
         assert_eq!(
-            done_text(&s, me, "OPEN", "pr".into(), now),
-            "pr",
-            "only a DONE"
+            send(&s, "OPEN", false).unwrap(),
+            "shipped",
+            "other kinds pass"
         );
+        assert_eq!(
+            send(&s, "DONE", true).unwrap(),
+            "shipped [forced past 1 unread tell: ASK o/r#1 from lead]"
+        );
+    }
+
+    #[test]
+    fn tell_force_parses_before_the_text_and_defaults_off() {
+        let f = |a: &[&str]| match Cli::try_parse_from(a).unwrap().cmd {
+            Cmd::Tell { force, text, .. } => (force, text),
+            _ => panic!("not a tell"),
+        };
+        let (force, text) = f(&[
+            "agent-fleet",
+            "tell",
+            "--force",
+            "lead",
+            "DONE",
+            "r",
+            "all",
+            "done",
+        ]);
+        assert!(force && text == ["all", "done"]);
+        assert!(!f(&["agent-fleet", "tell", "lead", "DONE", "r", "t"]).0);
     }
 
     #[test]
