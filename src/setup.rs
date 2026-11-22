@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 /// The agent programs `agent.start` knows, as profile kinds.
-pub const KINDS: [&str; 3] = ["claude", "codex", "devin"];
+pub const KINDS: [&str; 4] = ["claude", "codex", "devin", "agy"];
 
 /// The reference config is the template: what init writes is what the docs explain.
 const FLEET: &str = include_str!("../docs/fleet.example.toml");
@@ -388,6 +388,16 @@ mod tests {
                 "{k}"
             );
         }
+        // A dropped profile takes its comments along; a kept one parses.
+        assert!(!fleet_toml(&["claude"]).contains("trust this folder"));
+        let with_agy = fleet_toml(&["agy"]);
+        assert!(with_agy.contains("trust this folder"));
+        assert!(
+            crate::spawn::FleetConfig::parse(&with_agy)
+                .unwrap()
+                .profiles
+                .contains_key("agy")
+        );
         // The template as shipped (no program found) is a valid fleet.toml.
         crate::spawn::FleetConfig::parse(&fleet_toml(&[])).unwrap();
     }
@@ -630,8 +640,9 @@ mod tests {
         file(a.path(), "devin", 0o644); // not executable
         std::fs::create_dir(a.path().join("claude")).unwrap(); // a dir, not a program
         file(b.path(), "claude", 0o700);
+        file(b.path(), "agy", 0o755);
         let path = std::env::join_paths([a.path(), Path::new("/no/such/dir"), b.path()]).unwrap();
-        assert_eq!(kinds_in(&path), ["claude", "codex"]);
+        assert_eq!(kinds_in(&path), ["claude", "codex", "agy"]);
         assert!(kinds_in(std::ffi::OsStr::new("")).is_empty());
     }
 

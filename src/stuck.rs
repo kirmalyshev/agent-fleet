@@ -1681,4 +1681,24 @@ mod tests {
             }
         }
     }
+
+    /// Antigravity CLI (`agy` 1.3.6) screens captured from a live herdr pane: its idle and
+    /// working chrome names no stuck cause. It checkpoints its own context, so it has no
+    /// context footer to read.
+    #[test]
+    fn agy_idle_and_working_screens_are_not_stuck() {
+        let rule = "─".repeat(60);
+        let footer = "? for shortcuts            Gemini 3.8 Flash · high";
+        let idle = format!("Antigravity CLI 1.3.6\n\n{rule}\n>\n{rule}\n{footer}\n");
+        let working = format!(
+            "{rule}\n> Count from 1 to 40\n⣽  Generating...\n{rule}\n>\n{rule}\nesc to cancel            Gemini 3.8 Flash · high\n"
+        );
+        let now = Utc::now();
+        for screen in [idle, working] {
+            assert!(
+                stuck_cause(Some("agy"), &screen, None, now).is_none(),
+                "{screen}"
+            );
+        }
+    }
 }
