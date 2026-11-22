@@ -3011,6 +3011,27 @@
           ],
           "type": "object"
         },
+        "Report": {
+          "description": "An agent's last `msg.sent`.",
+          "properties": {
+            "kind": {
+              "type": "string"
+            },
+            "since": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "text",
+            "since"
+          ],
+          "type": "object"
+        },
         "Resource": {
           "properties": {
             "holder": {
@@ -4008,6 +4029,15 @@
           "description": "Hung processes by `<host>:<pid>` of the topmost one, `since` always set.",
           "type": "object"
         },
+        "idle_rung": {
+          "additionalProperties": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "default": {},
+          "description": "When the host last rang an agent's lead `IDLE`/`HELD` (key: the agent id) or `UNMANAGED`\n(key: the id + `UNMANAGED_KEY`); gone once the agent works or goes down.",
+          "type": "object"
+        },
         "last": {
           "description": "Id of the last event folded in.",
           "type": [
@@ -4069,6 +4099,14 @@
             "$ref": "#/$defs/RefusedKill"
           },
           "type": "array"
+        },
+        "reports": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Report"
+          },
+          "default": {},
+          "description": "Each up agent's last `msg.sent`, what `IDLE` quotes and `auto_retire` reads (`DONE`/`MERGED`).",
+          "type": "object"
         },
         "resources": {
           "additionalProperties": {
