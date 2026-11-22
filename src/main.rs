@@ -343,6 +343,7 @@ enum Cmd {
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         text: Vec<String>,
         /// Send a DONE, MERGED, READY or REPORT past unread tells (emergency; the text records it).
+        /// Put it before the text: after it, it is part of the text.
         #[arg(long)]
         force: bool,
     },
@@ -2074,7 +2075,10 @@ async fn main() -> Result<()> {
             text,
             force,
         } => {
-            let state = ctx.state().await?;
+            let (state, replica) = ctx.snapshot_state().await?;
+            if let Some(note) = &replica {
+                eprintln!("agent-fleet: {note}");
+            }
             let to = tell_to(&state, agent)?;
             let busy = state
                 .recipient(&to)
@@ -2089,19 +2093,26 @@ async fn main() -> Result<()> {
             let waiting = state.pending_for(&to).0 + 1;
             let me = ctx.me().await?;
             let said = text.join(" ");
-            let text = match report_text(
-                &state,
-                &me.id,
-                kind,
-                said.clone(),
-                *force,
-                chrono::Utc::now(),
-            ) {
+            // The replica never sees the acks `read` spooled, so it cannot gate: let it through.
+            let gated = if replica.is_some() {
+                eprintln!("agent-fleet: unread tells not checked (hub unreachable)");
+                Ok(said.clone())
+            } else {
+                report_text(
+                    &state,
+                    &me.id,
+                    kind,
+                    said.clone(),
+                    *force,
+                    chrono::Utc::now(),
+                )
+            };
+            let text = match gated {
                 Ok(t) => t,
                 Err(unread) => {
                     eprintln!("{unread}");
                     eprintln!(
-                        "agent-fleet: {kind} refused, you have unread tells above; act on them, run `agent-fleet read`, then tell again (--force in an emergency)"
+                        "agent-fleet: {kind} refused, you have unread tells above; act on them, run `agent-fleet read`, then tell again (emergency: `agent-fleet tell --force <agent> {kind} <ref> <text>`, flag before the text)"
                     );
                     std::process::exit(1);
                 }
