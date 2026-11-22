@@ -1407,6 +1407,42 @@ pub(crate) fn tail(s: &str) -> String {
     s[i..].to_string()
 }
 
+/// Answers request `id` with a failed `spawn.result` and rings `SPAWN-FAILED <name>: <error>` to
+/// whoever asked and to the agent's lead (once each): a `--no-wait` requester is not watching.
+async fn reject(host: &Host, id: &str, sp: &Spawn, error: &str) {
+    let r = &sp.request;
+    host.publish(
+        host.presence(Known::SpawnResult(SpawnResult {
+            agent: r.agent.clone(),
+            ok: false,
+            pane: None,
+            worktree: None,
+            error: Some(error.to_string()),
+        }))
+        .re(id),
+    )
+    .await;
+    let mut to: Vec<String> = [r.lead.clone(), Some(sp.by.clone())]
+        .into_iter()
+        .flatten()
+        .filter(|a| is_agent_id(a))
+        .collect();
+    to.dedup();
+    if to.is_empty() {
+        to.push(COORDINATOR.into());
+    }
+    for to in to {
+        host.publish(host.presence(Known::MsgSent(MsgSent {
+            to,
+            kind: "SPAWN-FAILED".into(),
+            reference: r.name.clone(),
+            text: error.to_string(),
+            closes: Vec::new(),
+        })))
+        .await;
+    }
+}
+
 /// Executes one `spawn.requested` and answers it with `spawn.result`.
 pub async fn execute(host: &Host, id: &str, sp: &Spawn, state: &State) {
     let Some(_busy) = host.busy_guard(format!("spawn of {}", sp.request.agent)) else {
@@ -1450,17 +1486,7 @@ pub async fn execute(host: &Host, id: &str, sp: &Spawn, state: &State) {
         }
         Err(err) => {
             undo(host, r, &made).await;
-            host.publish(
-                host.presence(Known::SpawnResult(SpawnResult {
-                    agent: r.agent.clone(),
-                    ok: false,
-                    pane: None,
-                    worktree: None,
-                    error: Some(tail(&format!("{err:#}"))),
-                }))
-                .re(id),
-            )
-            .await;
+            reject(host, id, sp, &tail(&format!("{err:#}"))).await;
         }
     }
 }
@@ -1705,29 +1731,43 @@ async fn handoffs(
             }
         }
         // Everything else is a tell: one per episode, deduped through the log.
-        let Some(to) = crate::doctor::escalate(state, id) else {
-            continue;
+        let sent = |to: &str, kind: &str| {
+            events.iter().any(|e| {
+                e.ts > a.since
+                    && matches!(&e.body,
+                        Body::Known(Known::MsgSent(m))
+                            if m.to == to && m.kind == kind && m.reference == name)
+            })
         };
-        let kind = match cause {
-            StuckCause::Quota => "QUOTA",
-            _ => "NEVER_STARTED",
-        };
-        if events.iter().any(|e| {
-            e.ts > a.since
-                && matches!(&e.body,
-                    Body::Known(Known::MsgSent(m))
-                        if m.to == to && m.kind == kind && m.reference == name)
-        }) {
-            continue;
+        let mut tells: Vec<(String, &str)> = Vec::new();
+        // The requester may be watching nothing (`--no-wait`): a spawn that never worked is its
+        // failure, whether or not the agent has a lead. It gets SPAWN-FAILED instead of the lead's kind.
+        let requester = (cause != StuckCause::Quota && is_agent_id(&sp.by)).then(|| sp.by.clone());
+        if let Some(r) = &requester {
+            tells.push((r.clone(), "SPAWN-FAILED"));
         }
-        host.publish(host.presence(Known::MsgSent(MsgSent {
-            to: to.to_string(),
-            kind: kind.into(),
-            reference: name.to_string(),
-            text,
-            closes: Vec::new(),
-        })))
-        .await;
+        if let Some(to) = crate::doctor::escalate(state, id)
+            && requester.as_deref() != Some(to)
+        {
+            let kind = match cause {
+                StuckCause::Quota => "QUOTA",
+                _ => "NEVER_STARTED",
+            };
+            tells.push((to.to_string(), kind));
+        }
+        for (to, kind) in tells {
+            if sent(&to, kind) {
+                continue;
+            }
+            host.publish(host.presence(Known::MsgSent(MsgSent {
+                to,
+                kind: kind.into(),
+                reference: name.to_string(),
+                text: text.clone(),
+                closes: Vec::new(),
+            })))
+            .await;
+        }
     }
 }
 
@@ -1971,21 +2011,7 @@ pub async fn spawn_loop(host: Arc<Host>) {
         );
         for id in expired {
             if let Some(sp) = state.spawns.get(&id) {
-                host.publish(
-                    Envelope::new(
-                        host.actor(),
-                        &sp.project,
-                        Known::SpawnResult(SpawnResult {
-                            agent: sp.request.agent.clone(),
-                            ok: false,
-                            pane: None,
-                            worktree: None,
-                            error: Some("expired".into()),
-                        }),
-                    )
-                    .re(&id),
-                )
-                .await;
+                reject(&host, &id, sp, "expired").await;
             }
         }
         for id in todo {
@@ -4405,7 +4431,9 @@ profile = "devin"
             .unwrap()
             .iter()
             .filter_map(|e| match &e.body {
-                Body::Known(Known::MsgSent(m)) => Some((m.kind.clone(), m.text.clone())),
+                Body::Known(Known::MsgSent(m)) if m.kind != "SPAWN-FAILED" => {
+                    Some((m.kind.clone(), m.text.clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -5080,6 +5108,69 @@ profile = "devin"
     }
 
     #[tokio::test]
+    async fn a_failed_spawn_rings_the_requester_and_the_lead_once_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run(dir.path(), &[("worktree.create", vec![err("boom")])]).await;
+        // lead and requester differ: both are told
+        let mut sp = spawn_of(req(None));
+        sp.by = "agent:h/s/boss".into();
+        execute(&host, "req1", &sp, &State::default()).await;
+        let got: Vec<_> = msgs(&host)
+            .into_iter()
+            .filter(|m| m.kind == "SPAWN-FAILED")
+            .collect();
+        let mut to: Vec<&str> = got.iter().map(|m| m.to.as_str()).collect();
+        to.sort();
+        assert_eq!(to, ["agent:h/s/boss", "agent:h/s/me"], "{got:?}");
+        assert!(
+            got.iter()
+                .all(|m| m.reference == "dv-7" && !m.text.is_empty())
+        );
+        // lead == requester: one ring, not two
+        let dir2 = tempfile::tempdir().unwrap();
+        let _co2 = checkout(dir2.path());
+        let (host, _stub) = run(dir2.path(), &[("worktree.create", vec![err("boom")])]).await;
+        execute(&host, "req1", &spawn_of(req(None)), &State::default()).await;
+        let n = msgs(&host)
+            .iter()
+            .filter(|m| m.kind == "SPAWN-FAILED")
+            .count();
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_spawn_with_no_agent_behind_it_rings_the_coordinator() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run(dir.path(), &[("worktree.create", vec![err("boom")])]).await;
+        let mut sp = spawn_of(req(None));
+        sp.by = "human:me".into();
+        sp.request.lead = None;
+        execute(&host, "req1", &sp, &State::default()).await;
+        let got = msgs(&host);
+        assert!(
+            got.iter()
+                .any(|m| m.kind == "SPAWN-FAILED" && m.to == "coordinator"),
+            "{got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_spawn_request_rings_the_requester() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run(dir.path(), &[]).await;
+        reject(&host, "req1", &spawn_of(req(None)), "expired").await;
+        let got = msgs(&host);
+        assert!(
+            got.iter()
+                .any(|m| m.kind == "SPAWN-FAILED" && m.text.contains("expired")),
+            "{got:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_never_started_agent_is_told_not_handed_off() {
         let dir = tempfile::tempdir().unwrap();
         let _co = checkout(dir.path());
@@ -5128,6 +5219,66 @@ profile = "devin"
                 && m.to == "agent:h/s/lead"
                 && m.text.contains("never reached working")),
             "the lead is told: {got:?}"
+        );
+        assert!(
+            got.iter()
+                .any(|m| m.kind == "SPAWN-FAILED" && m.to == "agent:h/s/x"),
+            "the requester is told too: {got:?}"
+        );
+        // the log dedupes a second pass of the same episode
+        let events: Vec<Event> = host.replica.lock().unwrap().all().unwrap().to_vec();
+        handoffs(&host, &s, &events, &mut handed, &mut HashSet::new()).await;
+        assert_eq!(msgs(&host).len(), got.len());
+    }
+
+    #[tokio::test]
+    async fn a_never_started_agent_with_no_lead_still_rings_its_requester() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run_act(dir.path(), &[]).await;
+        let mut s = stalled_state(None);
+        s.agents.get_mut("agent:h/s/a").unwrap().worked = None;
+        let mut r = req(None);
+        r.agent = "agent:h/s/a".into();
+        r.name = "a".into();
+        let req_ev = Envelope::new(actor(), "p", Known::SpawnRequested(Box::new(r))).into_event();
+        let mut res_ev = Envelope::new(
+            actor(),
+            "p",
+            Known::SpawnResult(SpawnResult {
+                agent: "agent:h/s/a".into(),
+                ok: true,
+                pane: Some("w:1".into()),
+                worktree: Some("/w/a".into()),
+                error: None,
+            }),
+        )
+        .re(&req_ev.id)
+        .into_event();
+        res_ev.ts = Utc::now() - chrono::Duration::minutes(10);
+        let events = [req_ev, res_ev];
+        for e in &events {
+            s.apply(e);
+        }
+        let reqs = |host: &Host| {
+            host.replica
+                .lock()
+                .unwrap()
+                .all()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(&e.body, Body::Known(Known::SpawnRequested(_))))
+                .count()
+        };
+        let mut handed = HashSet::new();
+        handoffs(&host, &s, &events, &mut handed, &mut HashSet::new()).await;
+        assert!(handed.is_empty(), "no automatic handoff");
+        assert_eq!(reqs(&host), 0);
+        let got = msgs(&host);
+        assert!(
+            got.iter()
+                .any(|m| m.kind == "SPAWN-FAILED" && m.to == "agent:h/s/x"),
+            "the requester is told too: {got:?}"
         );
         // the log dedupes a second pass of the same episode
         let events: Vec<Event> = host.replica.lock().unwrap().all().unwrap().to_vec();
