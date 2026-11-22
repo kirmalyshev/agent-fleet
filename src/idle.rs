@@ -83,15 +83,21 @@ pub fn due(
             .reports
             .get(id)
             .filter(|r| a.worked.is_none_or(|w| r.since >= w));
+        let mine: Vec<_> = s
+            .tasks
+            .values()
+            .filter(|t| t.owner.as_deref() == Some(id))
+            .collect();
+        // Every task it owns ended, or it reported DONE/MERGED since it last worked.
         let finished = report.is_some_and(|r| ["DONE", "MERGED"].contains(&r.kind.as_str()))
-            || s.tasks
-                .values()
-                .any(|t| t.owner.as_deref() == Some(id) && t.state.is_terminal());
+            || (!mine.is_empty() && mine.iter().all(|t| t.state.is_terminal()));
+        // A retire is asked once per stretch since it last worked, not per state flip.
+        let since = a.worked.or(report.map(|r| r.since)).unwrap_or(a.since);
         if c.auto_retire && finished && idle >= RETIRE_AFTER && sp.is_some() {
             let asked: Vec<_> = s
                 .retires
                 .values()
-                .filter(|r| r.request.agent == *id && r.since >= a.since)
+                .filter(|r| r.request.agent == *id && r.since >= since)
                 .collect();
             // Asked once per idle stretch; while it still runs, ring nobody either.
             if asked.is_empty() {
@@ -101,7 +107,8 @@ pub fn due(
                 continue;
             }
         }
-        let stale = Duration::minutes(c.stale_min as i64);
+        // ponytail: 0 would ring every tick; 1 min is the floor.
+        let stale = Duration::minutes(c.stale_min.clamp(1, 1_000_000) as i64);
         let again = s.idle_rung.get(id).is_none_or(|t| now - *t >= stale * 2);
         let Some(to) = lead else { continue };
         if idle < stale || !again {
@@ -265,7 +272,7 @@ mod tests {
             "b1".into(),
             crate::state::Blocker {
                 task: Some("t1".into()),
-                what: "login for Kirill".into(),
+                what: "login for the operator".into(),
                 owner: None,
                 unblocks_when: None,
                 pid: None,
@@ -278,7 +285,7 @@ mod tests {
             panic!()
         };
         assert_eq!(*kind, "HELD");
-        assert!(text.contains("login for Kirill"), "{text}");
+        assert!(text.contains("login for the operator"), "{text}");
     }
 
     #[test]
@@ -341,6 +348,59 @@ mod tests {
         s.tasks
             .insert("t".into(), task(crate::event::TaskState::Completed));
         assert_eq!(acts(&s, 30, on)[0].1, Act::Retire);
+    }
+
+    #[test]
+    fn stale_min_zero_is_one_minute_not_a_ring_per_tick() {
+        let mut s = state();
+        spawned(&mut s, "agent:h/s/a");
+        s.idle_rung
+            .insert("agent:h/s/a".into(), t0() + Duration::minutes(5));
+        let zero = Config {
+            stale_min: 0,
+            ..Config::default()
+        };
+        assert!(acts(&s, 5, zero.clone()).is_empty());
+        assert_eq!(acts(&s, 7, zero).len(), 1);
+    }
+
+    #[test]
+    fn a_state_flip_does_not_ask_for_another_retire() {
+        let mut s = state();
+        spawned(&mut s, "agent:h/s/a");
+        s.reports.insert(
+            "agent:h/s/a".into(),
+            Report {
+                kind: "DONE".into(),
+                text: "x".into(),
+                since: t0(),
+            },
+        );
+        s.retires.insert(
+            "r1".into(),
+            crate::state::Retire {
+                request: crate::event::RetireRequested {
+                    agent: "agent:h/s/a".into(),
+                    host: "h".into(),
+                    decide: None,
+                },
+                by: "host:h".into(),
+                project: "p".into(),
+                result: Some(crate::event::RetireResult {
+                    agent: "agent:h/s/a".into(),
+                    ok: false,
+                    text: "dirty".into(),
+                }),
+                since: t0() + Duration::minutes(10),
+            },
+        );
+        // idle -> done at +15: a.since moves past the retire, the refusal still stands
+        s.agents.get_mut("agent:h/s/a").unwrap().since = t0() + Duration::minutes(15);
+        let on = Config {
+            auto_retire: true,
+            ..Config::default()
+        };
+        assert!(!acts(&s, 40, on).iter().any(|(_, a)| *a == Act::Retire));
     }
 
     #[test]
