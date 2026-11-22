@@ -124,6 +124,9 @@ enum Cmd {
         /// Minutes an agent may idle or block after working before its lead is told STALLED.
         #[arg(long = "stall-min", default_value_t = spawn::STALL_MIN)]
         stall_min: u64,
+        /// Minutes an idle agent's BLOCKED/QUESTION may go unanswered before its lead is re-rung.
+        #[arg(long = "waiting-min", default_value_t = 10)]
+        waiting_min: u64,
         /// Act on a stuck agent — Enter/Escape/continue keystrokes and handoffs. Off, the
         /// host only classifies, records `agent.stuck`, and tells the lead.
         #[arg(long)]
@@ -1089,6 +1092,7 @@ async fn main() -> Result<()> {
             repos,
             locks,
             stall_min,
+            waiting_min,
             stuck_act,
         } => {
             let cfg = host::Config {
@@ -1112,6 +1116,7 @@ async fn main() -> Result<()> {
                 config_dir: spawn::machine_dir(&ctx.cli.instance),
                 locks: locks.clone(),
                 stall_min: *stall_min,
+                waiting_min: *waiting_min,
                 stuck_act: *stuck_act,
             };
             host::run(cfg, ctx.client()?).await?;

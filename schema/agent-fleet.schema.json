@@ -3754,6 +3754,41 @@
           ],
           "type": "object"
         },
+        "Waiting": {
+          "description": "An agent's last `BLOCKED` or `QUESTION`, open until the lead tells it anything or it works.",
+          "properties": {
+            "id": {
+              "description": "The id of the `msg.sent`.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "rung": {
+              "default": false,
+              "description": "The host already re-rang the lead (`STILL-WAITING`).",
+              "type": "boolean"
+            },
+            "since": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "to",
+            "kind",
+            "text",
+            "since"
+          ],
+          "type": "object"
+        },
         "Worktree": {
           "properties": {
             "since": {
@@ -4117,6 +4152,14 @@
           },
           "default": {},
           "description": "Self-update requests by their `update.requested` id, kept for 24 h.",
+          "type": "object"
+        },
+        "waiting": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Waiting"
+          },
+          "default": {},
+          "description": "Each agent's open `BLOCKED`/`QUESTION` to its lead, until answered (see `Waiting`).",
           "type": "object"
         },
         "worktree_procs": {
