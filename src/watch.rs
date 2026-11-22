@@ -318,6 +318,58 @@ impl<'a> Tick<'a> {
         }
     }
 
+    /// `sleep 270` / `timeout 270 cmd`, still inside its own duration: it waits for its clock,
+    /// not for anything that can hang. Past it, the process is overdue and judged as any other.
+    /// `sleep infinity` has no end to be past, so it waits by design.
+    fn timed_wait(&self, p: &Proc) -> bool {
+        let Some(started) = p.started else {
+            return false;
+        };
+        let mut words = p.args.as_deref().unwrap_or("").split_whitespace();
+        let secs = |w: &str| -> Option<f64> {
+            let (num, unit) = match w.char_indices().last()? {
+                (i, 's' | 'm' | 'h' | 'd') => w.split_at(i),
+                _ => (w, "s"),
+            };
+            let n: f64 = num
+                .parse()
+                .ok()
+                .filter(|n: &f64| n.is_finite() && *n >= 0.0)?;
+            Some(
+                n * match unit {
+                    "m" => 60.0,
+                    "h" => 3600.0,
+                    "d" => 86400.0,
+                    _ => 1.0,
+                },
+            )
+        };
+        let total = match p.name.as_str() {
+            "sleep" => {
+                words.next();
+                let w: Vec<&str> = words.collect();
+                if w == ["infinity"] {
+                    return true;
+                }
+                w.iter().map(|w| secs(w)).sum::<Option<f64>>()
+            }
+            // The first word that is not a flag is the duration (`-s KILL` takes a value).
+            "timeout" => {
+                words.next();
+                let mut prev_takes_value = false;
+                words
+                    .find(|w| {
+                        let skip = prev_takes_value || w.starts_with('-');
+                        prev_takes_value = matches!(*w, "-s" | "--signal" | "-k" | "--kill-after");
+                        !skip
+                    })
+                    .and_then(secs)
+            }
+            _ => None,
+        };
+        total.is_some_and(|t| (self.at - started).num_milliseconds() as f64 / 1000.0 < t)
+    }
+
     /// A command whose hung members are all idle by design is not hung. A wrapper (`bash -c
     /// 'tail -f x'`) is hung beside its follower and is spared with it, when every hung process
     /// under it is one. Any other lone filter blocked on a pipe nobody writes is a real hang.
@@ -329,7 +381,8 @@ impl<'a> Tick<'a> {
             .map(|c| c.pid)
             .collect();
         let spared = |pid: u32| {
-            let by_design = |q: u32| Self::idle_by_design(&self.now.0[&q]);
+            let by_design =
+                |q: u32| Self::idle_by_design(&self.now.0[&q]) || self.timed_wait(&self.now.0[&q]);
             // A launcher that only runs another command: a shell, or an exec-style wrapper.
             let wrapper = |q: u32| {
                 let n = self.now.0[&q].name.as_str();
@@ -1429,8 +1482,54 @@ mod tests {
     }
 
     #[test]
+    fn a_sleep_or_timeout_is_idle_until_its_own_duration_has_passed() {
+        // `sleep 270` started 4 min before the third tick: 240 s of 270.
+        let layout = |name: &'static str, args: &'static str| {
+            vec![
+                (30, SHELL, "bash", "bash -c go", 0, 20),
+                (31, 30, name, args, 0, 0),
+            ]
+        };
+        for (name, args) in [
+            ("sleep", "sleep 270"),
+            ("sleep", "sleep 4m 30s"),
+            ("timeout", "timeout 270 true"),
+        ] {
+            let l = layout(name, args);
+            let mut w = Watch::default();
+            let t = || tree(&l);
+            w.step(t(), at(0), &seen());
+            w.step(t(), at(2), &seen());
+            let v = w.step(t(), at(4), &seen());
+            assert!(
+                v.iter().all(|c| !matches!(c.verdict, Verdict::Hung(_))),
+                "{args}: {v:#?}"
+            );
+        }
+        // still alive past its duration: that is a hang
+        let l = layout("sleep", "sleep 60");
+        let mut w = Watch::default();
+        let t = || tree(&l);
+        w.step(t(), at(0), &seen());
+        w.step(t(), at(2), &seen());
+        let v = w.step(t(), at(4), &seen());
+        assert!(matches!(verdict(&v, 31), Some(Verdict::Hung(_))), "{v:#?}");
+        // `sleep infinity` has no end to be past: idle by design
+        let l = layout("sleep", "sleep infinity");
+        let mut w = Watch::default();
+        let t = || tree(&l);
+        w.step(t(), at(0), &seen());
+        w.step(t(), at(2), &seen());
+        let v = w.step(t(), at(4), &seen());
+        assert!(
+            v.iter().all(|c| !matches!(c.verdict, Verdict::Hung(_))),
+            "{v:#?}"
+        );
+    }
+
+    #[test]
     fn a_real_hang_beside_a_follower_or_a_daemon_stays_hung() {
-        for (name, args) in [("sleep", "sleep 9999"), ("head", "head -3")] {
+        for (name, args) in [("python3", "python3 deadlock.py"), ("head", "head -3")] {
             for (fname, fargs) in [("tail", "tail -f x.log"), ("DTServiceHub", "DTServiceHub")] {
                 // A wrapper over both, and two siblings under the tool shell.
                 let layouts = [
@@ -1517,8 +1616,8 @@ mod tests {
                 "{reader}: {v:#?}"
             );
         }
-        // A stuck non-filter sibling in the follower's group (`tail -f X & sleep 3600`).
-        for stuck in ["sleep 3600", "curl http://localhost:9/x"] {
+        // A stuck non-filter sibling in the follower's group (`tail -f X & python3 stuck.py`).
+        for stuck in ["python3 deadlock.py", "curl http://localhost:9/x"] {
             let v = step(stuck, "tail -f /tmp/x/all.log", true);
             assert!(
                 matches!(verdict(&v, 41), Some(Verdict::Hung(_))),
@@ -1586,7 +1685,7 @@ mod tests {
         let t = || {
             tree(&[
                 (31, SHELL, "node", "node server.js", 0, 20),
-                (32, SHELL, "sleep", "sleep 9999", 0, 20),
+                (32, SHELL, "python3", "python3 deadlock.py", 0, 20),
             ])
         };
         w.step(t(), at(0), &sn);
@@ -1602,7 +1701,7 @@ mod tests {
             tree(&[
                 (30, SHELL, "bash", "bash dev.sh", 0, 20),
                 (31, 30, "java", "java Main", cpu, 20),
-                (32, 30, "sleep", "sleep 9999", 0, 20),
+                (32, 30, "python3", "python3 deadlock.py", 0, 20),
             ])
         };
         w.step(t(0), at(0), &seen());
