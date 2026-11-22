@@ -463,7 +463,8 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
         if s.agents
             .get(id)
             .is_some_and(|a| a.state != AgentState::Working)
-            && now - w.since >= crate::state::WAITING_MIN
+            // `rung`: the host re-rang past its own `--waiting-min`, so both agree for any value.
+            && w.rung
         {
             out.push(finding(
                 "unanswered",
@@ -1475,7 +1476,7 @@ mod tests {
                 kind: "BLOCKED".into(),
                 text: "which way?".into(),
                 since: Utc::now() - chrono::Duration::minutes(30),
-                rung: false,
+                rung: true,
             },
         );
         let f = findings(&s, Utc::now());

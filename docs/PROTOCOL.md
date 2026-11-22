@@ -540,7 +540,7 @@ the host sends ONE `ESCALATED` `msg.sent` to the lead's own lead, and so on up t
 A `BLOCKED` or `QUESTION` an agent sends is tracked (`State.waiting`) until its lead sends that agent
 any tell, or the agent works again. Past `--waiting-min` (default 10) with the agent not working, the
 host re-rings the lead once with `STILL-WAITING <agent>: <original text>` (`re` = the ask), and
-`doctor` lists the agent as `unanswered`. A `msg.read` ack is not an answer.
+`doctor` lists the agent as `unanswered` once that ring is out, until the lead answers. A `msg.read` ack is not an answer.
 
 ## Chores
 

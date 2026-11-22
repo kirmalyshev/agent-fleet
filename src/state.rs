@@ -531,9 +531,6 @@ pub const UNREAD: &str = "UNREAD";
 /// The kind of the tell that re-rings a lead whose agent's BLOCKED or QUESTION got no reply.
 pub const STILL_WAITING: &str = "STILL-WAITING";
 
-/// How long an agent that asked may sit idle, unanswered, before its lead is re-rung.
-pub const WAITING_MIN: chrono::Duration = chrono::Duration::minutes(10);
-
 /// A tell to a working agent still unread this long after its send goes back to its sender.
 pub const UNREAD_ESCALATE: chrono::Duration = chrono::Duration::minutes(10);
 
@@ -870,6 +867,10 @@ impl State {
                 // A re-up (host or herdr restart) keeps what the entry already knows: the last
                 // working time, the current stretch when the state did not change, the usage.
                 let old = self.agents.get(&d.agent);
+                if old.is_none() {
+                    // A new incarnation owes nothing to a previous one's ask.
+                    self.waiting.remove(&d.agent);
+                }
                 self.agents.insert(
                     d.agent.clone(),
                     Agent {
@@ -1210,7 +1211,9 @@ impl State {
             Known::MsgSent(d) => {
                 match e.actor.kind {
                     ActorKind::Agent => {
-                        if ["BLOCKED", "QUESTION"].contains(&d.kind.as_str()) {
+                        if ["BLOCKED", "QUESTION"].contains(&d.kind.as_str())
+                            && self.agents.contains_key(&e.actor.id)
+                        {
                             self.waiting.insert(
                                 e.actor.id.clone(),
                                 Waiting {
@@ -2284,6 +2287,10 @@ mod tests {
                 .is_empty()
         );
         assert!(s.unanswered("other", at20, min).is_empty());
+        // an ask from an agent that is not up is not tracked
+        let mut s = State::default();
+        s.apply(&at(1, ActorKind::Agent, a, "m", None, msg(lead, "BLOCKED")));
+        assert!(s.waiting.is_empty());
         // a status kind is no ask
         let mut s = State::default();
         s.apply(&at(0, ActorKind::Agent, a, "u", None, up(AgentState::Idle)));
