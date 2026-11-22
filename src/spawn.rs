@@ -5199,6 +5199,90 @@ profile = "devin"
     }
 
     #[tokio::test]
+    async fn fleet_toml_idle_drives_a_retire_asked_once_and_the_rings_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        let toml = co.join(".agent-fleet/fleet.toml");
+        let body = std::fs::read_to_string(&toml).unwrap();
+        std::fs::write(
+            &toml,
+            format!("{body}\n[idle]\nstale_min = 5\nauto_retire = true\n"),
+        )
+        .unwrap();
+        let (host, _stub) = run(dir.path(), &[]).await;
+        let (a, lead) = ("agent:h/s/a", "agent:h/s/lead");
+        let mut s = State::default();
+        let mut r = req(None);
+        r.agent = a.into();
+        r.name = "a".into();
+        r.issue = None;
+        s.apply(
+            &Envelope::new(
+                Actor {
+                    kind: ActorKind::Agent,
+                    id: lead.into(),
+                },
+                "p",
+                Known::SpawnRequested(Box::new(r)),
+            )
+            .into_event(),
+        );
+        for id in [a, lead] {
+            s.agents.insert(id.into(), live_agent());
+            s.agents.get_mut(id).unwrap().since = Utc::now() - chrono::Duration::minutes(11);
+        }
+        s.roles.insert(
+            a.into(),
+            crate::state::Role {
+                level: Level::Implementer,
+                lead: Some(lead.into()),
+                domain: None,
+                by: "x".into(),
+                since: Utc::now(),
+            },
+        );
+        s.reports.insert(
+            a.into(),
+            crate::state::Report {
+                kind: "DONE".into(),
+                text: "shipped".into(),
+                since: Utc::now() - chrono::Duration::minutes(12),
+            },
+        );
+        let fold = |s: &mut State| {
+            let all = host.replica.lock().unwrap().all().unwrap();
+            for e in all {
+                s.apply(&e);
+            }
+        };
+        let count = |kind: &str| msgs(&host).iter().filter(|m| m.kind == kind).count();
+        let retires = || {
+            host.replica
+                .lock()
+                .unwrap()
+                .all()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(&e.body, Body::Known(Known::RetireRequested(_))))
+                .count()
+        };
+        // finished + 11 min idle: retired (not rung); the agent has no spawn-less ring
+        idle(&host, &s).await;
+        fold(&mut s);
+        idle(&host, &s).await;
+        assert_eq!(retires(), 1);
+        assert_eq!(count("IDLE"), 0);
+        // an agent that asked to be retired is rung once past stale_min when auto_retire finds nothing
+        s.reports.clear();
+        s.retires.clear();
+        idle(&host, &s).await;
+        fold(&mut s);
+        idle(&host, &s).await;
+        assert_eq!(count("IDLE"), 1);
+        assert_eq!(retires(), 1);
+    }
+
+    #[tokio::test]
     async fn a_failed_spawn_rings_the_requester_and_the_lead_once_each() {
         let dir = tempfile::tempdir().unwrap();
         let _co = checkout(dir.path());

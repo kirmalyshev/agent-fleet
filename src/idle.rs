@@ -87,17 +87,19 @@ pub fn due(
             || s.tasks
                 .values()
                 .any(|t| t.owner.as_deref() == Some(id) && t.state.is_terminal());
-        if c.auto_retire
-            && finished
-            && idle >= RETIRE_AFTER
-            && sp.is_some()
-            && !s
+        if c.auto_retire && finished && idle >= RETIRE_AFTER && sp.is_some() {
+            let asked: Vec<_> = s
                 .retires
                 .values()
-                .any(|r| r.request.agent == *id && r.since >= a.since)
-        {
-            out.push((id.clone(), Act::Retire));
-            continue;
+                .filter(|r| r.request.agent == *id && r.since >= a.since)
+                .collect();
+            // Asked once per idle stretch; while it still runs, ring nobody either.
+            if asked.is_empty() {
+                out.push((id.clone(), Act::Retire));
+            }
+            if asked.is_empty() || asked.iter().any(|r| r.result.is_none()) {
+                continue;
+            }
         }
         let stale = Duration::minutes(c.stale_min as i64);
         let again = s.idle_rung.get(id).is_none_or(|t| now - *t >= stale * 2);
@@ -308,6 +310,58 @@ mod tests {
                 .iter()
                 .any(|(_, a)| *a == Act::Retire)
         );
+    }
+
+    #[test]
+    fn a_terminal_task_finishes_an_agent_and_a_live_one_does_not() {
+        let mut s = state();
+        spawned(&mut s, "agent:h/s/a");
+        let task = |state| crate::state::Task {
+            project: "p".into(),
+            title: "T".into(),
+            url: None,
+            state,
+            since: t0(),
+            owner: Some("agent:h/s/a".into()),
+            lead: None,
+            blocked_by: Default::default(),
+            handoffs: vec![],
+        };
+        let on = Config {
+            auto_retire: true,
+            ..Config::default()
+        };
+        s.tasks
+            .insert("t".into(), task(crate::event::TaskState::Working));
+        assert!(
+            !acts(&s, 30, on.clone())
+                .iter()
+                .any(|(_, a)| *a == Act::Retire)
+        );
+        s.tasks
+            .insert("t".into(), task(crate::event::TaskState::Completed));
+        assert_eq!(acts(&s, 30, on)[0].1, Act::Retire);
+    }
+
+    #[test]
+    fn with_no_lead_the_root_coordinator_is_rung() {
+        let mut s = state();
+        spawned(&mut s, "agent:h/s/a");
+        s.roles.clear();
+        s.roles.insert(
+            "agent:h/s/lead".into(),
+            crate::state::Role {
+                level: crate::event::Level::RootCoordinator,
+                lead: None,
+                domain: None,
+                by: "x".into(),
+                since: t0(),
+            },
+        );
+        let Act::Ring { to, .. } = &acts(&s, 30, Config::default())[0].1 else {
+            panic!()
+        };
+        assert_eq!(to, "agent:h/s/lead");
     }
 
     #[test]
