@@ -1105,6 +1105,7 @@ mod tests {
             "codex exec 'audit'",
             "timeout 300 codex exec x",
             "gemini --prompt audit",
+            "gemini -p audit",
         ] {
             assert_eq!(agent_start(line, true), None, "{line}");
             assert!(agent_start(line, false).is_some(), "{line}");

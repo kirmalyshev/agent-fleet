@@ -1179,6 +1179,16 @@ mod tests {
         // A codex count-down footer is not full at 96 or 100.
         assert!(stuck_cause(Some("codex"), "96% context left", None, now).is_none());
         assert!(stuck_cause(Some("gemini"), "96% context left", None, now).is_none());
+        // gemini reads only its own shape, not claude's or devin's.
+        for other in [
+            "Context left until auto-compact: 5%",
+            "SWE-2 High · Context: 190,000 / 200,000 tokens (95%)",
+        ] {
+            assert!(
+                stuck_cause(Some("gemini"), other, None, now).is_none(),
+                "{other}"
+            );
+        }
         assert!(
             stuck_cause(
                 Some("codex"),
