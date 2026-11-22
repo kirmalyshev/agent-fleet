@@ -52,13 +52,13 @@ kind = "devin"
 args = []
 prefix = "dv-"
 
-# agy (Google Antigravity CLI) asks "Do you trust this folder?" in every new folder and stays
-# blocked until answered: a `ready` script can add the worktree path to the
-# `trustedWorkspaces` list in its settings.json.
 [profiles.agy]
 kind = "agy"
 args = []
 prefix = "ag-"
+# agy (Google Antigravity CLI) asks "Do you trust this folder?" in every new folder and stays
+# blocked until answered: a `ready` script can add the worktree path to the
+# `trustedWorkspaces` list in its settings.json.
 
 # [profiles.opus]                # a second claude profile, picked by a rule below
 # kind = "claude"

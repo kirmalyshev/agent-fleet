@@ -544,12 +544,14 @@ fn agent_admin(args: &[String]) -> bool {
     }
 }
 
-/// A one-shot run that answers and exits: `claude -p|--print …`, `codex exec …`, `agy -p|--prompt …`.
+/// A one-shot run that answers and exits: `claude -p|--print …`, `codex exec …`, `agy -p|--print|--prompt …`.
 fn agent_oneshot(w: &[String]) -> bool {
     match base(&w[0]) {
         "claude" => w[1..].iter().any(|a| a == "-p" || a == "--print"),
         "codex" => first_arg(&w[1..]).is_some_and(|a| a == "exec"),
-        "agy" => w[1..].iter().any(|a| a == "-p" || a == "--prompt"),
+        "agy" => w[1..]
+            .iter()
+            .any(|a| matches!(a.as_str(), "-p" | "--print" | "--prompt")),
         _ => false,
     }
 }
@@ -1100,6 +1102,7 @@ mod tests {
             "claude --model opus --print x",
             "codex exec 'audit'",
             "timeout 300 codex exec x",
+            "agy --print audit",
             "agy --prompt audit",
             "agy -p audit",
         ] {

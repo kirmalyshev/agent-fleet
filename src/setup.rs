@@ -388,6 +388,16 @@ mod tests {
                 "{k}"
             );
         }
+        // A dropped profile takes its comments along; a kept one parses.
+        assert!(!fleet_toml(&["claude"]).contains("trust this folder"));
+        let with_agy = fleet_toml(&["agy"]);
+        assert!(with_agy.contains("trust this folder"));
+        assert!(
+            crate::spawn::FleetConfig::parse(&with_agy)
+                .unwrap()
+                .profiles
+                .contains_key("agy")
+        );
         // The template as shipped (no program found) is a valid fleet.toml.
         crate::spawn::FleetConfig::parse(&fleet_toml(&[])).unwrap();
     }
