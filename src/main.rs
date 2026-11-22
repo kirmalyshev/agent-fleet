@@ -2145,7 +2145,11 @@ fn report_text(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<String, String> {
     let mail = s.unread_for(me, now);
-    if !REPORT_KINDS.contains(&kind) || mail.is_empty() {
+    if !REPORT_KINDS
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case(kind.trim()))
+        || mail.is_empty()
+    {
         return Ok(text);
     }
     if !force {
@@ -2495,6 +2499,10 @@ mod tests {
                 "{k} lists the unread tell: {err}"
             );
         }
+        assert!(
+            send(&s, "done", false).is_err(),
+            "kind case does not matter"
+        );
         assert_eq!(
             send(&s, "OPEN", false).unwrap(),
             "shipped",
@@ -2504,6 +2512,26 @@ mod tests {
             send(&s, "DONE", true).unwrap(),
             "shipped [forced past 1 unread tell: ASK o/r#1 from lead]"
         );
+    }
+
+    #[test]
+    fn tell_force_parses_before_the_text_and_defaults_off() {
+        let f = |a: &[&str]| match Cli::try_parse_from(a).unwrap().cmd {
+            Cmd::Tell { force, text, .. } => (force, text),
+            _ => panic!("not a tell"),
+        };
+        let (force, text) = f(&[
+            "agent-fleet",
+            "tell",
+            "--force",
+            "lead",
+            "DONE",
+            "r",
+            "all",
+            "done",
+        ]);
+        assert!(force && text == ["all", "done"]);
+        assert!(!f(&["agent-fleet", "tell", "lead", "DONE", "r", "t"]).0);
     }
 
     #[test]
