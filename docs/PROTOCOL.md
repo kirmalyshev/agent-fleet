@@ -872,7 +872,10 @@ that works: `agent.wait` for `idle` (2 min),
 stall, then one re-send — never twice to an agent that started working. On success the host
 writes `agent.role` (level, lead from the request) and `task.assigned` for
 `task:<repo name>/<issue>` (a 409 is not a failure), answers `spawn.result`, and closes a
-`replaces` agent's pane and workspace — never its worktree. `retire` runs (5 min) when an agent's
+`replaces` agent's pane and workspace — never its worktree. A failed or expired `spawn.result` sends `SPAWN-FAILED <name>: <reason>` to the requester and
+the agent's lead (the coordinator when neither is an agent). An agent that never reaches `working`
+sends the requester `SPAWN-FAILED` and the lead `NEVER_STARTED` (one message when they are the same
+agent). `retire` runs (5 min) when an agent's
 last pane is closed (`pane.closed`, `pane.exited`, `workspace.closed`; not an agent that left its
 pane, not a herdr listing gap), and on a failed spawn's new worktree before it is removed; only for
 a worktree a spawn made, and not while another agent holds it (a handoff, a reviewer). The script must itself refuse an
