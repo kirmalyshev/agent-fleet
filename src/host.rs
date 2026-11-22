@@ -88,6 +88,8 @@ pub struct Config {
     pub locks: Vec<(String, PathBuf)>,
     /// Minutes an agent may idle/block after working before its lead is told it's stalled.
     pub stall_min: u64,
+    /// Minutes an agent's BLOCKED/QUESTION may go unanswered while it idles before the lead is re-rung.
+    pub waiting_min: u64,
     /// `host --stuck-act`: let the host act on a stuck cause itself — keystrokes and
     /// handoffs. Off (the default) it only classifies, records `agent.stuck`, and tells.
     pub stuck_act: bool,
@@ -2028,6 +2030,7 @@ mod tests {
             config_dir: None,
             locks: Vec::new(),
             stall_min: 15,
+            waiting_min: 10,
             stuck_act: false,
         };
         let client = Client::new("http://127.0.0.1:1", "t".into(), dir.join("spool.jsonl"));
@@ -2764,6 +2767,7 @@ mod tests {
             config_dir: None,
             locks: Vec::new(),
             stall_min: 15,
+            waiting_min: 10,
             stuck_act: false,
         };
         let host = Host::new(
@@ -2841,6 +2845,7 @@ mod tests {
             config_dir: None,
             locks: Vec::new(),
             stall_min: 15,
+            waiting_min: 10,
             stuck_act: false,
         };
         let replica = Store::open(&cfg.replica).unwrap();

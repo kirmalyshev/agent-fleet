@@ -546,6 +546,7 @@ mod tests {
             config_dir: Some(config_dir.to_path_buf()),
             locks: Vec::new(),
             stall_min: 15,
+            waiting_min: 10,
             stuck_act: false,
         }
     }

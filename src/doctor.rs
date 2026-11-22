@@ -69,7 +69,7 @@ const SHARED_BY_ALL: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Finding {
     /// `stale`, `hung`, `heavy`, `duplicate`, `forgotten`, `unpushed`, `orphan`, `breach`,
-    /// `queued`, `undelivered`, `refused`, `role`, `quota`, `spawn`, `unmanaged`, `stalled`, `build`, `update`, `orphan-pr`, `tmp`
+    /// `queued`, `undelivered`, `refused`, `role`, `quota`, `spawn`, `unanswered`, `unmanaged`, `stalled`, `build`, `update`, `orphan-pr`, `tmp`
     /// (the last two added by `main`).
     pub kind: &'static str,
     /// The agent id or `<host>:<path>` it is about.
@@ -459,6 +459,26 @@ fn hung_pids_of(s: &State, id: &str, now: DateTime<Utc>) -> bool {
 
 pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
     let mut out = Vec::new();
+    for (id, w) in &s.waiting {
+        if s.agents
+            .get(id)
+            .is_some_and(|a| a.state != AgentState::Working)
+            // `rung`: the host re-rang past its own `--waiting-min`, so both agree for any value.
+            && w.rung
+        {
+            out.push(finding(
+                "unanswered",
+                id,
+                format!(
+                    "{} to {} {} ago, no reply: {}",
+                    w.kind,
+                    w.to,
+                    ago(now, w.since),
+                    w.text
+                ),
+            ));
+        }
+    }
     // Worktree key → the live agents working in it.
     let mut occupied: BTreeMap<&String, Vec<&String>> = BTreeMap::new();
     for (id, a) in &s.agents {
@@ -1429,6 +1449,43 @@ mod tests {
         assert!(k.contains(&("unpushed", "h:/w/late")));
         // the agent-level hung and the process-level hung it needs
         assert_eq!(f.len(), 8, "{f:#?}");
+    }
+
+    #[test]
+    fn an_idle_agents_unanswered_ask_is_a_finding() {
+        let mut s = State::default();
+        let a = "agent:h/s/a";
+        s.agents.insert(
+            a.into(),
+            crate::state::Agent {
+                host: "h".into(),
+                kind: None,
+                pane: None,
+                state: AgentState::Idle,
+                since: Utc::now(),
+                worked: None,
+                finished: None,
+                usage: None,
+            },
+        );
+        s.waiting.insert(
+            a.into(),
+            crate::state::Waiting {
+                id: "m".into(),
+                to: "agent:h/s/lead".into(),
+                kind: "BLOCKED".into(),
+                text: "which way?".into(),
+                since: Utc::now() - chrono::Duration::minutes(30),
+                rung: true,
+            },
+        );
+        let f = findings(&s, Utc::now());
+        assert!(
+            f.iter().any(|f| f.kind == "unanswered"
+                && f.subject == a
+                && f.detail.contains("which way?")),
+            "{f:?}"
+        );
     }
 
     #[test]

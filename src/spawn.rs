@@ -1771,6 +1771,30 @@ async fn handoffs(
     }
 }
 
+/// An agent that asked (`BLOCKED`/`QUESTION`) and sits idle with no word from its lead is
+/// re-rung to that lead once, as `STILL-WAITING <agent>: <the ask>`. The reducer marks it rung
+/// (`re` = the ask), so a restart does not ring twice.
+async fn still_waiting(host: &Host, state: &State) {
+    let prefix = agent_prefix(&host.cfg.host, &host.cfg.session);
+    let min = chrono::Duration::minutes(host.cfg.waiting_min as i64);
+    for (agent, w) in state.unanswered(&host.cfg.host, Utc::now(), min) {
+        if !agent.starts_with(&prefix) {
+            continue;
+        }
+        host.publish(
+            host.presence(Known::MsgSent(MsgSent {
+                to: w.to.clone(),
+                kind: crate::state::STILL_WAITING.into(),
+                reference: short(agent).into(),
+                text: w.text.clone(),
+                closes: Vec::new(),
+            }))
+            .re(&w.id),
+        )
+        .await;
+    }
+}
+
 /// The unanswered requests for this host/session, split into `expired` (answered "expired",
 /// not executed) and `todo`. Each request id is attempted at most once per process — a request
 /// whose `spawn.result` could not be published is not retried every scan.
@@ -1999,6 +2023,7 @@ pub async fn spawn_loop(host: Arc<Host>) {
         crate::merge::serve(&host, &mut merge_seen);
         handoffs(&host, state, events, &mut handed, &mut warned).await;
         stuck(&host, state, events, &mut stuck_seen, &handed).await;
+        still_waiting(&host, state).await;
         crate::chores::serve(&host, state, &mut chores_seen).await;
     }
 }
@@ -2465,6 +2490,7 @@ profile = "devin"
             config_dir: None,
             locks: Vec::new(),
             stall_min: 15,
+            waiting_min: 10,
             stuck_act,
         }
     }
@@ -5048,6 +5074,37 @@ profile = "devin"
             1,
             "the continue is deduped in the log, not only in memory: {got:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_ask_from_an_idle_agent_re_rings_its_lead_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run(dir.path(), &[]).await;
+        let mut s = State::default();
+        let a = "agent:h/s/a";
+        s.agents.insert(a.into(), live_agent());
+        s.agents.get_mut(a).unwrap().state = AgentState::Idle;
+        s.waiting.insert(
+            a.into(),
+            crate::state::Waiting {
+                id: "m1".into(),
+                to: "agent:h/s/lead".into(),
+                kind: "BLOCKED".into(),
+                text: "which way?".into(),
+                since: Utc::now() - chrono::Duration::minutes(30),
+                rung: false,
+            },
+        );
+        still_waiting(&host, &s).await;
+        let got: Vec<_> = msgs(&host)
+            .into_iter()
+            .filter(|m| m.kind == "STILL-WAITING")
+            .collect();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].to, "agent:h/s/lead");
+        assert_eq!(got[0].reference, "a");
+        assert_eq!(got[0].text, "which way?");
     }
 
     #[tokio::test]

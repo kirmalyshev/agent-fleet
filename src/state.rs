@@ -39,6 +39,9 @@ pub struct State {
     pub answers: BTreeMap<String, Answered>,
     /// Undelivered doorbells by the id of their `msg.sent`.
     pub msgs: BTreeMap<String, Msg>,
+    /// Each agent's open `BLOCKED`/`QUESTION` to its lead, until answered (see `Waiting`).
+    #[serde(default)]
+    pub waiting: BTreeMap<String, Waiting>,
     /// Delivered doorbells their recipient has not read (`msg.read`) yet: retransmitted until it does.
     #[serde(default)]
     pub unread: BTreeMap<String, Unread>,
@@ -434,6 +437,20 @@ pub struct Msg {
     pub since: DateTime<Utc>,
 }
 
+/// An agent's last `BLOCKED` or `QUESTION`, open until the lead tells it anything or it works.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Waiting {
+    /// The id of the `msg.sent`.
+    pub id: String,
+    pub to: String,
+    pub kind: String,
+    pub text: String,
+    pub since: DateTime<Utc>,
+    /// The host already re-rang the lead (`STILL-WAITING`).
+    #[serde(default)]
+    pub rung: bool,
+}
+
 /// A delivered doorbell not read yet.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Unread {
@@ -511,6 +528,9 @@ pub const DEADLETTER: &str = "DEADLETTER";
 /// The kind of the tell that tells a sender its tell to a working agent is still unread.
 pub const UNREAD: &str = "UNREAD";
 
+/// The kind of the tell that re-rings a lead whose agent's BLOCKED or QUESTION got no reply.
+pub const STILL_WAITING: &str = "STILL-WAITING";
+
 /// A tell to a working agent still unread this long after its send goes back to its sender.
 pub const UNREAD_ESCALATE: chrono::Duration = chrono::Duration::minutes(10);
 
@@ -572,6 +592,27 @@ impl State {
                         closes: Vec::new(),
                     },
                 ))
+            })
+            .collect()
+    }
+
+    /// Agents on `host` that asked (`BLOCKED`/`QUESTION`) at least `min` ago, sit not working, and
+    /// whose lead has told them nothing since: `(agent, ask)`. A host's `STILL-WAITING` marks `rung`.
+    pub fn unanswered(
+        &self,
+        host: &str,
+        now: DateTime<Utc>,
+        min: chrono::Duration,
+    ) -> Vec<(&String, &Waiting)> {
+        self.waiting
+            .iter()
+            .filter(|(id, w)| {
+                !w.rung
+                    && now - w.since >= min
+                    && self
+                        .agents
+                        .get(*id)
+                        .is_some_and(|a| a.host == host && a.state != AgentState::Working)
             })
             .collect()
     }
@@ -826,6 +867,10 @@ impl State {
                 // A re-up (host or herdr restart) keeps what the entry already knows: the last
                 // working time, the current stretch when the state did not change, the usage.
                 let old = self.agents.get(&d.agent);
+                if old.is_none() {
+                    // A new incarnation owes nothing to a previous one's ask.
+                    self.waiting.remove(&d.agent);
+                }
                 self.agents.insert(
                     d.agent.clone(),
                     Agent {
@@ -840,6 +885,7 @@ impl State {
                         worked: (d.state == AgentState::Working)
                             .then(|| {
                                 self.signals.remove(&d.agent);
+                                self.waiting.remove(&d.agent);
                                 ts
                             })
                             .or_else(|| old.and_then(|a| a.worked)),
@@ -946,6 +992,7 @@ impl State {
                 // Only `agent.up` brings an agent in: a late state change never revives a downed one.
                 if let Some(a) = self.agents.get_mut(&d.agent) {
                     if d.state == AgentState::Working {
+                        self.waiting.remove(&d.agent);
                         a.worked = Some(ts);
                         a.finished = None;
                         self.signals.remove(&d.agent);
@@ -960,6 +1007,7 @@ impl State {
                 }
             }
             Known::AgentDown(d) => {
+                self.waiting.remove(&d.agent);
                 if self.agents.remove(&d.agent).is_some() {
                     self.gone.insert(d.agent.clone(), ts);
                 }
@@ -1161,6 +1209,44 @@ impl State {
                 }
             }
             Known::MsgSent(d) => {
+                match e.actor.kind {
+                    ActorKind::Agent => {
+                        if ["BLOCKED", "QUESTION"].contains(&d.kind.as_str())
+                            && self.agents.contains_key(&e.actor.id)
+                        {
+                            self.waiting.insert(
+                                e.actor.id.clone(),
+                                Waiting {
+                                    id: e.id.clone(),
+                                    to: d.to.clone(),
+                                    kind: d.kind.clone(),
+                                    text: d.text.clone(),
+                                    since: ts,
+                                    rung: false,
+                                },
+                            );
+                        }
+                        // Any tell from the lead to the waiting agent is the answer.
+                        let from = e.actor.id.as_str();
+                        if self
+                            .waiting
+                            .get(&d.to)
+                            .is_some_and(|w| w.to == from || self.recipient(&w.to) == Some(from))
+                        {
+                            self.waiting.remove(&d.to);
+                        }
+                    }
+                    ActorKind::Host if d.kind == STILL_WAITING => {
+                        if let Some(w) = self
+                            .waiting
+                            .values_mut()
+                            .find(|w| Some(&w.id) == e.re.as_ref())
+                        {
+                            w.rung = true;
+                        }
+                    }
+                    _ => {}
+                }
                 // A host's dead letter takes the tell it names (`re`) off the recipient's queue.
                 // One for a tell already read or handed over (a host's view lagging) is dropped.
                 // A digest hands over every tell in `closes`.
@@ -2146,6 +2232,122 @@ mod tests {
 
         s.apply(&role(None, ActorKind::Agent));
         assert!(s.roles.is_empty());
+    }
+
+    #[test]
+    fn a_blocked_or_question_tell_stays_unanswered_until_the_lead_tells_the_agent_or_it_works() {
+        let t0 = Utc::now();
+        let at = |mins: i64, kind: ActorKind, actor: &str, id: &str, re: Option<&str>, body| {
+            let mut e = Envelope::new(
+                Actor {
+                    kind,
+                    id: actor.into(),
+                },
+                "p",
+                body,
+            );
+            e.id = id.into();
+            e.re = re.map(str::to_string);
+            let mut e = e.into_event();
+            e.ts = t0 + chrono::Duration::minutes(mins);
+            e
+        };
+        let (a, lead) = ("agent:h/s/a", "agent:h/s/lead");
+        let msg = |to: &str, kind: &str| {
+            Known::MsgSent(MsgSent {
+                to: to.into(),
+                kind: kind.into(),
+                reference: "r".into(),
+                text: "which way?".into(),
+                closes: Vec::new(),
+            })
+        };
+        let up = |state| {
+            Known::AgentUp(AgentUp {
+                agent: a.into(),
+                host: "h".into(),
+                kind: None,
+                pane: None,
+                state,
+            })
+        };
+        let min = chrono::Duration::minutes(10);
+        let at20 = t0 + chrono::Duration::minutes(20);
+        let fresh = || {
+            let mut s = State::default();
+            s.apply(&at(0, ActorKind::Agent, a, "u", None, up(AgentState::Idle)));
+            s.apply(&at(1, ActorKind::Agent, a, "m", None, msg(lead, "BLOCKED")));
+            s
+        };
+        // idle, nobody answered, past the limit: unanswered; before it: not yet
+        let s = fresh();
+        assert_eq!(s.unanswered("h", at20, min).len(), 1);
+        assert!(
+            s.unanswered("h", t0 + chrono::Duration::minutes(5), min)
+                .is_empty()
+        );
+        assert!(s.unanswered("other", at20, min).is_empty());
+        // an ask from an agent that is not up is not tracked
+        let mut s = State::default();
+        s.apply(&at(1, ActorKind::Agent, a, "m", None, msg(lead, "BLOCKED")));
+        assert!(s.waiting.is_empty());
+        // a status kind is no ask
+        let mut s = State::default();
+        s.apply(&at(0, ActorKind::Agent, a, "u", None, up(AgentState::Idle)));
+        s.apply(&at(1, ActorKind::Agent, a, "m", None, msg(lead, "DONE")));
+        assert!(s.unanswered("h", at20, min).is_empty());
+        // the lead tells the agent anything: answered
+        let mut s = fresh();
+        s.apply(&at(2, ActorKind::Agent, lead, "r", None, msg(a, "ANSWER")));
+        assert!(s.unanswered("h", at20, min).is_empty());
+        // somebody else telling it is no answer
+        let mut s = fresh();
+        s.apply(&at(
+            2,
+            ActorKind::Agent,
+            "agent:h/s/z",
+            "r",
+            None,
+            msg(a, "HI"),
+        ));
+        assert_eq!(s.unanswered("h", at20, min).len(), 1);
+        // the agent resumes working: answered
+        let mut s = fresh();
+        s.apply(&at(
+            2,
+            ActorKind::Host,
+            "host:h",
+            "w",
+            None,
+            Known::AgentState(AgentStateChanged {
+                agent: a.into(),
+                state: AgentState::Working,
+            }),
+        ));
+        assert!(s.unanswered("h", at20, min).is_empty());
+        // the host's STILL-WAITING (re = the ask) is rung once
+        let mut s = fresh();
+        s.apply(&at(
+            12,
+            ActorKind::Host,
+            "host:h",
+            "sw",
+            Some("m"),
+            msg(lead, STILL_WAITING),
+        ));
+        assert!(s.unanswered("h", at20, min).is_empty());
+        // a role-addressed ask is answered by whoever holds the role
+        let mut s = State::default();
+        s.apply(&at(0, ActorKind::Agent, a, "u", None, up(AgentState::Idle)));
+        s.apply(&at(
+            1,
+            ActorKind::Agent,
+            a,
+            "m",
+            None,
+            msg(COORDINATOR, "QUESTION"),
+        ));
+        assert_eq!(s.unanswered("h", at20, min).len(), 1);
     }
 
     #[test]
