@@ -191,7 +191,7 @@ impl Watch {
             }
         }
         for (&pid, (why, agent)) in &seen.orphans {
-            if now.0.contains_key(&pid) && !t.out.iter().any(|c| c.pid == pid) {
+            if now.0.get(&pid).is_some_and(|p| !p.zombie) && !t.out.iter().any(|c| c.pid == pid) {
                 t.out.push(Classified {
                     pid,
                     agent: agent.clone(),
@@ -1469,6 +1469,50 @@ mod tests {
         // Both stuck: the pipeline is one hang, reader included.
         let v = run(20, false);
         assert!(matches!(verdict(&v, 51), Some(Verdict::Hung(_))), "{v:#?}");
+    }
+
+    #[test]
+    fn a_reader_outside_the_writers_group_or_with_no_group_is_still_hung() {
+        // A busy-or-young sibling that is not this pipeline's writer proves nothing.
+        let run = |writer_group: Option<u32>, reader_group: Option<u32>| {
+            let pipe = || {
+                let mut t = tree(&[
+                    (50, SHELL, "bun", "bun run check", 0, -3),
+                    (51, SHELL, "cat", "cat", 0, 20),
+                ]);
+                t.0.get_mut(&50).unwrap().pgid = writer_group;
+                t.0.get_mut(&51).unwrap().pgid = reader_group;
+                t
+            };
+            let mut w = Watch::default();
+            w.step(pipe(), at(0), &seen());
+            w.step(pipe(), at(2), &seen());
+            w.step(pipe(), at(4), &seen())
+        };
+        for (a, b) in [(Some(50), Some(51)), (None, None)] {
+            let v = run(a, b);
+            assert!(matches!(verdict(&v, 51), Some(Verdict::Hung(_))), "{v:#?}");
+        }
+        let v = run(Some(50), Some(50));
+        assert!(
+            !matches!(verdict(&v, 51), Some(Verdict::Hung(_))),
+            "cat: {v:#?}"
+        );
+    }
+
+    #[test]
+    fn a_zombie_with_an_orphan_proof_is_not_reported() {
+        let mut w = Watch::default();
+        let mut s = seen();
+        s.orphans.insert(31, ("dead owner".into(), None));
+        let run = || {
+            let mut t = tree(&[(31, SHELL, "bun", "", 0, 20)]);
+            t.0.get_mut(&31).unwrap().zombie = true;
+            t
+        };
+        w.step(run(), at(0), &s);
+        let v = w.step(run(), at(2), &s);
+        assert!(v.iter().all(|c| c.pid != 31), "{v:#?}");
     }
 
     #[test]

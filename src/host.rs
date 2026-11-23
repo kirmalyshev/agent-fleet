@@ -1118,6 +1118,8 @@ impl Host {
             }
         }
         scan::descendants(&procs, &mut proved);
+        // A zombie has exited: nothing to prove orphaned or to kill.
+        proved.retain(|p, _| procs.0.get(p).is_none_or(|x| !x.zombie));
         let now = chrono::Utc::now();
         let mut seen_strays = HashSet::new();
         for (pid, why) in proved {
