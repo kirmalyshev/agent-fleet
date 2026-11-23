@@ -15,7 +15,7 @@ use crate::ui::ago;
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     /// Minutes an agent may sit not working before its lead is rung `IDLE`/`HELD`; rung again
-    /// every twice that while it stays so.
+    /// every twice that while it stays so (`HELD` with unchanged text backs off, see `HELD_CAP`).
     pub stale_min: u64,
     /// Retire an agent that reported DONE/MERGED (or whose task ended) and idled `RETIRE_AFTER`.
     pub auto_retire: bool,
@@ -35,6 +35,9 @@ impl Default for Config {
 
 /// A finished agent idle this long is retired when `auto_retire` is on.
 pub const RETIRE_AFTER: Duration = Duration::minutes(10);
+
+/// The longest gap between two identical `HELD` rings.
+pub const HELD_CAP: Duration = Duration::hours(8);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Act {
@@ -121,13 +124,24 @@ pub fn due(
         }
         // ponytail: 0 would ring every tick; 1 min is the floor.
         let stale = Duration::minutes(c.stale_min.clamp(1, 1_000_000) as i64);
-        let again = s.idle_rung.get(id).is_none_or(|t| now - *t >= stale * 2);
         let Some(to) = lead else { continue };
-        if idle < stale || !again {
+        if idle < stale {
             continue;
         }
         let name = short(id);
-        let (kind, text) = match held(s, id) {
+        let held = held(s, id);
+        // A wait that does not change is not news: the same HELD text backs off, 2x, 4x, 8x the
+        // base gap, up to `HELD_CAP`. New text, or the agent working, starts over.
+        let gap = match (&held, s.held_streak.get(id)) {
+            (Some(h), Some((t, n))) if *t == format!("{name}: {h}") => {
+                (stale * 2 * 2i32.saturating_pow((*n - 1).min(16))).min(HELD_CAP)
+            }
+            _ => stale * 2,
+        };
+        if s.idle_rung.get(id).is_some_and(|t| now - *t < gap) {
+            continue;
+        }
+        let (kind, text) = match held {
             Some(h) => ("HELD", format!("{name}: {h}")),
             None => {
                 let what = report.map_or_else(
@@ -298,6 +312,58 @@ mod tests {
         };
         assert_eq!(*kind, "HELD");
         assert!(text.contains("login for the operator"), "{text}");
+    }
+
+    #[test]
+    fn an_unchanged_held_backs_off_to_the_cap_and_new_text_starts_over() {
+        let mut s = state();
+        spawned(&mut s, "agent:h/s/a");
+        s.tasks.insert(
+            "t1".into(),
+            crate::state::Task {
+                project: "p".into(),
+                title: "T".into(),
+                url: None,
+                state: crate::event::TaskState::Working,
+                since: t0(),
+                owner: Some("agent:h/s/a".into()),
+                lead: None,
+                blocked_by: Default::default(),
+                handoffs: vec![],
+            },
+        );
+        let blocker = |what: &str| crate::state::Blocker {
+            task: Some("t1".into()),
+            what: what.into(),
+            owner: None,
+            unblocks_when: None,
+            pid: None,
+            started: None,
+            by: "x".into(),
+            since: t0(),
+        };
+        s.blockers
+            .insert("b1".into(), blocker("waits the operator"));
+        let held_text = "a: held: waits the operator";
+        // Ring n at `at`; the next is due `gap` later, not a minute before.
+        let mut at = 20;
+        for (n, gap) in [(1, 40), (2, 80), (3, 160), (4, 320), (5, 480), (6, 480)] {
+            s.idle_rung
+                .insert("agent:h/s/a".into(), t0() + Duration::minutes(at));
+            s.held_streak
+                .insert("agent:h/s/a".into(), (held_text.into(), n));
+            assert!(
+                acts(&s, at + gap - 1, Config::default()).is_empty(),
+                "n={n}"
+            );
+            assert_eq!(acts(&s, at + gap, Config::default()).len(), 1, "n={n}");
+            at += gap;
+        }
+        // The blocker text changes: back to the base gap.
+        s.blockers.insert("b1".into(), blocker("waits for the key"));
+        s.idle_rung
+            .insert("agent:h/s/a".into(), t0() + Duration::minutes(at));
+        assert_eq!(acts(&s, at + 40, Config::default()).len(), 1);
     }
 
     #[test]

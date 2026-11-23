@@ -49,6 +49,10 @@ pub struct State {
     /// (key: the id + `UNMANAGED_KEY`); gone once the agent works or goes down.
     #[serde(default)]
     pub idle_rung: BTreeMap<String, DateTime<Utc>>,
+    /// The last `HELD` text rung per agent and how many times in a row: the host backs off an
+    /// unchanged one. Gone once the agent works, changes state, goes down or is rung `IDLE`.
+    #[serde(default)]
+    pub held_streak: BTreeMap<String, (String, u32)>,
     /// Delivered doorbells their recipient has not read (`msg.read`) yet: retransmitted until it does.
     #[serde(default)]
     pub unread: BTreeMap<String, Unread>,
@@ -473,10 +477,12 @@ pub const UNMANAGED_KEY: &str = "#unmanaged";
 fn clear_asks(
     waiting: &mut BTreeMap<String, Waiting>,
     idle_rung: &mut BTreeMap<String, DateTime<Utc>>,
+    held_streak: &mut BTreeMap<String, (String, u32)>,
     agent: &str,
 ) {
     waiting.remove(agent);
     idle_rung.remove(agent);
+    held_streak.remove(agent);
 }
 
 /// A delivered doorbell not read yet.
@@ -897,7 +903,12 @@ impl State {
                 let old = self.agents.get(&d.agent);
                 if old.is_none() {
                     // A new incarnation owes nothing to a previous one's ask.
-                    clear_asks(&mut self.waiting, &mut self.idle_rung, &d.agent);
+                    clear_asks(
+                        &mut self.waiting,
+                        &mut self.idle_rung,
+                        &mut self.held_streak,
+                        &d.agent,
+                    );
                 }
                 self.agents.insert(
                     d.agent.clone(),
@@ -913,7 +924,12 @@ impl State {
                         worked: (d.state == AgentState::Working)
                             .then(|| {
                                 self.signals.remove(&d.agent);
-                                clear_asks(&mut self.waiting, &mut self.idle_rung, &d.agent);
+                                clear_asks(
+                                    &mut self.waiting,
+                                    &mut self.idle_rung,
+                                    &mut self.held_streak,
+                                    &d.agent,
+                                );
                                 ts
                             })
                             .or_else(|| old.and_then(|a| a.worked)),
@@ -1020,7 +1036,12 @@ impl State {
                 // Only `agent.up` brings an agent in: a late state change never revives a downed one.
                 if let Some(a) = self.agents.get_mut(&d.agent) {
                     if d.state == AgentState::Working {
-                        clear_asks(&mut self.waiting, &mut self.idle_rung, &d.agent);
+                        clear_asks(
+                            &mut self.waiting,
+                            &mut self.idle_rung,
+                            &mut self.held_streak,
+                            &d.agent,
+                        );
                         a.worked = Some(ts);
                         a.finished = None;
                         self.signals.remove(&d.agent);
@@ -1029,13 +1050,19 @@ impl State {
                         a.finished = Some(ts);
                     }
                     if a.state != d.state {
+                        self.held_streak.remove(&d.agent);
                         a.state = d.state;
                         a.since = ts;
                     }
                 }
             }
             Known::AgentDown(d) => {
-                clear_asks(&mut self.waiting, &mut self.idle_rung, &d.agent);
+                clear_asks(
+                    &mut self.waiting,
+                    &mut self.idle_rung,
+                    &mut self.held_streak,
+                    &d.agent,
+                );
                 self.reports.remove(&d.agent);
                 self.idle_rung
                     .remove(&format!("{}{UNMANAGED_KEY}", d.agent));
@@ -1291,6 +1318,19 @@ impl State {
                             "UNMANAGED" => format!("{}{UNMANAGED_KEY}", d.reference),
                             _ => d.reference.clone(),
                         };
+                        match d.kind.as_str() {
+                            "HELD" => {
+                                let n = match self.held_streak.get(&key) {
+                                    Some((t, n)) if *t == d.text => n + 1,
+                                    _ => 1,
+                                };
+                                self.held_streak.insert(key.clone(), (d.text.clone(), n));
+                            }
+                            "IDLE" => {
+                                self.held_streak.remove(&key);
+                            }
+                            _ => {}
+                        }
                         self.idle_rung.insert(key, ts);
                     }
                     _ => {}
