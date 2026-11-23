@@ -2565,6 +2565,65 @@ mod tests {
     }
 
     #[test]
+    fn with_no_declared_lead_the_coordinator_counts_as_the_lead() {
+        let t0 = Utc::now();
+        let at = |actor: &str, body| {
+            let mut e = Envelope::new(
+                Actor {
+                    kind: ActorKind::Agent,
+                    id: actor.into(),
+                },
+                "p",
+                body,
+            )
+            .into_event();
+            e.ts = t0;
+            e
+        };
+        let (a, co, peer) = ("agent:h/s/a", "agent:h/s/co", "agent:h/s/peer");
+        let tell = |to: &str| {
+            Known::MsgSent(MsgSent {
+                to: to.into(),
+                kind: "FIX".into(),
+                reference: "r".into(),
+                text: "t".into(),
+                closes: Vec::new(),
+            })
+        };
+        let mut s = State::default();
+        for id in [a, co, peer] {
+            s.apply(&at(
+                id,
+                Known::AgentUp(AgentUp {
+                    agent: id.into(),
+                    host: "h".into(),
+                    kind: None,
+                    pane: None,
+                    state: AgentState::Idle,
+                }),
+            ));
+        }
+        s.roles.insert(
+            co.into(),
+            Role {
+                level: Level::RootCoordinator,
+                lead: None,
+                domain: None,
+                by: "x".into(),
+                since: t0,
+            },
+        );
+        s.apply(&at(peer, tell(a)));
+        assert!(s.told.is_empty());
+        // a tell to an agent that is not up, or to the `coordinator` alias, is not recorded
+        s.apply(&at(co, tell("agent:h/s/ghost")));
+        s.apply(&at(co, tell("coordinator")));
+        assert!(s.told.is_empty());
+        s.apply(&at(co, tell(a)));
+        assert_eq!(s.told[a], t0);
+    }
+
+    #[test]
     fn a_blocked_or_question_tell_stays_unanswered_until_the_lead_tells_the_agent_or_it_works() {
         let t0 = Utc::now();
         let at = |mins: i64, kind: ActorKind, actor: &str, id: &str, re: Option<&str>, body| {

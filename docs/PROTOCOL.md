@@ -558,7 +558,8 @@ remembers (`idle_rung`), so a restart rings once. With `auto_retire`, an agent t
 `DONE`/`MERGED` after it last worked (or whose task ended) and has idled 10 min gets a host
 `retire.requested`, asked once per idle stretch: the same locked retire, which stops on
 uncommitted work and rings the lead. A tell from its lead after that `DONE` (new work; the reducer's
-`told`) cancels it: the agent is not finished until it reports again. An agent in a pane with no spawn record (started by hand)
+`told`) cancels it: the agent is not finished until it reports again (any tell counts, even a thanks; the
+lead is still rung `IDLE` and can retire it by hand). An agent in a pane with no spawn record (started by hand)
 gets one `UNMANAGED` ring and is listed by `doctor` as `unmanaged`; it is never auto-retired.
 `[idle] exempt = ["name"]` lists agents the host never rings or retires, by agent name or by the
 basename of the worktree they work in; for a hand-started agent every project's list applies.

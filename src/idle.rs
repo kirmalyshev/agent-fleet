@@ -106,7 +106,11 @@ pub fn due(
         // Every task it owns ended, or it reported DONE/MERGED since it last worked.
         // A tell from its lead since then is new work: the DONE no longer stands.
         let since = a.worked.or(report.map(|r| r.since)).unwrap_or(a.since);
-        let told = s.told.get(id).is_some_and(|t| *t > since);
+        // A DONE after the tell answers it; `report` is never older than `worked`.
+        let told = s
+            .told
+            .get(id)
+            .is_some_and(|t| *t > report.map_or(since, |r| r.since));
         let finished = !told
             && (report.is_some_and(|r| ["DONE", "MERGED"].contains(&r.kind.as_str()))
                 || (!mine.is_empty() && mine.iter().all(|t| t.state.is_terminal())));
@@ -459,6 +463,29 @@ mod tests {
             },
         );
         assert!(!acts(&s, 30, on).iter().any(|(_, a)| *a == Act::Retire));
+    }
+
+    #[test]
+    fn a_done_after_the_leads_tell_answers_it() {
+        let on = Config {
+            auto_retire: true,
+            ..Config::default()
+        };
+        let mut s = state();
+        spawned(&mut s, "agent:h/s/a");
+        // worked, was told, then reported DONE without being seen working again
+        s.agents.get_mut("agent:h/s/a").unwrap().worked = Some(t0() - Duration::minutes(5));
+        s.told
+            .insert("agent:h/s/a".into(), t0() - Duration::minutes(1));
+        s.reports.insert(
+            "agent:h/s/a".into(),
+            Report {
+                kind: "DONE".into(),
+                text: "x".into(),
+                since: t0(),
+            },
+        );
+        assert_eq!(acts(&s, 10, on)[0].1, Act::Retire);
     }
 
     #[test]
