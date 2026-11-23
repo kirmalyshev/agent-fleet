@@ -1500,7 +1500,7 @@ impl Host {
                 // Typed once as a queued ring and not seen, the agent since idle: still never a
                 // second typing. Acknowledge it if it shows, else leave it pending.
                 if !queue && !again && typed.contains(id) {
-                    let shown = crate::stuck::screen(&self, to).await;
+                    let shown = crate::stuck::screen_of(&self, &pane).await;
                     if shown.as_deref().is_some_and(|t| has_id(t, id)) {
                         self.ack_seen(id, to, msg, attempts.get(id).copied()).await;
                     }
@@ -1518,7 +1518,7 @@ impl Host {
                     {
                         continue;
                     }
-                    let shown = crate::stuck::screen(&self, to).await;
+                    let shown = crate::stuck::screen_of(&self, &pane).await;
                     if shown.as_deref().is_none_or(crate::stuck::dialog_open) {
                         if waiting.insert(id.clone()) {
                             eprintln!(
@@ -1572,7 +1572,11 @@ impl Host {
                 match herdr_call(&self.cfg.herdr_socket, "agent.prompt", params).await {
                     // A retransmit's id is on the screen already (its first ring): seeing it proves
                     // nothing, so a retyped one counts as rung and waits for its `msg.read`.
-                    Ok(_) if queue && !again && self.queued_visible(to, id).await != Some(true) => {
+                    Ok(_)
+                        if queue
+                            && !again
+                            && self.queued_visible(&pane, id).await != Some(true) =>
+                    {
                         typed.insert(id.clone());
                         bump(&self.n.ring_failures);
                         eprintln!(
@@ -1653,9 +1657,11 @@ impl Host {
         }
     }
 
-    async fn queued_visible(&self, to: &str, id: &str) -> Option<bool> {
+    async fn queued_visible(&self, pane: &str, id: &str) -> Option<bool> {
         tokio::time::sleep(QUEUE_CHECK).await;
-        crate::stuck::screen(self, to).await.map(|t| has_id(&t, id))
+        crate::stuck::screen_of(self, pane)
+            .await
+            .map(|t| has_id(&t, id))
     }
 }
 
@@ -1888,6 +1894,8 @@ mod tests {
     struct FakeHerdr {
         status: Mutex<String>,
         prompts: Mutex<Vec<String>>,
+        /// The `target` of each `agent.read`.
+        reads: Mutex<Vec<String>>,
         /// What `agent.read` shows; a prompt is appended to it when `echo` is set.
         screen: Mutex<String>,
         echo: Mutex<bool>,
@@ -1933,6 +1941,10 @@ mod tests {
                                 .unwrap();
                         }
                         "agent.read" => {
+                            fake.reads
+                                .lock()
+                                .unwrap()
+                                .push(req["params"]["target"].as_str().unwrap().into());
                             let text = fake.screen.lock().unwrap().clone();
                             wr.write_all(reply(json!({ "text": text })).as_bytes())
                                 .await
@@ -2386,6 +2398,18 @@ mod tests {
             !crate::stuck::dialog_open(&old),
             "a dialog scrolled far up is history"
         );
+    }
+
+    #[tokio::test]
+    async fn a_busy_claude_agents_screen_is_read_by_pane_not_by_name() {
+        // A name can be missing or shared across herdr sessions; the pane is the one agent.
+        let dir = tempfile::tempdir().unwrap();
+        let (_host, fake, _) =
+            host_on_fake_prog(dir.path(), "working", "OK", 0, "claude", ("> ", true)).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let reads = fake.reads.lock().unwrap().clone();
+        assert!(!reads.is_empty(), "the screen was read");
+        assert!(reads.iter().all(|t| t == "w:1"), "{reads:?}");
     }
 
     #[tokio::test]

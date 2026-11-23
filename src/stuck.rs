@@ -695,11 +695,16 @@ pub struct Seen {
 
 /// The agent's visible screen, or `None` when herdr cannot read it.
 pub(crate) async fn screen(host: &Host, id: &str) -> Option<String> {
-    let name = crate::host::short(id);
+    screen_of(host, crate::host::short(id)).await
+}
+
+/// As `screen`, for a herdr target: a pane id names one agent, a short name may be missing or
+/// shared.
+pub(crate) async fn screen_of(host: &Host, target: &str) -> Option<String> {
     herdr_call(
         &host.cfg.herdr_socket,
         "agent.read",
-        json!({ "target": name, "source": "visible", "strip_ansi": true }),
+        json!({ "target": target, "source": "visible", "strip_ansi": true }),
     )
     .await
     .ok()?["text"]
