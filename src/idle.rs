@@ -104,10 +104,18 @@ pub fn due(
             .filter(|t| t.owner.as_deref() == Some(id))
             .collect();
         // Every task it owns ended, or it reported DONE/MERGED since it last worked.
-        let finished = report.is_some_and(|r| ["DONE", "MERGED"].contains(&r.kind.as_str()))
-            || (!mine.is_empty() && mine.iter().all(|t| t.state.is_terminal()));
-        // A retire is asked once per stretch since it last worked, not per state flip.
+        // A tell from its lead since then is new work: the DONE no longer stands.
         let since = a.worked.or(report.map(|r| r.since)).unwrap_or(a.since);
+        // Only the agent's own next report answers a tell, not its working again: the unfiltered
+        // last report (the agent's last `msg.sent`), else when it came up.
+        let told = s
+            .told
+            .get(id)
+            .is_some_and(|t| *t > s.reports.get(id).map_or(a.since, |r| r.since));
+        let finished = !told
+            && (report.is_some_and(|r| ["DONE", "MERGED"].contains(&r.kind.as_str()))
+                || (!mine.is_empty() && mine.iter().all(|t| t.state.is_terminal())));
+        // A retire is asked once per stretch since it last worked, not per state flip.
         if c.auto_retire && finished && idle >= RETIRE_AFTER && sp.is_some() {
             let asked: Vec<_> = s
                 .retires
@@ -409,6 +417,112 @@ mod tests {
             .insert("agent:h/s/a".into(), ("a: held: x".into(), 5));
         assert!(acts(&s, 300 + 599, c.clone()).is_empty());
         assert_eq!(acts(&s, 300 + 600, c).len(), 1);
+    }
+
+    #[test]
+    fn a_tell_from_the_lead_after_the_done_cancels_the_retire() {
+        let on = Config {
+            auto_retire: true,
+            ..Config::default()
+        };
+        let mut s = state();
+        spawned(&mut s, "agent:h/s/a");
+        s.reports.insert(
+            "agent:h/s/a".into(),
+            Report {
+                kind: "DONE".into(),
+                text: "audit".into(),
+                since: t0(),
+            },
+        );
+        // told before the DONE: still finished
+        s.told
+            .insert("agent:h/s/a".into(), t0() - Duration::minutes(1));
+        assert_eq!(acts(&s, 10, on.clone())[0].1, Act::Retire);
+        // told after it (new work): not finished, so no retire; the ring still quotes the DONE
+        s.told
+            .insert("agent:h/s/a".into(), t0() + Duration::minutes(2));
+        assert!(
+            !acts(&s, 30, on.clone())
+                .iter()
+                .any(|(_, a)| *a == Act::Retire)
+        );
+        // the same when it finished by its tasks ending, with no DONE at all
+        s.reports.clear();
+        s.tasks.insert(
+            "t1".into(),
+            crate::state::Task {
+                project: "p".into(),
+                title: "T".into(),
+                url: None,
+                state: crate::event::TaskState::Completed,
+                since: t0(),
+                owner: Some("agent:h/s/a".into()),
+                lead: None,
+                blocked_by: Default::default(),
+                handoffs: vec![],
+            },
+        );
+        assert!(!acts(&s, 30, on).iter().any(|(_, a)| *a == Act::Retire));
+    }
+
+    #[test]
+    fn working_after_the_leads_tell_does_not_make_the_agent_finished_again() {
+        let on = Config {
+            auto_retire: true,
+            ..Config::default()
+        };
+        let mut s = state();
+        spawned(&mut s, "agent:h/s/a");
+        s.reports.insert(
+            "agent:h/s/a".into(),
+            Report {
+                kind: "DONE".into(),
+                text: "x".into(),
+                since: t0(),
+            },
+        );
+        s.told
+            .insert("agent:h/s/a".into(), t0() + Duration::minutes(2));
+        s.agents.get_mut("agent:h/s/a").unwrap().worked = Some(t0() + Duration::minutes(3));
+        s.tasks.insert(
+            "t1".into(),
+            crate::state::Task {
+                project: "p".into(),
+                title: "T".into(),
+                url: None,
+                state: crate::event::TaskState::Completed,
+                since: t0(),
+                owner: Some("agent:h/s/a".into()),
+                lead: None,
+                blocked_by: Default::default(),
+                handoffs: vec![],
+            },
+        );
+        assert!(!acts(&s, 30, on).iter().any(|(_, a)| *a == Act::Retire));
+    }
+
+    #[test]
+    fn a_done_after_the_leads_tell_answers_it() {
+        let on = Config {
+            auto_retire: true,
+            ..Config::default()
+        };
+        let mut s = state();
+        spawned(&mut s, "agent:h/s/a");
+        // worked, was told, then reported DONE without being seen working again
+        s.agents.get_mut("agent:h/s/a").unwrap().worked = Some(t0() - Duration::minutes(5));
+        s.told
+            .insert("agent:h/s/a".into(), t0() - Duration::minutes(1));
+        s.reports.insert(
+            "agent:h/s/a".into(),
+            Report {
+                kind: "DONE".into(),
+                text: "x".into(),
+                since: t0(),
+            },
+        );
+        assert_eq!(acts(&s, 10, on)[0].1, Act::Retire);
     }
 
     #[test]

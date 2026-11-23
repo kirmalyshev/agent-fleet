@@ -45,6 +45,10 @@ pub struct State {
     /// Each up agent's last `msg.sent`, what `IDLE` quotes and `auto_retire` reads (`DONE`/`MERGED`).
     #[serde(default)]
     pub reports: BTreeMap<String, Report>,
+    /// When each agent's lead last told it anything: new work after a `DONE`, so `auto_retire`
+    /// waits for a fresh one. Gone when the agent goes down.
+    #[serde(default)]
+    pub told: BTreeMap<String, DateTime<Utc>>,
     /// When the host last rang an agent's lead `IDLE`/`HELD` (key: the agent id) or `UNMANAGED`
     /// (key: the id + `UNMANAGED_KEY`); gone once the agent works or goes down.
     #[serde(default)]
@@ -1067,6 +1071,7 @@ impl State {
                     &d.agent,
                 );
                 self.reports.remove(&d.agent);
+                self.told.remove(&d.agent);
                 self.idle_rung
                     .remove(&format!("{}{UNMANAGED_KEY}", d.agent));
                 if self.agents.remove(&d.agent).is_some() {
@@ -1297,8 +1302,15 @@ impl State {
                                 },
                             );
                         }
-                        // Any tell from the lead to the waiting agent is the answer.
                         let from = e.actor.id.as_str();
+                        let lead = self.roles.get(&d.to).and_then(|r| r.lead.as_deref());
+                        if self.agents.contains_key(&d.to)
+                            && (lead == Some(from)
+                                || (lead.is_none() && self.coordinator() == Some(from)))
+                        {
+                            self.told.insert(d.to.clone(), ts);
+                        }
+                        // Any tell from the lead to the waiting agent is the answer.
                         if self
                             .waiting
                             .get(&d.to)
@@ -2485,6 +2497,130 @@ mod tests {
             }),
         ));
         assert!(s.reports.is_empty() && s.idle_rung.is_empty());
+    }
+
+    #[test]
+    fn a_tell_from_the_lead_is_remembered_and_one_from_anyone_else_is_not() {
+        let t0 = Utc::now();
+        let at = |mins: i64, actor: &str, body| {
+            let mut e = Envelope::new(
+                Actor {
+                    kind: ActorKind::Agent,
+                    id: actor.into(),
+                },
+                "p",
+                body,
+            )
+            .into_event();
+            e.ts = t0 + chrono::Duration::minutes(mins);
+            e
+        };
+        let (a, lead, peer) = ("agent:h/s/a", "agent:h/s/lead", "agent:h/s/peer");
+        let tell = |to: &str| {
+            Known::MsgSent(MsgSent {
+                to: to.into(),
+                kind: "FIX".into(),
+                reference: "r".into(),
+                text: "t".into(),
+                closes: Vec::new(),
+            })
+        };
+        let mut s = State::default();
+        for id in [a, lead, peer] {
+            s.apply(&at(
+                0,
+                id,
+                Known::AgentUp(AgentUp {
+                    agent: id.into(),
+                    host: "h".into(),
+                    kind: None,
+                    pane: None,
+                    state: AgentState::Idle,
+                }),
+            ));
+        }
+        s.roles.insert(
+            a.into(),
+            Role {
+                level: Level::Implementer,
+                lead: Some(lead.into()),
+                domain: None,
+                by: "x".into(),
+                since: t0,
+            },
+        );
+        s.apply(&at(1, peer, tell(a)));
+        assert!(s.told.is_empty(), "a peer is not the lead");
+        s.apply(&at(2, lead, tell(a)));
+        assert_eq!(s.told[a], t0 + chrono::Duration::minutes(2));
+        s.apply(&at(
+            3,
+            "host:h",
+            Known::AgentDown(AgentDown {
+                agent: a.into(),
+                reason: None,
+            }),
+        ));
+        assert!(s.told.is_empty());
+    }
+
+    #[test]
+    fn with_no_declared_lead_the_coordinator_counts_as_the_lead() {
+        let t0 = Utc::now();
+        let at = |actor: &str, body| {
+            let mut e = Envelope::new(
+                Actor {
+                    kind: ActorKind::Agent,
+                    id: actor.into(),
+                },
+                "p",
+                body,
+            )
+            .into_event();
+            e.ts = t0;
+            e
+        };
+        let (a, co, peer) = ("agent:h/s/a", "agent:h/s/co", "agent:h/s/peer");
+        let tell = |to: &str| {
+            Known::MsgSent(MsgSent {
+                to: to.into(),
+                kind: "FIX".into(),
+                reference: "r".into(),
+                text: "t".into(),
+                closes: Vec::new(),
+            })
+        };
+        let mut s = State::default();
+        for id in [a, co, peer] {
+            s.apply(&at(
+                id,
+                Known::AgentUp(AgentUp {
+                    agent: id.into(),
+                    host: "h".into(),
+                    kind: None,
+                    pane: None,
+                    state: AgentState::Idle,
+                }),
+            ));
+        }
+        s.roles.insert(
+            co.into(),
+            Role {
+                level: Level::RootCoordinator,
+                lead: None,
+                domain: None,
+                by: "x".into(),
+                since: t0,
+            },
+        );
+        s.apply(&at(peer, tell(a)));
+        assert!(s.told.is_empty());
+        // a tell to an agent that is not up, or to the `coordinator` alias, is not recorded
+        s.apply(&at(co, tell("agent:h/s/ghost")));
+        s.apply(&at(co, tell("coordinator")));
+        assert!(s.told.is_empty());
+        s.apply(&at(co, tell(a)));
+        assert_eq!(s.told[a], t0);
     }
 
     #[test]
