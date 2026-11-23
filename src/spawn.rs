@@ -1829,6 +1829,20 @@ async fn idle(host: &Host, state: &State) {
         if !agent.starts_with(&prefix) {
             continue;
         }
+        // An agent waiting on its own background shell is working: no IDLE/HELD ring, no
+        // retire. Read only for an act that would fire; an unreadable screen changes nothing.
+        let waiting = !matches!(
+            &act,
+            crate::idle::Act::Ring {
+                kind: "UNMANAGED",
+                ..
+            }
+        ) && crate::stuck::screen(host, &agent)
+            .await
+            .is_some_and(|sc| crate::stuck::background_shell(&sc));
+        if waiting {
+            continue;
+        }
         match act {
             crate::idle::Act::Ring { to, kind, text } => {
                 host.publish(host.presence(Known::MsgSent(MsgSent {
@@ -5200,6 +5214,42 @@ profile = "devin"
         idle(&host, &s).await;
         let got: Vec<_> = msgs(&host).into_iter().map(|m| m.kind).collect();
         assert!(got.contains(&"IDLE".to_string()), "{got:?}");
+        assert!(got.contains(&"UNMANAGED".to_string()), "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_with_a_background_shell_running_is_not_rung_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let rule = "─".repeat(40);
+        let footer = format!(
+            "⏺ Eval started.\n\n{rule}\n❯ \n{rule}\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · 1 shell still running\n"
+        );
+        let reply = json!({ "result": { "text": footer } });
+        let (host, _stub) = run(dir.path(), &[("agent.read", vec![reply; 4])]).await;
+        let prefix = agent_prefix(&host.cfg.host, &host.cfg.session);
+        let (a, lead) = (format!("{prefix}a"), format!("{prefix}lead"));
+        let mut s = State::default();
+        for id in [&a, &lead] {
+            s.agents.insert(id.clone(), live_agent());
+            s.agents.get_mut(id).unwrap().state = AgentState::Idle;
+            s.agents.get_mut(id).unwrap().since = Utc::now() - chrono::Duration::minutes(30);
+            s.agents.get_mut(id).unwrap().host = host.cfg.host.clone();
+        }
+        s.roles.insert(
+            a.clone(),
+            crate::state::Role {
+                level: crate::event::Level::Implementer,
+                lead: Some(lead.clone()),
+                domain: None,
+                by: "x".into(),
+                since: Utc::now(),
+            },
+        );
+        s.first_cwd.insert(a.clone(), "/w/a".into());
+        idle(&host, &s).await;
+        let got: Vec<_> = msgs(&host).into_iter().map(|m| m.kind).collect();
+        assert!(!got.contains(&"IDLE".to_string()), "{got:?}");
         assert!(got.contains(&"UNMANAGED".to_string()), "{got:?}");
     }
 

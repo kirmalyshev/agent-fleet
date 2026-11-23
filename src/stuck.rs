@@ -712,6 +712,25 @@ pub(crate) async fn screen_of(host: &Host, target: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether a claude footer says a background shell is still running (`· 1 shell still
+/// running`, `· 2 shells still running`): the agent is waiting on its own job, not idle.
+/// Only the program's own lines count, so prose quoting the phrase does not.
+pub(crate) fn background_shell(screen: &str) -> bool {
+    let chrome = chrome_lines(Some("claude"), screen);
+    screen.lines().zip(chrome).any(|(l, c)| {
+        c && l
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(4)
+            .any(|w| {
+                w[0].parse::<u32>().is_ok_and(|n| n > 0)
+                    && ["shell", "shells"].contains(&w[1])
+                    && w[2] == "still"
+                    && w[3] == "running"
+            })
+    })
+}
+
 /// Whether the bottom of `screen` shows a selection dialog (a permission prompt, an
 /// `AskUserQuestion` menu, a plan approval): an Enter typed there would pick an option on
 /// the agent's behalf. Only the last lines count, so prose higher up cannot trip it.
@@ -971,6 +990,26 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_claude_footer_with_a_running_shell_is_background_work() {
+        let box_ = "─".repeat(40);
+        let screen = |footer: &str| {
+            format!("⏺ Started the eval in the background.\n\n{box_}\n❯ \n{box_}\n  {footer}\n")
+        };
+        for n in ["1 shell", "3 shells"] {
+            let f = format!("⏵⏵ bypass permissions on (shift+tab to cycle) · {n} still running");
+            assert!(background_shell(&screen(&f)), "{f}");
+        }
+        assert!(!background_shell(&screen(
+            "⏵⏵ bypass permissions on (shift+tab to cycle)"
+        )));
+        assert!(!background_shell(&screen("· 0 shells still running")));
+        // the agent's own prose quoting the phrase is not the footer
+        assert!(!background_shell(&format!(
+            "⏺ The footer reads 1 shell still running\n\n{box_}\n❯ \n{box_}\n  ? for shortcuts\n"
+        )));
+    }
+
     use super::*;
     use crate::state::Quota;
 

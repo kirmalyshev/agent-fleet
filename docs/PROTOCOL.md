@@ -561,6 +561,8 @@ uncommitted work and rings the lead. A tell from its lead after that `DONE` (new
 `told`) cancels it: the agent is not finished until it reports again (any tell counts, even a thanks; the
 lead is still rung `IDLE` and can retire it by hand). An agent in a pane with no spawn record (started by hand)
 gets one `UNMANAGED` ring and is listed by `doctor` as `unmanaged`; it is never auto-retired.
+An agent whose claude footer reads `N shell(s) still running` is waiting on its own background job: the host
+neither rings it `IDLE`/`HELD` nor retires it while the footer shows (an unreadable screen changes nothing).
 `[idle] exempt = ["name"]` lists agents the host never rings or retires, by agent name or by the
 basename of the worktree they work in; for a hand-started agent every project's list applies.
 
