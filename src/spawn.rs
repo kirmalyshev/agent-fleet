@@ -1831,15 +1831,20 @@ async fn idle(host: &Host, state: &State) {
         }
         // An agent waiting on its own background shell is working: no IDLE/HELD ring, no
         // retire. Read only for an act that would fire; an unreadable screen changes nothing.
+        // ponytail: a shell that never ends mutes only HELD_CAP; then the ring goes through.
         let waiting = !matches!(
             &act,
             crate::idle::Act::Ring {
                 kind: "UNMANAGED",
                 ..
             }
-        ) && crate::stuck::screen(host, &agent)
-            .await
-            .is_some_and(|sc| crate::stuck::background_shell(&sc));
+        ) && state
+            .agents
+            .get(&agent)
+            .is_some_and(|a| Utc::now() - a.since < crate::idle::HELD_CAP)
+            && crate::stuck::screen(host, &agent)
+                .await
+                .is_some_and(|sc| crate::stuck::background_shell(&sc));
         if waiting {
             continue;
         }
@@ -5217,40 +5222,152 @@ profile = "devin"
         assert!(got.contains(&"UNMANAGED".to_string()), "{got:?}");
     }
 
-    #[tokio::test]
-    async fn an_agent_with_a_background_shell_running_is_not_rung_idle() {
-        let dir = tempfile::tempdir().unwrap();
-        let _co = checkout(dir.path());
+    const SHELL_FOOTER: &str =
+        "⏵⏵ bypass permissions on (shift+tab to cycle) · 1 shell still running";
+
+    /// A claude screen whose footer line is `footer`.
+    fn claude_screen(footer: &str) -> Value {
         let rule = "─".repeat(40);
-        let footer = format!(
-            "⏺ Eval started.\n\n{rule}\n❯ \n{rule}\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · 1 shell still running\n"
-        );
-        let reply = json!({ "result": { "text": footer } });
-        let (host, _stub) = run(dir.path(), &[("agent.read", vec![reply; 4])]).await;
+        let text = format!("⏺ Eval started.\n\n{rule}\n❯ \n{rule}\n  {footer}\n");
+        json!({ "result": { "text": text } })
+    }
+
+    /// Agent `a`, led by `lead`, idle for `mins`.
+    fn idle_for(host: &Host, mins: i64) -> (State, String) {
         let prefix = agent_prefix(&host.cfg.host, &host.cfg.session);
         let (a, lead) = (format!("{prefix}a"), format!("{prefix}lead"));
         let mut s = State::default();
         for id in [&a, &lead] {
             s.agents.insert(id.clone(), live_agent());
             s.agents.get_mut(id).unwrap().state = AgentState::Idle;
-            s.agents.get_mut(id).unwrap().since = Utc::now() - chrono::Duration::minutes(30);
+            s.agents.get_mut(id).unwrap().since = Utc::now() - chrono::Duration::minutes(mins);
             s.agents.get_mut(id).unwrap().host = host.cfg.host.clone();
         }
         s.roles.insert(
             a.clone(),
             crate::state::Role {
                 level: crate::event::Level::Implementer,
-                lead: Some(lead.clone()),
+                lead: Some(lead),
                 domain: None,
                 by: "x".into(),
                 since: Utc::now(),
             },
         );
         s.first_cwd.insert(a.clone(), "/w/a".into());
+        (s, a)
+    }
+
+    fn kinds(host: &Host) -> Vec<String> {
+        msgs(host).into_iter().map(|m| m.kind).collect()
+    }
+
+    #[tokio::test]
+    async fn an_agent_with_a_background_shell_running_is_not_rung_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run(
+            dir.path(),
+            &[("agent.read", vec![claude_screen(SHELL_FOOTER); 4])],
+        )
+        .await;
+        let (s, _) = idle_for(&host, 30);
         idle(&host, &s).await;
-        let got: Vec<_> = msgs(&host).into_iter().map(|m| m.kind).collect();
+        let got = kinds(&host);
         assert!(!got.contains(&"IDLE".to_string()), "{got:?}");
         assert!(got.contains(&"UNMANAGED".to_string()), "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn the_ring_goes_through_once_the_footer_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run(
+            dir.path(),
+            &[(
+                "agent.read",
+                vec![
+                    claude_screen(SHELL_FOOTER),
+                    claude_screen("⏵⏵ bypass permissions on (shift+tab to cycle)"),
+                ],
+            )],
+        )
+        .await;
+        let (s, _) = idle_for(&host, 30);
+        idle(&host, &s).await;
+        assert!(!kinds(&host).contains(&"IDLE".to_string()));
+        idle(&host, &s).await;
+        assert!(
+            kinds(&host).contains(&"IDLE".to_string()),
+            "{:?}",
+            kinds(&host)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shell_that_never_ends_mutes_the_ring_only_for_held_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run(
+            dir.path(),
+            &[("agent.read", vec![claude_screen(SHELL_FOOTER); 4])],
+        )
+        .await;
+        let (s, _) = idle_for(&host, crate::idle::HELD_CAP.num_minutes() + 1);
+        idle(&host, &s).await;
+        assert!(
+            kinds(&host).contains(&"IDLE".to_string()),
+            "{:?}",
+            kinds(&host)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_agent_with_a_background_shell_running_is_not_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        let toml = co.join(".agent-fleet/fleet.toml");
+        let body = std::fs::read_to_string(&toml).unwrap();
+        std::fs::write(&toml, format!("{body}\n[idle]\nauto_retire = true\n")).unwrap();
+        let (host, _stub) = run(
+            dir.path(),
+            &[("agent.read", vec![claude_screen(SHELL_FOOTER); 4])],
+        )
+        .await;
+        let (mut s, a) = idle_for(&host, 30);
+        let mut r = req(None);
+        r.agent = a.clone();
+        r.name = "a".into();
+        r.issue = None;
+        s.apply(
+            &Envelope::new(
+                Actor {
+                    kind: ActorKind::Agent,
+                    id: "agent:h/s/lead".into(),
+                },
+                "p",
+                Known::SpawnRequested(Box::new(r)),
+            )
+            .into_event(),
+        );
+        s.reports.insert(
+            a,
+            crate::state::Report {
+                kind: "DONE".into(),
+                text: "shipped".into(),
+                since: Utc::now() - chrono::Duration::minutes(40),
+            },
+        );
+        idle(&host, &s).await;
+        let retires = host
+            .replica
+            .lock()
+            .unwrap()
+            .all()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(&e.body, Body::Known(Known::RetireRequested(_))))
+            .count();
+        assert_eq!(retires, 0);
     }
 
     #[tokio::test]

@@ -990,13 +990,16 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::state::Quota;
+
     #[test]
     fn a_claude_footer_with_a_running_shell_is_background_work() {
         let box_ = "─".repeat(40);
         let screen = |footer: &str| {
             format!("⏺ Started the eval in the background.\n\n{box_}\n❯ \n{box_}\n  {footer}\n")
         };
-        for n in ["1 shell", "3 shells"] {
+        for n in ["1 shell", "3 shells", "12 shells"] {
             let f = format!("⏵⏵ bypass permissions on (shift+tab to cycle) · {n} still running");
             assert!(background_shell(&screen(&f)), "{f}");
         }
@@ -1009,9 +1012,6 @@ mod tests {
             "⏺ The footer reads 1 shell still running\n\n{box_}\n❯ \n{box_}\n  ? for shortcuts\n"
         )));
     }
-
-    use super::*;
-    use crate::state::Quota;
 
     fn agent(state: AgentState, worked: bool) -> Agent {
         let now = Utc::now();
