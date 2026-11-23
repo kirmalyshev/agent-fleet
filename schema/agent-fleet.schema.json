@@ -4015,6 +4015,26 @@
           "description": "When each agent that is not up went down (`agent.down`), kept 24 h: a tell to it goes to\nthe coordinator `GONE_AFTER` later, never on a listing flap.",
           "type": "object"
         },
+        "held_streak": {
+          "additionalProperties": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            ],
+            "type": "array"
+          },
+          "default": {},
+          "description": "The last `HELD` text rung per agent and how many times in a row: the host backs off an\nunchanged one. Gone once the agent works, changes state, goes down or is rung `IDLE`.",
+          "type": "object"
+        },
         "hosts": {
           "additionalProperties": {
             "$ref": "#/$defs/Host"

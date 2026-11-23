@@ -49,6 +49,10 @@ pub struct State {
     /// (key: the id + `UNMANAGED_KEY`); gone once the agent works or goes down.
     #[serde(default)]
     pub idle_rung: BTreeMap<String, DateTime<Utc>>,
+    /// The last `HELD` text rung per agent and how many times in a row: the host backs off an
+    /// unchanged one. Gone once the agent works, changes state, goes down or is rung `IDLE`.
+    #[serde(default)]
+    pub held_streak: BTreeMap<String, (String, u32)>,
     /// Delivered doorbells their recipient has not read (`msg.read`) yet: retransmitted until it does.
     #[serde(default)]
     pub unread: BTreeMap<String, Unread>,
@@ -473,10 +477,12 @@ pub const UNMANAGED_KEY: &str = "#unmanaged";
 fn clear_asks(
     waiting: &mut BTreeMap<String, Waiting>,
     idle_rung: &mut BTreeMap<String, DateTime<Utc>>,
+    held_streak: &mut BTreeMap<String, (String, u32)>,
     agent: &str,
 ) {
     waiting.remove(agent);
     idle_rung.remove(agent);
+    held_streak.remove(agent);
 }
 
 /// A delivered doorbell not read yet.
@@ -897,7 +903,15 @@ impl State {
                 let old = self.agents.get(&d.agent);
                 if old.is_none() {
                     // A new incarnation owes nothing to a previous one's ask.
-                    clear_asks(&mut self.waiting, &mut self.idle_rung, &d.agent);
+                    clear_asks(
+                        &mut self.waiting,
+                        &mut self.idle_rung,
+                        &mut self.held_streak,
+                        &d.agent,
+                    );
+                }
+                if old.is_some_and(|a| a.state != d.state) {
+                    self.held_streak.remove(&d.agent);
                 }
                 self.agents.insert(
                     d.agent.clone(),
@@ -913,7 +927,12 @@ impl State {
                         worked: (d.state == AgentState::Working)
                             .then(|| {
                                 self.signals.remove(&d.agent);
-                                clear_asks(&mut self.waiting, &mut self.idle_rung, &d.agent);
+                                clear_asks(
+                                    &mut self.waiting,
+                                    &mut self.idle_rung,
+                                    &mut self.held_streak,
+                                    &d.agent,
+                                );
                                 ts
                             })
                             .or_else(|| old.and_then(|a| a.worked)),
@@ -1020,7 +1039,12 @@ impl State {
                 // Only `agent.up` brings an agent in: a late state change never revives a downed one.
                 if let Some(a) = self.agents.get_mut(&d.agent) {
                     if d.state == AgentState::Working {
-                        clear_asks(&mut self.waiting, &mut self.idle_rung, &d.agent);
+                        clear_asks(
+                            &mut self.waiting,
+                            &mut self.idle_rung,
+                            &mut self.held_streak,
+                            &d.agent,
+                        );
                         a.worked = Some(ts);
                         a.finished = None;
                         self.signals.remove(&d.agent);
@@ -1029,13 +1053,19 @@ impl State {
                         a.finished = Some(ts);
                     }
                     if a.state != d.state {
+                        self.held_streak.remove(&d.agent);
                         a.state = d.state;
                         a.since = ts;
                     }
                 }
             }
             Known::AgentDown(d) => {
-                clear_asks(&mut self.waiting, &mut self.idle_rung, &d.agent);
+                clear_asks(
+                    &mut self.waiting,
+                    &mut self.idle_rung,
+                    &mut self.held_streak,
+                    &d.agent,
+                );
                 self.reports.remove(&d.agent);
                 self.idle_rung
                     .remove(&format!("{}{UNMANAGED_KEY}", d.agent));
@@ -1291,6 +1321,19 @@ impl State {
                             "UNMANAGED" => format!("{}{UNMANAGED_KEY}", d.reference),
                             _ => d.reference.clone(),
                         };
+                        match d.kind.as_str() {
+                            "HELD" => {
+                                let n = match self.held_streak.get(&key) {
+                                    Some((t, n)) if *t == d.text => n + 1,
+                                    _ => 1,
+                                };
+                                self.held_streak.insert(key.clone(), (d.text.clone(), n));
+                            }
+                            "IDLE" => {
+                                self.held_streak.remove(&key);
+                            }
+                            _ => {}
+                        }
                         self.idle_rung.insert(key, ts);
                     }
                     _ => {}
@@ -2280,6 +2323,101 @@ mod tests {
 
         s.apply(&role(None, ActorKind::Agent));
         assert!(s.roles.is_empty());
+    }
+
+    #[test]
+    fn held_rings_count_while_the_text_repeats_and_reset_on_new_text_idle_or_a_state_change() {
+        let t0 = Utc::now();
+        let a = "agent:h/s/a";
+        let mut s = State::default();
+        let mut n = 0;
+        let mut ev = |s: &mut State, kind: ActorKind, actor: &str, body| {
+            n += 1;
+            let mut e = Envelope::new(
+                Actor {
+                    kind,
+                    id: actor.into(),
+                },
+                "p",
+                body,
+            )
+            .into_event();
+            e.ts = t0 + chrono::Duration::minutes(n);
+            s.apply(&e);
+        };
+        let ring = |kind: &str, text: &str| {
+            Known::MsgSent(MsgSent {
+                to: "agent:h/s/lead".into(),
+                kind: kind.into(),
+                reference: a.into(),
+                text: text.into(),
+                closes: Vec::new(),
+            })
+        };
+        let state = |st| {
+            Known::AgentState(AgentStateChanged {
+                agent: a.into(),
+                state: st,
+            })
+        };
+        ev(
+            &mut s,
+            ActorKind::Agent,
+            a,
+            Known::AgentUp(AgentUp {
+                agent: a.into(),
+                host: "h".into(),
+                kind: None,
+                pane: None,
+                state: AgentState::Idle,
+            }),
+        );
+        for want in 1..=3 {
+            ev(&mut s, ActorKind::Host, "host:h", ring("HELD", "x"));
+            assert_eq!(s.held_streak[a], ("x".to_string(), want));
+        }
+        ev(&mut s, ActorKind::Host, "host:h", ring("HELD", "y"));
+        assert_eq!(s.held_streak[a], ("y".to_string(), 1));
+        // another ring kind for the same agent leaves the HELD streak alone, IDLE ends it
+        ev(&mut s, ActorKind::Host, "host:h", ring("UNMANAGED", "u"));
+        assert_eq!(s.held_streak[a].1, 1);
+        ev(&mut s, ActorKind::Host, "host:h", ring("IDLE", "i"));
+        assert!(!s.held_streak.contains_key(a));
+        // a same-state report keeps it; a real state change, working and down clear it
+        ev(&mut s, ActorKind::Host, "host:h", ring("HELD", "y"));
+        ev(&mut s, ActorKind::Agent, a, state(AgentState::Idle));
+        assert!(s.held_streak.contains_key(a));
+        ev(&mut s, ActorKind::Agent, a, state(AgentState::Blocked));
+        assert!(!s.held_streak.contains_key(a));
+        ev(&mut s, ActorKind::Host, "host:h", ring("HELD", "y"));
+        ev(&mut s, ActorKind::Agent, a, state(AgentState::Working));
+        assert!(!s.held_streak.contains_key(a));
+        ev(&mut s, ActorKind::Agent, a, state(AgentState::Idle));
+        ev(&mut s, ActorKind::Host, "host:h", ring("HELD", "y"));
+        let up = |st| {
+            Known::AgentUp(AgentUp {
+                agent: a.into(),
+                host: "h".into(),
+                kind: None,
+                pane: None,
+                state: st,
+            })
+        };
+        ev(&mut s, ActorKind::Agent, a, up(AgentState::Idle));
+        assert!(s.held_streak.contains_key(a));
+        ev(&mut s, ActorKind::Agent, a, up(AgentState::Blocked));
+        assert!(!s.held_streak.contains_key(a));
+        ev(&mut s, ActorKind::Host, "host:h", ring("HELD", "y"));
+        ev(
+            &mut s,
+            ActorKind::Agent,
+            a,
+            Known::AgentDown(AgentDown {
+                agent: a.into(),
+                reason: None,
+            }),
+        );
+        assert!(s.held_streak.is_empty());
     }
 
     #[test]
