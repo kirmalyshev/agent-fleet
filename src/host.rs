@@ -2894,6 +2894,7 @@ mod tests {
             args: None,
             started,
             pgid: None,
+            zombie: false,
         };
         let procs = scan::Procs(HashMap::from([
             (10, proc_at(Some(t0))),

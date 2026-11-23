@@ -24,6 +24,8 @@ pub struct Proc {
     pub started: Option<DateTime<Utc>>,
     /// The process-group id — the group leader's pid — when the platform reports it.
     pub pgid: Option<u32>,
+    /// STAT Z: exited, waiting for its parent to reap it.
+    pub zombie: bool,
 }
 
 /// Every process on this machine at one moment. Empty outside Linux and macOS.
@@ -51,11 +53,10 @@ impl Procs {
             let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse().ok()) else {
                 continue;
             };
-            let Some((ppid, ticks, pages, boot_ticks, pgid)) =
-                std::fs::read_to_string(entry.path().join("stat"))
-                    .ok()
-                    .and_then(|s| parse_stat(&s))
-            else {
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let Some((ppid, ticks, pages, boot_ticks, pgid)) = parse_stat(&stat) else {
                 continue;
             };
             let cwd = std::fs::read_link(entry.path().join("cwd"))
@@ -87,6 +88,7 @@ impl Procs {
                     args,
                     started,
                     pgid: Some(pgid),
+                    zombie: stat_zombie(&stat),
                 },
             );
         }
@@ -97,7 +99,7 @@ impl Procs {
     #[cfg(target_os = "macos")]
     pub fn read() -> Self {
         let out = std::process::Command::new("ps")
-            .args(["-axo", "pid=,ppid=,pgid=,rss=,time=,lstart=,args="])
+            .args(["-axo", "pid=,ppid=,pgid=,rss=,time=,lstart=,stat=,args="])
             .output()
             .ok()
             .filter(|o| o.status.success())
@@ -258,7 +260,7 @@ pub fn by_worktree(
     out
 }
 
-/// `ps -axo pid=,ppid=,pgid=,rss=,time=,lstart=,args=` → pid → Proc (macOS; `ps` reports no
+/// `ps -axo pid=,ppid=,pgid=,rss=,time=,lstart=,stat=,args=` → pid → Proc (macOS; `ps` reports no
 /// cwd). `lstart` is five words (`Sat Nov 15 21:31:45 2025`), `args` the rest, and the
 /// name is argv[0]'s basename — which also covers a path with a space in it.
 #[cfg(any(target_os = "macos", test))]
@@ -274,14 +276,15 @@ pub fn parse_ps(s: &str) -> HashMap<u32, Proc> {
             );
             let cpu_ms = parse_ps_time(f.get(4)?)?;
             let started = parse_lstart(&f.get(5..10)?.join(" "));
-            let argv0 = f.get(10)?;
+            let zombie = f.get(10)?.starts_with('Z');
+            let argv0 = f.get(11)?;
             // macOS gives a path, and a login shell is `-zsh`.
             let name = argv0
                 .rsplit('/')
                 .next()?
                 .trim_start_matches('-')
                 .to_string();
-            let args = f.get(10..).map(|a| a.join(" ")).filter(|a| !a.is_empty());
+            let args = f.get(11..).map(|a| a.join(" ")).filter(|a| !a.is_empty());
             Some((
                 pid,
                 Proc {
@@ -294,6 +297,7 @@ pub fn parse_ps(s: &str) -> HashMap<u32, Proc> {
                     args,
                     started,
                     pgid: Some(pgid),
+                    zombie,
                 },
             ))
         })
@@ -339,6 +343,13 @@ pub fn parse_stat(s: &str) -> Option<(u32, u64, u64, u64, u32)> {
         n(19)?,
         n(2)? as u32,
     ))
+}
+
+/// Whether `/proc/<pid>/stat` says STAT Z (the state is the first field after the command).
+#[cfg(any(target_os = "linux", test))]
+pub fn stat_zombie(s: &str) -> bool {
+    s.rfind(')')
+        .is_some_and(|i| s[i + 1..].split_whitespace().next() == Some("Z"))
 }
 
 /// `/proc/stat`'s `btime` line: the epoch second the machine booted.
@@ -947,6 +958,7 @@ mod tests {
                             args: None,
                             started: None,
                             pgid: Some(pgid),
+                            zombie: false,
                         },
                     )
                 })
@@ -1046,6 +1058,7 @@ mod tests {
             args: Some(args.into()),
             started: Some(now - chrono::Duration::minutes(m)),
             pgid: Some(pgid),
+            zombie: false,
         };
         let mut t = procs(&[
             (65813, 1, 45872, "java"),
@@ -1256,12 +1269,23 @@ mod tests {
     }
 
     #[test]
+    fn a_zombie_is_read_off_the_state_column_or_proc_stat() {
+        let t = parse_ps(
+            "  5  1  5  0  0:00.00 Sat Nov 15 20:00:01 2025 Z+ (bun)\n\
+             \x20 6  1  6  9  0:01.00 Sat Nov 15 20:00:01 2025 Ss /bin/zsh\n",
+        );
+        assert!(t[&5].zombie && !t[&6].zombie);
+        assert!(stat_zombie("73288 (bun test) Z 60953 1 1 0"));
+        assert!(!stat_zombie("7 (a) b) S 1 1 1 0") && !stat_zombie("garbage"));
+    }
+
+    #[test]
     fn ps_output_parses_every_time_shape() {
-        let s = "    1      0      1  12345   0:05.50 Sat Nov 15 20:00:01 2025 /sbin/launchd\n\
-                 \x20  42      1      1  20480  12:34:56 Sat Nov 15 08:00:01 2025 /opt/bin/herdr\n\
-                 \x20  99     42     42   4096 2-03:04:05 Sat Nov 15 18:00:01 2025 /usr/bin/claude\n\
-                 \x20 100     42     42    512   7:08.09 Sat Nov 15 19:00:01 2025 -zsh\n\
-                 \x20   7      1      7   1024   1:00.00 Sat Nov 15 19:30:01 2025 /opt/tool/agent-fleet -p my proj\n\
+        let s = "    1      0      1  12345   0:05.50 Sat Nov 15 20:00:01 2025 S /sbin/launchd\n\
+                 \x20  42      1      1  20480  12:34:56 Sat Nov 15 08:00:01 2025 S /opt/bin/herdr\n\
+                 \x20  99     42     42   4096 2-03:04:05 Sat Nov 15 18:00:01 2025 S /usr/bin/claude\n\
+                 \x20 100     42     42    512   7:08.09 Sat Nov 15 19:00:01 2025 S -zsh\n\
+                 \x20   7      1      7   1024   1:00.00 Sat Nov 15 19:30:01 2025 S /opt/tool/agent-fleet -p my proj\n\
                  \x20 bad line\n";
         let t = Procs(parse_ps(s));
         assert_eq!(t.0.len(), 5);
@@ -1330,6 +1354,7 @@ mod tests {
             args: None,
             started: None,
             pgid: None,
+            zombie: false,
         }
     }
 

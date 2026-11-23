@@ -728,6 +728,7 @@ mod tests {
             args: Some(format!("{name} --flag")),
             started: None,
             pgid: None,
+            zombie: false,
         }
     }
 

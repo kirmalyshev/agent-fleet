@@ -788,6 +788,12 @@ established TCP connection anywhere under its shell (a network wait such as `gh 
   a tick after a gap of more than two intervals (the machine slept) only re-reads the table;
 - `orphan`: a `proc.orphaned` proof holds.
 
+A zombie (STAT `Z`) has exited and only its parent can reap it: it is never classified, never
+counts as a child, and is not evidence. A filter at the end of a pipe (`tail`, `grep`, `cat`, …)
+is not `hung` while another member of its process group is not hung (a writer that is too
+young to judge, or waiting): the writer is judged instead. If the writer is hung too, the
+pipeline is one report.
+
 The topmost hung process of a chain is reported as `proc.hung` with every hung pid under it
 (tops of one agent in one process group, the members of a pipeline, are one report: the
 lowest pid's),

@@ -22,6 +22,12 @@ pub const HUNG_TICKS: u32 = 2;
 /// A wait this long is reported: nothing waits more than 30 min.
 pub const WAIT_MAX: Duration = Duration::minutes(30);
 
+/// Readers at the end of a pipe: idle by design while their writer lives.
+const FILTERS: &[&str] = &[
+    "grep", "egrep", "fgrep", "rg", "awk", "gawk", "sed", "head", "tail", "cut", "tr", "tee", "jq",
+    "cat",
+];
+
 /// The shells an agent runs its commands in; their subtrees are what the agent started.
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
 
@@ -145,11 +151,30 @@ impl Watch {
                     // A pipeline's members are siblings: the reader is not hung while its
                     // producer works, so one busy member makes the whole command busy.
                     let mut ranges = Vec::new();
-                    for c in t.kids(shell).to_vec() {
+                    let members = t.kids(shell).to_vec();
+                    for &c in &members {
                         let begin = t.out.len();
                         t.worked = false;
                         t.visit(c, agent);
                         ranges.push((begin, t.out.len(), t.worked));
+                    }
+                    // A reader judged hung beside a live writer (another member of its
+                    // group that is not hung itself: too young, or waiting) is not hung: the
+                    // writer is the one to judge.
+                    let hung = |t: &Tick, r: &(usize, usize, bool)| {
+                        t.out[r.0..r.1]
+                            .iter()
+                            .any(|c| matches!(c.verdict, Verdict::Hung(_)))
+                    };
+                    for i in 0..ranges.len() {
+                        let group = now.0[&members[i]].pgid;
+                        let live_writer = (0..ranges.len()).any(|j| {
+                            j != i && now.0[&members[j]].pgid == group && !hung(&t, &ranges[j])
+                        });
+                        let reader = FILTERS.contains(&now.0[&members[i]].name.as_str());
+                        if group.is_some() && reader && live_writer && hung(&t, &ranges[i]) {
+                            t.revive(ranges[i].0, ranges[i].1);
+                        }
                     }
                     let busy = ranges.iter().any(|r| r.2);
                     let start = ranges.first().map_or(t.out.len(), |r| r.0);
@@ -220,6 +245,11 @@ impl<'a> Tick<'a> {
     ) -> Self {
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
         for (&pid, p) in &now.0 {
+            // A zombie (STAT Z) has exited: nothing to classify, kill or wait on, and no child
+            // that started. Only its parent can reap it.
+            if p.zombie {
+                continue;
+            }
             children.entry(p.ppid).or_default().push(pid);
         }
         Tick {
@@ -402,11 +432,7 @@ impl<'a> Tick<'a> {
             // ponytail: a non-job-control shell puts every sibling in one group, so only a known
             // filter counts as a reader; match the pipe's inode to cover any other reader.
             let pgid = self.now.0[&pid].pgid;
-            let filter = [
-                "grep", "egrep", "fgrep", "rg", "awk", "gawk", "sed", "head", "tail", "cut", "tr",
-                "tee", "jq",
-            ]
-            .contains(&self.now.0[&pid].name.as_str());
+            let filter = FILTERS.contains(&self.now.0[&pid].name.as_str());
             let piped = below.is_empty()
                 && filter
                 && pgid.is_some()
@@ -1316,6 +1342,7 @@ mod tests {
                             args: Some(args.into()),
                             started: Some(t0() - Duration::minutes(age)),
                             pgid: None,
+                            zombie: false,
                         },
                     )
                 })
@@ -1387,6 +1414,61 @@ mod tests {
         assert_eq!(e.deepest.as_deref(), Some("xcrun simctl bootstatus ABC -b"));
         assert!(matches!(verdict(&v, 31), Some(Verdict::Hung(_))));
         assert_eq!(v[0].agent.as_deref(), Some("agent:h/s/o-1"));
+    }
+
+    #[test]
+    fn a_zombie_is_never_classified_nor_counted_as_a_child() {
+        // STAT Z: already exited, only its parent can reap it; nothing to kill or wait on.
+        let mut w = Watch::default();
+        let run = || {
+            let mut t = tree(&[
+                (30, SHELL, "bun", "bun test", 0, 20),
+                (31, 30, "bun", "", 0, 20),
+            ]);
+            t.0.get_mut(&31).unwrap().zombie = true;
+            t
+        };
+        w.step(run(), at(0), &seen());
+        w.step(run(), at(2), &seen());
+        let v = w.step(run(), at(4), &seen());
+        assert!(v.iter().all(|c| c.pid != 31), "{v:#?}");
+        assert!(matches!(verdict(&v, 30), Some(Verdict::Hung(_))), "{v:#?}");
+        let hung = v.iter().find(|c| c.pid == 30).unwrap();
+        let Verdict::Hung(e) = &hung.verdict else {
+            panic!()
+        };
+        assert_eq!(e.deepest, None, "a zombie is no evidence");
+    }
+
+    #[test]
+    fn a_reader_beside_a_live_writer_is_not_hung_whatever_the_writer_is_doing() {
+        // `bun run check | tail -6`: same parent, one group. The writer is alive but not
+        // classified hung (too young to judge, or waiting in a queue): judge the writer.
+        let pipe = |writer_age: i64| {
+            let mut t = tree(&[
+                (50, SHELL, "bun", "bun run check", 0, writer_age),
+                (51, SHELL, "tail", "tail -6", 0, 20),
+            ]);
+            t.0.get_mut(&50).unwrap().pgid = Some(50);
+            t.0.get_mut(&51).unwrap().pgid = Some(50);
+            t
+        };
+        let run = |writer_age: i64, waiting: bool| {
+            let mut s = seen();
+            if waiting {
+                s.waiting.insert(50, ("sim lock".into(), at(0)));
+            }
+            let mut w = Watch::default();
+            w.step(pipe(writer_age), at(0), &s);
+            w.step(pipe(writer_age), at(2), &s);
+            w.step(pipe(writer_age), at(4), &s)
+        };
+        for v in [run(-3, false), run(20, true)] {
+            assert!(!matches!(verdict(&v, 51), Some(Verdict::Hung(_))), "{v:#?}");
+        }
+        // Both stuck: the pipeline is one hang, reader included.
+        let v = run(20, false);
+        assert!(matches!(verdict(&v, 51), Some(Verdict::Hung(_))), "{v:#?}");
     }
 
     #[test]
