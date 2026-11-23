@@ -106,11 +106,12 @@ pub fn due(
         // Every task it owns ended, or it reported DONE/MERGED since it last worked.
         // A tell from its lead since then is new work: the DONE no longer stands.
         let since = a.worked.or(report.map(|r| r.since)).unwrap_or(a.since);
-        // A DONE after the tell answers it; `report` is never older than `worked`.
+        // Only the agent's own next report answers a tell, not its working again: the unfiltered
+        // last report (the agent's last `msg.sent`), else when it came up.
         let told = s
             .told
             .get(id)
-            .is_some_and(|t| *t > report.map_or(since, |r| r.since));
+            .is_some_and(|t| *t > s.reports.get(id).map_or(a.since, |r| r.since));
         let finished = !told
             && (report.is_some_and(|r| ["DONE", "MERGED"].contains(&r.kind.as_str()))
                 || (!mine.is_empty() && mine.iter().all(|t| t.state.is_terminal())));
@@ -448,6 +449,42 @@ mod tests {
         );
         // the same when it finished by its tasks ending, with no DONE at all
         s.reports.clear();
+        s.tasks.insert(
+            "t1".into(),
+            crate::state::Task {
+                project: "p".into(),
+                title: "T".into(),
+                url: None,
+                state: crate::event::TaskState::Completed,
+                since: t0(),
+                owner: Some("agent:h/s/a".into()),
+                lead: None,
+                blocked_by: Default::default(),
+                handoffs: vec![],
+            },
+        );
+        assert!(!acts(&s, 30, on).iter().any(|(_, a)| *a == Act::Retire));
+    }
+
+    #[test]
+    fn working_after_the_leads_tell_does_not_make_the_agent_finished_again() {
+        let on = Config {
+            auto_retire: true,
+            ..Config::default()
+        };
+        let mut s = state();
+        spawned(&mut s, "agent:h/s/a");
+        s.reports.insert(
+            "agent:h/s/a".into(),
+            Report {
+                kind: "DONE".into(),
+                text: "x".into(),
+                since: t0(),
+            },
+        );
+        s.told
+            .insert("agent:h/s/a".into(), t0() + Duration::minutes(2));
+        s.agents.get_mut("agent:h/s/a").unwrap().worked = Some(t0() + Duration::minutes(3));
         s.tasks.insert(
             "t1".into(),
             crate::state::Task {
