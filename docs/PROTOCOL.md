@@ -552,7 +552,7 @@ An agent not `working` for `stale_min` gets its lead (else the up root coordinat
 `msg.sent` from the host: `IDLE <agent> <for>: <last report or task> — retire?`, or
 `HELD <agent>: <reason>` when its open task is held. The ring repeats every `2 x stale_min` while
 the agent stays idle, except that a `HELD` with unchanged text backs off (2x, 4x, 8x, ... the base
-gap, capped at 8 h); new text, the agent working or changing state, or an `IDLE` ring starts over
+gap, capped at 8 h, or at `2 x stale_min` when that is longer); new text, the agent working or changing state, or an `IDLE` ring starts over
 (`held_streak`). `ref` is the agent's full id and the host's ring is what the reducer
 remembers (`idle_rung`), so a restart rings once. With `auto_retire`, an agent that reported
 `DONE`/`MERGED` after it last worked (or whose task ended) and has idled 10 min gets a host

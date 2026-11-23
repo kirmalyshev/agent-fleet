@@ -36,7 +36,7 @@ impl Default for Config {
 /// A finished agent idle this long is retired when `auto_retire` is on.
 pub const RETIRE_AFTER: Duration = Duration::minutes(10);
 
-/// The longest gap between two identical `HELD` rings.
+/// The longest gap between two identical `HELD` rings (never below the plain `2 x stale_min`).
 pub const HELD_CAP: Duration = Duration::hours(8);
 
 #[derive(Debug, Clone, PartialEq)]
@@ -134,7 +134,8 @@ pub fn due(
         // base gap, up to `HELD_CAP`. New text, or the agent working, starts over.
         let gap = match (&held, s.held_streak.get(id)) {
             (Some(h), Some((t, n))) if *t == format!("{name}: {h}") => {
-                (stale * 2 * 2i32.saturating_pow((*n - 1).min(16))).min(HELD_CAP)
+                (stale * 2 * 2i32.saturating_pow(n.saturating_sub(1).min(16)))
+                    .min(HELD_CAP.max(stale * 2))
             }
             _ => stale * 2,
         };
@@ -364,6 +365,50 @@ mod tests {
         s.idle_rung
             .insert("agent:h/s/a".into(), t0() + Duration::minutes(at));
         assert_eq!(acts(&s, at + 40, Config::default()).len(), 1);
+    }
+
+    #[test]
+    fn the_held_cap_never_undercuts_the_plain_gap() {
+        let mut s = state();
+        spawned(&mut s, "agent:h/s/a");
+        s.blockers.insert(
+            "b1".into(),
+            crate::state::Blocker {
+                task: Some("t1".into()),
+                what: "x".into(),
+                owner: None,
+                unblocks_when: None,
+                pid: None,
+                started: None,
+                by: "x".into(),
+                since: t0(),
+            },
+        );
+        s.tasks.insert(
+            "t1".into(),
+            crate::state::Task {
+                project: "p".into(),
+                title: "T".into(),
+                url: None,
+                state: crate::event::TaskState::Working,
+                since: t0(),
+                owner: Some("agent:h/s/a".into()),
+                lead: None,
+                blocked_by: Default::default(),
+                handoffs: vec![],
+            },
+        );
+        // stale_min 300: plain gap 600 min > the 8 h cap
+        let c = Config {
+            stale_min: 300,
+            ..Config::default()
+        };
+        s.idle_rung
+            .insert("agent:h/s/a".into(), t0() + Duration::minutes(300));
+        s.held_streak
+            .insert("agent:h/s/a".into(), ("a: held: x".into(), 5));
+        assert!(acts(&s, 300 + 599, c.clone()).is_empty());
+        assert_eq!(acts(&s, 300 + 600, c).len(), 1);
     }
 
     #[test]
