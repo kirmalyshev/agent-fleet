@@ -806,6 +806,10 @@ pub struct SpawnRequested {
     /// An existing checkout: open a workspace there instead of creating a worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<String>,
+    /// Run in the host's own checkout of `repo`: no worktree, no branch, and retire only closes
+    /// the pane. Mutually exclusive with `worktree`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub in_place: bool,
     /// An agent to close once the new one has taken its brief (a handoff).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaces: Option<String>,
@@ -1231,6 +1235,23 @@ pub fn api_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_place_defaults_to_false_and_is_only_written_when_true() {
+        let mut r: SpawnRequested = serde_json::from_value(serde_json::json!({
+            "name": "a", "agent": "agent:h/s/a", "host": "h", "session": "s", "repo": "r",
+            "branch": "b", "profile": "p", "brief": "x", "why": "t"
+        }))
+        .unwrap();
+        assert!(!r.in_place);
+        assert!(!serde_json::to_string(&r).unwrap().contains("in_place"));
+        r.in_place = true;
+        assert!(
+            serde_json::to_string(&r)
+                .unwrap()
+                .contains("\"in_place\":true")
+        );
+    }
 
     fn agent() -> Actor {
         Actor {

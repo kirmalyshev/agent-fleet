@@ -26,6 +26,10 @@ agent-fleet repo add owner/repo
 agent-fleet spawn owner/repo#123       # prints: agent:<host>/<session>/<name> is up (pane …, <worktree>)
 ```
 
+To run an agent in the repository's own checkout, with a brief you wrote (a release agent, say),
+add `--in-place --brief <file>`: no worktree is made, and `retire` closes the pane and leaves the
+checkout alone.
+
 Start more, then see the fleet:
 
 ```sh
