@@ -332,7 +332,11 @@ claude --append-system-prompt "$(agent-fleet coordinator)"
 agent-fleet role me root-coordinator
 ```
 
-For another harness, copy the output into its agent file (for example under `.agents/`).
+To have the hub run it for you, spawn it: `agent-fleet spawn owner/repo --title coordinator
+--name coordinator --level root-coordinator`. A root-coordinator spawn gets this prompt as its
+brief in place of `brief.md`, and the level declares its role. This repository also ships the
+agent for other harnesses as `.agents/coordinator.md` and `.claude/agents/coordinator.md`, both
+links to `agents/coordinator.md`.
 
 `agent-fleet tell coordinator …` then reaches it, and the host tells it about hung and orphaned
 processes.

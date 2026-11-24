@@ -1791,6 +1791,7 @@ async fn main() -> Result<()> {
             let src = std::fs::read_to_string(cfg_dir.join(&cfg.brief))
                 .with_context(|| format!("read {}", cfg_dir.join(&cfg.brief).display()))?;
             let brief = spawn::render(spawn::brief_body(&src), &vals)?;
+            let brief = setup::brief_for(d.level, brief, &cfg_dir)?;
             if *dry_run {
                 println!("spawn {target_ref} \"{}\"", issue.title);
                 println!("rule      {}", d.why);

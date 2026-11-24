@@ -313,6 +313,15 @@ pub fn coordinator_prompt(cfg_dir: &Path) -> Result<String> {
     Ok(out)
 }
 
+/// The brief a spawn at `level` gets: a root-coordinator's is the coordinator prompt over every
+/// connected repository, anyone else's is the rendered `brief`.
+pub fn brief_for(level: crate::event::Level, brief: String, cfg_dir: &Path) -> Result<String> {
+    match level {
+        crate::event::Level::RootCoordinator => coordinator_prompt(cfg_dir),
+        _ => Ok(brief),
+    }
+}
+
 /// Drops `slug` from `[repos]`; the checkout itself is left alone.
 pub fn rm(cfg_dir: &Path, slug: &str) -> Result<()> {
     let (p, src) = read_machine(cfg_dir)?;
@@ -586,6 +595,29 @@ mod tests {
             std::fs::read_to_string(d.path().join("coordinator.md")).unwrap(),
             "mine"
         );
+    }
+
+    #[test]
+    fn a_root_coordinator_spawn_gets_the_coordinator_prompt_and_others_their_brief() {
+        let cfg = tempfile::tempdir().unwrap();
+        init(cfg.path(), &["claude"]).unwrap();
+        let l = crate::event::Level::RootCoordinator;
+        let got = brief_for(l, "implementer brief".into(), cfg.path()).unwrap();
+        assert!(got.contains("name: coordinator") && !got.contains("implementer brief"));
+        let l = crate::event::Level::Implementer;
+        assert_eq!(
+            brief_for(l, "implementer brief".into(), cfg.path()).unwrap(),
+            "implementer brief"
+        );
+    }
+
+    #[test]
+    fn the_repo_ships_the_coordinator_for_other_harnesses_as_links_to_the_one_file() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for link in [".agents/coordinator.md", ".claude/agents/coordinator.md"] {
+            let got = std::fs::read_to_string(root.join(link)).unwrap();
+            assert_eq!(got, COORDINATOR, "{link}");
+        }
     }
 
     #[test]
