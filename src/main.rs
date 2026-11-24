@@ -1281,7 +1281,7 @@ async fn main() -> Result<()> {
                 }
             } else {
                 let window = chrono::Duration::seconds(since.unwrap_or(14 * 86400));
-                let card = scorecard::compute(&client.events_after(None).await?, now, window, *by);
+                let card = scorecard::compute(&client.all_events().await?, now, window, *by);
                 if *json {
                     println!("{}", serde_json::to_string_pretty(&card)?);
                 } else {

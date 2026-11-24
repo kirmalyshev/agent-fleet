@@ -568,6 +568,19 @@ impl Client {
         Ok(self.get(&path).await?.json().await?)
     }
 
+    /// The whole log, oldest first: `GET /events` pages (1000 at a time), so keep asking after the
+    /// last id until a page comes back empty.
+    pub async fn all_events(&self) -> Result<Vec<Event>> {
+        let mut all: Vec<Event> = Vec::new();
+        loop {
+            let page = self.events_after(all.last().map(|e| e.id.as_str())).await?;
+            if page.is_empty() {
+                return Ok(all);
+            }
+            all.extend(page);
+        }
+    }
+
     /// Follows `GET /events/stream` from `after`, calling `f` for each event until the stream ends.
     pub async fn follow(
         &self,
@@ -894,6 +907,20 @@ mod tests {
             "no flush may find the lock still held by a child"
         );
         hub.abort();
+    }
+
+    #[tokio::test]
+    async fn all_events_reads_past_the_first_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let _hub = start_hub(listener, &dir.path().join("hub.db")).await;
+        let c = Client::new(&base, "tok".into(), dir.path().join("spool"));
+        for i in 0..1003 {
+            c.write(&block(i)).await.unwrap();
+        }
+        assert_eq!(c.events_after(None).await.unwrap().len(), 1000);
+        assert_eq!(c.all_events().await.unwrap().len(), 1003);
     }
 
     #[tokio::test]

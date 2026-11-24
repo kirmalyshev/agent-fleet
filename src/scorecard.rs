@@ -29,7 +29,7 @@ pub struct Row {
     pub to_done_min: Dist,
     /// `FIX` reports per spawn: review rounds after the first push.
     pub fix_rounds: f64,
-    /// Failed merge requests per finished spawn.
+    /// Failed merge requests per spawn that opened a PR; `None` when none did.
     pub gate_reds: Option<f64>,
     /// A newer spawn on the same issue within 7 days of a finish.
     pub fixups: usize,
@@ -328,12 +328,14 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
                 to_pr_min: dist(|r| r.first_pr),
                 to_done_min: dist(|r| r.done),
                 fix_rounds: per(started.iter().map(|(_, r)| r.fixes).sum(), n),
-                gate_reds: (!to_done.is_empty()).then(|| {
-                    per(
-                        started.iter().map(|(_, r)| r.gate_reds).sum(),
-                        to_done.len(),
-                    )
-                }),
+                gate_reds: {
+                    let opened: Vec<_> = started
+                        .iter()
+                        .filter(|(_, r)| r.first_pr.is_some())
+                        .collect();
+                    (!opened.is_empty())
+                        .then(|| per(opened.iter().map(|(_, r)| r.gate_reds).sum(), opened.len()))
+                },
                 fixups: started.iter().map(|(i, _)| fixups[*i]).sum(),
                 blocks: started.iter().map(|(_, r)| r.blocks).sum(),
                 no_handoff_pct: 100.0
@@ -375,7 +377,12 @@ pub fn render(s: &Scorecard) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let days = s.window_s as f64 / 86400.0;
-    let _ = writeln!(out, "scorecard by {}, last {days:.0}d", s.by);
+    let span = if days >= 1.0 {
+        format!("{days:.0}d")
+    } else {
+        format!("{:.0}h", s.window_s as f64 / 3600.0)
+    };
+    let _ = writeln!(out, "scorecard by {}, last {span}", s.by);
     if s.rows.is_empty() {
         out.push_str("no spawns in the window\n");
     }
@@ -417,7 +424,7 @@ pub fn render(s: &Scorecard) -> String {
     }
     out.push_str(
         "\nlegend: speed = minutes from spawn to the first OPEN / MERGED|DONE tell. fix rounds = FIX tells per\n\
-         spawn (a proxy: PR verdicts are not in the log). BLOCKED = BLOCKED tells. gate reds = failed merge requests per finished spawn. fix-up = a newer spawn on the same issue\n\
+         spawn (a proxy: PR verdicts are not in the log). BLOCKED = BLOCKED tells. gate reds = failed `merge.requested` results per spawn that opened a PR (a local merge writes no such event). fix-up = a newer spawn on the same issue\n\
          within 7d of a finish. interventions = IDLE, STALLED, UNREAD, HUNG and stuck events per agent-hour.\n\
          quota = points the program's busiest quota window rose over the agent's life (shared by concurrent\n\
          agents, a rough proxy; ? = no data). Failed and unconfirmed spawns (no result, never up) count only in their own columns.\n\
@@ -763,7 +770,38 @@ mod tests {
             json!({"ok": false, "text": "red"}),
         ));
         let r = row(&run(&log, By::Profile), "sonnet").clone();
-        assert_eq!(r.gate_reds, Some(1.0)); // a's red + b's red over 2 finished
+        assert_eq!(r.gate_reds, Some(1.0)); // a's red + b's red over 2 spawns with a PR
+    }
+
+    #[test]
+    fn a_red_on_a_spawn_that_never_finished_still_counts_per_spawn_with_a_pr() {
+        let mut log = fixture();
+        log.push(spawn("70", 5, "h", "sonnet", 4));
+        log.push(ev(
+            "71",
+            5,
+            "host:h",
+            "spawn.result",
+            json!({"agent": "agent:h/s/h", "ok": true}),
+        ));
+        log.push(tell("72", 50, "agent:h/s/h", "OPEN"));
+        log.push(ev(
+            "73",
+            51,
+            "agent:h/s/h",
+            "merge.requested",
+            json!({"repo": "o/r", "pr": 7, "sha": "abcdef1", "host": "h"}),
+        ));
+        log.push(evre(
+            "74",
+            "73",
+            52,
+            "host:h",
+            "merge.result",
+            json!({"ok": false, "text": "red"}),
+        ));
+        let r = row(&run(&log, By::Profile), "sonnet").clone();
+        assert_eq!(r.gate_reds, Some(2.0 / 3.0)); // a's and h's reds over a, b, h
     }
 
     #[test]
