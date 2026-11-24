@@ -325,12 +325,15 @@ as `coordinator.md` in the config dir; edit that copy to change it for the machi
 repository, the project rules to read first (`.agent-fleet/coordinator.md`
 and `AGENTS.md`, whichever exist; a repository with none is listed as
 having none). Project rules extend the generic agent and never replace it. Start the coordinator
-with that prompt, and in its pane (or with `--as`) declare the role:
+with that prompt:
 
 ```sh
-claude --append-system-prompt "$(agent-fleet coordinator)"
-agent-fleet role me root-coordinator
+agent-fleet coordinator claude              # in this terminal
+agent-fleet coordinator claude --pane <id>  # in a herdr pane at a shell prompt
 ```
+
+Its first message has it run `agent-fleet role me root-coordinator`. With no connected repository
+it still starts and tells you to `agent-fleet repo add`. Only `claude` takes a system prompt for now.
 
 To have the hub run it for you, spawn it: `agent-fleet spawn owner/repo --title coordinator
 --name coordinator --level root-coordinator`. A root-coordinator spawn gets this prompt as its
@@ -465,7 +468,7 @@ From `agent-fleet --help`; every command has its own `--help`.
 | `self-update` | Every host that is up pulls `main` in the clone its binary was built from, rebuilds and restarts; prints the commit each one then runs. A dirty clone or one not on `main` refuses |
 | `instances` | The agent-fleet instances on this machine and the hub each one uses |
 | `init` | Write this machine's fleet.toml, brief.md and coordinator.md into the instance's config dir (`AGENT_FLEET_CONFIG_DIR` overrides it): commented templates with a profile for each agent program on PATH and one default rule. Never overwrites an existing file. Lists the user-level Claude and Codex skills that drive terminals (herdr, tmux, cmux) |
-| `coordinator` | Print the coordinator prompt for this machine's hub: the generic coordinator agent (`coordinator.md` in the config dir, written by `init`), then each connected repository with the project rules to read for it. Start the one coordinator with it, e.g. `claude --append-system-prompt "$(agent-fleet coordinator)"`, then `agent-fleet role me root-coordinator` |
+| `coordinator` | Print the coordinator prompt for this machine's hub: the generic coordinator agent (`coordinator.md` in the config dir, written by `init`), then each connected repository with the project rules to read for it. Start the one coordinator with it, e.g. `claude --append-system-prompt "$(agent-fleet coordinator)"`, then `agent-fleet role me root-coordinator`. With a program (`claude`) it starts that program with the prompt loaded, in this terminal or in the herdr pane named by `--pane`; its first message has it take the root-coordinator role |
 | `repo` | Connect a repository to the fleet on this machine: `add` records its checkout in the machine's fleet.toml, `ls` lists, `rm` disconnects. The host picks changes up without a restart |
 | `dev` | Per-worktree dev environments from the repository's `.agent-fleet/dev.toml` (`up`, `down`, `status` …: each worktree gets a slot with its own ports and values, runs its own services, and shares the infra; `db`, `test`), the worktrees of the connected repositories (`ls`, `clean`), and the agents and PRs on them (`agents`, `prs`) |
 | `tui` | The fleet on one screen, live: agents, worktrees, tasks, findings, resources, asks; `:` runs any command from it. `--all`: every instance on this machine |

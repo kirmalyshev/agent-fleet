@@ -313,6 +313,36 @@ pub fn coordinator_prompt(cfg_dir: &Path) -> Result<String> {
     Ok(out)
 }
 
+/// The first message a started coordinator gets: what to do before the tick loop.
+pub const COORDINATOR_OPENING: &str = "Run `agent-fleet role me root-coordinator`, then `agent-fleet repo ls`, then start your first tick.";
+
+/// The command that starts the coordinator on `program` with `prompt` as its system prompt: in
+/// the current terminal, or (with `pane`) typed into that herdr pane's shell prompt.
+pub fn coordinator_argv(program: &str, prompt: &str, pane: Option<&str>) -> Result<Vec<String>> {
+    if program != "claude" {
+        bail!("coordinator: `{program}` is not supported yet; only `claude` takes a system prompt");
+    }
+    let args = ["--append-system-prompt", prompt, COORDINATOR_OPENING].map(String::from);
+    let mut argv: Vec<String> = match pane {
+        Some(p) => [
+            "herdr",
+            "agent",
+            "start",
+            "coordinator",
+            "--kind",
+            program,
+            "--pane",
+            p,
+            "--",
+        ]
+        .map(String::from)
+        .into(),
+        None => vec![program.to_string()],
+    };
+    argv.extend(args);
+    Ok(argv)
+}
+
 /// The brief a spawn at `level` gets: a root-coordinator's is the coordinator prompt over every
 /// connected repository, anyone else's is the rendered `brief`.
 pub fn brief_for(level: crate::event::Level, brief: String, cfg_dir: &Path) -> Result<String> {
@@ -595,6 +625,71 @@ mod tests {
             std::fs::read_to_string(d.path().join("coordinator.md")).unwrap(),
             "mine"
         );
+    }
+
+    #[test]
+    fn coordinator_argv_starts_claude_with_the_prompt_and_in_a_pane_through_herdr() {
+        let a = coordinator_argv("claude", "RULES", None).unwrap();
+        assert_eq!(a[..3], ["claude", "--append-system-prompt", "RULES"]);
+        assert_eq!(a[3], COORDINATOR_OPENING);
+        let a = coordinator_argv("claude", "RULES", Some("p1")).unwrap();
+        let head = [
+            "herdr",
+            "agent",
+            "start",
+            "coordinator",
+            "--kind",
+            "claude",
+            "--pane",
+            "p1",
+            "--",
+        ];
+        assert_eq!(a[..9], head);
+        assert_eq!(a[9..11], ["--append-system-prompt", "RULES"]);
+        assert!(coordinator_argv("codex", "RULES", None).is_err());
+    }
+
+    #[test]
+    fn the_shipped_rules_carry_the_general_lessons_and_no_project_specific_string() {
+        let c = COORDINATOR.to_lowercase();
+        for lesson in [
+            "must",
+            "same step",
+            "strongest",
+            "translation",
+            "cheapest",
+            "quota",
+            "one card",
+            "poll",
+            "read back",
+            "deployed",
+            "page link",
+            "one design",
+            "root-cause",
+            "least-loaded",
+            "stop",
+            "route around",
+        ] {
+            assert!(c.contains(lesson), "missing rule: {lesson}");
+        }
+        for private in [
+            "eait",
+            "ieat",
+            "kirill",
+            "devin",
+            "testflight",
+            "app store",
+            "herdr session",
+            "kirmalyshev",
+            "/users/",
+            "/home/",
+            "http://",
+            "https://",
+            "claude.ai",
+            "@",
+        ] {
+            assert!(!c.contains(private), "project-specific string: {private}");
+        }
     }
 
     #[test]
