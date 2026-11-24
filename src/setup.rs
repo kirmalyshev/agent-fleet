@@ -15,6 +15,8 @@ pub const KINDS: [&str; 4] = ["claude", "codex", "devin", "agy"];
 /// The reference config is the template: what init writes is what the docs explain.
 const FLEET: &str = include_str!("../docs/fleet.example.toml");
 const BRIEF: &str = include_str!("../docs/brief.example.md");
+/// The generic coordinator agent: what any fleet needs, no project in it.
+const COORDINATOR: &str = include_str!("../agents/coordinator.md");
 /// The template's default rule; init points it at the first program found.
 const DEFAULT_RULE: &str = "profile = \"claude\"";
 
@@ -64,7 +66,7 @@ pub fn fleet_toml(found: &[&str]) -> String {
     out
 }
 
-/// Writes `fleet.toml` and `brief.md` into `dir`, each only if it does not exist yet.
+/// Writes `fleet.toml`, `brief.md` and `coordinator.md` into `dir`, each only if it does not exist yet.
 /// Returns each file and whether it was written.
 pub fn init(dir: &Path, found: &[&str]) -> Result<Vec<(PathBuf, bool)>> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
@@ -72,6 +74,7 @@ pub fn init(dir: &Path, found: &[&str]) -> Result<Vec<(PathBuf, bool)>> {
     for (name, body) in [
         ("fleet.toml", fleet_toml(found)),
         ("brief.md", BRIEF.to_string()),
+        ("coordinator.md", COORDINATOR.to_string()),
     ] {
         let p = dir.join(name);
         let wrote = match std::fs::OpenOptions::new()
@@ -247,12 +250,71 @@ pub fn add(cfg_dir: &Path, slug: &str, dir: &Path) -> Result<(PathBuf, bool)> {
         ),
     }
     let (p, src) = read_machine(cfg_dir)?;
+    install_coordinator(cfg_dir)?;
     let new = set_repo(&src, slug, Some(&top)).with_context(|| format!("{}", p.display()))?;
     if new == src {
         return Ok((top, false));
     }
     replace(&p, &new)?;
     Ok((top, true))
+}
+
+/// Writes the machine's `coordinator.md` unless one is there (a config older than the file).
+fn install_coordinator(cfg_dir: &Path) -> Result<()> {
+    let p = cfg_dir.join("coordinator.md");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&p)
+    {
+        Ok(mut f) => f
+            .write_all(COORDINATOR.as_bytes())
+            .with_context(|| format!("write {}", p.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("create {}", p.display())),
+    }
+}
+
+/// Where a connected repository keeps rules that extend the generic coordinator, in reading
+/// order; only the files that exist.
+pub fn project_rules(checkout: &Path) -> Vec<PathBuf> {
+    [
+        ".agent-fleet/coordinator.md",
+        "src/agent-fleet/coordinator.md",
+        "AGENTS.md",
+    ]
+    .iter()
+    .map(|r| checkout.join(r))
+    .filter(|p| p.is_file())
+    .collect()
+}
+
+/// The one coordinator prompt for this machine's hub: the generic agent (the machine's own
+/// `coordinator.md` when it has one), then each connected repository with the project rules to
+/// read for it. Paths, not contents: the coordinator reads them fresh each time.
+pub fn coordinator_prompt(cfg_dir: &Path) -> Result<String> {
+    let mut out = match std::fs::read_to_string(cfg_dir.join("coordinator.md")) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => COORDINATOR.to_string(),
+        Err(e) => return Err(e).context("read coordinator.md"),
+    };
+    out.push_str("\n\n## Connected repositories\n\n");
+    let repos = registered(cfg_dir)?;
+    if repos.is_empty() {
+        out.push_str("There are no connected repositories yet (`agent-fleet init`, then `agent-fleet repo add`).\n");
+    }
+    for (slug, co) in repos {
+        let rules = project_rules(&co);
+        if rules.is_empty() {
+            out.push_str(&format!("- {slug} ({}): no project rules\n", co.display()));
+            continue;
+        }
+        out.push_str(&format!("- {slug} ({}): read first\n", co.display()));
+        for r in rules {
+            out.push_str(&format!("  - {}\n", r.display()));
+        }
+    }
+    Ok(out)
 }
 
 /// Drops `slug` from `[repos]`; the checkout itself is left alone.
@@ -425,10 +487,87 @@ mod tests {
         let again = init(&dir, &["claude"]).unwrap();
         assert_eq!(
             again.iter().map(|(_, w)| *w).collect::<Vec<_>>(),
-            [false, true]
+            [false, true, false]
         );
         assert_eq!(
             std::fs::read_to_string(dir.join("fleet.toml")).unwrap(),
+            "mine"
+        );
+    }
+
+    #[test]
+    fn init_writes_the_generic_coordinator_and_it_names_no_project() {
+        let d = tempfile::tempdir().unwrap();
+        init(d.path(), &["claude"]).unwrap();
+        let c = std::fs::read_to_string(d.path().join("coordinator.md")).unwrap();
+        assert!(c.starts_with("---\nname: coordinator\n"), "agent format");
+        assert!(c.contains("agent-fleet merge"));
+        for private in ["/users/", "/home/", "http://", "https://"] {
+            assert!(
+                !c.to_lowercase().contains(private),
+                "{private} in a public file"
+            );
+        }
+    }
+
+    #[test]
+    fn coordinator_prompt_layers_each_repos_own_rules_and_a_bare_repo_still_works() {
+        let cfg = tempfile::tempdir().unwrap();
+        init(cfg.path(), &["claude"]).unwrap();
+        let (a, b) = (
+            checkout("git@github.com:o/a.git"),
+            checkout("git@github.com:o/b.git"),
+        );
+        std::fs::create_dir_all(a.path().join("src/agent-fleet")).unwrap();
+        std::fs::write(a.path().join("src/agent-fleet/coordinator.md"), "A rules").unwrap();
+        std::fs::write(a.path().join("AGENTS.md"), "A agents").unwrap();
+        add(cfg.path(), "o/a", a.path()).unwrap();
+        add(cfg.path(), "o/b", b.path()).unwrap();
+
+        let out = coordinator_prompt(cfg.path()).unwrap();
+        assert!(
+            out.contains("name: coordinator"),
+            "the generic agent comes first"
+        );
+        let (ta, tb) = (top(&a), top(&b));
+        let rules = ta.join("src/agent-fleet/coordinator.md");
+        assert!(out.contains("o/a"), "{out}");
+        assert!(out.contains(&rules.display().to_string()), "{out}");
+        assert!(out.contains(&ta.join("AGENTS.md").display().to_string()));
+        // o/b has no project rules: listed, nothing invented.
+        assert!(out.contains("o/b"));
+        assert!(!out.contains(&tb.join("AGENTS.md").display().to_string()));
+        assert!(out.contains("no project rules"));
+        // The rules extend the generic text, never replace it.
+        assert!(out.find("name: coordinator").unwrap() < out.find("o/a").unwrap());
+    }
+
+    #[test]
+    fn coordinator_prompt_with_no_repos_is_the_generic_agent_and_prefers_the_machines_copy() {
+        let cfg = tempfile::tempdir().unwrap();
+        init(cfg.path(), &["claude"]).unwrap();
+        let none = coordinator_prompt(cfg.path()).unwrap();
+        assert!(none.contains("name: coordinator") && none.contains("no connected repositor"));
+        std::fs::write(cfg.path().join("coordinator.md"), "my own coordinator").unwrap();
+        assert!(
+            coordinator_prompt(cfg.path())
+                .unwrap()
+                .starts_with("my own coordinator")
+        );
+    }
+
+    #[test]
+    fn repo_add_installs_the_coordinator_an_older_config_lacks() {
+        let cfg = tempfile::tempdir().unwrap();
+        init(cfg.path(), &["claude"]).unwrap();
+        std::fs::remove_file(cfg.path().join("coordinator.md")).unwrap();
+        let co = checkout("git@github.com:o/r.git");
+        add(cfg.path(), "o/r", co.path()).unwrap();
+        assert!(cfg.path().join("coordinator.md").is_file());
+        std::fs::write(cfg.path().join("coordinator.md"), "mine").unwrap();
+        add(cfg.path(), "o/r", co.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cfg.path().join("coordinator.md")).unwrap(),
             "mine"
         );
     }
