@@ -73,7 +73,7 @@ One crate, one binary. `docs/PROTOCOL.md` is the spec, `schema/` the generated J
 | `src/signal.rs` | `hook signal`: harness hook events become `agent.signal`. |
 | `src/quota.rs` | Each agent program's usage quota and `hook statusline`. |
 | `src/spawn.rs` | `fleet.toml` routing, briefs, the host's spawn executor. |
-| `src/setup.rs` | `init` and `repo add`, `ls`, `rm`: the machine's `fleet.toml`, brief, coordinator and connected repos; `coordinator` prints the layered coordinator prompt. |
+| `src/setup.rs` | `init` and `repo add`, `ls`, `rm`: the machine's `fleet.toml`, brief, coordinator and connected repos; `coordinator` prints the layered coordinator prompt, or with a program (`claude`) starts it with the prompt loaded. |
 | `agents/coordinator.md` | The generic coordinator agent `init` installs. Public: no project, host or person names. |
 | `src/dev.rs` | `agent-fleet dev`: per-worktree slots and services from `.agent-fleet/dev.toml`. |
 | `src/kill.rs` | `agent-fleet kill` and `hook bash`. |
