@@ -1791,7 +1791,9 @@ async fn main() -> Result<()> {
             let src = std::fs::read_to_string(cfg_dir.join(&cfg.brief))
                 .with_context(|| format!("read {}", cfg_dir.join(&cfg.brief).display()))?;
             let brief = spawn::render(spawn::brief_body(&src), &vals)?;
-            let brief = setup::brief_for(d.level, brief, &cfg_dir)?;
+            let machine = spawn::machine_dir(&ctx.cli.instance)
+                .context("no user config dir; set AGENT_FLEET_CONFIG_DIR")?;
+            let brief = setup::brief_for(d.level, brief, &machine)?;
             if *dry_run {
                 println!("spawn {target_ref} \"{}\"", issue.title);
                 println!("rule      {}", d.why);
@@ -1903,6 +1905,7 @@ async fn main() -> Result<()> {
                 &to,
                 note.as_deref().unwrap_or(""),
                 &title,
+                spawn::machine_dir(&ctx.cli.instance).as_deref(),
             )?;
             if state.agents.contains_key(&req.agent) {
                 bail!("{} is already up", req.agent);
