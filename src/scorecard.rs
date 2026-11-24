@@ -28,7 +28,7 @@ pub struct Row {
     /// Minutes from spawn to the first `MERGED` or `DONE` report.
     pub to_done_min: Dist,
     /// `FIX` reports per spawn: review rounds after the first push.
-    pub fix_rounds: f64,
+    pub fix_rounds: Option<f64>,
     /// Failed merge requests per spawn that opened a PR; `None` when none did.
     pub gate_reds: Option<f64>,
     /// A newer spawn on the same issue within 7 days of a finish.
@@ -36,7 +36,7 @@ pub struct Row {
     /// `BLOCKED` reports.
     pub blocks: usize,
     /// Percent of spawns not handed off to another agent.
-    pub no_handoff_pct: f64,
+    pub no_handoff_pct: Option<f64>,
     /// IDLE, STALLED, HUNG, stuck and UNREAD events per agent-hour; `None` with no hours.
     pub interventions_per_hour: Option<f64>,
     /// Standard deviation of the minutes to done; `None` under two finished spawns.
@@ -45,6 +45,8 @@ pub struct Row {
     pub quota_pp: Option<f64>,
     /// Agents the quota figure is a mean over.
     pub quota_n: usize,
+    /// Agents left out of the quota figure because their window reset (a negative rise).
+    pub quota_reset: usize,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize)]
@@ -68,6 +70,8 @@ struct Run {
     spawned: DateTime<Utc>,
     failed: bool,
     confirmed: bool,
+    /// The newest event the log has from or about this agent.
+    last: Option<DateTime<Utc>>,
     up: Option<DateTime<Utc>>,
     down: Option<DateTime<Utc>>,
     first_pr: Option<DateTime<Utc>>,
@@ -115,6 +119,7 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
         let Body::Known(k) = &e.body else { continue };
         let from = e.actor.id.as_str();
         let own = |m: &HashMap<String, usize>| m.get(from).copied();
+        let actor_run = own(&by_agent);
         let resolve = |id: &str| {
             by_agent
                 .get(id)
@@ -138,6 +143,7 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
                     spawned: e.ts,
                     failed: false,
                     confirmed: false,
+                    last: None,
                     up: None,
                     down: None,
                     first_pr: None,
@@ -161,6 +167,16 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
                     runs[i].up.get_or_insert(e.ts);
                     runs[i].down = None;
                     runs[i].confirmed = true;
+                }
+            }
+            Known::AgentUsage(u) => {
+                if let Some(i) = resolve(&u.agent) {
+                    runs[i].last = Some(e.ts);
+                }
+            }
+            Known::AgentState(u) => {
+                if let Some(i) = resolve(&u.agent) {
+                    runs[i].last = Some(e.ts);
                 }
             }
             Known::AgentDown(d) => {
@@ -243,6 +259,13 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
             }
             _ => {}
         }
+        if let Some(i) = actor_run {
+            runs[i].last = Some(e.ts);
+        }
+    }
+
+    for series in quota.values_mut() {
+        series.sort_by_key(|(t, _)| *t); // spooled events arrive late; `ts` is the writer's clock
     }
 
     let since = now - window;
@@ -306,20 +329,20 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
             let hours: f64 = started
                 .iter()
                 .map(|(_, r)| {
-                    let end = r.down.or(r.done).unwrap_or(now);
+                    let end = r.down.or(r.last).unwrap_or(r.spawned);
                     mins(r.up.unwrap_or(r.spawned), end) / 60.0
                 })
                 .sum();
             let mean = per_f(&to_done);
-            let rises: Vec<f64> = started
+            let all_rises: Vec<f64> = started
                 .iter()
                 .filter_map(|(_, r)| {
                     let kind = r.kind.as_deref()?;
-                    let end = r.down.or(r.done).unwrap_or(now);
-                    let d = quota_at(&r.host, kind, end)? - quota_at(&r.host, kind, r.spawned)?;
-                    (d >= 0.0).then_some(d)
+                    let end = r.down.or(r.last).unwrap_or(r.spawned);
+                    Some(quota_at(&r.host, kind, end)? - quota_at(&r.host, kind, r.spawned)?)
                 })
                 .collect();
+            let rises: Vec<f64> = all_rises.iter().copied().filter(|d| *d >= 0.0).collect();
             Row {
                 key,
                 n,
@@ -327,7 +350,7 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
                 unconfirmed: g.iter().filter(|(_, r)| !r.confirmed).count(),
                 to_pr_min: dist(|r| r.first_pr),
                 to_done_min: dist(|r| r.done),
-                fix_rounds: per(started.iter().map(|(_, r)| r.fixes).sum(), n),
+                fix_rounds: (n > 0).then(|| per(started.iter().map(|(_, r)| r.fixes).sum(), n)),
                 gate_reds: {
                     let opened: Vec<_> = started
                         .iter()
@@ -338,8 +361,8 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
                 },
                 fixups: started.iter().map(|(i, _)| fixups[*i]).sum(),
                 blocks: started.iter().map(|(_, r)| r.blocks).sum(),
-                no_handoff_pct: 100.0
-                    * per(started.iter().filter(|(_, r)| !r.handed_off).count(), n),
+                no_handoff_pct: (n > 0)
+                    .then(|| 100.0 * per(started.iter().filter(|(_, r)| !r.handed_off).count(), n)),
                 interventions_per_hour: (hours > 0.0).then(|| {
                     started.iter().map(|(_, r)| r.interventions).sum::<usize>() as f64 / hours
                 }),
@@ -349,6 +372,7 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
                 }),
                 quota_pp: (!rises.is_empty()).then(|| per_f(&rises)),
                 quota_n: rises.len(),
+                quota_reset: all_rises.len() - rises.len(),
             }
         })
         .collect();
@@ -373,14 +397,22 @@ fn per_f(v: &[f64]) -> f64 {
 }
 
 /// The table `agent-fleet stats` prints: one row per key, then what each column means.
+/// `p50 12m p90 40m`, or `?` for an empty sample.
+fn pcts(d: &Dist) -> String {
+    if d.n == 0 {
+        "?".into()
+    } else {
+        format!("p50 {}m p90 {}m", d.p50, d.p90)
+    }
+}
+
 pub fn render(s: &Scorecard) -> String {
     use std::fmt::Write;
     let mut out = String::new();
-    let days = s.window_s as f64 / 86400.0;
-    let span = if days >= 1.0 {
-        format!("{days:.0}d")
-    } else {
-        format!("{:.0}h", s.window_s as f64 / 3600.0)
+    let span = match s.window_s {
+        w if w >= 2 * 86400 => format!("{}d", w / 86400),
+        w if w >= 3600 => format!("{}h", w / 3600),
+        w => format!("{}m", w / 60),
     };
     let _ = writeln!(out, "scorecard by {}, last {span}", s.by);
     if s.rows.is_empty() {
@@ -388,9 +420,9 @@ pub fn render(s: &Scorecard) -> String {
     }
     for r in &s.rows {
         let opt = |v: Option<f64>, f: fn(f64) -> String| v.map_or("?".into(), f);
-        let q = r
-            .quota_pp
-            .map_or("?".into(), |q| format!("{q:.0}pp (n={})", r.quota_n));
+        let q = r.quota_pp.map_or("?".into(), |q| {
+            format!("{q:.0}pp (n={}, {} reset)", r.quota_n, r.quota_reset)
+        });
         let _ = writeln!(
             out,
             "\n{}  n={}  spawn failures {}  unconfirmed {}",
@@ -398,26 +430,24 @@ pub fn render(s: &Scorecard) -> String {
         );
         let _ = writeln!(
             out,
-            "  speed        to PR p50 {}m p90 {}m (n={}) | to done p50 {}m p90 {}m (n={})",
-            r.to_pr_min.p50,
-            r.to_pr_min.p90,
+            "  speed        to PR {} (n={}) | to done {} (n={})",
+            pcts(&r.to_pr_min),
             r.to_pr_min.n,
-            r.to_done_min.p50,
-            r.to_done_min.p90,
+            pcts(&r.to_done_min),
             r.to_done_min.n
         );
         let _ = writeln!(
             out,
-            "  quality      fix rounds {:.1} | gate reds/merge {} | fix-up PRs {} | BLOCKED {}",
-            r.fix_rounds,
+            "  quality      fix rounds {} | gate reds/merge {} | fix-up PRs {} | BLOCKED {}",
+            opt(r.fix_rounds, |v| format!("{v:.1}")),
             opt(r.gate_reds, |v| format!("{v:.2}")),
             r.fixups,
             r.blocks
         );
         let _ = writeln!(
             out,
-            "  predictable  no handoff {:.0}% | interventions/h {} | done sd {}m | quota {q}",
-            r.no_handoff_pct,
+            "  predictable  no handoff {}% | interventions/h {} | done sd {}m | quota {q}",
+            opt(r.no_handoff_pct, |v| format!("{v:.0}")),
             opt(r.interventions_per_hour, |v| format!("{v:.2}")),
             opt(r.done_sd_min, |v| format!("{v:.0}"))
         );
@@ -427,7 +457,7 @@ pub fn render(s: &Scorecard) -> String {
          spawn (a proxy: PR verdicts are not in the log). BLOCKED = BLOCKED tells. gate reds = failed `merge.requested` results per spawn that opened a PR (a local merge writes no such event). fix-up = a newer spawn on the same issue\n\
          within 7d of a finish. interventions = IDLE, STALLED, UNREAD, HUNG and stuck events per agent-hour.\n\
          quota = points the program's busiest quota window rose over the agent's life (shared by concurrent\n\
-         agents, a rough proxy; ? = no data). Failed and unconfirmed spawns (no result, never up) count only in their own columns.\n\
+         agents, a rough proxy; ? = no data; reset = agents whose quota window reset mid-life, left out). Agent-hours run from agent.up to agent.down, else to the newest event about the agent. Failed and unconfirmed spawns (no result, never up) count only in their own columns.\n\
          Under --by kind a spawn that never came up has no program: it shows as `<profile> (never up)`. Tells name\n\
          an agent by short name when a host sends them, so a reused name takes the newest spawn.\n",
     );
@@ -606,7 +636,7 @@ mod tests {
         let mut ev = fixture();
         ev.push(tell("20", 70, "agent:h/s/a", "BLOCKED"));
         let r = row(&run(&ev, By::Profile), "sonnet").clone();
-        assert_eq!(r.fix_rounds, 1.0); // 2 FIX over 2 spawns
+        assert_eq!(r.fix_rounds, Some(1.0)); // 2 FIX over 2 spawns
         assert_eq!(r.gate_reds, Some(0.5)); // 1 red over 2 finished
         assert_eq!(r.blocks, 1);
     }
@@ -628,14 +658,17 @@ mod tests {
     #[test]
     fn handoff_by_event_or_replacing_spawn_is_not_a_clean_finish() {
         let r = row(&run(&fixture(), By::Profile), "sonnet").clone();
-        assert_eq!(r.no_handoff_pct, 50.0); // b handed off
+        assert_eq!(r.no_handoff_pct, Some(50.0)); // b handed off
         let mut ev = fixture();
         let mut rep = spawn("23", 80, "g", "opus", 3);
         if let crate::event::Body::Known(crate::event::Known::SpawnRequested(s)) = &mut rep.body {
             s.replaces = Some("agent:h/s/a".into());
         }
         ev.push(rep);
-        assert_eq!(row(&run(&ev, By::Profile), "sonnet").no_handoff_pct, 0.0);
+        assert_eq!(
+            row(&run(&ev, By::Profile), "sonnet").no_handoff_pct,
+            Some(0.0)
+        );
     }
 
     #[test]
@@ -841,7 +874,7 @@ mod tests {
             json!({"host": "h", "kind": "claude", "read_at": at(50), "windows": []}),
         ));
         let r = row(&run(&log, By::Profile), "sonnet").clone();
-        assert_eq!((r.quota_pp, r.quota_n), (Some(0.0), 1)); // only b (80 -> 80) counts
+        assert_eq!((r.quota_pp, r.quota_n, r.quota_reset), (Some(0.0), 1, 1)); // b: 80 -> 80; a reset
     }
 
     #[test]
@@ -860,6 +893,7 @@ mod tests {
             down("04", 30, "a"),
             up("05", 60, "a", "claude"), // restarted: no longer down
             ev_host_tell("06", 70, "IDLE", a),
+            ev("07", 120, "host:h", "agent.usage", json!({"agent": a})),
         ];
         let s = compute(&log, at(120), Duration::days(1), By::Profile);
         assert_eq!(row(&s, "sonnet").interventions_per_hour, Some(0.5)); // 1 over 2h
@@ -879,6 +913,59 @@ mod tests {
         let with = row(&run(&log, By::Profile), "sonnet").clone();
         let base = row(&run(&fixture(), By::Profile), "sonnet").clone();
         assert_eq!(with.interventions_per_hour, base.interventions_per_hour);
+    }
+
+    #[test]
+    fn a_late_arriving_older_quota_sample_does_not_shadow_a_newer_one() {
+        let mut log = fixture();
+        log.push(ev_quota("40", 0, 10.0));
+        log.push(ev_quota("41", 95, 30.0));
+        log.push(ev_quota("42", 50, 99.0)); // logged last, written at minute 50
+        let r = row(&run(&log, By::Profile), "sonnet").clone();
+        // a: 10 -> 30 (not 99); b ends at minute 71: 10 -> 99
+        assert_eq!(r.quota_pp, Some((20.0 + 89.0) / 2.0));
+    }
+
+    #[test]
+    fn an_agent_that_never_reported_down_runs_to_its_newest_event_not_to_now() {
+        let a = "agent:h/s/a";
+        let log = vec![
+            spawn("01", 0, "a", "sonnet", 1),
+            ev(
+                "02",
+                0,
+                "host:h",
+                "spawn.result",
+                json!({"agent": a, "ok": true}),
+            ),
+            up("03", 0, "a", "claude"),
+            tell("04", 60, a, "OPEN"),
+            ev_host_tell("05", 30, "IDLE", a),
+        ];
+        let s = compute(&log, at(10 * 24 * 60), Duration::days(30), By::Profile);
+        assert_eq!(row(&s, "sonnet").interventions_per_hour, Some(1.0)); // 1 over 60 min
+    }
+
+    #[test]
+    fn a_row_with_no_pr_and_no_spawns_prints_question_marks() {
+        let text = render(&run(&fixture(), By::Profile));
+        let devin = text.split("devin").nth(1).unwrap();
+        assert!(devin.contains("to PR ? (n=0)"), "{devin}");
+        assert!(devin.contains("fix rounds ?"), "{devin}");
+        assert_eq!(row(&run(&fixture(), By::Profile), "devin").fix_rounds, None);
+    }
+
+    #[test]
+    fn the_window_label_scales_from_minutes_to_days() {
+        let w = |secs| {
+            render(&Scorecard {
+                window_s: secs,
+                ..Default::default()
+            })
+        };
+        assert!(w(1800).contains("last 30m"));
+        assert!(w(36 * 3600).contains("last 36h"));
+        assert!(w(14 * 86400).contains("last 14d"));
     }
 
     #[test]
