@@ -892,7 +892,12 @@ configuration, and a handoff's worktree is not a config source — and refuses
 `origin`, calls `worktree.create` (label `<name> #<issue>`, no focus, trust the repository); a
 create that fails on an existing branch is retried once after reclaiming it, and only when it
 holds no work — no commit the remotes lack, a clean tree. With `worktree` set on the request (a
-handoff), it opens a `workspace.create` there instead and never removes the worktree. Then
+handoff), it opens a `workspace.create` there instead and never removes the worktree. With
+`in_place` it does the same in the host's own checkout of `repo` (no fetch, worktree or branch),
+and answers `spawn.result` with that checkout as `worktree`; `in_place` with `worktree` is
+refused. A retire of an in-place agent closes its pane and removes nothing (neither `retire`
+hook nor `git worktree remove` runs). `agent-fleet spawn --brief <file>` sends the file as
+`brief` as written: no token rendering, no coordinator prompt; an empty file is refused. Then
 `ready` runs (new worktrees only, 15 min), each `unset_env` is typed into the pane's shell,
 `TMPDIR`, `TMP` and `TEMP` are exported there as the agent's scratch dir, outside any checkout:
 `<cache dir>/agent-fleet/tmp/<session>/<name>` (`~/.cache/agent-fleet/tmp/...` on Linux,

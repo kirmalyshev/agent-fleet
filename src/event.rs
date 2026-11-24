@@ -1236,6 +1236,23 @@ pub fn api_schema() -> Value {
 mod tests {
     use super::*;
 
+    #[test]
+    fn in_place_defaults_to_false_and_is_only_written_when_true() {
+        let mut r: SpawnRequested = serde_json::from_value(serde_json::json!({
+            "name": "a", "agent": "agent:h/s/a", "host": "h", "session": "s", "repo": "r",
+            "branch": "b", "profile": "p", "brief": "x", "why": "t"
+        }))
+        .unwrap();
+        assert!(!r.in_place);
+        assert!(!serde_json::to_string(&r).unwrap().contains("in_place"));
+        r.in_place = true;
+        assert!(
+            serde_json::to_string(&r)
+                .unwrap()
+                .contains("\"in_place\":true")
+        );
+    }
+
     fn agent() -> Actor {
         Actor {
             kind: ActorKind::Agent,

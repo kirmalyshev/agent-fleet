@@ -1653,7 +1653,7 @@ impl State {
         let (mine, tree) = self
             .spawns
             .values()
-            .filter(|s| s.request.host == host && s.request.agent == agent && !s.request.in_place)
+            .filter(|s| s.request.host == host && s.request.agent == agent)
             .filter_map(|s| ok(s).map(|t| (s, t)))
             .max_by_key(|(s, _)| s.since)?;
         let made = self.spawns.values().any(|s| {

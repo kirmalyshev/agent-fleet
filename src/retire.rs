@@ -708,6 +708,24 @@ pub async fn run_here(h: &Here<'_>) -> Done {
 async fn try_here(h: &Here<'_>) -> Result<Done> {
     let sp = h.sp;
     let agent = crate::spawn::short(&sp.request.agent);
+    // In place: no tree was made; retire is the pane close and nothing else.
+    if sp.request.in_place && sp.request.host == h.host {
+        let up = h.state.agents.contains_key(&sp.request.agent);
+        let pane = sp.result.as_ref().and_then(|r| r.pane.clone());
+        let step = pane_step(up, pane.as_deref(), h.sock.as_deref())
+            .map_err(|e| anyhow::anyhow!("{agent}: {e}; nothing closed"))?;
+        if h.decide != Some(Decide::Keep)
+            && let Some((p, s)) = step
+        {
+            crate::host::herdr_call(s, "pane.close", serde_json::json!({ "pane_id": p }))
+                .await
+                .with_context(|| format!("{agent}: pane {p} did not close"))?;
+        }
+        return Ok(done(
+            true,
+            format!("{agent} runs in place: pane closed, the checkout left alone"),
+        ));
+    }
     // The host's own rule: only a tree the fleet made, on THIS host, that no newer spawn handed
     // to another agent — never a main checkout, never another agent's tree.
     let Some((repo, wt, issue)) = h.state.retire_target(&sp.request.agent, h.host) else {
@@ -926,6 +944,39 @@ pub async fn serve(host: &crate::host::Host, seen: &mut std::collections::HashSe
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn retire_of_an_in_place_agent_succeeds_and_touches_no_tree() {
+        use crate::state::{Spawn, State};
+        let request: crate::event::SpawnRequested = serde_json::from_value(serde_json::json!({
+            "name": "r-1", "agent": "agent:h/s/r-1", "host": "h", "session": "s", "repo": "o/r",
+            "branch": "r-1", "profile": "p", "brief": "x", "why": "t", "in_place": true
+        }))
+        .unwrap();
+        let sp = Spawn {
+            request,
+            by: "agent:h/s/me".into(),
+            project: "p".into(),
+            result: None,
+            since: chrono::Utc::now(),
+            answered: None,
+        };
+        let state = State::default(); // agent not up: nothing to close
+        let data = std::env::temp_dir();
+        let here = Here {
+            state: &state,
+            sp: &sp,
+            host: "h",
+            decide: None,
+            machine: None,
+            cwd_checkout: None,
+            data_dir: &data,
+            sock: None,
+        };
+        let d = run_here(&here).await;
+        assert!(d.ok, "{}", d.text);
+        assert!(d.text.contains("left alone"));
+    }
 
     #[test]
     fn a_host_runs_only_its_own_unanswered_retires_once() {

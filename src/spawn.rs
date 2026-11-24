@@ -2822,6 +2822,27 @@ profile = "devin"
         );
     }
     #[test]
+    fn a_handoff_of_an_in_place_agent_never_retires_the_checkout() {
+        let mut r = req(None);
+        r.in_place = true;
+        let s = state_with(vec![
+            answered(r, "agent:h/s/a", "/main", 0),
+            answered(req(Some("/main".into())), "agent:h/s/b", "/main", 10),
+        ]);
+        assert_eq!(s.retire_target("agent:h/s/a", "h"), None);
+        assert_eq!(s.retire_target("agent:h/s/b", "h"), None);
+    }
+    #[test]
+    fn an_in_place_agent_does_not_inherit_an_older_spawns_tree_of_the_same_name() {
+        let mut r = req(None);
+        r.in_place = true;
+        let s = state_with(vec![
+            answered(req(None), "agent:h/s/a", "/w/old", 0),
+            answered(r, "agent:h/s/a", "/main", 10),
+        ]);
+        assert_eq!(s.retire_target("agent:h/s/a", "h"), None);
+    }
+    #[test]
     fn retire_target_skips_a_tree_another_live_agent_works_in_or_a_handoff_still_pending() {
         let mut rv = answered(req(Some("/w".into())), "agent:h/s/rev", "/w", 20);
         let mut s = state_with(vec![
@@ -3129,6 +3150,42 @@ profile = "devin"
         assert!(calls.contains(&"worktree.remove".into()), "{calls:?}");
         let r = result(&host).unwrap();
         assert!(!r.ok && r.error.as_deref().unwrap().contains("agent.start"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_in_place_spawn_closes_the_workspace_and_never_touches_the_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        let (host, stub) = run(
+            dir.path(),
+            &[
+                ("workspace.create", vec![ws_created("unused")]),
+                ("agent.start", vec![err("agent_broken")]),
+            ],
+        )
+        .await;
+        let mut r = req(None);
+        r.in_place = true;
+        execute(&host, "req1", &spawn_of(r), &State::default()).await;
+        let calls = stub.calls();
+        assert!(calls.contains(&"pane.close".into()), "{calls:?}");
+        assert!(calls.contains(&"workspace.close".into()), "{calls:?}");
+        assert!(!calls.contains(&"worktree.remove".into()), "{calls:?}");
+        assert!(co.join(".git").is_dir());
+        assert!(!result(&host).unwrap().ok);
+    }
+
+    #[tokio::test]
+    async fn in_place_with_a_worktree_is_refused_before_anything_is_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, stub) = run(dir.path(), &[]).await;
+        let mut r = req(Some("/w".into()));
+        r.in_place = true;
+        execute(&host, "req1", &spawn_of(r), &State::default()).await;
+        let res = result(&host).unwrap();
+        assert!(!res.ok && res.error.unwrap().contains("mutually exclusive"));
+        assert!(stub.calls().is_empty());
     }
 
     #[tokio::test]
