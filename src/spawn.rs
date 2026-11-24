@@ -136,7 +136,7 @@ pub struct Rule {
 
 fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
     #[derive(Deserialize)]
-    #[serde(untagged)]
+    #[serde(untagged, expecting = "a profile name or a list of profile names")]
     enum OneOrMany {
         One(String),
         Many(Vec<String>),
@@ -272,7 +272,20 @@ impl FleetConfig {
                     "fleet.toml: rule {} names an unknown profile {:?}{}",
                     i + 1,
                     bad,
-                    line_of(src, &format!("\"{bad}\""))
+                    nth_rule(src, i)
+                );
+            }
+            if let Some(dup) = r
+                .profile
+                .iter()
+                .enumerate()
+                .find_map(|(j, p)| r.profile[..j].contains(p).then_some(p))
+            {
+                bail!(
+                    "fleet.toml: rule {} lists profile {:?} twice{}",
+                    i + 1,
+                    dup,
+                    nth_rule(src, i)
                 );
             }
             if r.keywords.as_ref().is_none_or(|k| k.is_empty()) {
@@ -536,7 +549,10 @@ pub fn decide(
                 None => "default rule".into(),
             });
             (
-                rule.profile[0].clone(),
+                rule.profile
+                    .first()
+                    .cloned()
+                    .context("fleet.toml: rule names no profile")?,
                 rule.host.clone(),
                 rule.level,
                 rule.profile.clone(),
@@ -575,25 +591,35 @@ pub fn decide(
             .is_some_and(|q| q.exhausted_at(Utc::now()))
     };
     // A rule that lists several profiles: the least-loaded one with a seat and quota; the list
-    // order breaks ties. None fits: the first one's own cap/fallback walk below decides.
+    // order breaks ties. Load counts this repo's agents and pending requests on every host,
+    // quota is the target host's.
     if listed.len() > 1 {
         let mut pick: Option<(usize, &String)> = None;
+        let mut any_full = false;
         for p in &listed {
             let cap = cfg.profiles[p].cap;
             let n = load(p);
-            if cap.is_some_and(|c| n >= c as usize) {
+            let full = cap.is_some_and(|c| n >= c as usize);
+            let out = no_quota(p);
+            if full {
+                any_full = true;
                 why.push(format!("{p} at cap {}", cap.unwrap_or(0)));
-            } else if no_quota(p) {
+            }
+            if out {
                 why.push(format!(
                     "{p} skipped: {} quota exhausted on {host}",
                     cfg.profiles[p].kind
                 ));
-            } else if pick.is_none_or(|(m, _)| n < m) {
+            }
+            if !full && !out && pick.is_none_or(|(m, _)| n < m) {
                 pick = Some((n, p));
             }
         }
         if let Some((n, p)) = pick {
-            why.push(format!("picked {p} ({n} live) of [{}]", listed.join(", ")));
+            why.push(format!(
+                "picked {p} ({n} in use) of [{}]",
+                listed.join(", ")
+            ));
             return Ok(Decision {
                 profile: p.clone(),
                 host,
@@ -601,7 +627,19 @@ pub fn decide(
                 why: why.join("; "),
             });
         }
-        why.push(format!("none of [{}] can take it", listed.join(", ")));
+        // A seat may free up: wait. Only when every one is out of quota does the first one's
+        // fallback chain take over.
+        if any_full {
+            bail!(
+                "no seat among [{}]: {}; wait for one to free",
+                listed.join(", "),
+                why.join("; ")
+            );
+        }
+        match &cfg.profiles[&listed[0]].fallback {
+            Some(f) => profile = f.clone(),
+            None => bail!("no profile can take it ({})", why.join("; ")),
+        }
     }
     loop {
         let p = &cfg.profiles[&profile];
@@ -2297,7 +2335,7 @@ profile = "devin"
             .unwrap_err()
             .to_string();
         assert!(
-            e.contains("unknown profile") && e.contains("profile = \"nope\""),
+            e.contains("unknown profile") && e.contains("[[rules]]"),
             "{e}"
         );
         let e = cfg(&CFG.replace("fallback = \"sonnet\"", "fallback = \"devin\""))
@@ -2512,7 +2550,7 @@ profile = ["devin", "codex", "agy"]
                 },
             );
         };
-        let up = |s: &mut State, name: &str, profile: &str| {
+        let up = |s: &mut State, name: &str, profile: &str, done: bool| {
             let id = format!("agent:h/s/{name}");
             s.agents.insert(
                 id.clone(),
@@ -2570,12 +2608,14 @@ profile = ["devin", "codex", "agy"]
             )
             .re(&req_ev.id)
             .into_event();
-            s.apply(&res);
+            if done {
+                s.apply(&res);
+            }
         };
         // all idle: list order breaks the tie
         assert_eq!(pick(&s).unwrap().profile, "devin");
         // least-loaded wins: devin has one, codex and agy none → codex
-        up(&mut s, "a", "devin");
+        up(&mut s, "a", "devin", true);
         let d = pick(&s).unwrap();
         assert_eq!(d.profile, "codex");
         assert!(
@@ -2584,17 +2624,17 @@ profile = ["devin", "codex", "agy"]
             d.why
         );
         // a profile at cap is skipped, not fatal
-        up(&mut s, "b", "devin");
-        up(&mut s, "c", "codex");
-        up(&mut s, "d", "agy");
-        up(&mut s, "e", "agy");
+        up(&mut s, "b", "devin", true);
+        up(&mut s, "c", "codex", true);
+        up(&mut s, "d", "agy", true);
+        up(&mut s, "e", "agy", true);
         let d = pick(&s).unwrap();
         assert_eq!(d.profile, "codex");
         assert!(d.why.contains("devin at cap 2"), "{}", d.why);
         assert!(d.why.contains("agy at cap 2"), "{}", d.why);
         // quota out is skipped
         let mut s3 = State::default();
-        up(&mut s3, "f", "devin");
+        up(&mut s3, "f", "devin", true);
         quota_out(&mut s3, "codex");
         let d = pick(&s3).unwrap();
         assert_eq!(d.profile, "agy");
@@ -2604,16 +2644,66 @@ profile = ["devin", "codex", "agy"]
             d.why
         );
         // every listed profile full: no seat
-        up(&mut s, "g", "codex");
+        up(&mut s, "g", "codex", true);
         let e = pick(&s).unwrap_err().to_string();
         assert!(e.contains("no seat"), "{e}");
-        // every listed profile out → first one's fallback chain
+        // a pending request counts like a live agent
+        let mut sp = State::default();
+        up(&mut sp, "p1", "devin", false);
+        up(&mut sp, "p2", "devin", false);
+        up(&mut sp, "p3", "codex", false);
+        assert_eq!(pick(&sp).unwrap().profile, "agy");
+        // cap and quota in one decision: both reasons, then the free one
+        let mut mixed = State::default();
+        up(&mut mixed, "m1", "devin", true);
+        up(&mut mixed, "m2", "devin", true);
+        quota_out(&mut mixed, "codex");
+        let d = pick(&mixed).unwrap();
+        assert_eq!(d.profile, "agy");
+        assert!(
+            d.why.contains("devin at cap 2") && d.why.contains("codex skipped"),
+            "{}",
+            d.why
+        );
+        // full and out of quota: wait for the seat, never the fallback
+        up(&mut mixed, "m3", "agy", true);
+        up(&mut mixed, "m4", "agy", true);
+        let e = pick(&mixed).unwrap_err().to_string();
+        assert!(e.contains("no seat among [devin, codex, agy]"), "{e}");
+        // every one out of quota: the first one's fallback, and the line says why
         let mut s2 = State::default();
         for k in ["devin", "codex", "agy"] {
             quota_out(&mut s2, k);
         }
         let d = pick(&s2).unwrap();
         assert_eq!(d.profile, "sonnet");
+        assert!(
+            d.why.contains("agy skipped: agy quota exhausted on h"),
+            "{}",
+            d.why
+        );
+        // a one-element list is the single-name rule
+        let one = cfg(&LIST.replace("[\"devin\", \"codex\", \"agy\"]", "[\"codex\"]")).unwrap();
+        assert_eq!(one.rules[0].profile, ["codex"]);
+        assert_eq!(
+            decide(
+                &one,
+                &issue("x", &[]),
+                &Overrides::default(),
+                &State::default(),
+                "h"
+            )
+            .unwrap()
+            .profile,
+            "codex"
+        );
+        // a list names a profile twice: refused, on the rule's line
+        let e = cfg(&LIST.replace("\"codex\", \"agy\"]", "\"devin\"]"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("twice") && e.contains("[[rules]]"), "{e}");
+        // a wrong type names `profile`'s rule
+        assert!(cfg(&LIST.replace("[\"devin\", \"codex\", \"agy\"]", "5")).is_err());
         // --profile still bypasses the list
         let o = Overrides {
             profile: Some("agy"),
