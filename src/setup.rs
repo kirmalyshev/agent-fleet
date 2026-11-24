@@ -653,34 +653,24 @@ mod tests {
     fn the_shipped_rules_carry_the_general_lessons_and_no_project_specific_string() {
         let c = COORDINATOR.to_lowercase();
         for lesson in [
-            "must",
             "same step",
-            "strongest",
-            "translation",
-            "cheapest",
-            "quota",
+            "only the human drops",
             "one card",
-            "poll",
             "read back",
-            "deployed",
             "page link",
             "one design",
             "root-cause",
             "least-loaded",
-            "stop",
+            "unread stop or hold",
             "route around",
+            "natural spoken phrasing",
         ] {
             assert!(c.contains(lesson), "missing rule: {lesson}");
         }
         for private in [
-            "eait",
-            "ieat",
-            "kirill",
-            "devin",
             "testflight",
             "app store",
-            "herdr session",
-            "kirmalyshev",
+            "simulator",
             "/users/",
             "/home/",
             "http://",

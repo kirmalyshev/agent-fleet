@@ -28,12 +28,12 @@ Each turn, in this order:
 - Spawn with `agent-fleet spawn <owner/repo>#<n>` (or `--title` for work with no issue). One
   agent per issue. Check `agent-fleet ps` first: never start a second agent on work an agent
   already holds.
-- Models: implementation runs on a cheap implementer model. Research, audit and design run on
-  the strongest. Translations run through a dedicated translation profile and must read as natural
-  spoken phrasing in each language. A single user's data dig runs on the cheapest.
+- The rules and profiles should encode this, and a rule that gets it wrong is fixed: implementation
+  on the cheapest capable profile; research, audit and design on the strongest; translation on a
+  dedicated profile, in natural spoken phrasing; a single user's data dig on the cheapest.
 - Give an implementer a scope in one sentence. The repository's own AGENTS.md is binding on it.
 - Talk to agents with `agent-fleet tell <agent> <TYPE> <ref> "<text>"`, for example `agent-fleet tell s-12 FIX owner/repo#12 "rebase on main"`. Keep tells short and specific.
-- Read every tell each turn and never discard it. Tell agents only through `agent-fleet tell`.
+- Tell agents only through `agent-fleet tell`.
 - Retire only: `agent-fleet retire <agent>` (uncommitted work stops it until you pass `--decide delete|keep|stash`). Never `kill`, `pkill` or `killall`; never close a pane
   that holds unmerged or unpushed work.
 
@@ -49,7 +49,7 @@ Each turn, in this order:
 ## When a gate is red
 
 One root-cause agent, not one per symptom. Spawn it with the failing output as its scope. Do
-not bisect by hand and do not merge around the failure. Run heavy gates on the least-loaded host.
+not bisect by hand and do not merge around the failure. Where a rule leaves the host open, run heavy gates on the least-loaded host.
 
 ## Quota
 
@@ -60,9 +60,8 @@ your report.
 ## Releases
 
 A release has a scope. An item marked MUST blocks the submit: nothing ships until it is merged
-and verified. Do not cut or submit a release with a MUST open: a MUST that is not merged and verified blocks
-the submit, and only the human drops one. Deploys and store submissions
-stay with the person or agent the project's rules name.
+and verified. Do not cut or submit a release with a MUST open; only the human drops one. Deploys
+and store submissions stay with the person or agent the project's rules name.
 
 ## Research becomes work
 
@@ -71,13 +70,13 @@ with the decision and the evidence linked, then spawn on that issue. Never leave
 
 ## Asking the human
 
-Use one decisions surface: `agent-fleet ask <task> "<question>" --option ... --rec ...`.
-One card per question, with a picture, options and your recommendation. Never ask in free text
-what an ask can carry, and never ask what the repository's rules already answer.
+Use one decisions surface: `agent-fleet ask <task> "<question>" --option ... --rec ... --context ...`.
+One card per question, with options and your recommendation. Put a page link to any picture in
+`--context`: a picture goes to the human as a page link, never only as a file attachment. Never
+ask in free text what an ask can carry, and never ask what the repository's rules already answer.
 
-- Poll for answers after you post a card. Remove a card the moment it is answered.
+- Check the hub's Asks view after you post one, and act on answers as they land.
 - Read back any answer that reverses an earlier decision before you act on it.
-- A picture goes to the human as a page link, never only as a file attachment.
 - One product, one design across every surface: a design change names the answer that approved it.
 
 ## Guards

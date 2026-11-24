@@ -183,3 +183,40 @@ fn hub_check_reads_a_log_from_a_build_before_the_at_column_and_refuses_garbage()
     assert!(!out.status.success());
     assert!(!String::from_utf8_lossy(&out.stderr).trim().is_empty());
 }
+
+#[test]
+fn coordinator_claude_execs_claude_with_the_prompt_and_refuses_other_programs() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let fake = bin.join("claude");
+    let dump = home.path().join("argv");
+    std::fs::write(
+        &fake,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", dump.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let go = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_agent-fleet"))
+            .args(args)
+            .env("HOME", home.path())
+            .env("XDG_DATA_HOME", home.path().join("data"))
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("PATH", &path)
+            .env_remove("AGENT_FLEET_INSTANCE")
+            .output()
+            .unwrap()
+    };
+    assert!(go(&["init"]).status.success());
+    assert!(go(&["coordinator", "claude"]).status.success());
+    let argv = std::fs::read_to_string(&dump).unwrap();
+    assert!(argv.starts_with("--append-system-prompt\n"), "{argv}");
+    assert!(argv.contains("name: coordinator") && argv.contains("root-coordinator"));
+    let out = go(&["coordinator", "codex"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not supported"));
+    assert!(!go(&["coordinator", "--pane", "p1"]).status.success());
+}
