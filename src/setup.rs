@@ -278,15 +278,11 @@ fn install_coordinator(cfg_dir: &Path) -> Result<()> {
 /// Where a connected repository keeps rules that extend the generic coordinator, in reading
 /// order; only the files that exist.
 pub fn project_rules(checkout: &Path) -> Vec<PathBuf> {
-    [
-        ".agent-fleet/coordinator.md",
-        "src/agent-fleet/coordinator.md",
-        "AGENTS.md",
-    ]
-    .iter()
-    .map(|r| checkout.join(r))
-    .filter(|p| p.is_file())
-    .collect()
+    [".agent-fleet/coordinator.md", "AGENTS.md"]
+        .iter()
+        .map(|r| checkout.join(r))
+        .filter(|p| p.is_file())
+        .collect()
 }
 
 /// The one coordinator prompt for this machine's hub: the generic agent (the machine's own
@@ -315,6 +311,15 @@ pub fn coordinator_prompt(cfg_dir: &Path) -> Result<String> {
         }
     }
     Ok(out)
+}
+
+/// The brief a spawn at `level` gets: a root-coordinator's is the coordinator prompt over every
+/// connected repository, anyone else's is the rendered `brief`.
+pub fn brief_for(level: crate::event::Level, brief: String, cfg_dir: &Path) -> Result<String> {
+    match level {
+        crate::event::Level::RootCoordinator => coordinator_prompt(cfg_dir),
+        _ => Ok(brief),
+    }
 }
 
 /// Drops `slug` from `[repos]`; the checkout itself is left alone.
@@ -518,8 +523,8 @@ mod tests {
             checkout("git@github.com:o/a.git"),
             checkout("git@github.com:o/b.git"),
         );
-        std::fs::create_dir_all(a.path().join("src/agent-fleet")).unwrap();
-        std::fs::write(a.path().join("src/agent-fleet/coordinator.md"), "A rules").unwrap();
+        std::fs::create_dir_all(a.path().join(".agent-fleet")).unwrap();
+        std::fs::write(a.path().join(".agent-fleet/coordinator.md"), "A rules").unwrap();
         std::fs::write(a.path().join("AGENTS.md"), "A agents").unwrap();
         add(cfg.path(), "o/a", a.path()).unwrap();
         add(cfg.path(), "o/b", b.path()).unwrap();
@@ -530,7 +535,7 @@ mod tests {
             "the generic agent comes first"
         );
         let (ta, tb) = (top(&a), top(&b));
-        let rules = ta.join("src/agent-fleet/coordinator.md");
+        let rules = ta.join(".agent-fleet/coordinator.md");
         assert!(out.contains("o/a"), "{out}");
         assert!(out.contains(&rules.display().to_string()), "{out}");
         assert!(out.contains(&ta.join("AGENTS.md").display().to_string()));
@@ -554,6 +559,65 @@ mod tests {
                 .unwrap()
                 .starts_with("my own coordinator")
         );
+    }
+
+    #[test]
+    fn project_rules_are_the_files_that_exist_in_reading_order() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(project_rules(d.path()).is_empty());
+        std::fs::write(d.path().join("AGENTS.md"), "a").unwrap();
+        assert_eq!(project_rules(d.path()), [d.path().join("AGENTS.md")]);
+        std::fs::create_dir(d.path().join(".agent-fleet")).unwrap();
+        std::fs::write(d.path().join(".agent-fleet/coordinator.md"), "c").unwrap();
+        std::fs::create_dir_all(d.path().join("docs")).unwrap();
+        std::fs::write(d.path().join("docs/coordinator.md"), "x").unwrap();
+        assert_eq!(
+            project_rules(d.path()),
+            [
+                d.path().join(".agent-fleet/coordinator.md"),
+                d.path().join("AGENTS.md")
+            ],
+            "project layout beyond the convention is not read"
+        );
+    }
+
+    #[test]
+    fn install_coordinator_creates_once_and_never_overwrites() {
+        let d = tempfile::tempdir().unwrap();
+        install_coordinator(d.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("coordinator.md")).unwrap(),
+            COORDINATOR
+        );
+        std::fs::write(d.path().join("coordinator.md"), "mine").unwrap();
+        install_coordinator(d.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("coordinator.md")).unwrap(),
+            "mine"
+        );
+    }
+
+    #[test]
+    fn a_root_coordinator_spawn_gets_the_coordinator_prompt_and_others_their_brief() {
+        let cfg = tempfile::tempdir().unwrap();
+        init(cfg.path(), &["claude"]).unwrap();
+        let l = crate::event::Level::RootCoordinator;
+        let got = brief_for(l, "implementer brief".into(), cfg.path()).unwrap();
+        assert!(got.contains("name: coordinator") && !got.contains("implementer brief"));
+        let l = crate::event::Level::Implementer;
+        assert_eq!(
+            brief_for(l, "implementer brief".into(), cfg.path()).unwrap(),
+            "implementer brief"
+        );
+    }
+
+    #[test]
+    fn the_repo_ships_the_coordinator_for_other_harnesses_as_links_to_the_one_file() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for link in [".agents/coordinator.md", ".claude/agents/coordinator.md"] {
+            let got = std::fs::read_to_string(root.join(link)).unwrap();
+            assert_eq!(got, COORDINATOR, "{link}");
+        }
     }
 
     #[test]

@@ -322,8 +322,8 @@ Tell the fleet who coordinates. A hub has one coordinator, over every connected 
 `agent-fleet init` writes the generic coordinator agent (`agents/coordinator.md` in this repository)
 as `coordinator.md` in the config dir; edit that copy to change it for the machine.
 `agent-fleet coordinator` prints it followed by a "Connected repositories" section: for each
-repository, the project rules to read first (`.agent-fleet/coordinator.md`,
-`src/agent-fleet/coordinator.md`, `AGENTS.md`, whichever exist; a repository with none is listed as
+repository, the project rules to read first (`.agent-fleet/coordinator.md`
+and `AGENTS.md`, whichever exist; a repository with none is listed as
 having none). Project rules extend the generic agent and never replace it. Start the coordinator
 with that prompt, and in its pane (or with `--as`) declare the role:
 
@@ -332,7 +332,11 @@ claude --append-system-prompt "$(agent-fleet coordinator)"
 agent-fleet role me root-coordinator
 ```
 
-For another harness, copy the output into its agent file (for example under `.agents/`).
+To have the hub run it for you, spawn it: `agent-fleet spawn owner/repo --title coordinator
+--name coordinator --level root-coordinator`. A root-coordinator spawn gets this prompt as its
+brief in place of `brief.md`, and the level declares its role. This repository also ships the
+agent for other harnesses as `.agents/coordinator.md` and `.claude/agents/coordinator.md`, both
+links to `agents/coordinator.md`.
 
 `agent-fleet tell coordinator …` then reaches it, and the host tells it about hung and orphaned
 processes.

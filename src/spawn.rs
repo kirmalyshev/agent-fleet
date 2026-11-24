@@ -652,6 +652,7 @@ pub fn lead_name(state: &State, id: &str) -> String {
 
 /// The `spawn.requested` a handoff writes: the agent's repo, issue, branch and EXISTING
 /// worktree to a new agent of `to`, with `replaces` naming the agent to close.
+#[allow(clippy::too_many_arguments)] // ponytail: bundle into a struct if it grows again
 pub fn handoff_request(
     state: &State,
     cfg: &FleetConfig,
@@ -660,6 +661,7 @@ pub fn handoff_request(
     to: &str,
     extra: &str,
     title: &str,
+    machine: Option<&Path>,
 ) -> Result<SpawnRequested> {
     let old = &sp.request;
     let Some(p) = cfg.profiles.get(to) else {
@@ -705,7 +707,15 @@ pub fn handoff_request(
     ] {
         vals.insert(k.into(), v.to_string());
     }
-    let brief = render(brief_body(&src), &vals)?;
+    let mut brief = render(brief_body(&src), &vals)?;
+    if let (Level::RootCoordinator, Some(m)) = (level, machine) {
+        // A replacement coordinator is briefed as one: the handoff note, then the coordinator prompt.
+        brief = format!(
+            "{}\n\n{}",
+            handoff_note(&old.name, extra),
+            crate::setup::coordinator_prompt(m)?
+        );
+    }
     let why = match extra.is_empty() {
         true => format!("handoff: {} → {to}", old.name),
         false => format!("handoff: {} → {to} ({extra})", old.name),
@@ -1627,6 +1637,7 @@ pub async fn hand_off(
         to,
         extra,
         &task_title(state, sp).await,
+        host.cfg.config_dir.as_deref(),
     )?;
     if state.agents.contains_key(&req.agent) {
         bail!("{} is already up", req.agent);
@@ -3430,6 +3441,49 @@ profile = "devin"
     }
 
     #[test]
+    fn a_handed_off_root_coordinator_is_briefed_as_one() {
+        let c = cfg(CFG).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.md"), "implementer brief").unwrap();
+        let machine = tempfile::tempdir().unwrap();
+        crate::setup::init(machine.path(), &["claude"]).unwrap();
+        let mut r = req(Some("/w".into()));
+        r.level = Some(Level::RootCoordinator);
+        let sp = spawn_of(r);
+        let go = |m: Option<&Path>| {
+            handoff_request(&State::default(), &c, dir.path(), &sp, "sonnet", "", "", m)
+                .unwrap()
+                .brief
+        };
+        let b = go(Some(machine.path()));
+        assert!(
+            b.contains("name: coordinator") && !b.contains("implementer brief"),
+            "{b}"
+        );
+        assert_eq!(
+            go(None),
+            "implementer brief",
+            "no machine dir: the brief as before"
+        );
+        let mut r = req(Some("/w".into()));
+        r.level = Some(Level::Implementer);
+        let sp = spawn_of(r);
+        let b = handoff_request(
+            &State::default(),
+            &c,
+            dir.path(),
+            &sp,
+            "sonnet",
+            "",
+            "",
+            Some(machine.path()),
+        )
+        .unwrap()
+        .brief;
+        assert_eq!(b, "implementer brief", "only a root-coordinator changes");
+    }
+
+    #[test]
     fn lead_renders_coordinator_for_the_root_coordinator_and_the_id_otherwise() {
         let c = cfg(CFG).unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -3437,7 +3491,7 @@ profile = "devin"
         let sp = spawn_of(req(Some("/w".into())));
         let mut s = State::default();
         let brief = |s: &State| {
-            handoff_request(s, &c, dir.path(), &sp, "sonnet", "", "")
+            handoff_request(s, &c, dir.path(), &sp, "sonnet", "", "", None)
                 .unwrap()
                 .brief
         };
@@ -3481,9 +3535,18 @@ profile = "devin"
             answered: Some(Utc::now()),
         };
         // --to devin regenerates dv-7, the very agent being replaced.
-        let e = handoff_request(&State::default(), &c, dir.path(), &sp, "devin", "", "")
-            .unwrap_err()
-            .to_string();
+        let e = handoff_request(
+            &State::default(),
+            &c,
+            dir.path(),
+            &sp,
+            "devin",
+            "",
+            "",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("same agent"), "{e}");
     }
 
