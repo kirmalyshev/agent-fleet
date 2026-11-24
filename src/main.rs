@@ -2627,6 +2627,32 @@ mod tests {
     }
 
     #[test]
+    fn stats_defaults_to_the_scorecard_and_log_keeps_the_old_vitals() {
+        let stats = |a: &[&str]| match Cli::try_parse_from(a).unwrap().cmd {
+            Cmd::Stats {
+                since,
+                by,
+                log,
+                json,
+            } => (since, by, log, json),
+            _ => panic!("not stats"),
+        };
+        assert_eq!(
+            stats(&["agent-fleet", "stats"]),
+            (None, scorecard::By::Profile, false, false)
+        );
+        assert_eq!(
+            stats(&["agent-fleet", "stats", "--log", "--since", "7d", "--json"]),
+            (Some(7 * 86400), scorecard::By::Profile, true, true)
+        );
+        assert_eq!(
+            stats(&["agent-fleet", "stats", "--by", "kind"]).1,
+            scorecard::By::Kind
+        );
+        assert!(Cli::try_parse_from(["agent-fleet", "stats", "--by", "bogus"]).is_err());
+    }
+
+    #[test]
     fn hook_signal_eats_any_arguments() {
         // Exit 2 from a Stop or UserPromptSubmit hook blocks Claude Code — `hook signal`
         // parses whatever comes after `signal` and always exits 0.

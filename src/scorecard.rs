@@ -21,6 +21,8 @@ pub struct Row {
     /// Spawns that started.
     pub n: usize,
     pub spawn_failures: usize,
+    /// Spawns with neither a result nor an `agent.up`: left out of every figure below.
+    pub unconfirmed: usize,
     /// Minutes from spawn to the first `OPEN` report.
     pub to_pr_min: Dist,
     /// Minutes from spawn to the first `MERGED` or `DONE` report.
@@ -28,19 +30,21 @@ pub struct Row {
     /// `FIX` reports per spawn: review rounds after the first push.
     pub fix_rounds: f64,
     /// Failed merge requests per finished spawn.
-    pub gate_reds: f64,
+    pub gate_reds: Option<f64>,
     /// A newer spawn on the same issue within 7 days of a finish.
     pub fixups: usize,
     /// `BLOCKED` reports.
     pub blocks: usize,
     /// Percent of spawns not handed off to another agent.
     pub no_handoff_pct: f64,
-    /// IDLE, STALLED, HUNG, stuck and UNREAD events per agent-hour.
-    pub interventions_per_hour: f64,
-    /// Standard deviation of the minutes to done.
-    pub done_sd_min: f64,
+    /// IDLE, STALLED, HUNG, stuck and UNREAD events per agent-hour; `None` with no hours.
+    pub interventions_per_hour: Option<f64>,
+    /// Standard deviation of the minutes to done; `None` under two finished spawns.
+    pub done_sd_min: Option<f64>,
     /// Mean quota points the program's busiest window rose over the agent's life; `None` unknown.
     pub quota_pp: Option<f64>,
+    /// Agents the quota figure is a mean over.
+    pub quota_n: usize,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize)]
@@ -63,6 +67,7 @@ struct Run {
     issue: Option<u64>,
     spawned: DateTime<Utc>,
     failed: bool,
+    confirmed: bool,
     up: Option<DateTime<Utc>>,
     down: Option<DateTime<Utc>>,
     first_pr: Option<DateTime<Utc>>,
@@ -77,6 +82,20 @@ struct Run {
 /// Time-ordered `(read at, used percent)` samples.
 type Series = Vec<(DateTime<Utc>, f64)>;
 
+/// PR numbers a tell names: `#12`, `PR 12`, `pull/12`.
+fn pr_numbers(text: &str) -> Vec<u64> {
+    let mut out = Vec::new();
+    for marker in ["#", "PR ", "pull/"] {
+        for part in text.split(marker).skip(1) {
+            let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(n) = digits.parse() {
+                out.push(n);
+            }
+        }
+    }
+    out
+}
+
 fn mins(a: DateTime<Utc>, b: DateTime<Utc>) -> f64 {
     (b - a).num_seconds().max(0) as f64 / 60.0
 }
@@ -87,6 +106,8 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
     let mut by_name: HashMap<String, usize> = HashMap::new();
     let mut tell_to: HashMap<&str, &str> = HashMap::new();
     let mut merges: HashMap<&str, usize> = HashMap::new();
+    // (repo, PR number) -> the run whose tells name that PR, last one wins.
+    let mut pr_runs: HashMap<(String, u64), usize> = HashMap::new();
     // (host, program) -> (time, busiest window's used percent), in log order.
     let mut quota: HashMap<(&str, &str), Series> = HashMap::new();
 
@@ -116,6 +137,7 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
                     issue: s.issue,
                     spawned: e.ts,
                     failed: false,
+                    confirmed: false,
                     up: None,
                     down: None,
                     first_pr: None,
@@ -130,12 +152,15 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
             Known::SpawnResult(r) => {
                 if let Some(i) = resolve(&r.agent) {
                     runs[i].failed = !r.ok;
+                    runs[i].confirmed = true;
                 }
             }
             Known::AgentUp(u) => {
                 if let Some(i) = resolve(&u.agent) {
                     runs[i].kind = u.kind.clone().or(runs[i].kind.take());
                     runs[i].up.get_or_insert(e.ts);
+                    runs[i].down = None;
+                    runs[i].confirmed = true;
                 }
             }
             Known::AgentDown(d) => {
@@ -158,8 +183,13 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
                     runs[i].handed_off = true;
                 }
             }
-            Known::MergeRequested(_) => {
-                if let Some(i) = own(&by_agent) {
+            // The lead usually merges, so the PR is traced to the agent whose tells name it.
+            Known::MergeRequested(m) => {
+                if let Some(i) = pr_runs
+                    .get(&(m.repo.clone(), m.pr))
+                    .copied()
+                    .or(own(&by_agent))
+                {
                     merges.insert(&e.id, i);
                 }
             }
@@ -169,17 +199,21 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
                 }
             }
             Known::AgentQuota(q) => {
-                let used = q.windows.iter().map(|w| w.used_pct).fold(0.0, f64::max);
-                quota
-                    .entry((&q.host, &q.kind))
-                    .or_default()
-                    .push((e.ts, used));
+                if let Some(used) = q.windows.iter().map(|w| w.used_pct).reduce(f64::max) {
+                    quota
+                        .entry((&q.host, &q.kind))
+                        .or_default()
+                        .push((e.ts, used));
+                }
             }
             Known::MsgSent(m) => {
                 tell_to.insert(&e.id, &m.to);
                 if e.actor.kind == ActorKind::Agent {
                     if let Some(i) = own(&by_agent) {
                         let r = &mut runs[i];
+                        for n in pr_numbers(&format!("{} {}", m.reference, m.text)) {
+                            pr_runs.insert((r.repo.clone(), n), i);
+                        }
                         match m.kind.as_str() {
                             "OPEN" => {
                                 r.first_pr.get_or_insert(e.ts);
@@ -243,7 +277,10 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
     for (i, r) in runs.iter().enumerate().filter(|(_, r)| r.spawned >= since) {
         let key = match by {
             By::Profile => r.profile.clone(),
-            By::Kind => r.kind.clone().unwrap_or_else(|| r.profile.clone()),
+            By::Kind => r
+                .kind
+                .clone()
+                .unwrap_or_else(|| format!("{} (never up)", r.profile)),
         };
         groups.entry(key).or_default().push((i, r));
     }
@@ -251,7 +288,7 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
     let rows = groups
         .into_iter()
         .map(|(key, g)| {
-            let started: Vec<_> = g.iter().filter(|(_, r)| !r.failed).collect();
+            let started: Vec<_> = g.iter().filter(|(_, r)| r.confirmed && !r.failed).collect();
             let n = started.len();
             let to_done: Vec<f64> = started
                 .iter()
@@ -286,27 +323,30 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
             Row {
                 key,
                 n,
-                spawn_failures: g.len() - n,
+                spawn_failures: g.iter().filter(|(_, r)| r.failed).count(),
+                unconfirmed: g.iter().filter(|(_, r)| !r.confirmed).count(),
                 to_pr_min: dist(|r| r.first_pr),
                 to_done_min: dist(|r| r.done),
                 fix_rounds: per(started.iter().map(|(_, r)| r.fixes).sum(), n),
-                gate_reds: per(
-                    started.iter().map(|(_, r)| r.gate_reds).sum(),
-                    to_done.len(),
-                ),
+                gate_reds: (!to_done.is_empty()).then(|| {
+                    per(
+                        started.iter().map(|(_, r)| r.gate_reds).sum(),
+                        to_done.len(),
+                    )
+                }),
                 fixups: started.iter().map(|(i, _)| fixups[*i]).sum(),
                 blocks: started.iter().map(|(_, r)| r.blocks).sum(),
                 no_handoff_pct: 100.0
                     * per(started.iter().filter(|(_, r)| !r.handed_off).count(), n),
-                interventions_per_hour: if hours > 0.0 {
+                interventions_per_hour: (hours > 0.0).then(|| {
                     started.iter().map(|(_, r)| r.interventions).sum::<usize>() as f64 / hours
-                } else {
-                    0.0
-                },
-                done_sd_min: (to_done.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
-                    / to_done.len().max(1) as f64)
-                    .sqrt(),
+                }),
+                done_sd_min: (to_done.len() >= 2).then(|| {
+                    (to_done.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / to_done.len() as f64)
+                        .sqrt()
+                }),
                 quota_pp: (!rises.is_empty()).then(|| per_f(&rises)),
+                quota_n: rises.len(),
             }
         })
         .collect();
@@ -340,11 +380,14 @@ pub fn render(s: &Scorecard) -> String {
         out.push_str("no spawns in the window\n");
     }
     for r in &s.rows {
-        let q = r.quota_pp.map_or("?".into(), |q| format!("{q:.0}pp"));
+        let opt = |v: Option<f64>, f: fn(f64) -> String| v.map_or("?".into(), f);
+        let q = r
+            .quota_pp
+            .map_or("?".into(), |q| format!("{q:.0}pp (n={})", r.quota_n));
         let _ = writeln!(
             out,
-            "\n{}  n={}  spawn failures {}",
-            r.key, r.n, r.spawn_failures
+            "\n{}  n={}  spawn failures {}  unconfirmed {}",
+            r.key, r.n, r.spawn_failures, r.unconfirmed
         );
         let _ = writeln!(
             out,
@@ -358,21 +401,28 @@ pub fn render(s: &Scorecard) -> String {
         );
         let _ = writeln!(
             out,
-            "  quality      fix rounds {:.1} | gate reds/merge {:.2} | fix-up PRs {} | BLOCKED {}",
-            r.fix_rounds, r.gate_reds, r.fixups, r.blocks
+            "  quality      fix rounds {:.1} | gate reds/merge {} | fix-up PRs {} | BLOCKED {}",
+            r.fix_rounds,
+            opt(r.gate_reds, |v| format!("{v:.2}")),
+            r.fixups,
+            r.blocks
         );
         let _ = writeln!(
             out,
-            "  predictable  no handoff {:.0}% | interventions/h {:.2} | done sd {:.0}m | quota {q}",
-            r.no_handoff_pct, r.interventions_per_hour, r.done_sd_min
+            "  predictable  no handoff {:.0}% | interventions/h {} | done sd {}m | quota {q}",
+            r.no_handoff_pct,
+            opt(r.interventions_per_hour, |v| format!("{v:.2}")),
+            opt(r.done_sd_min, |v| format!("{v:.0}"))
         );
     }
     out.push_str(
         "\nlegend: speed = minutes from spawn to the first OPEN / MERGED|DONE tell. fix rounds = FIX tells per\n\
-         spawn. gate reds = failed merge requests per finished spawn. fix-up = a newer spawn on the same issue\n\
+         spawn (a proxy: PR verdicts are not in the log). BLOCKED = BLOCKED tells. gate reds = failed merge requests per finished spawn. fix-up = a newer spawn on the same issue\n\
          within 7d of a finish. interventions = IDLE, STALLED, UNREAD, HUNG and stuck events per agent-hour.\n\
          quota = points the program's busiest quota window rose over the agent's life (shared by concurrent\n\
-         agents, a rough proxy; ? = no samples). Failed spawns count only in `spawn failures`.\n",
+         agents, a rough proxy; ? = no data). Failed and unconfirmed spawns (no result, never up) count only in their own columns.\n\
+         Under --by kind a spawn that never came up has no program: it shows as `<profile> (never up)`. Tells name\n\
+         an agent by short name when a host sends them, so a reused name takes the newest spawn.\n",
     );
     out
 }
@@ -550,7 +600,7 @@ mod tests {
         ev.push(tell("20", 70, "agent:h/s/a", "BLOCKED"));
         let r = row(&run(&ev, By::Profile), "sonnet").clone();
         assert_eq!(r.fix_rounds, 1.0); // 2 FIX over 2 spawns
-        assert_eq!(r.gate_reds, 0.5); // 1 red over 2 finished
+        assert_eq!(r.gate_reds, Some(0.5)); // 1 red over 2 finished
         assert_eq!(r.blocks, 1);
     }
 
@@ -613,7 +663,7 @@ mod tests {
         // a lived minute 1..95 = 94 min; b minute 11..71 = 60 min; 5 events over 154 min
         let r = row(&run(&log, By::Profile), "sonnet").clone();
         assert!(
-            (r.interventions_per_hour - 5.0 / (154.0 / 60.0)).abs() < 1e-6,
+            (r.interventions_per_hour.unwrap() - 5.0 / (154.0 / 60.0)).abs() < 1e-6,
             "{r:?}"
         );
     }
@@ -641,13 +691,16 @@ mod tests {
     #[test]
     fn time_to_done_spread_is_a_standard_deviation() {
         let r = row(&run(&fixture(), By::Profile), "sonnet").clone();
-        assert!((r.done_sd_min - 30.0).abs() < 1e-6, "{r:?}"); // 90 and 30: mean 60, sd 30
+        assert!((r.done_sd_min.unwrap() - 30.0).abs() < 1e-6, "{r:?}"); // 90 and 30: mean 60, sd 30
     }
 
     #[test]
     fn by_kind_groups_on_the_program_and_unknown_spawns_fall_back_to_the_profile() {
         let s = run(&fixture(), By::Kind);
         assert_eq!(row(&s, "claude").n, 2);
+        assert_eq!(s.by, "kind");
+        // the failed devin spawn never came up, so it has no program
+        assert_eq!(row(&s, "devin (never up)").spawn_failures, 1);
     }
 
     #[test]
@@ -684,10 +737,118 @@ mod tests {
     }
 
     #[test]
+    fn a_merge_the_lead_requests_is_traced_to_the_agent_whose_tells_name_the_pr() {
+        let mut log = fixture();
+        // b's tell names PR 5; the lead (not b) asks for the merge, and it fails
+        log.push(ev(
+            "50",
+            42,
+            "agent:h/s/b",
+            "msg.sent",
+            json!({"to": "coordinator", "kind": "READY", "ref": "o/r#5", "text": "PR 5 ready"}),
+        ));
+        log.push(ev(
+            "51",
+            43,
+            "agent:h/s/lead",
+            "merge.requested",
+            json!({"repo": "o/r", "pr": 5, "sha": "abcdef1", "host": "h"}),
+        ));
+        log.push(evre(
+            "52",
+            "51",
+            44,
+            "host:h",
+            "merge.result",
+            json!({"ok": false, "text": "red"}),
+        ));
+        let r = row(&run(&log, By::Profile), "sonnet").clone();
+        assert_eq!(r.gate_reds, Some(1.0)); // a's red + b's red over 2 finished
+    }
+
+    #[test]
+    fn no_data_is_none_not_zero() {
+        let log = vec![
+            spawn("01", 0, "a", "sonnet", 1),
+            ev(
+                "02",
+                0,
+                "host:h",
+                "spawn.result",
+                json!({"agent": "agent:h/s/a", "ok": true}),
+            ),
+        ];
+        let r = row(&run(&log, By::Profile), "sonnet").clone();
+        assert_eq!((r.gate_reds, r.done_sd_min, r.quota_pp), (None, None, None));
+        assert!(render(&run(&log, By::Profile)).contains("done sd ?m"));
+    }
+
+    #[test]
+    fn a_spawn_with_no_result_and_no_agent_up_is_unconfirmed_and_left_out() {
+        let log = vec![spawn("01", 0, "a", "sonnet", 1)];
+        let r = row(&run(&log, By::Profile), "sonnet").clone();
+        assert_eq!((r.n, r.unconfirmed, r.spawn_failures), (0, 1, 0));
+    }
+
+    #[test]
+    fn a_quota_reset_during_the_agents_life_and_empty_readings_give_no_rise() {
+        let mut log = fixture();
+        log.push(ev_quota("40", 0, 80.0));
+        log.push(ev_quota("41", 95, 5.0)); // reset: negative rise, dropped
+        log.push(ev(
+            "42",
+            50,
+            "host:h",
+            "agent.quota",
+            json!({"host": "h", "kind": "claude", "read_at": at(50), "windows": []}),
+        ));
+        let r = row(&run(&log, By::Profile), "sonnet").clone();
+        assert_eq!((r.quota_pp, r.quota_n), (Some(0.0), 1)); // only b (80 -> 80) counts
+    }
+
+    #[test]
+    fn a_running_agent_counts_hours_to_now_and_a_restart_reopens_it() {
+        let a = "agent:h/s/a";
+        let log = vec![
+            spawn("01", 0, "a", "sonnet", 1),
+            ev(
+                "02",
+                0,
+                "host:h",
+                "spawn.result",
+                json!({"agent": a, "ok": true}),
+            ),
+            up("03", 0, "a", "claude"),
+            down("04", 30, "a"),
+            up("05", 60, "a", "claude"), // restarted: no longer down
+            ev_host_tell("06", 70, "IDLE", a),
+        ];
+        let s = compute(&log, at(120), Duration::days(1), By::Profile);
+        assert_eq!(row(&s, "sonnet").interventions_per_hour, Some(0.5)); // 1 over 2h
+    }
+
+    #[test]
+    fn a_stuck_record_without_a_cause_and_events_after_now_do_not_count() {
+        let mut log = fixture();
+        log.push(ev(
+            "60",
+            40,
+            "host:h",
+            "agent.stuck",
+            json!({"agent": "agent:h/s/a", "detail": "cleared"}),
+        ));
+        log.push(ev_host_tell("61", 24 * 60 + 5, "IDLE", "agent:h/s/a")); // after now
+        let with = row(&run(&log, By::Profile), "sonnet").clone();
+        let base = row(&run(&fixture(), By::Profile), "sonnet").clone();
+        assert_eq!(with.interventions_per_hour, base.interventions_per_hour);
+    }
+
+    #[test]
     fn render_names_every_row_with_its_count_and_a_legend() {
         let text = render(&run(&fixture(), By::Profile));
         assert!(text.contains("sonnet") && text.contains("devin"), "{text}");
         assert!(text.contains("n=2"), "{text}");
         assert!(text.contains("p50") && text.contains("legend"), "{text}");
+        assert!(render(&Scorecard::default()).contains("no spawns in the window"));
     }
 }
