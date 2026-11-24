@@ -398,8 +398,21 @@ supervisor restarts it rather than leaving a host that looks healthy and no long
 ## Metrics
 
 The log is the record, so most numbers are read off it; the hub stamps each event's arrival
-time, and the host agent reports its own vitals in `host.health.stats`. `agent-fleet stats` shows
-them, `GET /stats` returns them as JSON.
+time, and the host agent reports its own vitals in `host.health.stats`. `agent-fleet stats --log`
+shows them, `GET /stats` returns them as JSON.
+
+`agent-fleet stats [--since 14d] [--by profile|kind] [--json]` is the scorecard: one row per
+routing profile (or agent program, from `agent.up`), read off the log by `src/scorecard.rs`. Spawns
+start at `spawn.requested`; `spawn.result` `ok: false` is a spawn failure and is left out of the
+rest. An agent's own `OPEN`, `MERGED`/`DONE`, `FIX` and `BLOCKED` tells give time to PR, time to
+done, review rounds and blocks. A failed `merge.result` answering a `merge.requested` for a PR the agent's own tells name (`#12`,
+`PR 12`, `pull/12`; the requester when none does) is a gate red. Review rounds and blocks are proxies: the
+agent's `FIX` and `BLOCKED` tells, as PR verdicts are not in the log. A later spawn on the same repo and issue within 7 days of a finish is a fix-up. A
+`handoff` by the agent, or a spawn that `replaces` it, is a handoff. IDLE and STALLED tells, UNREAD
+hand-backs, `proc.hung` and `agent.stuck` with a cause other than `waiting`, `held` or `resource` are interventions, divided by the hours from
+`agent.up` to `agent.down`. The quota proxy is the rise of the program's busiest `agent.quota`
+window over the agent's life; concurrent agents share it. A figure with no data prints `?` and is `null` in `--json`. A spawn with no
+`spawn.result` and no `agent.up` is `unconfirmed` and left out of every other figure.
 
 - **Doorbells.** Sent, delivered, pending, and lost (undelivered for over 10 minutes). Time to
   delivery splits into `wait` (sent until the ring that worked: the agent was busy) and
