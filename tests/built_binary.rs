@@ -207,6 +207,7 @@ fn coordinator_claude_execs_claude_with_the_prompt_and_refuses_other_programs() 
             .env("XDG_CONFIG_HOME", home.path().join("config"))
             .env("PATH", &path)
             .env_remove("AGENT_FLEET_INSTANCE")
+            .env_remove("AGENT_FLEET_CONFIG_DIR")
             .output()
             .unwrap()
     };
