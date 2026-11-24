@@ -110,7 +110,7 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
     let mut by_name: HashMap<String, usize> = HashMap::new();
     let mut tell_to: HashMap<&str, &str> = HashMap::new();
     let mut merges: HashMap<&str, usize> = HashMap::new();
-    // (repo, PR number) -> the run whose tells name that PR, last one wins.
+    // (repo, PR number) -> the first run whose tells name that PR: its author.
     let mut pr_runs: HashMap<(String, u64), usize> = HashMap::new();
     // (host, program) -> (time, busiest window's used percent), in log order.
     let mut quota: HashMap<(&str, &str), Series> = HashMap::new();
@@ -228,7 +228,7 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
                     if let Some(i) = own(&by_agent) {
                         let r = &mut runs[i];
                         for n in pr_numbers(&format!("{} {}", m.reference, m.text)) {
-                            pr_runs.insert((r.repo.clone(), n), i);
+                            pr_runs.entry((r.repo.clone(), n)).or_insert(i);
                         }
                         match m.kind.as_str() {
                             "OPEN" => {
@@ -276,6 +276,7 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
             runs.iter()
                 .filter(|s| {
                     s.agent != r.agent
+                        && s.confirmed
                         && !s.failed
                         && s.repo == r.repo
                         && s.issue.is_some()
@@ -503,6 +504,16 @@ mod tests {
         )
     }
 
+    fn ev_ok(id: &str, name: &str) -> Event {
+        ev(
+            id,
+            0,
+            "host:h",
+            "spawn.result",
+            json!({"agent": format!("agent:h/s/{name}"), "ok": true}),
+        )
+    }
+
     fn tell(id: &str, mins: i64, from: &str, kind: &str) -> Event {
         ev(
             id,
@@ -646,11 +657,13 @@ mod tests {
         let mut ev = fixture();
         // `a` (issue 1) finished at minute 90; a spawn on issue 1 two days later is its fix-up
         ev.push(spawn("21", 90 + 2 * 24 * 60, "d", "devin", 1));
+        ev.push(ev_ok("2a", "d"));
         let s = compute(&ev, at(10 * 24 * 60), Duration::days(14), By::Profile);
         assert_eq!(row(&s, "sonnet").fixups, 1);
         // a spawn on the same issue 8 days after the finish is new work, not a fix-up
         let mut late = fixture();
         late.push(spawn("22", 90 + 8 * 24 * 60, "e", "devin", 1));
+        late.push(ev_ok("2b", "e"));
         let s = compute(&late, at(20 * 24 * 60), Duration::days(30), By::Profile);
         assert_eq!(row(&s, "sonnet").fixups, 0);
     }
@@ -835,6 +848,58 @@ mod tests {
         ));
         let r = row(&run(&log, By::Profile), "sonnet").clone();
         assert_eq!(r.gate_reds, Some(2.0 / 3.0)); // a's and h's reds over a, b, h
+    }
+
+    #[test]
+    fn the_first_agent_to_name_a_pr_keeps_its_gate_reds() {
+        let mut log = fixture();
+        log.push(ev(
+            "80",
+            42,
+            "agent:h/s/b",
+            "msg.sent",
+            json!({"to": "coordinator", "kind": "READY", "ref": "o/r#5", "text": "PR 5 ready"}),
+        ));
+        // a later agent mentions PR 5 too; the red must stay with b
+        log.push(spawn("81", 43, "rev", "devin", 9));
+        log.push(ev(
+            "82",
+            43,
+            "host:h",
+            "spawn.result",
+            json!({"agent": "agent:h/s/rev", "ok": true}),
+        ));
+        log.push(ev(
+            "83",
+            44,
+            "agent:h/s/rev",
+            "msg.sent",
+            json!({"to": "coordinator", "kind": "REPORT", "ref": "o/r#5", "text": "reviewed PR 5"}),
+        ));
+        log.push(ev(
+            "84",
+            45,
+            "agent:h/s/lead",
+            "merge.requested",
+            json!({"repo": "o/r", "pr": 5, "sha": "abcdef1", "host": "h"}),
+        ));
+        log.push(evre(
+            "85",
+            "84",
+            46,
+            "host:h",
+            "merge.result",
+            json!({"ok": false, "text": "red"}),
+        ));
+        let s = run(&log, By::Profile);
+        assert_eq!(row(&s, "sonnet").gate_reds, Some(1.0)); // a's + b's reds over a, b
+    }
+
+    #[test]
+    fn an_unconfirmed_spawn_is_not_a_fixup() {
+        let mut log = fixture();
+        log.push(spawn("90", 100, "ghost", "devin", 1)); // same issue as a, no result, never up
+        assert_eq!(row(&run(&log, By::Profile), "sonnet").fixups, 0);
     }
 
     #[test]
