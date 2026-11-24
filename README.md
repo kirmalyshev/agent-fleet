@@ -146,7 +146,7 @@ agent-fleet repo rm owner/repo
 that is not a git checkout and a checkout whose `origin` is another repository. The host re-reads
 the list at each spawn and scan, so no restart is needed. It lists the repository's own terminal-driving
 skills (`.claude/skills`, `.codex/skills`) the same way. A repository with its own
-`.agent-fleet/fleet.toml` uses that file instead of the machine's rules. It also writes the
+`.agent-fleet/fleet.toml` uses that file instead of the machine's rules. `repo add` also writes the
 machine's `coordinator.md` if the config dir has none.
 
 `agent-fleet host --repo owner/repo=<checkout>` flags still work and merge with this list.

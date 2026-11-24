@@ -301,7 +301,7 @@ pub fn coordinator_prompt(cfg_dir: &Path) -> Result<String> {
     out.push_str("\n\n## Connected repositories\n\n");
     let repos = registered(cfg_dir)?;
     if repos.is_empty() {
-        out.push_str("There are no connected repositories yet (`agent-fleet repo add`).\n");
+        out.push_str("There are no connected repositories yet (`agent-fleet init`, then `agent-fleet repo add`).\n");
     }
     for (slug, co) in repos {
         let rules = project_rules(&co);

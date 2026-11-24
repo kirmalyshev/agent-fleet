@@ -29,13 +29,13 @@ Each turn, in this order:
   agent per issue. Check `agent-fleet ps` first: never start a second agent on work an agent
   already holds.
 - Give an implementer a scope in one sentence. The repository's own AGENTS.md is binding on it.
-- Talk to agents with `agent-fleet tell <agent> "..."`. Keep tells short and specific.
-- Retire only: `agent-fleet retire`. Never `kill`, `pkill` or `killall`; never close a pane
+- Talk to agents with `agent-fleet tell <agent> <TYPE> <ref> "<text>"`, for example `agent-fleet tell s-12 FIX owner/repo#12 "rebase on main"`. Keep tells short and specific.
+- Retire only: `agent-fleet retire <agent>` (uncommitted work stops it until you pass `--decide delete|keep|stash`). Never `kill`, `pkill` or `killall`; never close a pane
   that holds unmerged or unpushed work.
 
 ## Merging
 
-- Merge only through `agent-fleet merge <repo> <pr> <sha>`, where `<sha>` is the head that
+- Merge only through `agent-fleet merge <owner/repo>#<pr> <sha>`, where `<sha>` is the head that
   carries a `VERDICT: READY <sha>` review comment. A new head needs a new verdict, except a
   clean merge of main.
 - Never `gh pr merge`. A red gate is a fix, not a retry.
