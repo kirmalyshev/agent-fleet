@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
-use crate::event::{ActorKind, Body, Event, Known};
+use crate::event::{ActorKind, Body, Event, Known, StuckCause};
 use crate::stats::Dist;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -184,7 +184,15 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
                     runs[i].down = Some(e.ts);
                 }
             }
-            Known::AgentStuck(s) if s.cause.is_some() => {
+            // `Waiting`, `Held` and `Resource` are ordinary pauses, not stalls.
+            Known::AgentStuck(s)
+                if s.cause.is_some_and(|c| {
+                    !matches!(
+                        c,
+                        StuckCause::Waiting | StuckCause::Held | StuckCause::Resource
+                    )
+                }) =>
+            {
                 if let Some(i) = resolve(&s.agent) {
                     runs[i].interventions += 1;
                 }
@@ -456,7 +464,7 @@ pub fn render(s: &Scorecard) -> String {
     out.push_str(
         "\nlegend: speed = minutes from spawn to the first OPEN / MERGED|DONE tell. fix rounds = FIX tells per\n\
          spawn (a proxy: PR verdicts are not in the log). BLOCKED = BLOCKED tells. gate reds = failed `merge.requested` results per spawn that opened a PR (a local merge writes no such event). fix-up = a newer spawn on the same issue\n\
-         within 7d of a finish. interventions = IDLE, STALLED, UNREAD, HUNG and stuck events per agent-hour.\n\
+         within 7d of a finish. interventions = IDLE, STALLED, UNREAD, HUNG and stuck (not waiting, held or resource) events per agent-hour.\n\
          quota = points the program's busiest quota window rose over the agent's life (shared by concurrent\n\
          agents, a rough proxy; ? = no data; reset = agents whose quota window reset mid-life, left out). Agent-hours run from agent.up to agent.down, else to the newest event about the agent. Failed and unconfirmed spawns (no result, never up) count only in their own columns.\n\
          Under --by kind a spawn that never came up has no program: it shows as `<profile> (never up)`. Tells name\n\
@@ -965,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stuck_record_without_a_cause_and_events_after_now_do_not_count() {
+    fn a_stuck_record_without_a_cause_or_with_a_pause_cause_and_events_after_now_do_not_count() {
         let mut log = fixture();
         log.push(ev(
             "60",
@@ -974,6 +982,15 @@ mod tests {
             "agent.stuck",
             json!({"agent": "agent:h/s/a", "detail": "cleared"}),
         ));
+        for (id, cause) in [("62", "waiting"), ("63", "held"), ("64", "resource")] {
+            log.push(ev(
+                id,
+                41,
+                "host:h",
+                "agent.stuck",
+                json!({"agent": "agent:h/s/a", "cause": cause, "detail": "d"}),
+            ));
+        }
         log.push(ev_host_tell("61", 24 * 60 + 5, "IDLE", "agent:h/s/a")); // after now
         let with = row(&run(&log, By::Profile), "sonnet").clone();
         let base = row(&run(&fixture(), By::Profile), "sonnet").clone();
