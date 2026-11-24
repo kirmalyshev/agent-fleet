@@ -1653,13 +1653,12 @@ impl State {
         let (mine, tree) = self
             .spawns
             .values()
-            .filter(|s| s.request.host == host && s.request.agent == agent)
+            .filter(|s| s.request.host == host && s.request.agent == agent && !s.request.in_place)
             .filter_map(|s| ok(s).map(|t| (s, t)))
             .max_by_key(|(s, _)| s.since)?;
-        let made = self
-            .spawns
-            .values()
-            .any(|s| s.request.worktree.is_none() && ok(s).as_deref() == Some(&tree));
+        let made = self.spawns.values().any(|s| {
+            s.request.worktree.is_none() && !s.request.in_place && ok(s).as_deref() == Some(&tree)
+        });
         // Another agent holds the tree: up in it now, or handed it in a newer spawn that is
         // answered ok or not answered yet (the window before its pane exists).
         let held = self.spawns.values().any(|s| {

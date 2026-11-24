@@ -286,8 +286,15 @@ enum Cmd {
         #[arg(long)]
         name: Option<String>,
         /// The new worktree's branch [default: the name].
-        #[arg(long)]
+        #[arg(long, conflicts_with = "in_place")]
         branch: Option<String>,
+        /// Run in the host's own checkout of the repo: no worktree, no branch. Retire closes the
+        /// pane and never touches the checkout.
+        #[arg(long)]
+        in_place: bool,
+        /// Send this file as the brief, as written, instead of rendering `.agent-fleet/brief.md`.
+        #[arg(long)]
+        brief: Option<PathBuf>,
         /// Skip the rules and use this profile.
         #[arg(long)]
         profile: Option<String>,
@@ -1708,6 +1715,8 @@ async fn main() -> Result<()> {
             scope,
             name,
             branch,
+            in_place,
+            brief: brief_file,
             profile,
             host,
             level,
@@ -1816,7 +1825,14 @@ async fn main() -> Result<()> {
             let brief = spawn::render(spawn::brief_body(&src), &vals)?;
             let machine = spawn::machine_dir(&ctx.cli.instance)
                 .context("no user config dir; set AGENT_FLEET_CONFIG_DIR")?;
-            let brief = setup::brief_for(d.level, brief, &machine)?;
+            let brief = match brief_file {
+                Some(f) => std::fs::read_to_string(f)
+                    .with_context(|| format!("read brief {}", f.display()))?,
+                None => setup::brief_for(d.level, brief, &machine)?,
+            };
+            if brief.trim().is_empty() {
+                bail!("the brief is empty");
+            }
             if *dry_run {
                 println!("spawn {target_ref} \"{}\"", issue.title);
                 println!("rule      {}", d.why);
@@ -1874,6 +1890,7 @@ async fn main() -> Result<()> {
                 lead: Some(lead),
                 worktree: None,
                 replaces: None,
+                in_place: *in_place,
                 why: d.why.clone(),
             };
             let id = ctx

@@ -806,6 +806,10 @@ pub struct SpawnRequested {
     /// An existing checkout: open a workspace there instead of creating a worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<String>,
+    /// Run in the host's own checkout of `repo`: no worktree, no branch, and retire only closes
+    /// the pane. Mutually exclusive with `worktree`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub in_place: bool,
     /// An agent to close once the new one has taken its brief (a handoff).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaces: Option<String>,

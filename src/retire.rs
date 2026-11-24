@@ -974,6 +974,7 @@ mod tests {
                     lead: None,
                     worktree: None,
                     replaces: None,
+                    in_place: false,
                     why: String::new(),
                 },
                 by: "x".into(),

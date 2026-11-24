@@ -1138,6 +1138,10 @@
             "host": {
               "type": "string"
             },
+            "in_place": {
+              "description": "Run in the host's own checkout of `repo`: no worktree, no branch, and retire only closes\nthe pane. Mutually exclusive with `worktree`.",
+              "type": "boolean"
+            },
             "issue": {
               "format": "uint64",
               "minimum": 0,
@@ -3312,6 +3316,10 @@
             },
             "host": {
               "type": "string"
+            },
+            "in_place": {
+              "description": "Run in the host's own checkout of `repo`: no worktree, no branch, and retire only closes\nthe pane. Mutually exclusive with `worktree`.",
+              "type": "boolean"
             },
             "issue": {
               "format": "uint64",

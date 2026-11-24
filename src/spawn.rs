@@ -738,6 +738,7 @@ pub fn handoff_request(
         lead,
         worktree: Some(worktree),
         replaces: Some(old.agent.clone()),
+        in_place: false,
         why,
     })
 }
@@ -1184,7 +1185,17 @@ async fn run_spawn(
     // worktree is the agent's own tree and is never read for config.
     let (cfg, prof) = host_profile(&checkout, host.cfg.config_dir.as_deref(), r)?;
     check_wire_fields(&checkout, r).await?;
-    let res = match &r.worktree {
+    if r.in_place && r.worktree.is_some() {
+        bail!("in_place and worktree are mutually exclusive");
+    }
+    // In place: the host's own checkout is the "existing worktree"; nothing is created, so a
+    // failure or a retire only ever closes the pane.
+    let existing = if r.in_place {
+        Some(checkout.to_string_lossy().into_owned())
+    } else {
+        r.worktree.clone()
+    };
+    let res = match &existing {
         Some(wt) => {
             if !Path::new(wt).is_dir() {
                 bail!("no such worktree: {wt}");
@@ -1247,9 +1258,7 @@ async fn run_spawn(
         .as_str()
         .context("worktree/workspace create: no workspace.workspace_id")?
         .to_string();
-    let wt = r
-        .worktree
-        .clone()
+    let wt = existing
         .or_else(|| res["worktree"]["path"].as_str().map(str::to_string))
         .or_else(|| {
             res["workspace"]["worktree"]["checkout_path"]
@@ -2305,6 +2314,7 @@ profile = "devin"
                 lead: None,
                 worktree: None,
                 replaces: None,
+                in_place: false,
                 why: String::new(),
             };
             s.apply(
@@ -2424,6 +2434,7 @@ profile = "devin"
             lead: None,
             worktree: None,
             replaces: None,
+            in_place: false,
             why: String::new(),
         };
         let actor = || Actor {
@@ -2664,6 +2675,7 @@ profile = "devin"
             lead: Some("agent:h/s/me".into()),
             worktree: wt,
             replaces: None,
+            in_place: false,
             why: "t".into(),
         }
     }
@@ -2939,6 +2951,34 @@ profile = "devin"
             r.ok && r.pane.as_deref() == Some("w:1")
                 && r.worktree.as_deref() == Some(wt.to_str().unwrap())
         );
+    }
+
+    #[tokio::test]
+    async fn an_in_place_spawn_opens_a_workspace_in_the_main_checkout_and_makes_no_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        let (host, stub) = run(
+            dir.path(),
+            &[("workspace.create", vec![ws_created("unused")])],
+        )
+        .await;
+        let mut r = req(None);
+        r.in_place = true;
+        execute(&host, "req1", &spawn_of(r), &State::default()).await;
+        let calls = stub.calls();
+        assert_eq!(calls[0], "workspace.create");
+        assert!(!calls.contains(&"worktree.create".to_string()));
+        let res = result(&host).unwrap();
+        assert!(res.ok, "{:?}", res.error);
+        assert_eq!(res.worktree.as_deref(), Some(co.to_str().unwrap()));
+    }
+
+    #[test]
+    fn an_in_place_spawn_is_never_a_retire_target() {
+        let mut r = req(None);
+        r.in_place = true;
+        let s = state_with(vec![answered(r, "agent:h/s/a", "/main", 0)]);
+        assert_eq!(s.retire_target("agent:h/s/a", "h"), None);
     }
 
     #[tokio::test]

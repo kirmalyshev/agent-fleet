@@ -966,6 +966,7 @@ mod tests {
             lead: None,
             worktree: None,
             replaces: None,
+            in_place: false,
             why: String::new(),
         };
         let mut st = State::default();
@@ -1047,6 +1048,7 @@ mod tests {
                 lead: None,
                 worktree: None,
                 replaces: None,
+                in_place: false,
                 why: String::new(),
             };
             crate::state::Spawn {

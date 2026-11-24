@@ -97,7 +97,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `msg.delivered` | to, observed, rung?, attempts? | re = the send | host |
 | | `msg.read` | — | re = the send | agent (the recipient) |
 | | `handoff` | to, next, done?, evidence[], learned? | task | agent |
-| spawn | `spawn.requested` | name, agent, host, session, repo, issue?, branch, profile, brief, level?, lead?, worktree?, replaces?, why | | agent, host |
+| spawn | `spawn.requested` | name, agent, host, session, repo, issue?, branch, profile, brief, level?, lead?, worktree?, in_place?, replaces?, why | | agent, host |
 | | `spawn.result` | agent, ok, pane?, worktree?, error? | re = the request | host |
 | | `retire.requested` | agent, host, decide? — the agent's host runs `retire` itself | | agent, host |
 | | `retire.result` | agent, ok, text | re = the request | host |
