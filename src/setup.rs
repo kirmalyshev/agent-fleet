@@ -502,7 +502,7 @@ mod tests {
         let c = std::fs::read_to_string(d.path().join("coordinator.md")).unwrap();
         assert!(c.starts_with("---\nname: coordinator\n"), "agent format");
         assert!(c.contains("agent-fleet merge"));
-        for private in ["ieat", "kirill", "eait", "/Users/"] {
+        for private in ["/users/", "/home/", "http://", "https://"] {
             assert!(
                 !c.to_lowercase().contains(private),
                 "{private} in a public file"
@@ -565,7 +565,7 @@ mod tests {
         add(cfg.path(), "o/r", co.path()).unwrap();
         assert!(cfg.path().join("coordinator.md").is_file());
         std::fs::write(cfg.path().join("coordinator.md"), "mine").unwrap();
-        add(cfg.path(), "o/r2", co.path()).ok();
+        add(cfg.path(), "o/r", co.path()).unwrap();
         assert_eq!(
             std::fs::read_to_string(cfg.path().join("coordinator.md")).unwrap(),
             "mine"
