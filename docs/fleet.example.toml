@@ -76,6 +76,8 @@ prefix = "ag-"
 # match = ["research", "design", "label:design"]
 # profile = "opus"
 # host = "build-box"
+# `profile` may also be a list: ["devin", "codex", "agy"] takes the least-loaded one with a seat
+# (`cap`) and quota; list order breaks ties.
 
 [[rules]]                        # the default rule
 profile = "claude"

@@ -835,6 +835,12 @@ work and never picks the worker; `label:x` matches only
 a label named x. Config errors name the line that is wrong: an unknown profile, a fallback
 cycle, two defaults, no default.
 
+A rule's `profile` is one name or a list (`profile = ["devin", "codex", "agy"]`). With a list, `spawn`
+takes the least-loaded listed profile that is under its `cap` and whose agent program has quota on
+the host; list order breaks ties, and the decision line (`spawn --dry-run` prints it) says which
+was skipped and why. When none of them can take it, the first one's `fallback` chain applies as for
+a single name. `--profile` still bypasses the list.
+
 The machine's rules are `fleet.toml` and its brief in the instance's config directory: the user
 config directory (`~/.config/agent-fleet` on Linux) for the default instance and `instances/<name>`
 under it for the others; `AGENT_FLEET_CONFIG_DIR` names the directory outright. `agent-fleet init`
