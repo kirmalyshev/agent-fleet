@@ -145,11 +145,17 @@ enum Cmd {
     SelfUpdate,
     /// The agent-fleet instances on this machine and the hub each one uses.
     Instances,
-    /// Write this machine's fleet.toml and brief.md into the instance's config dir
+    /// Write this machine's fleet.toml, brief.md and coordinator.md into the instance's config dir
     /// (`AGENT_FLEET_CONFIG_DIR` overrides it): commented templates with a profile for each agent
     /// program on PATH and one default rule. Never overwrites an existing file. Lists the
     /// user-level Claude and Codex skills that drive terminals (herdr, tmux, cmux).
     Init,
+    /// Print the coordinator prompt for this machine's hub: the generic coordinator agent
+    /// (`coordinator.md` in the config dir, written by `init`), then each connected repository
+    /// with the project rules to read for it. Start the one coordinator with it, e.g.
+    /// `claude --append-system-prompt "$(agent-fleet coordinator)"`, then
+    /// `agent-fleet role me root-coordinator`.
+    Coordinator,
     /// Connect a repository to the fleet on this machine: `add` records its checkout in the
     /// machine's fleet.toml, `ls` lists, `rm` disconnects. The host picks changes up without a
     /// restart.
@@ -943,6 +949,7 @@ fn machine_config(cmd: &Cmd, instance: &str) -> Result<()> {
             let found = setup::terminal_skills(&setup::project_skill_dirs(&top));
             print!("{}", setup::skills_report(&found));
         }
+        Cmd::Coordinator => print!("{}", setup::coordinator_prompt(&dir)?),
         Cmd::Repo { cmd: RepoCmd::Ls } => {
             for (repo, co) in setup::registered(&dir)? {
                 let gone = if co.is_dir() { "" } else { "  (missing)" };
@@ -1039,7 +1046,7 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-    if let Cmd::Init | Cmd::Repo { .. } = &cli.cmd {
+    if let Cmd::Init | Cmd::Coordinator | Cmd::Repo { .. } = &cli.cmd {
         return machine_config(&cli.cmd, &cli.instance);
     }
     if let Cmd::Dev { cmd } = &cli.cmd
@@ -1067,7 +1074,7 @@ async fn main() -> Result<()> {
     };
     let now = Utc::now();
     match &ctx.cli.cmd {
-        Cmd::Api { .. } | Cmd::Init | Cmd::Repo { .. } => unreachable!(),
+        Cmd::Api { .. } | Cmd::Init | Cmd::Coordinator | Cmd::Repo { .. } => unreachable!(),
         Cmd::Hub { listen, db, check } => {
             if *check {
                 let db = db.clone().unwrap_or_else(|| ctx.paths.hub_db());

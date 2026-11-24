@@ -81,7 +81,7 @@ agent-fleet --version                  # the crate version and the commit it was
 agent-fleet init
 ```
 
-`agent-fleet init` writes this machine's `fleet.toml` and `brief.md` into the user config dir
+`agent-fleet init` writes this machine's `fleet.toml`, `brief.md` and `coordinator.md` into the user config dir
 (`~/.config/agent-fleet` on Linux, `instances/<name>` under it for an instance other than
 `default`; `AGENT_FLEET_CONFIG_DIR` overrides it). They are the rules
 `spawn` uses for every repository: a profile for each agent program found on `PATH` (claude,
@@ -146,7 +146,8 @@ agent-fleet repo rm owner/repo
 that is not a git checkout and a checkout whose `origin` is another repository. The host re-reads
 the list at each spawn and scan, so no restart is needed. It lists the repository's own terminal-driving
 skills (`.claude/skills`, `.codex/skills`) the same way. A repository with its own
-`.agent-fleet/fleet.toml` uses that file instead of the machine's rules.
+`.agent-fleet/fleet.toml` uses that file instead of the machine's rules. It also writes the
+machine's `coordinator.md` if the config dir has none.
 
 `agent-fleet host --repo owner/repo=<checkout>` flags still work and merge with this list.
 Try a route without starting anything: `agent-fleet spawn owner/repo#123 --dry-run`. The
@@ -317,11 +318,21 @@ file) or to `~/.claude/settings.json`:
 - `hook statusline` records Claude's rate limits for the host to publish as the agent's quota.
   To keep your own status line, wrap it: `agent-fleet hook statusline -- <your command>`.
 
-Tell the fleet who coordinates. Run this in the coordinating agent's pane (or with `--as`):
+Tell the fleet who coordinates. A hub has one coordinator, over every connected repository.
+`agent-fleet init` writes the generic coordinator agent (`agents/coordinator.md` in this repository)
+as `coordinator.md` in the config dir; edit that copy to change it for the machine.
+`agent-fleet coordinator` prints it followed by a "Connected repositories" section: for each
+repository, the project rules to read first (`.agent-fleet/coordinator.md`,
+`src/agent-fleet/coordinator.md`, `AGENTS.md`, whichever exist; a repository with none is listed as
+having none). Project rules extend the generic agent and never replace it. Start the coordinator
+with that prompt, and in its pane (or with `--as`) declare the role:
 
 ```sh
+claude --append-system-prompt "$(agent-fleet coordinator)"
 agent-fleet role me root-coordinator
 ```
+
+For another harness, copy the output into its agent file (for example under `.agents/`).
 
 `agent-fleet tell coordinator …` then reaches it, and the host tells it about hung and orphaned
 processes.
@@ -449,7 +460,8 @@ From `agent-fleet --help`; every command has its own `--help`.
 | `ps` | What every agent is doing |
 | `self-update` | Every host that is up pulls `main` in the clone its binary was built from, rebuilds and restarts; prints the commit each one then runs. A dirty clone or one not on `main` refuses |
 | `instances` | The agent-fleet instances on this machine and the hub each one uses |
-| `init` | Write this machine's fleet.toml and brief.md into the instance's config dir (`AGENT_FLEET_CONFIG_DIR` overrides it): commented templates with a profile for each agent program on PATH and one default rule. Never overwrites an existing file. Lists the user-level Claude and Codex skills that drive terminals (herdr, tmux, cmux) |
+| `init` | Write this machine's fleet.toml, brief.md and coordinator.md into the instance's config dir (`AGENT_FLEET_CONFIG_DIR` overrides it): commented templates with a profile for each agent program on PATH and one default rule. Never overwrites an existing file. Lists the user-level Claude and Codex skills that drive terminals (herdr, tmux, cmux) |
+| `coordinator` | Print the coordinator prompt for this machine's hub: the generic coordinator agent (`coordinator.md` in the config dir, written by `init`), then each connected repository with the project rules to read for it. Start the one coordinator with it, e.g. `claude --append-system-prompt "$(agent-fleet coordinator)"`, then `agent-fleet role me root-coordinator` |
 | `repo` | Connect a repository to the fleet on this machine: `add` records its checkout in the machine's fleet.toml, `ls` lists, `rm` disconnects. The host picks changes up without a restart |
 | `dev` | Per-worktree dev environments from the repository's `.agent-fleet/dev.toml` (`up`, `down`, `status` …: each worktree gets a slot with its own ports and values, runs its own services, and shares the infra; `db`, `test`), the worktrees of the connected repositories (`ls`, `clean`), and the agents and PRs on them (`agents`, `prs`) |
 | `tui` | The fleet on one screen, live: agents, worktrees, tasks, findings, resources, asks; `:` runs any command from it. `--all`: every instance on this machine |
