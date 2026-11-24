@@ -322,8 +322,8 @@ Tell the fleet who coordinates. A hub has one coordinator, over every connected 
 `agent-fleet init` writes the generic coordinator agent (`agents/coordinator.md` in this repository)
 as `coordinator.md` in the config dir; edit that copy to change it for the machine.
 `agent-fleet coordinator` prints it followed by a "Connected repositories" section: for each
-repository, the project rules to read first (`.agent-fleet/coordinator.md`,
-`src/agent-fleet/coordinator.md`, `AGENTS.md`, whichever exist; a repository with none is listed as
+repository, the project rules to read first (`.agent-fleet/coordinator.md`
+and `AGENTS.md`, whichever exist; a repository with none is listed as
 having none). Project rules extend the generic agent and never replace it. Start the coordinator
 with that prompt, and in its pane (or with `--as`) declare the role:
 
