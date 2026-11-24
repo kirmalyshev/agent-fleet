@@ -14,6 +14,7 @@ mod prs;
 mod quota;
 mod retire;
 mod scan;
+mod scorecard;
 mod setup;
 mod signal;
 mod spawn;
@@ -375,11 +376,19 @@ enum Cmd {
     /// Your tells and where each is: `sent` (waiting for a ring), `unread <age>` (delivered, not
     /// read yet), or `read`.
     Sent,
-    /// Numbers about the fleet: doorbell latency and loss, event lag, host and hub vitals.
+    /// Scorecard per routing profile (or agent program): speed, quality and predictability,
+    /// computed from the events the hub already logs. `--log` prints the fleet's own vitals
+    /// instead: doorbell latency and loss, event lag, host and hub load.
     Stats {
-        /// Window back from now: `90s`, `30m`, `24h`, `7d`.
-        #[arg(long, default_value = "24h", value_parser = parse_window)]
-        since: i64,
+        /// Window back from now: `90s`, `30m`, `24h`, `7d`. Default `14d` (`24h` with `--log`).
+        #[arg(long, value_parser = parse_window)]
+        since: Option<i64>,
+        /// One row per routing profile, or per agent program.
+        #[arg(long, value_enum, default_value = "profile")]
+        by: scorecard::By,
+        /// Fleet vitals instead of the scorecard.
+        #[arg(long)]
+        log: bool,
         #[arg(long)]
         json: bool,
     },
@@ -1256,12 +1265,28 @@ async fn main() -> Result<()> {
             let id = ctx.write(Envelope::new(by, &ctx.cli.project, body)).await?;
             update::wait(&ctx.client()?, &id, &hosts).await?;
         }
-        Cmd::Stats { since, json } => {
-            let v = ctx.client()?.stats(*since).await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&v)?);
+        Cmd::Stats {
+            since,
+            by,
+            log,
+            json,
+        } => {
+            let client = ctx.client()?;
+            if *log {
+                let v = client.stats(since.unwrap_or(24 * 3600)).await?;
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                } else {
+                    print!("{}", ui::stats(&v)?);
+                }
             } else {
-                print!("{}", ui::stats(&v)?);
+                let window = chrono::Duration::seconds(since.unwrap_or(14 * 86400));
+                let card = scorecard::compute(&client.events_after(None).await?, now, window, *by);
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&card)?);
+                } else {
+                    print!("{}", scorecard::render(&card));
+                }
             }
         }
         Cmd::Proc { pid } => {

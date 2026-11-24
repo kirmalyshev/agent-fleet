@@ -492,7 +492,7 @@ From `agent-fleet --help`; every command has its own `--help`.
 | `tell` | Ring an agent's doorbell: `[agent-fleet <from>→<to>] TYPE ref: text (event <id>; ack: agent-fleet read)` |
 | `read` | Read your own tells: every one sent to you (or to a role you hold) not read yet, delivered or not, oldest first with its original sender and time; each is then acked (`msg.read`), so it stops being rung again. Run it at every turn start |
 | `sent` | Your tells and where each is: `sent` (waiting for a ring), `unread <age>` (delivered, not read yet), or `read` |
-| `stats` | Numbers about the fleet: doorbell latency and loss, event lag, host and hub vitals |
+| `stats` | Scorecard per routing profile (or agent program): speed, quality and predictability, computed from the events the hub already logs. `--log` prints the fleet's own vitals instead: doorbell latency and loss, event lag, host and hub load |
 | `proc` | What the log says of a process on this host: `hung`, `orphan`, `waiting` (in a lock's queue), `no report` (not hung, or not watched), or `gone` |
 | `doctor` | What needs a look: stale, hung or heavy agents, duplicate work, forgotten worktrees, unpushed commits |
 | `bench` | Load-test a throwaway in-process hub: post latency, throughput, follower lag, 409 races |

@@ -86,6 +86,7 @@ One crate, one binary. `docs/PROTOCOL.md` is the spec, `schema/` the generated J
 | `src/ui.rs`, `src/board.html` | Text views and the browser board. |
 | `src/tui.rs` | The operator's screen. |
 | `src/stats.rs`, `src/bench.rs` | Metrics read off the log, and the hub load test. |
+| `src/scorecard.rs` | `stats`: the per-profile scorecard (speed, quality, predictability), pure over the event log. |
 | `build.rs` | Embeds the commit the binary is built from. |
 | `tests/` | Tests that run the built binary. |
 
