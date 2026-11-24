@@ -508,7 +508,7 @@ mod tests {
         let src = std::fs::read_to_string(dir.join("fleet.toml")).unwrap();
         let cfg = crate::spawn::FleetConfig::parse(&src).unwrap();
         assert_eq!(cfg.profiles.keys().collect::<Vec<_>>(), ["codex", "devin"]);
-        assert_eq!(cfg.rules.last().unwrap().profile, "codex");
+        assert_eq!(cfg.rules.last().unwrap().profile, ["codex"]);
         assert!(cfg.repos.is_empty());
         assert!(
             src.contains("#   handoff_min "),
