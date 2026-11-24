@@ -560,8 +560,8 @@ mod tests {
         assert_eq!(project_rules(d.path()), [d.path().join("AGENTS.md")]);
         std::fs::create_dir(d.path().join(".agent-fleet")).unwrap();
         std::fs::write(d.path().join(".agent-fleet/coordinator.md"), "c").unwrap();
-        std::fs::create_dir_all(d.path().join("src/agent-fleet")).unwrap();
-        std::fs::write(d.path().join("src/agent-fleet/coordinator.md"), "x").unwrap();
+        std::fs::create_dir_all(d.path().join("docs")).unwrap();
+        std::fs::write(d.path().join("docs/coordinator.md"), "x").unwrap();
         assert_eq!(
             project_rules(d.path()),
             [
