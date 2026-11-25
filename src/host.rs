@@ -504,6 +504,11 @@ impl Host {
     /// Up under the name `info` carries; the record it had in this pane (the pane-id stub, or
     /// any other) goes down, `adopted as <name>`, unless another pane still holds that agent.
     pub(crate) async fn adopted(self: &Arc<Self>, pane: &str, info: &Value) {
+        // The agent quit since `adopt` ran (or the event is replayed after a restart): a bare
+        // shell is not an agent, and nothing would ever take the phantom down.
+        if info["agent"].is_null() {
+            return;
+        }
         let old = self
             .panes
             .lock()
@@ -2925,6 +2930,15 @@ mod tests {
             downs,
             [("agent:h/s/a".to_string(), Some("adopted as b".to_string()))]
         );
+    }
+
+    #[tokio::test]
+    async fn adopting_a_pane_with_no_agent_in_it_registers_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, _fake, _) = host_on_fake(dir.path(), "working").await;
+        host.adopted("w:9", &json!({ "name": "b", "agent_status": "idle" }))
+            .await;
+        assert!(!host.panes.lock().unwrap().contains_key("w:9"));
     }
 
     #[tokio::test]

@@ -96,19 +96,26 @@ pub fn unknown_panes(
     let prefix = crate::spawn::agent_prefix(host, session);
     panes
         .iter()
+        // herdr's empty name is no name (the host takes it so)
+        .map(|(pane, name)| (pane, name.as_ref().filter(|n| !n.is_empty())))
         .filter(|(pane, name)| {
-            !s.agents
-                .contains_key(&format!("{prefix}{}", name.as_deref().unwrap_or(pane)))
+            let named = format!("{prefix}{}", name.map_or(pane.as_str(), |n| n.as_str()));
+            // known by name, or by the pane (the hub's name may differ from herdr's)
+            !s.agents.contains_key(&named)
+                && !s
+                    .agents
+                    .iter()
+                    .any(|(id, a)| id.starts_with(&prefix) && a.pane.as_deref() == Some(pane))
         })
         .map(|(pane, name)| {
-            let fix = name.as_deref().unwrap_or("<name>");
+            let fix = name.map_or("<name>", |n| n.as_str());
             finding(
                 "unknown-pane",
                 format!("{host}:{pane}"),
                 format!(
                     "herdr has an agent in {pane}{} that the hub does not know; \
                      agent-fleet adopt {pane} {fix}",
-                    name.as_deref().map_or(String::new(), |n| format!(" ({n})"))
+                    name.map_or(String::new(), |n| format!(" ({n})"))
                 ),
             )
         })
@@ -1095,6 +1102,15 @@ mod tests {
         ];
         let got = unknown_panes(&s, "h", "s", &panes);
         assert_eq!(got.len(), 2, "{got:?}");
+        // an empty herdr name is no name; a pane the hub holds under another name is known
+        s.agents.get_mut("agent:h/s/known").unwrap().pane = Some("w4:p1".into());
+        let odd = [
+            ("w4:p1".to_string(), Some("renamed-in-herdr".to_string())),
+            ("w5:p1".to_string(), Some(String::new())),
+        ];
+        let got2 = unknown_panes(&s, "h", "s", &odd);
+        assert_eq!(got2.len(), 1, "{got2:?}");
+        assert!(got2[0].detail.contains("adopt w5:p1 <name>"));
         assert_eq!(got[0].subject, "h:w2:p1");
         assert!(got[0].detail.ends_with("agent-fleet adopt w2:p1 lost"));
         assert!(got[1].detail.contains("adopt w3:p1 <name>"));

@@ -1362,7 +1362,7 @@ async fn main() -> Result<()> {
             ctx.write(Envelope::new(ctx.me().await?, &ctx.cli.project, body))
                 .await?;
             println!(
-                "adopted {pane} as {}; its host registers it within a tick (check: agent-fleet ps)",
+                "adopted {pane} as {}; its host registers it within a tick if the hub got the event (check: agent-fleet ps; if the hub was down more than 10 min, run adopt again)",
                 plan.agent
             );
         }
