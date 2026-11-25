@@ -458,6 +458,99 @@ raised, a message was delivered) is a typed event. The state is computed from th
 6. **Every machine has a copy.** The host agent copies the whole log locally. When the hub is
    down, reads still work from that copy.
 
+## How a task is routed
+
+`agent-fleet spawn owner/repo#123` picks the profile and host from the rules in `fleet.toml`
+(the machine's file, or the repository's own `.agent-fleet/fleet.toml`, read from the base
+branch, so a PR cannot change the rules that route it).
+
+```
+ issue ──▶ rules, first match wins ──▶ profile (+ host) ──▶ agent in its own worktree
+                                          │
+                                          └─ at its cap or out of quota at spawn time
+                                             ──▶ the profile's `fallback`
+```
+
+- A rule's `match` words are compared with the issue's title and labels (`label:x` matches only a label named `x`);
+  `--scope` narrows the work and never picks the worker. A rule
+  with no `match` is the default and comes last. A rule's `host` says where the agent runs, for
+  work that needs a particular machine (a simulator, say).
+- A profile is one agent program with its arguments, prefix and `cap` (live agents per
+  repository). Two profiles can run the same program with different models, such as `claude`
+  with `--model opus`.
+- `profile` may be a list: the spawn takes the least-loaded profile that has a seat and quota,
+  and list order breaks ties.
+- A profile that no rule names is only started by hand: `agent-fleet spawn … --profile codex`.
+- `--dry-run` shows the choice and why, without starting anything. `agent-fleet stats` shows how
+  each profile has done, from the events the hub already logs: speed, quality, predictability.
+
+## The life of a task
+
+1. **Issue.** One issue, one branch, one pull request.
+2. **Spawn.** The host makes a worktree and a branch for the agent, runs the `ready` hook,
+   starts the program in a herdr pane and types the brief into it.
+3. **Work.** The agent reports through the CLI (`tell`, `block`, `ask`); the host reports what
+   it sees in the pane.
+4. **Pull request and verdict.** The agent opens a PR and a reviewer ends it with
+   `VERDICT: READY <full head sha>` as the last line of the PR's last comment. Without it,
+   or if the head has moved, `merge` refuses.
+5. **Check and merge.** `agent-fleet merge` runs the repository's gate, then squash-merges. A
+   red gate makes `merge` refuse and print the gate's output; the lead sends the agent back to
+   step 3.
+6. **Retire.** `agent-fleet retire` closes the pane and removes the worktree. Uncommitted work
+   is shown to the lead and kept until someone decides; it is never deleted silently.
+
+## When an agent stops
+
+The host classifies every stop and records it as `agent.stuck` with a cause. A question, a
+full context, an empty quota, an error, an account problem, a permission prompt, a rate
+limit, a wait on a shared resource, a deliberate hold, a plain wait or something unknown each
+get their own action: a message to the lead, a handoff to the profile's `on_quota`, or a
+`continue` once a rate limit lifts. Actions that touch an agent (the handoff, the `continue`)
+run only under `host --stuck-act`; without it the host records the cause and tells the lead what
+it would have done. An agent that never reached `working` after `handoff_min` minutes gets one
+message to its lead. Nothing acts before the state has lasted `--stall-min`, and each cause
+acts at most once per episode. The table of
+causes and actions is in [docs/PROTOCOL.md](docs/PROTOCOL.md).
+
+```
+working ──▶ idle or blocked ──cause read from the screen──▶ agent.stuck ──lead answers──▶ working
+   └──PR merged──▶ done ──▶ retire
+```
+
+(Simplified: `stuck` is a record on an idle or blocked agent, not a state of its own.)
+
+A process that is alive but not progressing is reported `HUNG`; a process whose agent is gone
+is `ORPHAN`. The messages carry the `agent-fleet kill` command that stops the process safely:
+it refuses agents, panes, the fleet's own daemons and your own ancestors, and signals another
+agent's process only when the watch reported it hung and a sample confirms it is idle. So an
+agent cannot kill itself or a neighbour's work.
+
+## Roles
+
+| Level | Does | Does not |
+|---|---|---|
+| `root-coordinator` | Normally one per hub; the latest declared gets the escalations. Routes work, answers agents, merges at a reviewed sha, asks the human through the board | Write code |
+| `domain-lead`, `implementation-lead` | Own a part of the work and the agents under it | |
+| `implementer` | One issue: code, tests, PR; reports to its lead in one line | |
+
+Set a level with `agent-fleet role` or `spawn --level`. A lead gets the messages about the
+agents under it, and a message nobody reads goes up the chain to the root coordinator.
+
+## Glossary
+
+| Term | Meaning |
+|---|---|
+| hub | The one process that keeps the event log and the folded state |
+| host | The watcher on one machine and herdr session; it feeds events to the hub and keeps a replica |
+| pane | A herdr terminal pane; one agent lives in each |
+| worktree | A git working copy in its own directory, so agents do not collide |
+| brief | The start instruction typed into an agent: the project's rules, its task, how to report |
+| doorbell | A message typed into the recipient's prompt, then confirmed with `msg.delivered` |
+| VERDICT | The last line of a PR's last comment, `VERDICT: READY <full head sha>`: ready at that commit |
+| gate | A check that must pass before `merge` |
+| retire | Closing an agent and removing its worktree; uncommitted work is shown, not deleted |
+
 ## Commands
 
 From `agent-fleet --help`; every command has its own `--help`.
