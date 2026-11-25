@@ -1,3 +1,4 @@
+mod adopt;
 mod bench;
 mod chores;
 mod client;
@@ -337,6 +338,15 @@ enum Cmd {
         /// What to do with real uncommitted changes: delete, keep, or stash.
         #[arg(long)]
         decide: Option<retire::Decide>,
+    },
+    /// Re-register a live herdr pane as the named agent the hub lost (its name was dropped when
+    /// it restarted in the pane). Run in a herdr pane of the same session. Refuses a pane another
+    /// agent holds and a name already up in another pane.
+    Adopt {
+        /// The herdr pane id, e.g. `w1:p1`.
+        pane: String,
+        /// The agent's name.
+        name: String,
     },
     /// Merge an approved PR: only when the PR's last comment ends `VERDICT: READY <full head
     /// sha>` (a READY at an ancestor sha carries across clean merges of the base), its head is
@@ -1350,11 +1360,69 @@ async fn main() -> Result<()> {
                 detail.map(|d| format!(": {d}")).unwrap_or_default()
             );
         }
+        Cmd::Adopt { pane, name } => {
+            let (Some(sock), Ok(session)) = (
+                std::env::var_os("HERDR_SOCKET_PATH").map(PathBuf::from),
+                std::env::var("HERDR_SESSION"),
+            ) else {
+                bail!("run adopt in a herdr pane: HERDR_SOCKET_PATH and HERDR_SESSION are unset");
+            };
+            let state = ctx.state().await?;
+            let host_name = ctx.host_name();
+            let plan = adopt::plan(&state, &host_name, &session, pane, name)
+                .map_err(anyhow::Error::msg)?;
+            let got = host::herdr_call(&sock, "agent.get", json!({ "target": pane })).await?;
+            if got["agent"]["agent"].is_null() {
+                bail!("pane {pane} holds no agent herdr knows");
+            }
+            host::herdr_call(
+                &sock,
+                "agent.rename",
+                json!({ "target": pane, "name": name }),
+            )
+            .await?;
+            let body = Known::AgentRenamed(event::AgentRenamed {
+                agent: plan.agent.clone(),
+                pane: pane.clone(),
+                from: plan.from,
+                rule: "adopt".into(),
+            });
+            ctx.write(Envelope::new(ctx.me().await?, &ctx.cli.project, body))
+                .await?;
+            println!(
+                "adopted {pane} as {}; its host registers it within a tick if the hub got the event (check: agent-fleet ps; if the hub was down more than 10 min, run adopt again)",
+                plan.agent
+            );
+        }
         Cmd::Doctor { json, apply } => {
             let state = ctx.state().await?;
             let mut f = doctor::findings(&state, now);
             if let Some(base) = tmpdir::base() {
                 f.extend(doctor::tmp_findings(&state, &ctx.host_name(), &base));
+            }
+            // Only from inside a herdr pane: that session's herdr is the one to compare with.
+            if let (Some(sock), Ok(session)) = (
+                std::env::var_os("HERDR_SOCKET_PATH").map(PathBuf::from),
+                std::env::var("HERDR_SESSION"),
+            ) && let Ok(list) = host::herdr_call(&sock, "agent.list", json!({})).await
+            {
+                let panes: Vec<(String, Option<String>)> = list["agents"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|a| {
+                        Some((
+                            a["pane_id"].as_str()?.to_string(),
+                            a["name"].as_str().map(str::to_string),
+                        ))
+                    })
+                    .collect();
+                f.extend(doctor::unknown_panes(
+                    &state,
+                    &ctx.host_name(),
+                    &session,
+                    &panes,
+                ));
             }
             let (cfg, cfg_err) =
                 match orphanpr::config(std::path::Path::new("."), &ctx.cli.instance) {

@@ -72,7 +72,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | presence | `agent.up` | agent, host, kind?, state, pane? | | host |
 | | `agent.state` | agent, state (`idle` `working` `blocked` `done` `unknown`) | | host |
 | | `agent.down` | agent, reason? | | host |
-| | `agent.renamed` | agent, pane, from?, rule — the fleet, not herdr, set the agent's name (`pane-name-memory`: herdr dropped it when the agent restarted in its pane); written just before the `agent.up` that carries it | | agent, host, human |
+| | `agent.renamed` | agent, pane, from?, rule — the fleet, not herdr, set the agent's name (`pane-name-memory`: herdr dropped it when the agent restarted in its pane; `adopt`: `agent-fleet adopt <pane> <name>`, which the pane's host registers as an `agent.up` and takes the pane-id record down, reason `adopted as <name>`); written just before the `agent.up` that carries it | | agent, host, human |
 | | `host.health` | host, disk_free, disk_total, agents, stats?, commit? (the commit its binary was built from), behind_since? (since when its 5-minute fetch has found `origin/main` ahead of that commit; every minute) | | host |
 | | `agent.usage` | agent, rss_kb?, cpu_pct?, procs?, cwd? (each scan) | | host |
 | | `agent.role` | agent, level? (`root-coordinator` `domain-lead` `implementation-lead` `implementer`; absent `level` removes the role), lead?, domain? | | agent, host |

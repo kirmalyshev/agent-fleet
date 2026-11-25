@@ -69,8 +69,8 @@ const SHARED_BY_ALL: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Finding {
     /// `stale`, `hung`, `heavy`, `duplicate`, `forgotten`, `unpushed`, `orphan`, `breach`,
-    /// `queued`, `undelivered`, `refused`, `role`, `quota`, `spawn`, `unanswered`, `unmanaged`, `stalled`, `build`, `update`, `orphan-pr`, `tmp`
-    /// (the last two added by `main`).
+    /// `queued`, `undelivered`, `refused`, `role`, `quota`, `spawn`, `unanswered`, `unmanaged`, `stalled`, `build`, `update`, `orphan-pr`, `tmp`, `unknown-pane`
+    /// (the last three added by `main`).
     pub kind: &'static str,
     /// The agent id or `<host>:<path>` it is about.
     pub subject: String,
@@ -83,6 +83,43 @@ fn finding(kind: &'static str, subject: impl Into<String>, detail: String) -> Fi
         subject: subject.into(),
         detail,
     }
+}
+
+/// Agents herdr lists in the fleet's session that the hub has no record of (`panes`: pane id and
+/// the name herdr gives it): live agents nobody can reach through the fleet (#206).
+pub fn unknown_panes(
+    s: &State,
+    host: &str,
+    session: &str,
+    panes: &[(String, Option<String>)],
+) -> Vec<Finding> {
+    let prefix = crate::spawn::agent_prefix(host, session);
+    panes
+        .iter()
+        // herdr's empty name is no name (the host takes it so)
+        .map(|(pane, name)| (pane, name.as_ref().filter(|n| !n.is_empty())))
+        .filter(|(pane, name)| {
+            let named = format!("{prefix}{}", name.map_or(pane.as_str(), |n| n.as_str()));
+            // known by name, or by the pane (the hub's name may differ from herdr's)
+            !s.agents.contains_key(&named)
+                && !s
+                    .agents
+                    .iter()
+                    .any(|(id, a)| id.starts_with(&prefix) && a.pane.as_deref() == Some(pane))
+        })
+        .map(|(pane, name)| {
+            let fix = name.map_or("<name>", |n| n.as_str());
+            finding(
+                "unknown-pane",
+                format!("{host}:{pane}"),
+                format!(
+                    "herdr has an agent in {pane}{} that the hub does not know; \
+                     agent-fleet adopt {pane} {fix}",
+                    name.map_or(String::new(), |n| format!(" ({n})"))
+                ),
+            )
+        })
+        .collect()
 }
 
 /// The worktree an agent works in: the deepest one on its host containing its cwd.
@@ -1041,6 +1078,44 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_herdr_agent_the_hub_lacks_is_a_finding_with_the_adopt_command() {
+        use crate::event::AgentState;
+        let mut s = State::default();
+        s.agents.insert(
+            "agent:h/s/known".into(),
+            crate::state::Agent {
+                host: "h".into(),
+                kind: None,
+                pane: None,
+                state: AgentState::Idle,
+                since: Utc::now(),
+                worked: None,
+                finished: None,
+                usage: None,
+            },
+        );
+        let panes = [
+            ("w1:p1".to_string(), Some("known".to_string())),
+            ("w2:p1".to_string(), Some("lost".to_string())),
+            ("w3:p1".to_string(), None),
+        ];
+        let got = unknown_panes(&s, "h", "s", &panes);
+        assert_eq!(got.len(), 2, "{got:?}");
+        // an empty herdr name is no name; a pane the hub holds under another name is known
+        s.agents.get_mut("agent:h/s/known").unwrap().pane = Some("w4:p1".into());
+        let odd = [
+            ("w4:p1".to_string(), Some("renamed-in-herdr".to_string())),
+            ("w5:p1".to_string(), Some(String::new())),
+        ];
+        let got2 = unknown_panes(&s, "h", "s", &odd);
+        assert_eq!(got2.len(), 1, "{got2:?}");
+        assert!(got2[0].detail.contains("adopt w5:p1 <name>"));
+        assert_eq!(got[0].subject, "h:w2:p1");
+        assert!(got[0].detail.ends_with("agent-fleet adopt w2:p1 lost"));
+        assert!(got[1].detail.contains("adopt w3:p1 <name>"));
+    }
+
     use super::*;
     use crate::event::WorktreeState;
     use crate::state::{Usage, worktree_key};
