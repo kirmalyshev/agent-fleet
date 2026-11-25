@@ -693,7 +693,21 @@ fn herdr_argv(w: &[String]) -> Option<HerdrWrite> {
     ) {
         return None;
     }
-    let mut rest = w[i + 2..].iter();
+    // herdr takes these global options after the verb too: `pane send-text p1 x --session s1`.
+    let mut tail = Vec::new();
+    let mut it = w[i + 2..].iter();
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix("--session=") {
+            session = Some(v.to_string());
+        } else if a == "--session" {
+            session = it.next().cloned();
+        } else if a.starts_with("--machine") || a.starts_with("--remote") {
+            return None;
+        } else {
+            tail.push(a);
+        }
+    }
+    let mut rest = tail.into_iter();
     let target = loop {
         let a = rest.next()?;
         match a.as_str() {
@@ -1363,6 +1377,21 @@ mod tests {
         assert_eq!(
             w("herdr --session s1 pane send-text wY9:p1 hi"),
             at(Some("s1"), "wY9:p1")
+        );
+        // `--session` and the remote options are accepted after the verb as well
+        assert_eq!(
+            w("herdr pane send-text --session s1 wY9:p1 hi"),
+            at(Some("s1"), "wY9:p1")
+        );
+        assert_eq!(
+            w("herdr agent prompt reviewer go --session=s1"),
+            at(Some("s1"), "reviewer")
+        );
+        assert_eq!(w("herdr pane send-text p1 x --machine box"), vec![]);
+        assert_eq!(w("herdr pane send-text p1 x --remote box"), vec![]);
+        assert_eq!(
+            w("herdr agent send-keys reviewer enter --session s1"),
+            vec![]
         );
         for (line, target) in [
             ("herdr pane send-keys w1:p2 q", "w1:p2"),
