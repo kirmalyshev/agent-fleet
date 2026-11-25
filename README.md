@@ -302,7 +302,8 @@ file) or to `~/.claude/settings.json`:
   "hooks": {
     "PreToolUse": [ { "matcher": "Bash|exec", "hooks": [ { "type": "command",
       "command": "command -v agent-fleet >/dev/null 2>&1 || exit 0; agent-fleet hook bash" } ] } ],
-    "PostToolUse":      [ { "hooks": [ { "type": "command", "command": "agent-fleet hook mail || true" } ] } ],
+    "PostToolUse":      [ { "hooks": [ { "type": "command", "command": "agent-fleet hook mail || true" } ] },
+                          { "hooks": [ { "type": "command", "command": "agent-fleet hook unread || true" } ] } ],
     "Stop":             [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ],
     "StopFailure":      [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ],
     "Notification":     [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ],
@@ -319,6 +320,13 @@ file) or to `~/.claude/settings.json`:
   pane (use `agent-fleet tell`).
 - `hook mail` hands a busy agent that takes no typed input (Devin CLI) the tells that arrived
   while it worked, at its next tool call.
+- `hook unread` hands a Claude Code agent its unread tells at its next tool call, whatever the
+  turn is doing, and marks them read (as `agent-fleet read` does), so a tell sent during a long
+  turn is not left waiting for the turn to end. Silent with none, with the hub down, outside
+  herdr, for subagents and for any other program. The host's typed doorbell still reaches the
+  agent at the turn boundary; `agent-fleet read` then finds nothing. Devin CLI gets its tells by
+  `hook mail`; Codex and Antigravity (`agy`) have no tool-call hook that adds context for the
+  agent, so theirs arrive as before.
 - `hook signal` reports rate limits, permission prompts, questions and turn ends as
   `agent.signal`, so `ps` and `doctor` can say why an agent is stuck.
 - `hook statusline` records Claude's rate limits for the host to publish as the agent's quota.

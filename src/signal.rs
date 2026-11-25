@@ -207,6 +207,124 @@ pub async fn hook(
     .await;
 }
 
+/// Window in which a hook that found no unread tell is not asked again: tool calls come in
+/// bursts, and a tell is minutes late at worst without it being seconds late with it.
+const UNREAD_CACHE: Duration = Duration::from_secs(2);
+
+/// `hook unread`'s JSON line for the harness: `me`'s unread tells as `additionalContext`, and the
+/// `msg.read` for each (what `agent-fleet read` writes), so none is handed over twice. `None` with
+/// none.
+pub fn unread_output(
+    s: &State,
+    me: &Actor,
+    project: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<(String, Vec<Envelope<Known>>)> {
+    let lines: Vec<String> = s
+        .unread_for(&me.id, now)
+        .iter()
+        .map(|(id, m)| crate::ui::mail_line(id, m))
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let text = format!(
+        "agent-fleet: tells sent to you while you worked (now marked read; act on them):\n{}",
+        lines.join("\n")
+    );
+    let out = json!({ "hookSpecificOutput": {
+        "hookEventName": "PostToolUse", "additionalContext": text } });
+    Some((out.to_string(), crate::read_acks(s, me, project, now)))
+}
+
+/// `hook unread`: one `/state` read from the hub, then the acks, then the tells. A tell is never
+/// lost to a failed ack (it may show twice, never not at all). Silent (`None`) with no tells, a
+/// hub that does not answer inside `HOOK_BUDGET`, or any error.
+pub async fn unread_with(
+    client: &crate::client::Client,
+    me: &Actor,
+    project: &str,
+) -> Option<String> {
+    let state = tokio::time::timeout(HOOK_BUDGET, client.state())
+        .await
+        .ok()?
+        .ok()?;
+    let (out, acks) = unread_output(&state, me, project, chrono::Utc::now())?;
+    // Spooled first: an ack the hub does not take in time replays on the next write.
+    if acks.iter().all(|a| client.queue(a).is_ok()) {
+        let _ = tokio::time::timeout(HOOK_BUDGET, client.flush_spool()).await;
+    }
+    Some(out)
+}
+
+/// The cache stamp of `pane`: one per pane, so one agent's empty check never silences another's.
+fn unread_stamp(paths: &Paths, pane: &str) -> std::path::PathBuf {
+    let safe: String = pane
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    paths.dir.join(format!("unread.checked.{safe}"))
+}
+
+/// Whether `stamp` is younger than `UNREAD_CACHE`.
+fn fresh(stamp: &Path) -> bool {
+    std::fs::metadata(stamp)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < UNREAD_CACHE)
+}
+
+/// The `hook unread` entry, for a `claude` agent in a herdr pane only: Devin's tells come by
+/// `hook mail` (both would show it twice), and a `claude` run inside another program's pane, or a
+/// Claude Code subagent (its hook input carries `agent_id`), must not take the pane agent's.
+pub async fn unread_hook(
+    paths: &Paths,
+    hub: Option<&str>,
+    token_file: Option<&Path>,
+    project: &str,
+    host: &str,
+    input: &str,
+) -> Option<String> {
+    if serde_json::from_str::<Value>(input)
+        .ok()
+        .is_some_and(|v| v.get("agent_id").is_some())
+    {
+        return None;
+    }
+    let stamp = unread_stamp(paths, &std::env::var("HERDR_PANE_ID").ok()?);
+    if fresh(&stamp) {
+        return None;
+    }
+    let (agent, program) = tokio::time::timeout(HOOK_BUDGET, who(host)).await.ok()??;
+    if program != "claude" {
+        return None;
+    }
+    let token = cli_token(paths, token_file)?;
+    let client = crate::client::Client::new(
+        hub.map(str::to_string)
+            .unwrap_or_else(|| paths.hub_url())
+            .as_str(),
+        token,
+        paths.spool(),
+    );
+    let me = Actor {
+        kind: ActorKind::Agent,
+        id: agent,
+    };
+    let out = unread_with(&client, &me, project).await;
+    if out.is_none() {
+        let _ = std::fs::write(&stamp, "");
+    }
+    out
+}
+
 /// The statusline's own signal: `context_window.used_percentage` at CONTEXT_FULL_PCT or more,
 /// once per Claude session (deduped in `file` — a session-id list next to
 /// `claude-rate-limits.json`). Never fails.
@@ -480,6 +598,159 @@ mod tests {
         assert!(
             spooled.contains("agent.signal") && spooled.contains("agent:h/s/a"),
             "the signal is spooled, not lost: {spooled}"
+        );
+    }
+
+    // ---- hook unread ----
+
+    fn tell_to_b(text: &str) -> (Actor, Actor, Vec<Envelope<Known>>) {
+        let a = Actor {
+            kind: ActorKind::Agent,
+            id: "agent:h/s/a".into(),
+        };
+        let b = Actor {
+            kind: ActorKind::Agent,
+            id: "agent:h/s/b".into(),
+        };
+        let e = Envelope::new(
+            a.clone(),
+            "p",
+            Known::MsgSent(MsgSent {
+                to: b.id.clone(),
+                kind: "DECIDE".into(),
+                reference: "r#1".into(),
+                text: text.into(),
+                closes: Vec::new(),
+            }),
+        );
+        (a, b, vec![e])
+    }
+
+    fn fold(es: &[Envelope<Known>]) -> State {
+        let mut s = State::default();
+        for e in es {
+            s.apply(&e.clone().into_event());
+        }
+        s
+    }
+
+    #[test]
+    fn unread_output_is_post_tool_use_additional_context_with_the_acks() {
+        let (_, b, es) = tell_to_b("push gated: wait for review");
+        let (out, acks) = unread_output(&fold(&es), &b, "p", chrono::Utc::now()).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+        let text = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(
+            text.contains("DECIDE") && text.contains("push gated: wait for review"),
+            "{text}"
+        );
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].re.as_deref(), Some(es[0].id.as_str()));
+        assert_eq!(acks[0].actor.id, b.id);
+    }
+
+    #[test]
+    fn unread_output_shows_a_tell_once() {
+        let (_, b, es) = tell_to_b("x");
+        let mut s = fold(&es);
+        let (_, acks) = unread_output(&s, &b, "p", chrono::Utc::now()).unwrap();
+        for a in acks {
+            s.apply(&a.into_event());
+        }
+        assert!(unread_output(&s, &b, "p", chrono::Utc::now()).is_none());
+    }
+
+    #[test]
+    fn unread_output_is_none_without_tells_for_that_agent() {
+        let (a, _, es) = tell_to_b("x");
+        assert!(unread_output(&State::default(), &a, "p", chrono::Utc::now()).is_none());
+        // the sender has nothing unread either
+        assert!(unread_output(&fold(&es), &a, "p", chrono::Utc::now()).is_none());
+    }
+
+    #[test]
+    fn the_unread_cache_is_per_pane_and_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            dir: dir.path().to_path_buf(),
+        };
+        let (a, b) = (unread_stamp(&paths, "w1:p1"), unread_stamp(&paths, "w1:p2"));
+        assert_ne!(a, b);
+        assert!(!fresh(&a), "never checked");
+        std::fs::write(&a, "").unwrap();
+        assert!(
+            fresh(&a) && !fresh(&b),
+            "one pane's check leaves the other's due"
+        );
+        let old = std::time::SystemTime::now() - Duration::from_secs(30);
+        std::fs::File::options()
+            .write(true)
+            .open(&a)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(!fresh(&a), "expired");
+    }
+
+    #[tokio::test]
+    async fn a_subagent_hook_takes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            dir: dir.path().to_path_buf(),
+        };
+        let input = r#"{"hook_event_name":"PostToolUse","agent_id":"sub1"}"#;
+        assert!(
+            unread_hook(&paths, None, None, "p", "h", input)
+                .await
+                .is_none()
+        );
+    }
+
+    fn client(base: &str, dir: &Path) -> crate::client::Client {
+        crate::client::Client::new(base, "tok".into(), dir.join("spool"))
+    }
+
+    #[tokio::test]
+    async fn unread_with_a_dead_hub_is_silent_and_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, b, _) = tell_to_b("x");
+        let t = std::time::Instant::now();
+        let out = unread_with(&client("http://127.0.0.1:1", dir.path()), &b, "p").await;
+        assert!(out.is_none());
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn unread_with_a_live_hub_hands_over_once_then_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = crate::hub::Hub::new(crate::store::Store::memory().unwrap()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = crate::hub::router(hub, "tok".into());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let c = client(&base, dir.path());
+        let (_, b, es) = tell_to_b("gate: DECIDE");
+        let none = unread_with(&c, &b, "p").await;
+        assert!(none.is_none(), "no tells yet");
+        c.write(&es[0]).await.unwrap();
+        let t = std::time::Instant::now();
+        let out = unread_with(&c, &b, "p").await.expect("the tell");
+        assert!(out.contains("gate: DECIDE"));
+        assert!(
+            t.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            t.elapsed()
+        );
+        assert!(
+            unread_with(&c, &b, "p").await.is_none(),
+            "acked: shown once"
         );
     }
 }
