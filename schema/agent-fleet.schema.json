@@ -91,6 +91,36 @@
           ],
           "type": "object"
         },
+        "AgentRenamed": {
+          "additionalProperties": false,
+          "description": "An agent's name was set by the fleet, not by herdr: the host restored the name herdr dropped\nwhen the agent restarted in its pane, or `adopt` named a live pane. Written just before the\n`agent.up` that carries the name; `rule` says which.",
+          "properties": {
+            "agent": {
+              "description": "The agent's full id after the rename.",
+              "type": "string"
+            },
+            "from": {
+              "description": "The id it had until now (a pane-id name, `agent:<host>/<session>/<pane>`), when it had one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane": {
+              "type": "string"
+            },
+            "rule": {
+              "description": "The rule that did it, e.g. `pane-name-memory` or `adopt`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "agent",
+            "pane",
+            "rule"
+          ],
+          "type": "object"
+        },
         "AgentRole": {
           "additionalProperties": false,
           "description": "An agent's declared level and the lead it reports to. Without `level` the agent's role is\nremoved.",
@@ -1114,6 +1144,13 @@
             "host": {
               "description": "The host that runs it: the agent's.",
               "type": "string"
+            },
+            "rule": {
+              "description": "The rule that asked, when a rule and not a person did: `idle.auto_retire`.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -1698,6 +1735,22 @@
             },
             "type": {
               "const": "agent.role",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/AgentRenamed"
+            },
+            "type": {
+              "const": "agent.renamed",
               "type": "string"
             }
           },
@@ -3234,6 +3287,13 @@
             "host": {
               "description": "The host that runs it: the agent's.",
               "type": "string"
+            },
+            "rule": {
+              "description": "The rule that asked, when a rule and not a person did: `idle.auto_retire`.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -4145,6 +4205,15 @@
             "string",
             "null"
           ]
+        },
+        "lead_idled": {
+          "default": [],
+          "description": "Agents the host has rung `IDLE` since they came up. A domain-lead is asked once: this\noutlives a state change, unlike `idle_rung`. Gone on `agent.down`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
         },
         "limits": {
           "additionalProperties": {

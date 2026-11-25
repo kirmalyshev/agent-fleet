@@ -53,6 +53,10 @@ pub struct State {
     /// (key: the id + `UNMANAGED_KEY`); gone once the agent works or goes down.
     #[serde(default)]
     pub idle_rung: BTreeMap<String, DateTime<Utc>>,
+    /// Agents the host has rung `IDLE` since they came up. A domain-lead is asked once: this
+    /// outlives a state change, unlike `idle_rung`. Gone on `agent.down`.
+    #[serde(default)]
+    pub lead_idled: BTreeSet<String>,
     /// The last `HELD` text rung per agent and how many times in a row: the host backs off an
     /// unchanged one. Gone once the agent works, changes state, goes down or is rung `IDLE`.
     #[serde(default)]
@@ -1089,6 +1093,8 @@ impl State {
                     }
                 }
             }
+            // Only the log keeps a rename: the `agent.up` after it carries the new id.
+            Known::AgentRenamed(_) => {}
             Known::AgentDown(d) => {
                 clear_asks(
                     &mut self.waiting,
@@ -1098,6 +1104,7 @@ impl State {
                 );
                 self.reports.remove(&d.agent);
                 self.told.remove(&d.agent);
+                self.lead_idled.remove(&d.agent);
                 self.idle_rung
                     .remove(&format!("{}{UNMANAGED_KEY}", d.agent));
                 if self.agents.remove(&d.agent).is_some() {
@@ -1368,6 +1375,7 @@ impl State {
                                 self.held_streak.insert(key.clone(), (d.text.clone(), n));
                             }
                             "IDLE" => {
+                                self.lead_idled.insert(key.clone());
                                 self.held_streak.remove(&key);
                             }
                             _ => {}
@@ -2512,6 +2520,8 @@ mod tests {
         s.apply(&at(4, ActorKind::Agent, a, state(AgentState::Working)));
         assert!(!s.idle_rung.contains_key(a));
         assert!(s.idle_rung.contains_key(&format!("{a}{UNMANAGED_KEY}")));
+        // but "rung IDLE once" outlives a state change: only `agent.down` ends it
+        assert!(s.lead_idled.contains(a));
         s.apply(&at(
             5,
             ActorKind::Host,
@@ -2521,7 +2531,7 @@ mod tests {
                 reason: None,
             }),
         ));
-        assert!(s.reports.is_empty() && s.idle_rung.is_empty());
+        assert!(s.reports.is_empty() && s.idle_rung.is_empty() && s.lead_idled.is_empty());
     }
 
     #[test]
@@ -3800,6 +3810,7 @@ mod tests {
                 agent: "agent:kir/s/dv-1".into(),
                 host: "kir".into(),
                 decide: None,
+                rule: None,
             }),
         );
         let id = req.id.clone();

@@ -992,6 +992,7 @@ mod tests {
                         agent: "agent:kir/s/a".into(),
                         host: host.into(),
                         decide: None,
+                        rule: None,
                     },
                     by: "agent:mac/s/me".into(),
                     project: "p".into(),

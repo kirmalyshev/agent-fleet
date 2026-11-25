@@ -2036,6 +2036,7 @@ async fn main() -> Result<()> {
                     agent: sp.request.agent.clone(),
                     host: sp.request.host.clone(),
                     decide: decide.map(|d| d.to_string()),
+                    rule: None,
                 });
                 let id = ctx
                     .write(Envelope::new(ctx.me().await?, &sp.project, body))
