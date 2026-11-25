@@ -112,6 +112,26 @@ impl Paths {
             .unwrap_or_else(|| DEFAULT_HUB.into())
     }
 
+    /// Every pane's mailbox (`mailbox`), under this instance's data dir.
+    pub fn mail_root(&self) -> PathBuf {
+        self.dir.join("mail")
+    }
+
+    /// The mailbox of agent `name` in herdr pane `pane`: doorbells the host leaves for it while it
+    /// is busy and cannot take typed input, which `hook mail` hands it at its next tool call. Keyed
+    /// by the agent too, so the pane's next agent never gets them.
+    pub fn mailbox(&self, pane: &str, name: &str) -> PathBuf {
+        let safe = |s: &str| -> String {
+            s.chars()
+                .map(|c| match c {
+                    'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => c,
+                    _ => '_',
+                })
+                .collect()
+        };
+        self.mail_root().join(safe(pane)).join(safe(name))
+    }
+
     pub fn hub_file(&self) -> PathBuf {
         self.dir.join("hub")
     }
@@ -548,6 +568,19 @@ impl Client {
         Ok(self.get(&path).await?.json().await?)
     }
 
+    /// The whole log, oldest first: `GET /events` pages (1000 at a time), so keep asking after the
+    /// last id until a page comes back empty.
+    pub async fn all_events(&self) -> Result<Vec<Event>> {
+        let mut all: Vec<Event> = Vec::new();
+        loop {
+            let page = self.events_after(all.last().map(|e| e.id.as_str())).await?;
+            if page.is_empty() {
+                return Ok(all);
+            }
+            all.extend(page);
+        }
+    }
+
     /// Follows `GET /events/stream` from `after`, calling `f` for each event until the stream ends.
     pub async fn follow(
         &self,
@@ -874,6 +907,20 @@ mod tests {
             "no flush may find the lock still held by a child"
         );
         hub.abort();
+    }
+
+    #[tokio::test]
+    async fn all_events_reads_past_the_first_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let _hub = start_hub(listener, &dir.path().join("hub.db")).await;
+        let c = Client::new(&base, "tok".into(), dir.path().join("spool"));
+        for i in 0..1003 {
+            c.write(&block(i)).await.unwrap();
+        }
+        assert_eq!(c.events_after(None).await.unwrap().len(), 1000);
+        assert_eq!(c.all_events().await.unwrap().len(), 1003);
     }
 
     #[tokio::test]

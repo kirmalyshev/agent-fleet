@@ -39,6 +39,24 @@ pub struct State {
     pub answers: BTreeMap<String, Answered>,
     /// Undelivered doorbells by the id of their `msg.sent`.
     pub msgs: BTreeMap<String, Msg>,
+    /// Each agent's open `BLOCKED`/`QUESTION` to its lead, until answered (see `Waiting`).
+    #[serde(default)]
+    pub waiting: BTreeMap<String, Waiting>,
+    /// Each up agent's last `msg.sent`, what `IDLE` quotes and `auto_retire` reads (`DONE`/`MERGED`).
+    #[serde(default)]
+    pub reports: BTreeMap<String, Report>,
+    /// When each agent's lead last told it anything: new work after a `DONE`, so `auto_retire`
+    /// waits for a fresh one. Gone when the agent goes down.
+    #[serde(default)]
+    pub told: BTreeMap<String, DateTime<Utc>>,
+    /// When the host last rang an agent's lead `IDLE`/`HELD` (key: the agent id) or `UNMANAGED`
+    /// (key: the id + `UNMANAGED_KEY`); gone once the agent works or goes down.
+    #[serde(default)]
+    pub idle_rung: BTreeMap<String, DateTime<Utc>>,
+    /// The last `HELD` text rung per agent and how many times in a row: the host backs off an
+    /// unchanged one. Gone once the agent works, changes state, goes down or is rung `IDLE`.
+    #[serde(default)]
+    pub held_streak: BTreeMap<String, (String, u32)>,
     /// Delivered doorbells their recipient has not read (`msg.read`) yet: retransmitted until it does.
     #[serde(default)]
     pub unread: BTreeMap<String, Unread>,
@@ -49,6 +67,9 @@ pub struct State {
     /// Read doorbells by the id of their `msg.sent`, kept for 24 h after the read.
     #[serde(default)]
     pub read: BTreeMap<String, Read>,
+    /// Tells handed back to their sender as `UNREAD` (`escalations`), kept while they are queued.
+    #[serde(default)]
+    pub escalated: BTreeSet<String>,
     /// Git worktrees by `<host>:<path>`.
     pub worktrees: BTreeMap<String, Worktree>,
     /// Processes running in worktrees (or orphaned beside them) by `<host>:<path>`.
@@ -445,6 +466,43 @@ pub struct Msg {
     pub since: DateTime<Utc>,
 }
 
+/// An agent's last `BLOCKED` or `QUESTION`, open until the lead tells it anything or it works.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Waiting {
+    /// The id of the `msg.sent`.
+    pub id: String,
+    pub to: String,
+    pub kind: String,
+    pub text: String,
+    pub since: DateTime<Utc>,
+    /// The host already re-rang the lead (`STILL-WAITING`).
+    #[serde(default)]
+    pub rung: bool,
+}
+
+/// An agent's last `msg.sent`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Report {
+    pub kind: String,
+    pub text: String,
+    pub since: DateTime<Utc>,
+}
+
+/// Suffix of the `idle_rung` key of an `UNMANAGED` ring.
+pub const UNMANAGED_KEY: &str = "#unmanaged";
+
+/// An agent that works owes nobody an answer or an idle ring.
+fn clear_asks(
+    waiting: &mut BTreeMap<String, Waiting>,
+    idle_rung: &mut BTreeMap<String, DateTime<Utc>>,
+    held_streak: &mut BTreeMap<String, (String, u32)>,
+    agent: &str,
+) {
+    waiting.remove(agent);
+    idle_rung.remove(agent);
+    held_streak.remove(agent);
+}
+
 /// A delivered doorbell not read yet.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Unread {
@@ -498,8 +556,7 @@ impl Msg {
     /// waited out a host reconnect. Questions and instructions (`ASK`, `BLOCKED`, ...) never go
     /// stale; past `MSG_EXPIRE` every tell goes to the coordinator instead (`dead_letters`).
     pub fn stale(&self, now: DateTime<Utc>) -> Option<String> {
-        let status = ["MERGED", "DONE", "RETIRE", "OPEN", "FIX"];
-        (status.contains(&self.kind.as_str()) && now - self.since > MSG_FRESH).then(|| {
+        (STATUS_KINDS.contains(&self.kind.as_str()) && now - self.since > MSG_FRESH).then(|| {
             format!(
                 "{} sent {}h ago, before this host came back",
                 self.kind,
@@ -519,6 +576,18 @@ impl Msg {
 
 /// The kind of the tell that hands an expired or orphaned tell to the coordinator.
 pub const DEADLETTER: &str = "DEADLETTER";
+
+/// The kind of the tell that tells a sender its tell to a working agent is still unread.
+pub const UNREAD: &str = "UNREAD";
+
+/// The kind of the tell that re-rings a lead whose agent's BLOCKED or QUESTION got no reply.
+pub const STILL_WAITING: &str = "STILL-WAITING";
+
+/// A tell to a working agent still unread this long after its send goes back to its sender.
+pub const UNREAD_ESCALATE: chrono::Duration = chrono::Duration::minutes(10);
+
+/// Status reports: nothing for the recipient to act on now, nor for their sender if unread.
+const STATUS_KINDS: [&str; 5] = ["MERGED", "DONE", "RETIRE", "OPEN", "FIX"];
 
 /// A tell whose recipient is not up this long after it was sent goes to the coordinator.
 pub const GONE_AFTER: chrono::Duration = chrono::Duration::minutes(10);
@@ -570,6 +639,71 @@ impl State {
                     MsgSent {
                         to: COORDINATOR.into(),
                         kind: DEADLETTER.into(),
+                        reference: m.reference.clone(),
+                        text,
+                        closes: Vec::new(),
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Agents on `host` that asked (`BLOCKED`/`QUESTION`) at least `min` ago, sit not working, and
+    /// whose lead has told them nothing since: `(agent, ask)`. A host's `STILL-WAITING` marks `rung`.
+    pub fn unanswered(
+        &self,
+        host: &str,
+        now: DateTime<Utc>,
+        min: chrono::Duration,
+    ) -> Vec<(&String, &Waiting)> {
+        self.waiting
+            .iter()
+            .filter(|(id, w)| {
+                !w.rung
+                    && now - w.since >= min
+                    && self
+                        .agents
+                        .get(*id)
+                        .is_some_and(|a| a.host == host && a.state != AgentState::Working)
+            })
+            .collect()
+    }
+
+    /// Tells to a `working` agent on `host` still unread (delivered or not) `UNREAD_ESCALATE` after
+    /// the send, as `(id, letter)`: one `UNREAD` tell back to each sender that is up, once per tell
+    /// (`escalated`). The tell stays queued. Status reports and the fleet's own letters never go back.
+    pub fn escalations(&self, host: &str, now: DateTime<Utc>) -> Vec<(String, MsgSent)> {
+        self.msgs
+            .iter()
+            .chain(self.unread.iter().map(|(id, u)| (id, &u.msg)))
+            .filter(|(id, m)| {
+                !self.escalated.contains(*id)
+                    && ![DEADLETTER, UNREAD].contains(&m.kind.as_str())
+                    && !STATUS_KINDS.contains(&m.kind.as_str())
+                    && now - m.since >= UNREAD_ESCALATE
+                    && !m.expired(now)
+                    && self.agents.contains_key(&m.from)
+            })
+            .filter_map(|(id, m)| {
+                let to = self.recipient(&m.to)?;
+                let a = self.agents.get(to)?;
+                if a.host != host || a.state != AgentState::Working || m.from == to {
+                    return None;
+                }
+                let age = now - m.since;
+                let text = format!(
+                    "[unread {}h{:02}m: {to} is working and has not read it] {} {}: {}",
+                    age.num_hours(),
+                    age.num_minutes() % 60,
+                    m.kind,
+                    m.reference,
+                    m.text
+                );
+                Some((
+                    id.clone(),
+                    MsgSent {
+                        to: m.from.clone(),
+                        kind: UNREAD.into(),
                         reference: m.reference.clone(),
                         text,
                         closes: Vec::new(),
@@ -785,6 +919,18 @@ impl State {
                 // A re-up (host or herdr restart) keeps what the entry already knows: the last
                 // working time, the current stretch when the state did not change, the usage.
                 let old = self.agents.get(&d.agent);
+                if old.is_none() {
+                    // A new incarnation owes nothing to a previous one's ask.
+                    clear_asks(
+                        &mut self.waiting,
+                        &mut self.idle_rung,
+                        &mut self.held_streak,
+                        &d.agent,
+                    );
+                }
+                if old.is_some_and(|a| a.state != d.state) {
+                    self.held_streak.remove(&d.agent);
+                }
                 self.agents.insert(
                     d.agent.clone(),
                     Agent {
@@ -799,6 +945,12 @@ impl State {
                         worked: (d.state == AgentState::Working)
                             .then(|| {
                                 self.signals.remove(&d.agent);
+                                clear_asks(
+                                    &mut self.waiting,
+                                    &mut self.idle_rung,
+                                    &mut self.held_streak,
+                                    &d.agent,
+                                );
                                 ts
                             })
                             .or_else(|| old.and_then(|a| a.worked)),
@@ -917,6 +1069,12 @@ impl State {
                 // Only `agent.up` brings an agent in: a late state change never revives a downed one.
                 if let Some(a) = self.agents.get_mut(&d.agent) {
                     if d.state == AgentState::Working {
+                        clear_asks(
+                            &mut self.waiting,
+                            &mut self.idle_rung,
+                            &mut self.held_streak,
+                            &d.agent,
+                        );
                         a.worked = Some(ts);
                         a.finished = None;
                         self.signals.remove(&d.agent);
@@ -925,12 +1083,23 @@ impl State {
                         a.finished = Some(ts);
                     }
                     if a.state != d.state {
+                        self.held_streak.remove(&d.agent);
                         a.state = d.state;
                         a.since = ts;
                     }
                 }
             }
             Known::AgentDown(d) => {
+                clear_asks(
+                    &mut self.waiting,
+                    &mut self.idle_rung,
+                    &mut self.held_streak,
+                    &d.agent,
+                );
+                self.reports.remove(&d.agent);
+                self.told.remove(&d.agent);
+                self.idle_rung
+                    .remove(&format!("{}{UNMANAGED_KEY}", d.agent));
                 if self.agents.remove(&d.agent).is_some() {
                     self.gone.insert(d.agent.clone(), ts);
                 }
@@ -1132,6 +1301,81 @@ impl State {
                 }
             }
             Known::MsgSent(d) => {
+                match e.actor.kind {
+                    ActorKind::Agent => {
+                        if self.agents.contains_key(&e.actor.id) {
+                            self.reports.insert(
+                                e.actor.id.clone(),
+                                Report {
+                                    kind: d.kind.clone(),
+                                    text: d.text.clone(),
+                                    since: ts,
+                                },
+                            );
+                        }
+                        if ["BLOCKED", "QUESTION"].contains(&d.kind.as_str())
+                            && self.agents.contains_key(&e.actor.id)
+                        {
+                            self.waiting.insert(
+                                e.actor.id.clone(),
+                                Waiting {
+                                    id: e.id.clone(),
+                                    to: d.to.clone(),
+                                    kind: d.kind.clone(),
+                                    text: d.text.clone(),
+                                    since: ts,
+                                    rung: false,
+                                },
+                            );
+                        }
+                        let from = e.actor.id.as_str();
+                        let lead = self.roles.get(&d.to).and_then(|r| r.lead.as_deref());
+                        if self.agents.contains_key(&d.to)
+                            && (lead == Some(from)
+                                || (lead.is_none() && self.coordinator() == Some(from)))
+                        {
+                            self.told.insert(d.to.clone(), ts);
+                        }
+                        // Any tell from the lead to the waiting agent is the answer.
+                        if self
+                            .waiting
+                            .get(&d.to)
+                            .is_some_and(|w| w.to == from || self.recipient(&w.to) == Some(from))
+                        {
+                            self.waiting.remove(&d.to);
+                        }
+                    }
+                    ActorKind::Host if d.kind == STILL_WAITING => {
+                        if let Some(w) = self
+                            .waiting
+                            .values_mut()
+                            .find(|w| Some(&w.id) == e.re.as_ref())
+                        {
+                            w.rung = true;
+                        }
+                    }
+                    ActorKind::Host if ["IDLE", "HELD", "UNMANAGED"].contains(&d.kind.as_str()) => {
+                        let key = match d.kind.as_str() {
+                            "UNMANAGED" => format!("{}{UNMANAGED_KEY}", d.reference),
+                            _ => d.reference.clone(),
+                        };
+                        match d.kind.as_str() {
+                            "HELD" => {
+                                let n = match self.held_streak.get(&key) {
+                                    Some((t, n)) if *t == d.text => n + 1,
+                                    _ => 1,
+                                };
+                                self.held_streak.insert(key.clone(), (d.text.clone(), n));
+                            }
+                            "IDLE" => {
+                                self.held_streak.remove(&key);
+                            }
+                            _ => {}
+                        }
+                        self.idle_rung.insert(key, ts);
+                    }
+                    _ => {}
+                }
                 // A host's dead letter takes the tell it names (`re`) off the recipient's queue.
                 // One for a tell already read or handed over (a host's view lagging) is dropped.
                 // A digest hands over every tell in `closes`.
@@ -1143,6 +1387,18 @@ impl State {
                     if !open {
                         return;
                     }
+                }
+                // A host's `UNREAD` marks the tell it names as handed back, which stays queued. One
+                // for a tell no longer queued (a host's view lagging) is dropped.
+                if d.kind == UNREAD && e.actor.kind == ActorKind::Host {
+                    let Some(re) = e
+                        .re
+                        .as_ref()
+                        .filter(|re| self.msgs.contains_key(*re) || self.unread.contains_key(*re))
+                    else {
+                        return;
+                    };
+                    self.escalated.insert(re.clone());
                 }
                 self.msgs.insert(
                     e.id.clone(),
@@ -1392,6 +1648,9 @@ impl State {
         self.answers
             .retain(|_, a| e.ts - a.acked.unwrap_or(a.at) <= ANSWER_KEPT);
         self.read.retain(|_, r| e.ts - r.at <= READ_KEPT);
+        let (msgs, unread) = (&self.msgs, &self.unread);
+        self.escalated
+            .retain(|id| msgs.contains_key(id) || unread.contains_key(id));
         self.gone.retain(|_, at| e.ts - *at <= MSG_EXPIRE);
         // The reducer has no clock: a spawn is pruned once a later event's `ts` is more than
         // SPAWN_KEPT past its answer (or its request, when it was never answered) — but never
@@ -1423,10 +1682,9 @@ impl State {
             .filter(|s| s.request.host == host && s.request.agent == agent)
             .filter_map(|s| ok(s).map(|t| (s, t)))
             .max_by_key(|(s, _)| s.since)?;
-        let made = self
-            .spawns
-            .values()
-            .any(|s| s.request.worktree.is_none() && ok(s).as_deref() == Some(&tree));
+        let made = self.spawns.values().any(|s| {
+            s.request.worktree.is_none() && !s.request.in_place && ok(s).as_deref() == Some(&tree)
+        });
         // Another agent holds the tree: up in it now, or handed it in a newer spawn that is
         // answered ok or not answered yet (the window before its pane exists).
         let held = self.spawns.values().any(|s| {
@@ -2105,6 +2363,408 @@ mod tests {
     }
 
     #[test]
+    fn held_rings_count_while_the_text_repeats_and_reset_on_new_text_idle_or_a_state_change() {
+        let t0 = Utc::now();
+        let a = "agent:h/s/a";
+        let mut s = State::default();
+        let mut n = 0;
+        let mut ev = |s: &mut State, kind: ActorKind, actor: &str, body| {
+            n += 1;
+            let mut e = Envelope::new(
+                Actor {
+                    kind,
+                    id: actor.into(),
+                },
+                "p",
+                body,
+            )
+            .into_event();
+            e.ts = t0 + chrono::Duration::minutes(n);
+            s.apply(&e);
+        };
+        let ring = |kind: &str, text: &str| {
+            Known::MsgSent(MsgSent {
+                to: "agent:h/s/lead".into(),
+                kind: kind.into(),
+                reference: a.into(),
+                text: text.into(),
+                closes: Vec::new(),
+            })
+        };
+        let state = |st| {
+            Known::AgentState(AgentStateChanged {
+                agent: a.into(),
+                state: st,
+            })
+        };
+        ev(
+            &mut s,
+            ActorKind::Agent,
+            a,
+            Known::AgentUp(AgentUp {
+                agent: a.into(),
+                host: "h".into(),
+                kind: None,
+                pane: None,
+                state: AgentState::Idle,
+            }),
+        );
+        for want in 1..=3 {
+            ev(&mut s, ActorKind::Host, "host:h", ring("HELD", "x"));
+            assert_eq!(s.held_streak[a], ("x".to_string(), want));
+        }
+        ev(&mut s, ActorKind::Host, "host:h", ring("HELD", "y"));
+        assert_eq!(s.held_streak[a], ("y".to_string(), 1));
+        // another ring kind for the same agent leaves the HELD streak alone, IDLE ends it
+        ev(&mut s, ActorKind::Host, "host:h", ring("UNMANAGED", "u"));
+        assert_eq!(s.held_streak[a].1, 1);
+        ev(&mut s, ActorKind::Host, "host:h", ring("IDLE", "i"));
+        assert!(!s.held_streak.contains_key(a));
+        // a same-state report keeps it; a real state change, working and down clear it
+        ev(&mut s, ActorKind::Host, "host:h", ring("HELD", "y"));
+        ev(&mut s, ActorKind::Agent, a, state(AgentState::Idle));
+        assert!(s.held_streak.contains_key(a));
+        ev(&mut s, ActorKind::Agent, a, state(AgentState::Blocked));
+        assert!(!s.held_streak.contains_key(a));
+        ev(&mut s, ActorKind::Host, "host:h", ring("HELD", "y"));
+        ev(&mut s, ActorKind::Agent, a, state(AgentState::Working));
+        assert!(!s.held_streak.contains_key(a));
+        ev(&mut s, ActorKind::Agent, a, state(AgentState::Idle));
+        ev(&mut s, ActorKind::Host, "host:h", ring("HELD", "y"));
+        let up = |st| {
+            Known::AgentUp(AgentUp {
+                agent: a.into(),
+                host: "h".into(),
+                kind: None,
+                pane: None,
+                state: st,
+            })
+        };
+        ev(&mut s, ActorKind::Agent, a, up(AgentState::Idle));
+        assert!(s.held_streak.contains_key(a));
+        ev(&mut s, ActorKind::Agent, a, up(AgentState::Blocked));
+        assert!(!s.held_streak.contains_key(a));
+        ev(&mut s, ActorKind::Host, "host:h", ring("HELD", "y"));
+        ev(
+            &mut s,
+            ActorKind::Agent,
+            a,
+            Known::AgentDown(AgentDown {
+                agent: a.into(),
+                reason: None,
+            }),
+        );
+        assert!(s.held_streak.is_empty());
+    }
+
+    #[test]
+    fn a_report_is_kept_and_an_idle_ring_marked_until_the_agent_works_or_goes_down() {
+        let t0 = Utc::now();
+        let at = |mins: i64, kind: ActorKind, actor: &str, body| {
+            let mut e = Envelope::new(
+                Actor {
+                    kind,
+                    id: actor.into(),
+                },
+                "p",
+                body,
+            )
+            .into_event();
+            e.ts = t0 + chrono::Duration::minutes(mins);
+            e
+        };
+        let a = "agent:h/s/a";
+        let msg = |kind: &str, reference: &str| {
+            Known::MsgSent(MsgSent {
+                to: "agent:h/s/lead".into(),
+                kind: kind.into(),
+                reference: reference.into(),
+                text: "t".into(),
+                closes: Vec::new(),
+            })
+        };
+        let state = |st| {
+            Known::AgentState(AgentStateChanged {
+                agent: a.into(),
+                state: st,
+            })
+        };
+        let mut s = State::default();
+        s.apply(&at(
+            0,
+            ActorKind::Agent,
+            a,
+            Known::AgentUp(AgentUp {
+                agent: a.into(),
+                host: "h".into(),
+                kind: None,
+                pane: None,
+                state: AgentState::Idle,
+            }),
+        ));
+        s.apply(&at(1, ActorKind::Agent, a, msg("DONE", "r")));
+        assert_eq!(s.reports[a].kind, "DONE");
+        s.apply(&at(2, ActorKind::Host, "host:h", msg("IDLE", a)));
+        s.apply(&at(3, ActorKind::Host, "host:h", msg("UNMANAGED", a)));
+        assert!(s.idle_rung.contains_key(a));
+        assert!(s.idle_rung.contains_key(&format!("{a}{UNMANAGED_KEY}")));
+        // working clears the idle ring, not the unmanaged one
+        s.apply(&at(4, ActorKind::Agent, a, state(AgentState::Working)));
+        assert!(!s.idle_rung.contains_key(a));
+        assert!(s.idle_rung.contains_key(&format!("{a}{UNMANAGED_KEY}")));
+        s.apply(&at(
+            5,
+            ActorKind::Host,
+            "host:h",
+            Known::AgentDown(AgentDown {
+                agent: a.into(),
+                reason: None,
+            }),
+        ));
+        assert!(s.reports.is_empty() && s.idle_rung.is_empty());
+    }
+
+    #[test]
+    fn a_tell_from_the_lead_is_remembered_and_one_from_anyone_else_is_not() {
+        let t0 = Utc::now();
+        let at = |mins: i64, actor: &str, body| {
+            let mut e = Envelope::new(
+                Actor {
+                    kind: ActorKind::Agent,
+                    id: actor.into(),
+                },
+                "p",
+                body,
+            )
+            .into_event();
+            e.ts = t0 + chrono::Duration::minutes(mins);
+            e
+        };
+        let (a, lead, peer) = ("agent:h/s/a", "agent:h/s/lead", "agent:h/s/peer");
+        let tell = |to: &str| {
+            Known::MsgSent(MsgSent {
+                to: to.into(),
+                kind: "FIX".into(),
+                reference: "r".into(),
+                text: "t".into(),
+                closes: Vec::new(),
+            })
+        };
+        let mut s = State::default();
+        for id in [a, lead, peer] {
+            s.apply(&at(
+                0,
+                id,
+                Known::AgentUp(AgentUp {
+                    agent: id.into(),
+                    host: "h".into(),
+                    kind: None,
+                    pane: None,
+                    state: AgentState::Idle,
+                }),
+            ));
+        }
+        s.roles.insert(
+            a.into(),
+            Role {
+                level: Level::Implementer,
+                lead: Some(lead.into()),
+                domain: None,
+                by: "x".into(),
+                since: t0,
+            },
+        );
+        s.apply(&at(1, peer, tell(a)));
+        assert!(s.told.is_empty(), "a peer is not the lead");
+        s.apply(&at(2, lead, tell(a)));
+        assert_eq!(s.told[a], t0 + chrono::Duration::minutes(2));
+        s.apply(&at(
+            3,
+            "host:h",
+            Known::AgentDown(AgentDown {
+                agent: a.into(),
+                reason: None,
+            }),
+        ));
+        assert!(s.told.is_empty());
+    }
+
+    #[test]
+    fn with_no_declared_lead_the_coordinator_counts_as_the_lead() {
+        let t0 = Utc::now();
+        let at = |actor: &str, body| {
+            let mut e = Envelope::new(
+                Actor {
+                    kind: ActorKind::Agent,
+                    id: actor.into(),
+                },
+                "p",
+                body,
+            )
+            .into_event();
+            e.ts = t0;
+            e
+        };
+        let (a, co, peer) = ("agent:h/s/a", "agent:h/s/co", "agent:h/s/peer");
+        let tell = |to: &str| {
+            Known::MsgSent(MsgSent {
+                to: to.into(),
+                kind: "FIX".into(),
+                reference: "r".into(),
+                text: "t".into(),
+                closes: Vec::new(),
+            })
+        };
+        let mut s = State::default();
+        for id in [a, co, peer] {
+            s.apply(&at(
+                id,
+                Known::AgentUp(AgentUp {
+                    agent: id.into(),
+                    host: "h".into(),
+                    kind: None,
+                    pane: None,
+                    state: AgentState::Idle,
+                }),
+            ));
+        }
+        s.roles.insert(
+            co.into(),
+            Role {
+                level: Level::RootCoordinator,
+                lead: None,
+                domain: None,
+                by: "x".into(),
+                since: t0,
+            },
+        );
+        s.apply(&at(peer, tell(a)));
+        assert!(s.told.is_empty());
+        // a tell to an agent that is not up, or to the `coordinator` alias, is not recorded
+        s.apply(&at(co, tell("agent:h/s/ghost")));
+        s.apply(&at(co, tell("coordinator")));
+        assert!(s.told.is_empty());
+        s.apply(&at(co, tell(a)));
+        assert_eq!(s.told[a], t0);
+    }
+
+    #[test]
+    fn a_blocked_or_question_tell_stays_unanswered_until_the_lead_tells_the_agent_or_it_works() {
+        let t0 = Utc::now();
+        let at = |mins: i64, kind: ActorKind, actor: &str, id: &str, re: Option<&str>, body| {
+            let mut e = Envelope::new(
+                Actor {
+                    kind,
+                    id: actor.into(),
+                },
+                "p",
+                body,
+            );
+            e.id = id.into();
+            e.re = re.map(str::to_string);
+            let mut e = e.into_event();
+            e.ts = t0 + chrono::Duration::minutes(mins);
+            e
+        };
+        let (a, lead) = ("agent:h/s/a", "agent:h/s/lead");
+        let msg = |to: &str, kind: &str| {
+            Known::MsgSent(MsgSent {
+                to: to.into(),
+                kind: kind.into(),
+                reference: "r".into(),
+                text: "which way?".into(),
+                closes: Vec::new(),
+            })
+        };
+        let up = |state| {
+            Known::AgentUp(AgentUp {
+                agent: a.into(),
+                host: "h".into(),
+                kind: None,
+                pane: None,
+                state,
+            })
+        };
+        let min = chrono::Duration::minutes(10);
+        let at20 = t0 + chrono::Duration::minutes(20);
+        let fresh = || {
+            let mut s = State::default();
+            s.apply(&at(0, ActorKind::Agent, a, "u", None, up(AgentState::Idle)));
+            s.apply(&at(1, ActorKind::Agent, a, "m", None, msg(lead, "BLOCKED")));
+            s
+        };
+        // idle, nobody answered, past the limit: unanswered; before it: not yet
+        let s = fresh();
+        assert_eq!(s.unanswered("h", at20, min).len(), 1);
+        assert!(
+            s.unanswered("h", t0 + chrono::Duration::minutes(5), min)
+                .is_empty()
+        );
+        assert!(s.unanswered("other", at20, min).is_empty());
+        // an ask from an agent that is not up is not tracked
+        let mut s = State::default();
+        s.apply(&at(1, ActorKind::Agent, a, "m", None, msg(lead, "BLOCKED")));
+        assert!(s.waiting.is_empty());
+        // a status kind is no ask
+        let mut s = State::default();
+        s.apply(&at(0, ActorKind::Agent, a, "u", None, up(AgentState::Idle)));
+        s.apply(&at(1, ActorKind::Agent, a, "m", None, msg(lead, "DONE")));
+        assert!(s.unanswered("h", at20, min).is_empty());
+        // the lead tells the agent anything: answered
+        let mut s = fresh();
+        s.apply(&at(2, ActorKind::Agent, lead, "r", None, msg(a, "ANSWER")));
+        assert!(s.unanswered("h", at20, min).is_empty());
+        // somebody else telling it is no answer
+        let mut s = fresh();
+        s.apply(&at(
+            2,
+            ActorKind::Agent,
+            "agent:h/s/z",
+            "r",
+            None,
+            msg(a, "HI"),
+        ));
+        assert_eq!(s.unanswered("h", at20, min).len(), 1);
+        // the agent resumes working: answered
+        let mut s = fresh();
+        s.apply(&at(
+            2,
+            ActorKind::Host,
+            "host:h",
+            "w",
+            None,
+            Known::AgentState(AgentStateChanged {
+                agent: a.into(),
+                state: AgentState::Working,
+            }),
+        ));
+        assert!(s.unanswered("h", at20, min).is_empty());
+        // the host's STILL-WAITING (re = the ask) is rung once
+        let mut s = fresh();
+        s.apply(&at(
+            12,
+            ActorKind::Host,
+            "host:h",
+            "sw",
+            Some("m"),
+            msg(lead, STILL_WAITING),
+        ));
+        assert!(s.unanswered("h", at20, min).is_empty());
+        // a role-addressed ask is answered by whoever holds the role
+        let mut s = State::default();
+        s.apply(&at(0, ActorKind::Agent, a, "u", None, up(AgentState::Idle)));
+        s.apply(&at(
+            1,
+            ActorKind::Agent,
+            a,
+            "m",
+            None,
+            msg(COORDINATOR, "QUESTION"),
+        ));
+        assert_eq!(s.unanswered("h", at20, min).len(), 1);
+    }
+
+    #[test]
     fn a_tell_goes_sent_then_delivered_then_read_and_only_its_recipient_reads_it() {
         let t0 = Utc::now();
         let at = |mins, actor: &str, re: Option<&str>, body| {
@@ -2406,6 +3066,101 @@ mod tests {
         // A second hand-over of a tell already closed (a lagging view) adds nothing.
         let n = s.msgs.len();
         s.apply(&dead(ActorKind::Host, "old"));
+        assert_eq!(s.msgs.len(), n);
+    }
+
+    #[test]
+    fn a_tell_a_working_agent_leaves_unread_goes_back_to_its_sender_once_and_stays_queued() {
+        let now = Utc::now();
+        let mut s = State::default();
+        let msg = |from: &str, kind: &str, mins: i64| Msg {
+            from: from.into(),
+            to: "agent:h/s/a".into(),
+            kind: kind.into(),
+            reference: "x#1".into(),
+            text: "stop and rebase".into(),
+            since: now - chrono::Duration::minutes(mins),
+        };
+        let up = |s: &mut State, id: &str, state: &str| {
+            s.agents.insert(
+                id.into(),
+                serde_json::from_value(serde_json::json!({
+                    "host": agent_host(id), "state": state, "since": now
+                }))
+                .unwrap(),
+            );
+        };
+        up(&mut s, "agent:h/s/a", "working");
+        up(&mut s, "agent:h/s/lead", "idle");
+        s.msgs
+            .insert("old".into(), msg("agent:h/s/lead", "ASK", 11));
+        s.msgs
+            .insert("young".into(), msg("agent:h/s/lead", "ASK", 9));
+        // Nobody to tell: a sender that is not up.
+        s.msgs
+            .insert("orphan".into(), msg("agent:h/s/gone", "ASK", 30));
+        // Nothing for the sender to act on: a status report, or the fleet's own letters.
+        s.msgs
+            .insert("report".into(), msg("agent:h/s/lead", "DONE", 30));
+        s.msgs
+            .insert("dl".into(), msg("agent:h/s/lead", DEADLETTER, 30));
+        s.unread.insert(
+            "rung".into(),
+            Unread {
+                msg: msg("agent:h/s/lead", "FYI", 20),
+                delivered: now - chrono::Duration::minutes(15),
+                rings: 2,
+            },
+        );
+        let got = s.escalations("h", now);
+        let ids: Vec<&str> = got.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["old", "rung"], "{got:?}");
+        let (_, back) = &got[0];
+        assert_eq!(
+            (
+                back.to.as_str(),
+                back.kind.as_str(),
+                back.reference.as_str()
+            ),
+            ("agent:h/s/lead", UNREAD, "x#1")
+        );
+        assert!(
+            back.text
+                .starts_with("[unread 0h11m: agent:h/s/a is working and has not read it")
+                && back.text.ends_with("] ASK x#1: stop and rebase"),
+            "{}",
+            back.text
+        );
+        assert!(
+            s.escalations("k", now).is_empty(),
+            "only the recipient's host"
+        );
+        // Idle, the agent is rung as usual: no escalation.
+        up(&mut s, "agent:h/s/a", "idle");
+        assert!(s.escalations("h", now).is_empty());
+        up(&mut s, "agent:h/s/a", "working");
+
+        // The host's letter marks the tell, which stays queued; an agent's does not.
+        let letter = |actor: ActorKind, re: &str| {
+            ev(actor, Known::MsgSent(got[0].1.clone()))
+                .re(re)
+                .into_event()
+        };
+        s.apply(&letter(ActorKind::Agent, "old"));
+        assert_eq!(s.escalations("h", now).len(), 2);
+        s.apply(&letter(ActorKind::Host, "old"));
+        s.apply(&letter(ActorKind::Host, "rung"));
+        assert!(s.escalations("h", now).is_empty(), "each goes back once");
+        assert!(s.msgs.contains_key("old") && s.unread.contains_key("rung"));
+        // Read: the mark goes with the tell, and a letter for it (a lagging view) adds nothing.
+        s.apply(
+            &ev(ActorKind::Agent, Known::MsgRead(MsgRead {}))
+                .re("old")
+                .into_event(),
+        );
+        assert!(!s.escalated.contains("old"), "pruned with its tell");
+        let n = s.msgs.len();
+        s.apply(&letter(ActorKind::Host, "old"));
         assert_eq!(s.msgs.len(), n);
     }
 

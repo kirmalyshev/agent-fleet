@@ -66,12 +66,15 @@ One crate, one binary. `docs/PROTOCOL.md` is the spec, `schema/` the generated J
 | `src/host.rs` | The host agent: herdr presence, replica, doorbells. |
 | `src/scan.rs` | Processes and worktrees on this machine. |
 | `src/watch.rs` | The watch tick: classifies agent-started processes as working, waiting, idle, hung or orphan. |
+| `src/idle.rs` | `[idle]`: rings a lead about an idle, held or hand-started agent; retires a finished one. |
+| `src/chores.rs` | `[chores]`: nudges for a stuck agent, the spawn queue, the sweep command. |
 | `src/stuck.rs` | Why a stuck agent is stuck, read off its screen, and the once-per-episode actions. |
 | `src/tmpdir.rs` | The per-agent scratch dir outside any checkout (`<cache dir>/agent-fleet/tmp/<session>/<name>`): TMPDIR export line, removal, size. |
 | `src/signal.rs` | `hook signal`: harness hook events become `agent.signal`; `log` writes another hook's event as the hooked agent. |
 | `src/quota.rs` | Each agent program's usage quota and `hook statusline`. |
 | `src/spawn.rs` | `fleet.toml` routing, briefs, the host's spawn executor. |
-| `src/setup.rs` | `init` and `repo add`, `ls`, `rm`: the machine's `fleet.toml`, brief and connected repos. |
+| `src/setup.rs` | `init` and `repo add`, `ls`, `rm`: the machine's `fleet.toml`, brief, coordinator and connected repos; `coordinator` prints the layered coordinator prompt, or with a program (`claude`) starts it with the prompt loaded. |
+| `agents/coordinator.md` | The generic coordinator agent `init` installs. Public: no project, host or person names. |
 | `src/dev.rs` | `agent-fleet dev`: per-worktree slots and services from `.agent-fleet/dev.toml`. |
 | `src/kill.rs` | `agent-fleet kill` and `hook bash`. |
 | `src/merge.rs` | `agent-fleet merge`: the approved-sha merge, its gate or required checks, and the host's side of `merge.requested`. |
@@ -83,6 +86,7 @@ One crate, one binary. `docs/PROTOCOL.md` is the spec, `schema/` the generated J
 | `src/ui.rs`, `src/board.html` | Text views and the browser board. |
 | `src/tui.rs` | The operator's screen. |
 | `src/stats.rs`, `src/bench.rs` | Metrics read off the log, and the hub load test. |
+| `src/scorecard.rs` | `stats`: the per-profile scorecard (speed, quality, predictability), pure over the event log. |
 | `build.rs` | Embeds the commit the binary is built from. |
 | `tests/` | Tests that run the built binary. |
 

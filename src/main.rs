@@ -1,10 +1,12 @@
 mod bench;
+mod chores;
 mod client;
 mod dev;
 mod doctor;
 mod event;
 mod host;
 mod hub;
+mod idle;
 mod kill;
 mod merge;
 mod orphanpr;
@@ -12,6 +14,7 @@ mod prs;
 mod quota;
 mod retire;
 mod scan;
+mod scorecard;
 mod setup;
 mod signal;
 mod spawn;
@@ -123,6 +126,9 @@ enum Cmd {
         /// Minutes an agent may idle or block after working before its lead is told STALLED.
         #[arg(long = "stall-min", default_value_t = spawn::STALL_MIN)]
         stall_min: u64,
+        /// Minutes an idle agent's BLOCKED/QUESTION may go unanswered before its lead is re-rung.
+        #[arg(long = "waiting-min", default_value_t = 10)]
+        waiting_min: u64,
         /// Act on a stuck agent — Enter/Escape/continue keystrokes and handoffs. Off, the
         /// host only classifies, records `agent.stuck`, and tells the lead.
         #[arg(long)]
@@ -140,11 +146,25 @@ enum Cmd {
     SelfUpdate,
     /// The agent-fleet instances on this machine and the hub each one uses.
     Instances,
-    /// Write this machine's fleet.toml and brief.md into the instance's config dir
+    /// Write this machine's fleet.toml, brief.md and coordinator.md into the instance's config dir
     /// (`AGENT_FLEET_CONFIG_DIR` overrides it): commented templates with a profile for each agent
     /// program on PATH and one default rule. Never overwrites an existing file. Lists the
     /// user-level Claude and Codex skills that drive terminals (herdr, tmux, cmux).
     Init,
+    /// Print the coordinator prompt for this machine's hub: the generic coordinator agent
+    /// (`coordinator.md` in the config dir, written by `init`), then each connected repository
+    /// with the project rules to read for it. Start the one coordinator with it, e.g.
+    /// `claude --append-system-prompt "$(agent-fleet coordinator)"`, then
+    /// `agent-fleet role me root-coordinator`. With a program (`claude`) it starts that program
+    /// with the prompt loaded, in this terminal or in the herdr pane named by `--pane`; its first
+    /// message has it take the root-coordinator role.
+    Coordinator {
+        /// The agent program to start (only `claude`). Omit to print the prompt.
+        program: Option<String>,
+        /// Start it in this herdr pane (at a shell prompt) instead of this terminal.
+        #[arg(long, requires = "program")]
+        pane: Option<String>,
+    },
     /// Connect a repository to the fleet on this machine: `add` records its checkout in the
     /// machine's fleet.toml, `ls` lists, `rm` disconnects. The host picks changes up without a
     /// restart.
@@ -267,8 +287,15 @@ enum Cmd {
         #[arg(long)]
         name: Option<String>,
         /// The new worktree's branch [default: the name].
-        #[arg(long)]
+        #[arg(long, conflicts_with = "in_place")]
         branch: Option<String>,
+        /// Run in the host's own checkout of the repo: no worktree, no branch. Retire closes the
+        /// pane and never touches the checkout.
+        #[arg(long)]
+        in_place: bool,
+        /// Send this file as the brief, as written, instead of rendering `.agent-fleet/brief.md`.
+        #[arg(long)]
+        brief: Option<PathBuf>,
         /// Skip the rules and use this profile.
         #[arg(long)]
         profile: Option<String>,
@@ -337,6 +364,10 @@ enum Cmd {
         reference: String,
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         text: Vec<String>,
+        /// Send a DONE, MERGED, READY or REPORT past unread tells (emergency; the text records it).
+        /// Put it before the text: after it, it is part of the text.
+        #[arg(long)]
+        force: bool,
     },
     /// Read your own tells: every one sent to you (or to a role you hold) not read yet, delivered
     /// or not, oldest first with its original sender and time; each is then acked (`msg.read`),
@@ -345,11 +376,19 @@ enum Cmd {
     /// Your tells and where each is: `sent` (waiting for a ring), `unread <age>` (delivered, not
     /// read yet), or `read`.
     Sent,
-    /// Numbers about the fleet: doorbell latency and loss, event lag, host and hub vitals.
+    /// Scorecard per routing profile (or agent program): speed, quality and predictability,
+    /// computed from the events the hub already logs. `--log` prints the fleet's own vitals
+    /// instead: doorbell latency and loss, event lag, host and hub load.
     Stats {
-        /// Window back from now: `90s`, `30m`, `24h`, `7d`.
-        #[arg(long, default_value = "24h", value_parser = parse_window)]
-        since: i64,
+        /// Window back from now: `90s`, `30m`, `24h`, `7d`. Default `14d` (`24h` with `--log`).
+        #[arg(long, value_parser = parse_window)]
+        since: Option<i64>,
+        /// One row per routing profile, or per agent program.
+        #[arg(long, value_enum, default_value = "profile")]
+        by: scorecard::By,
+        /// Fleet vitals instead of the scorecard.
+        #[arg(long)]
+        log: bool,
         #[arg(long)]
         json: bool,
     },
@@ -594,6 +633,13 @@ enum HookCmd {
     /// `UserPromptSubmit`, and any harness whose payload matches): maps the hook JSON on
     /// stdin to an `agent.signal` event and writes it. Never fails; outside herdr it exits 0.
     Signal {
+        /// Ignored: a hook exits 0 on any error, argument errors included.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// PostToolUse hook for Claude Code and Devin CLI: hands the agent the tells its host left in
+    /// its pane's mailbox while it was busy (`additionalContext`). Always exits 0.
+    Mail {
         /// Ignored: a hook exits 0 on any error, argument errors included.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -928,6 +974,22 @@ fn machine_config(cmd: &Cmd, instance: &str) -> Result<()> {
             let found = setup::terminal_skills(&setup::project_skill_dirs(&top));
             print!("{}", setup::skills_report(&found));
         }
+        Cmd::Coordinator { program, pane } => {
+            let prompt = setup::coordinator_prompt(&dir)?;
+            let Some(program) = program else {
+                print!("{prompt}");
+                return Ok(());
+            };
+            let argv = setup::coordinator_argv(program, &prompt, pane.as_deref())?;
+            if setup::registered(&dir)?.is_empty() {
+                eprintln!(
+                    "no connected repositories yet: `agent-fleet repo add <owner/repo>` in a checkout"
+                );
+            }
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new(&argv[0]).args(&argv[1..]).exec();
+            return Err(anyhow::Error::new(err).context(format!("start {}", argv[0])));
+        }
         Cmd::Repo { cmd: RepoCmd::Ls } => {
             for (repo, co) in setup::registered(&dir)? {
                 let gone = if co.is_dir() { "" } else { "  (missing)" };
@@ -1028,10 +1090,24 @@ async fn main() -> Result<()> {
                 }
                 std::process::exit(0);
             }
+            HookCmd::Mail { .. } => {
+                let mut input = String::new();
+                let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+                if let Some(paths) = &paths
+                    && let Some(out) = host::mail_hook(paths, |k| std::env::var(k).ok()).await
+                {
+                    // A closed stdout must not panic the hook: exit 0 whatever happens.
+                    let _ = std::io::Write::write_all(
+                        &mut std::io::stdout().lock(),
+                        format!("{out}\n").as_bytes(),
+                    );
+                }
+                std::process::exit(0);
+            }
         }
         return Ok(());
     }
-    if let Cmd::Init | Cmd::Repo { .. } = &cli.cmd {
+    if let Cmd::Init | Cmd::Coordinator { .. } | Cmd::Repo { .. } = &cli.cmd {
         return machine_config(&cli.cmd, &cli.instance);
     }
     if let Cmd::Dev { cmd } = &cli.cmd
@@ -1059,7 +1135,7 @@ async fn main() -> Result<()> {
     };
     let now = Utc::now();
     match &ctx.cli.cmd {
-        Cmd::Api { .. } | Cmd::Init | Cmd::Repo { .. } => unreachable!(),
+        Cmd::Api { .. } | Cmd::Init | Cmd::Coordinator { .. } | Cmd::Repo { .. } => unreachable!(),
         Cmd::Hub { listen, db, check } => {
             if *check {
                 let db = db.clone().unwrap_or_else(|| ctx.paths.hub_db());
@@ -1089,6 +1165,7 @@ async fn main() -> Result<()> {
             repos,
             locks,
             stall_min,
+            waiting_min,
             stuck_act,
         } => {
             let cfg = host::Config {
@@ -1112,6 +1189,7 @@ async fn main() -> Result<()> {
                 config_dir: spawn::machine_dir(&ctx.cli.instance),
                 locks: locks.clone(),
                 stall_min: *stall_min,
+                waiting_min: *waiting_min,
                 stuck_act: *stuck_act,
             };
             host::run(cfg, ctx.client()?).await?;
@@ -1209,12 +1287,28 @@ async fn main() -> Result<()> {
             let id = ctx.write(Envelope::new(by, &ctx.cli.project, body)).await?;
             update::wait(&ctx.client()?, &id, &hosts).await?;
         }
-        Cmd::Stats { since, json } => {
-            let v = ctx.client()?.stats(*since).await?;
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&v)?);
+        Cmd::Stats {
+            since,
+            by,
+            log,
+            json,
+        } => {
+            let client = ctx.client()?;
+            if *log {
+                let v = client.stats(since.unwrap_or(24 * 3600)).await?;
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                } else {
+                    print!("{}", ui::stats(&v)?);
+                }
             } else {
-                print!("{}", ui::stats(&v)?);
+                let window = chrono::Duration::seconds(since.unwrap_or(14 * 86400));
+                let card = scorecard::compute(&client.all_events().await?, now, window, *by);
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&card)?);
+                } else {
+                    print!("{}", scorecard::render(&card));
+                }
             }
         }
         Cmd::Proc { pid } => {
@@ -1668,6 +1762,8 @@ async fn main() -> Result<()> {
             scope,
             name,
             branch,
+            in_place,
+            brief: brief_file,
             profile,
             host,
             level,
@@ -1774,6 +1870,16 @@ async fn main() -> Result<()> {
             let src = std::fs::read_to_string(cfg_dir.join(&cfg.brief))
                 .with_context(|| format!("read {}", cfg_dir.join(&cfg.brief).display()))?;
             let brief = spawn::render(spawn::brief_body(&src), &vals)?;
+            let machine = spawn::machine_dir(&ctx.cli.instance)
+                .context("no user config dir; set AGENT_FLEET_CONFIG_DIR")?;
+            let brief = match brief_file {
+                Some(f) => std::fs::read_to_string(f)
+                    .with_context(|| format!("read brief {}", f.display()))?,
+                None => setup::brief_for(d.level, brief, &machine)?,
+            };
+            if brief.trim().is_empty() {
+                bail!("the brief is empty");
+            }
             if *dry_run {
                 println!("spawn {target_ref} \"{}\"", issue.title);
                 println!("rule      {}", d.why);
@@ -1831,6 +1937,7 @@ async fn main() -> Result<()> {
                 lead: Some(lead),
                 worktree: None,
                 replaces: None,
+                in_place: *in_place,
                 why: d.why.clone(),
             };
             let id = ctx
@@ -1885,6 +1992,7 @@ async fn main() -> Result<()> {
                 &to,
                 note.as_deref().unwrap_or(""),
                 &title,
+                spawn::machine_dir(&ctx.cli.instance).as_deref(),
             )?;
             if state.agents.contains_key(&req.agent) {
                 bail!("{} is already up", req.agent);
@@ -2063,8 +2171,12 @@ async fn main() -> Result<()> {
             kind,
             reference,
             text,
+            force,
         } => {
-            let state = ctx.state().await?;
+            let (state, replica) = ctx.snapshot_state().await?;
+            if let Some(note) = &replica {
+                eprintln!("agent-fleet: {note}");
+            }
             let to = tell_to(&state, agent)?;
             let busy = state
                 .recipient(&to)
@@ -2077,30 +2189,92 @@ async fn main() -> Result<()> {
                     a.state == AgentState::Working && state::queues_input(a.kind.as_deref())
                 });
             let waiting = state.pending_for(&to).0 + 1;
+            let me = ctx.me().await?;
+            let said = text.join(" ");
+            // The replica never sees the acks `read` spooled, so it cannot gate: let it through.
+            let gated = if replica.is_some() {
+                eprintln!("agent-fleet: unread tells not checked (hub unreachable)");
+                Ok(said.clone())
+            } else {
+                report_text(
+                    &state,
+                    &me.id,
+                    kind,
+                    said.clone(),
+                    *force,
+                    chrono::Utc::now(),
+                )
+            };
+            let text = match gated {
+                Ok(t) => t,
+                Err(unread) => {
+                    eprintln!("{unread}");
+                    eprintln!(
+                        "agent-fleet: {kind} refused, you have unread tells above; act on them, run `agent-fleet read`, then tell again (emergency: `agent-fleet tell --force <agent> {kind} <ref> <text>`, flag before the text)"
+                    );
+                    std::process::exit(1);
+                }
+            };
+            if text != said {
+                eprintln!("agent-fleet: sent past unread tells (--force)");
+            }
             let body = MsgSent {
                 to: to.clone(),
                 kind: kind.clone(),
                 reference: reference.clone(),
-                text: text.join(" "),
+                text,
                 closes: Vec::new(),
             };
-            ctx.write(Envelope::new(
-                ctx.me().await?,
-                &ctx.cli.project,
-                Known::MsgSent(body),
-            ))
-            .await?;
+            ctx.write(Envelope::new(me, &ctx.cli.project, Known::MsgSent(body)))
+                .await?;
             if busy {
                 let how = if recipient_queues {
                     "queued, read at its next turn boundary"
                 } else {
-                    "delivers when idle"
+                    "delivers at its next tool call (`hook mail`) or when idle"
                 };
                 println!("queued: {} busy, {how} ({waiting} pending)", short(agent));
             }
         }
     }
     Ok(())
+}
+
+/// Kinds that report the work finished: the lead must not get one from an agent that skipped its mail.
+const REPORT_KINDS: [&str; 4] = ["DONE", "MERGED", "READY", "REPORT"];
+
+/// The text of a report-kind tell `me` sends. With unread tells it is refused (`Err` holds them,
+/// one per line) unless `force`, which records them in the text so the lead sees it.
+fn report_text(
+    s: &State,
+    me: &str,
+    kind: &str,
+    text: String,
+    force: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<String, String> {
+    let mail = s.unread_for(me, now);
+    if !REPORT_KINDS
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case(kind.trim()))
+        || mail.is_empty()
+    {
+        return Ok(text);
+    }
+    if !force {
+        let lines: Vec<String> = mail.iter().map(|(id, m)| ui::mail_line(id, m)).collect();
+        return Err(lines.join("\n"));
+    }
+    let tells: Vec<String> = mail
+        .iter()
+        .map(|(_, m)| format!("{} {} from {}", m.kind, m.reference, short(&m.from)))
+        .collect();
+    let plural = if tells.len() == 1 { "" } else { "s" };
+    Ok(format!(
+        "{text} [forced past {} unread tell{plural}: {}]",
+        tells.len(),
+        tells.join(", ")
+    ))
 }
 
 /// `agent-fleet read`'s acks: one `msg.read` from `me` per tell `unread_for` shows it.
@@ -2403,6 +2577,101 @@ mod tests {
         );
         // The role name stays in the message, so delivery follows the role to its holder.
         assert_eq!(tell_to(&s, COORDINATOR).unwrap(), COORDINATOR);
+    }
+
+    #[test]
+    fn a_report_with_unread_tells_is_refused_unless_forced() {
+        let mut s = State::default();
+        let me = "agent:h/s/dv-1";
+        let now = Utc::now();
+        let send =
+            |s: &State, kind: &str, force| report_text(s, me, kind, "shipped".into(), force, now);
+        // Clean path: no unread tells.
+        for k in REPORT_KINDS {
+            assert_eq!(send(&s, k, false).unwrap(), "shipped");
+        }
+        s.msgs.insert(
+            "01A".into(),
+            state::Msg {
+                from: "agent:h/s/lead".into(),
+                to: me.into(),
+                kind: "ASK".into(),
+                reference: "o/r#1".into(),
+                text: "rebase first".into(),
+                since: Utc::now(),
+            },
+        );
+        for k in REPORT_KINDS {
+            let err = send(&s, k, false).unwrap_err();
+            assert!(
+                err.contains("rebase first"),
+                "{k} lists the unread tell: {err}"
+            );
+        }
+        assert!(
+            send(&s, "done", false).is_err(),
+            "kind case does not matter"
+        );
+        assert_eq!(
+            send(&s, "OPEN", false).unwrap(),
+            "shipped",
+            "other kinds pass"
+        );
+        assert_eq!(
+            send(&s, "DONE", true).unwrap(),
+            "shipped [forced past 1 unread tell: ASK o/r#1 from lead]"
+        );
+    }
+
+    #[test]
+    fn tell_force_parses_before_the_text_and_defaults_off() {
+        let f = |a: &[&str]| match Cli::try_parse_from(a).unwrap().cmd {
+            Cmd::Tell { force, text, .. } => (force, text),
+            _ => panic!("not a tell"),
+        };
+        let (force, text) = f(&[
+            "agent-fleet",
+            "tell",
+            "--force",
+            "lead",
+            "DONE",
+            "r",
+            "all",
+            "done",
+        ]);
+        assert!(force && text == ["all", "done"]);
+        assert!(!f(&["agent-fleet", "tell", "lead", "DONE", "r", "t"]).0);
+    }
+
+    #[test]
+    fn hook_mail_eats_any_arguments() {
+        assert!(Cli::try_parse_from(["agent-fleet", "hook", "mail", "--bogus", "x"]).is_ok());
+    }
+
+    #[test]
+    fn stats_defaults_to_the_scorecard_and_log_keeps_the_old_vitals() {
+        let stats = |a: &[&str]| match Cli::try_parse_from(a).unwrap().cmd {
+            Cmd::Stats {
+                since,
+                by,
+                log,
+                json,
+            } => (since, by, log, json),
+            _ => panic!("not stats"),
+        };
+        assert_eq!(
+            stats(&["agent-fleet", "stats"]),
+            (None, scorecard::By::Profile, false, false)
+        );
+        assert_eq!(
+            stats(&["agent-fleet", "stats", "--log", "--since", "7d", "--json"]),
+            (Some(7 * 86400), scorecard::By::Profile, true, true)
+        );
+        assert_eq!(
+            stats(&["agent-fleet", "stats", "--by", "kind"]).1,
+            scorecard::By::Kind
+        );
+        assert!(Cli::try_parse_from(["agent-fleet", "stats", "--by", "bogus"]).is_err());
     }
 
     #[test]

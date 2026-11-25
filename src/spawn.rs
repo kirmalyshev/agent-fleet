@@ -56,6 +56,13 @@ pub struct FleetConfig {
     /// `[orphan_pr]`: which repos `doctor` looks at for PRs no live agent owns.
     #[serde(default)]
     pub orphan_pr: crate::orphanpr::Config,
+    /// `[chores]`: the host's nudges, spawn queue and sweep command for this project.
+    #[serde(default)]
+    pub chores: crate::chores::Config,
+    /// `[idle]`: when the host rings a lead about an idle agent, and whether it retires a
+    /// finished one.
+    #[serde(default)]
+    pub idle: crate::idle::Config,
     /// `[repos]`: `owner/repo` → this machine's checkout. Read only from the machine's own
     /// fleet.toml (`agent-fleet repo add`); ignored in a checkout's. The host reads it through
     /// `setup::registered`, which needs no valid rules.
@@ -115,13 +122,29 @@ pub struct Rule {
     #[serde(rename = "match")]
     #[serde(default)]
     pub keywords: Option<Vec<String>>,
-    pub profile: String,
+    /// One profile, or a list: the spawn takes the least-loaded listed profile that is under its
+    /// `cap` and has quota on the host (list order breaks ties).
+    #[serde(deserialize_with = "one_or_many")]
+    pub profile: Vec<String>,
     /// The host to spawn on [default: the host running the CLI].
     #[serde(default)]
     pub host: Option<String>,
     /// The `agent.role` level declared for the new agent [default: implementer].
     #[serde(default)]
     pub level: Option<Level>,
+}
+
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged, expecting = "a profile name or a list of profile names")]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
 }
 
 /// The first `needle` line, as ` (line 12: …)`, for an error that blames a line.
@@ -182,6 +205,9 @@ impl FleetConfig {
             check_ready(r)
                 .with_context(|| format!("fleet.toml: retire {r:?}{}", line_of(src, "retire")))?;
         }
+        self.chores
+            .check(&self.profiles)
+            .map_err(|e| anyhow::anyhow!("fleet.toml: {e}"))?;
         let mut by_prefix: BTreeMap<&str, &str> = BTreeMap::new();
         for (name, p) in &self.profiles {
             if let Some(f) = &p.fallback
@@ -234,12 +260,32 @@ impl FleetConfig {
         }
         let mut defaults = 0;
         for (i, r) in self.rules.iter().enumerate() {
-            if !self.profiles.contains_key(&r.profile) {
+            if r.profile.is_empty() {
+                bail!(
+                    "fleet.toml: rule {} names no profile{}",
+                    i + 1,
+                    nth_rule(src, i)
+                );
+            }
+            if let Some(bad) = r.profile.iter().find(|p| !self.profiles.contains_key(*p)) {
                 bail!(
                     "fleet.toml: rule {} names an unknown profile {:?}{}",
                     i + 1,
-                    r.profile,
-                    line_of(src, &format!("profile = \"{}\"", r.profile))
+                    bad,
+                    nth_rule(src, i)
+                );
+            }
+            if let Some(dup) = r
+                .profile
+                .iter()
+                .enumerate()
+                .find_map(|(j, p)| r.profile[..j].contains(p).then_some(p))
+            {
+                bail!(
+                    "fleet.toml: rule {} lists profile {:?} twice{}",
+                    i + 1,
+                    dup,
+                    nth_rule(src, i)
                 );
             }
             if r.keywords.as_ref().is_none_or(|k| k.is_empty()) {
@@ -475,13 +521,13 @@ pub fn decide(
     local_host: &str,
 ) -> Result<Decision> {
     let mut why = Vec::new();
-    let (mut profile, rule_host, rule_level) = match o.profile {
+    let (mut profile, rule_host, rule_level, listed) = match o.profile {
         Some(p) => {
             if !cfg.profiles.contains_key(p) {
                 bail!("no profile {p:?} in fleet.toml");
             }
             why.push(format!("--profile {p}"));
-            (p.to_string(), None, None)
+            (p.to_string(), None, None, Vec::new())
         }
         None => {
             let (i, kw) = cfg
@@ -502,7 +548,15 @@ pub fn decide(
                 Some(k) => format!("matched {k:?}"),
                 None => "default rule".into(),
             });
-            (rule.profile.clone(), rule.host.clone(), rule.level)
+            (
+                rule.profile
+                    .first()
+                    .cloned()
+                    .context("fleet.toml: rule names no profile")?,
+                rule.host.clone(),
+                rule.level,
+                rule.profile.clone(),
+            )
         }
     };
     let host = o
@@ -511,31 +565,86 @@ pub fn decide(
         .unwrap_or(local_host)
         .to_string();
     let level = o.level.or(rule_level).unwrap_or(Level::Implementer);
+    let load = |profile: &str| {
+        let live = state
+            .agents
+            .keys()
+            .filter_map(|a| state.spawn_of(a))
+            .filter(|s| s.request.profile == profile && s.request.repo == issue.repo)
+            .count();
+        let pending = state
+            .spawns
+            .values()
+            .filter(|s| {
+                s.result.is_none()
+                    && s.request.profile == profile
+                    && s.request.repo == issue.repo
+                    && Utc::now() - s.since <= REQUEST_MAX_AGE
+            })
+            .count();
+        live + pending
+    };
+    let no_quota = |profile: &str| {
+        state
+            .quotas
+            .get(&format!("{host}:{}", cfg.profiles[profile].kind))
+            .is_some_and(|q| q.exhausted_at(Utc::now()))
+    };
+    // A rule that lists several profiles: the least-loaded one with a seat and quota; the list
+    // order breaks ties. Load counts this repo's agents and pending requests on every host,
+    // quota is the target host's.
+    if listed.len() > 1 {
+        let mut pick: Option<(usize, &String)> = None;
+        let mut any_full = false;
+        for p in &listed {
+            let cap = cfg.profiles[p].cap;
+            let n = load(p);
+            let full = cap.is_some_and(|c| n >= c as usize);
+            let out = no_quota(p);
+            if full {
+                any_full = true;
+                why.push(format!("{p} at cap {}", cap.unwrap_or(0)));
+            }
+            if out {
+                why.push(format!(
+                    "{p} skipped: {} quota exhausted on {host}",
+                    cfg.profiles[p].kind
+                ));
+            }
+            if !full && !out && pick.is_none_or(|(m, _)| n < m) {
+                pick = Some((n, p));
+            }
+        }
+        if let Some((n, p)) = pick {
+            why.push(format!(
+                "picked {p} ({n} in use) of [{}]",
+                listed.join(", ")
+            ));
+            return Ok(Decision {
+                profile: p.clone(),
+                host,
+                level,
+                why: why.join("; "),
+            });
+        }
+        // A seat may free up: wait. Only when every one is out of quota does the first one's
+        // fallback chain take over.
+        if any_full {
+            bail!(
+                "no seat among [{}]: {}; wait for one to free",
+                listed.join(", "),
+                why.join("; ")
+            );
+        }
+        match &cfg.profiles[&listed[0]].fallback {
+            Some(f) => profile = f.clone(),
+            None => bail!("no profile can take it ({})", why.join("; ")),
+        }
+    }
     loop {
         let p = &cfg.profiles[&profile];
-        let full = p.cap.is_some_and(|cap| {
-            let live = state
-                .agents
-                .keys()
-                .filter_map(|a| state.spawn_of(a))
-                .filter(|s| s.request.profile == profile && s.request.repo == issue.repo)
-                .count();
-            let pending = state
-                .spawns
-                .values()
-                .filter(|s| {
-                    s.result.is_none()
-                        && s.request.profile == profile
-                        && s.request.repo == issue.repo
-                        && Utc::now() - s.since <= REQUEST_MAX_AGE
-                })
-                .count();
-            live + pending >= cap as usize
-        });
-        let out = state
-            .quotas
-            .get(&format!("{host}:{}", p.kind))
-            .is_some_and(|q| q.exhausted_at(Utc::now()));
+        let full = p.cap.is_some_and(|cap| load(&profile) >= cap as usize);
+        let out = no_quota(&profile);
         if !full && !out {
             break;
         }
@@ -642,6 +751,7 @@ pub fn lead_name(state: &State, id: &str) -> String {
 
 /// The `spawn.requested` a handoff writes: the agent's repo, issue, branch and EXISTING
 /// worktree to a new agent of `to`, with `replaces` naming the agent to close.
+#[allow(clippy::too_many_arguments)] // ponytail: bundle into a struct if it grows again
 pub fn handoff_request(
     state: &State,
     cfg: &FleetConfig,
@@ -650,6 +760,7 @@ pub fn handoff_request(
     to: &str,
     extra: &str,
     title: &str,
+    machine: Option<&Path>,
 ) -> Result<SpawnRequested> {
     let old = &sp.request;
     let Some(p) = cfg.profiles.get(to) else {
@@ -695,7 +806,15 @@ pub fn handoff_request(
     ] {
         vals.insert(k.into(), v.to_string());
     }
-    let brief = render(brief_body(&src), &vals)?;
+    let mut brief = render(brief_body(&src), &vals)?;
+    if let (Level::RootCoordinator, Some(m)) = (level, machine) {
+        // A replacement coordinator is briefed as one: the handoff note, then the coordinator prompt.
+        brief = format!(
+            "{}\n\n{}",
+            handoff_note(&old.name, extra),
+            crate::setup::coordinator_prompt(m)?
+        );
+    }
     let why = match extra.is_empty() {
         true => format!("handoff: {} → {to}", old.name),
         false => format!("handoff: {} → {to} ({extra})", old.name),
@@ -718,6 +837,7 @@ pub fn handoff_request(
         lead,
         worktree: Some(worktree),
         replaces: Some(old.agent.clone()),
+        in_place: false,
         why,
     })
 }
@@ -1164,7 +1284,17 @@ async fn run_spawn(
     // worktree is the agent's own tree and is never read for config.
     let (cfg, prof) = host_profile(&checkout, host.cfg.config_dir.as_deref(), r)?;
     check_wire_fields(&checkout, r).await?;
-    let res = match &r.worktree {
+    if r.in_place && r.worktree.is_some() {
+        bail!("in_place and worktree are mutually exclusive");
+    }
+    // In place: the host's own checkout is the "existing worktree"; nothing is created, so a
+    // failure or a retire only ever closes the pane.
+    let existing = if r.in_place {
+        Some(checkout.to_string_lossy().into_owned())
+    } else {
+        r.worktree.clone()
+    };
+    let res = match &existing {
         Some(wt) => {
             if !Path::new(wt).is_dir() {
                 bail!("no such worktree: {wt}");
@@ -1227,9 +1357,7 @@ async fn run_spawn(
         .as_str()
         .context("worktree/workspace create: no workspace.workspace_id")?
         .to_string();
-    let wt = r
-        .worktree
-        .clone()
+    let wt = existing
         .or_else(|| res["worktree"]["path"].as_str().map(str::to_string))
         .or_else(|| {
             res["workspace"]["worktree"]["checkout_path"]
@@ -1401,6 +1529,42 @@ pub(crate) fn tail(s: &str) -> String {
     s[i..].to_string()
 }
 
+/// Answers request `id` with a failed `spawn.result` and rings `SPAWN-FAILED <name>: <error>` to
+/// whoever asked and to the agent's lead (once each): a `--no-wait` requester is not watching.
+async fn reject(host: &Host, id: &str, sp: &Spawn, error: &str) {
+    let r = &sp.request;
+    host.publish(
+        host.presence(Known::SpawnResult(SpawnResult {
+            agent: r.agent.clone(),
+            ok: false,
+            pane: None,
+            worktree: None,
+            error: Some(error.to_string()),
+        }))
+        .re(id),
+    )
+    .await;
+    let mut to: Vec<String> = [r.lead.clone(), Some(sp.by.clone())]
+        .into_iter()
+        .flatten()
+        .filter(|a| is_agent_id(a))
+        .collect();
+    to.dedup();
+    if to.is_empty() {
+        to.push(COORDINATOR.into());
+    }
+    for to in to {
+        host.publish(host.presence(Known::MsgSent(MsgSent {
+            to,
+            kind: "SPAWN-FAILED".into(),
+            reference: r.name.clone(),
+            text: error.to_string(),
+            closes: Vec::new(),
+        })))
+        .await;
+    }
+}
+
 /// Executes one `spawn.requested` and answers it with `spawn.result`.
 pub async fn execute(host: &Host, id: &str, sp: &Spawn, state: &State) {
     let Some(_busy) = host.busy_guard(format!("spawn of {}", sp.request.agent)) else {
@@ -1444,17 +1608,7 @@ pub async fn execute(host: &Host, id: &str, sp: &Spawn, state: &State) {
         }
         Err(err) => {
             undo(host, r, &made).await;
-            host.publish(
-                host.presence(Known::SpawnResult(SpawnResult {
-                    agent: r.agent.clone(),
-                    ok: false,
-                    pane: None,
-                    worktree: None,
-                    error: Some(tail(&format!("{err:#}"))),
-                }))
-                .re(id),
-            )
-            .await;
+            reject(host, id, sp, &tail(&format!("{err:#}"))).await;
         }
     }
 }
@@ -1473,7 +1627,7 @@ fn reached_working(events: &[Event], agent: &str, since: DateTime<Utc>) -> bool 
 
 /// The id prefix for this host agent's agents: `agent:<host>/<session>/`. Two `agent-fleet
 /// host` processes on one machine serve different sessions; only mine are mine.
-fn agent_prefix(host: &str, session: &str) -> String {
+pub(crate) fn agent_prefix(host: &str, session: &str) -> String {
     format!("agent:{host}/{session}/")
 }
 
@@ -1591,6 +1745,7 @@ pub async fn hand_off(
         to,
         extra,
         &task_title(state, sp).await,
+        host.cfg.config_dir.as_deref(),
     )?;
     if state.agents.contains_key(&req.agent) {
         bail!("{} is already up", req.agent);
@@ -1699,29 +1854,146 @@ async fn handoffs(
             }
         }
         // Everything else is a tell: one per episode, deduped through the log.
-        let Some(to) = crate::doctor::escalate(state, id) else {
-            continue;
+        let sent = |to: &str, kind: &str| {
+            events.iter().any(|e| {
+                e.ts > a.since
+                    && matches!(&e.body,
+                        Body::Known(Known::MsgSent(m))
+                            if m.to == to && m.kind == kind && m.reference == name)
+            })
         };
-        let kind = match cause {
-            StuckCause::Quota => "QUOTA",
-            _ => "NEVER_STARTED",
-        };
-        if events.iter().any(|e| {
-            e.ts > a.since
-                && matches!(&e.body,
-                    Body::Known(Known::MsgSent(m))
-                        if m.to == to && m.kind == kind && m.reference == name)
-        }) {
+        let mut tells: Vec<(String, &str)> = Vec::new();
+        // The requester may be watching nothing (`--no-wait`): a spawn that never worked is its
+        // failure, whether or not the agent has a lead. It gets SPAWN-FAILED instead of the lead's kind.
+        let requester = (cause != StuckCause::Quota && is_agent_id(&sp.by)).then(|| sp.by.clone());
+        if let Some(r) = &requester {
+            tells.push((r.clone(), "SPAWN-FAILED"));
+        }
+        if let Some(to) = crate::doctor::escalate(state, id)
+            && requester.as_deref() != Some(to)
+        {
+            let kind = match cause {
+                StuckCause::Quota => "QUOTA",
+                _ => "NEVER_STARTED",
+            };
+            tells.push((to.to_string(), kind));
+        }
+        for (to, kind) in tells {
+            if sent(&to, kind) {
+                continue;
+            }
+            host.publish(host.presence(Known::MsgSent(MsgSent {
+                to,
+                kind: kind.into(),
+                reference: name.to_string(),
+                text: text.clone(),
+                closes: Vec::new(),
+            })))
+            .await;
+        }
+    }
+}
+
+/// An agent that asked (`BLOCKED`/`QUESTION`) and sits idle with no word from its lead is
+/// re-rung to that lead once, as `STILL-WAITING <agent>: <the ask>`. The reducer marks it rung
+/// (`re` = the ask), so a restart does not ring twice.
+async fn still_waiting(host: &Host, state: &State) {
+    let prefix = agent_prefix(&host.cfg.host, &host.cfg.session);
+    let min = chrono::Duration::minutes(host.cfg.waiting_min as i64);
+    for (agent, w) in state.unanswered(&host.cfg.host, Utc::now(), min) {
+        if !agent.starts_with(&prefix) {
             continue;
         }
-        host.publish(host.presence(Known::MsgSent(MsgSent {
-            to: to.to_string(),
-            kind: kind.into(),
-            reference: name.to_string(),
-            text,
-            closes: Vec::new(),
-        })))
+        host.publish(
+            host.presence(Known::MsgSent(MsgSent {
+                to: w.to.clone(),
+                kind: crate::state::STILL_WAITING.into(),
+                reference: short(agent).into(),
+                text: w.text.clone(),
+                closes: Vec::new(),
+            }))
+            .re(&w.id),
+        )
         .await;
+    }
+}
+
+/// Idle agents are rung to their lead (`IDLE`, `HELD`, `UNMANAGED`); a finished one is retired
+/// when its project's `[idle] auto_retire` says so. The reducer marks each ring, so a restart
+/// does not ring twice.
+async fn idle(host: &Host, state: &State) {
+    let prefix = agent_prefix(&host.cfg.host, &host.cfg.session);
+    let cfgs: BTreeMap<String, crate::idle::Config> = host
+        .cfg
+        .checkouts_now()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(repo, dir)| {
+            let (fc, _) = load_in(&dir, host.cfg.config_dir.as_deref()).ok()?;
+            Some((repo, fc.idle))
+        })
+        .collect();
+    // A hand-started agent has no repo: only the projects' `exempt` lists apply to it.
+    let any_exempt: Vec<String> = cfgs.values().flat_map(|c| c.exempt.clone()).collect();
+    let cfg = |id: &str| {
+        find_spawn(state, id)
+            .and_then(|sp| cfgs.get(&sp.request.repo))
+            .cloned()
+            .unwrap_or_else(|| crate::idle::Config {
+                exempt: any_exempt.clone(),
+                ..Default::default()
+            })
+    };
+    for (agent, act) in crate::idle::due(state, &host.cfg.host, Utc::now(), &cfg) {
+        if !agent.starts_with(&prefix) {
+            continue;
+        }
+        // An agent waiting on its own background shell is working: no IDLE/HELD ring, no
+        // retire. Read only for an act that would fire; an unreadable screen changes nothing.
+        // ponytail: a shell that never ends mutes only HELD_CAP; then the ring goes through.
+        let waiting = !matches!(
+            &act,
+            crate::idle::Act::Ring {
+                kind: "UNMANAGED",
+                ..
+            }
+        ) && state
+            .agents
+            .get(&agent)
+            .is_some_and(|a| Utc::now() - a.since < crate::idle::HELD_CAP)
+            && crate::stuck::screen(host, &agent)
+                .await
+                .is_some_and(|sc| crate::stuck::background_shell(&sc));
+        if waiting {
+            continue;
+        }
+        match act {
+            crate::idle::Act::Ring { to, kind, text } => {
+                host.publish(host.presence(Known::MsgSent(MsgSent {
+                    to,
+                    kind: kind.into(),
+                    reference: agent.clone(),
+                    text,
+                    closes: Vec::new(),
+                })))
+                .await;
+            }
+            crate::idle::Act::Retire => {
+                let Some(sp) = find_spawn(state, &agent) else {
+                    continue;
+                };
+                host.publish(Envelope::new(
+                    host.actor(),
+                    &sp.project,
+                    Known::RetireRequested(crate::event::RetireRequested {
+                        agent: agent.clone(),
+                        host: host.cfg.host.clone(),
+                        decide: None,
+                    }),
+                ))
+                .await;
+            }
+        }
     }
 }
 
@@ -1916,6 +2188,7 @@ pub async fn spawn_loop(host: Arc<Host>) {
     let mut stuck_seen = crate::stuck::Seen::default();
     let mut retire_seen: HashSet<String> = HashSet::new();
     let mut merge_seen: HashSet<String> = HashSet::new();
+    let mut chores_seen = crate::chores::Seen::default();
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
         // A self-update restart is waiting for the work in flight: start none.
@@ -1940,21 +2213,7 @@ pub async fn spawn_loop(host: Arc<Host>) {
         );
         for id in expired {
             if let Some(sp) = state.spawns.get(&id) {
-                host.publish(
-                    Envelope::new(
-                        host.actor(),
-                        &sp.project,
-                        Known::SpawnResult(SpawnResult {
-                            agent: sp.request.agent.clone(),
-                            ok: false,
-                            pane: None,
-                            worktree: None,
-                            error: Some("expired".into()),
-                        }),
-                    )
-                    .re(&id),
-                )
-                .await;
+                reject(&host, &id, sp, "expired").await;
             }
         }
         for id in todo {
@@ -1966,6 +2225,9 @@ pub async fn spawn_loop(host: Arc<Host>) {
         crate::merge::serve(&host, &mut merge_seen);
         handoffs(&host, state, events, &mut handed, &mut warned).await;
         stuck(&host, state, events, &mut stuck_seen, &handed).await;
+        still_waiting(&host, state).await;
+        idle(&host, state).await;
+        crate::chores::serve(&host, state, &mut chores_seen).await;
     }
 }
 
@@ -2055,13 +2317,25 @@ profile = "devin"
     }
 
     #[test]
+    fn chores_parse_and_the_queue_profile_needs_a_cap() {
+        let on = format!(
+            "{CFG}\n[chores.queue]\nfile = \"q\"\nprofile = \"opus\"\n[chores.sweep]\nrun = [\"x\"]\n"
+        );
+        let e = cfg(&on).unwrap_err().to_string();
+        assert!(e.contains("no `cap`"), "{e}");
+        assert!(cfg(&format!("{CFG}\n[chores.sweep]\nrun = [\"x\"]\n")).is_ok());
+        let ok = format!("{CFG}\n[chores.queue]\nfile = \"q\"\nprofile = \"devin\"\n");
+        assert!(cfg(&ok).is_ok());
+    }
+
+    #[test]
     fn config_validation_names_the_wrong_line() {
         assert!(cfg(CFG).is_ok());
         let e = cfg(&CFG.replace("profile = \"opus\"", "profile = \"nope\""))
             .unwrap_err()
             .to_string();
         assert!(
-            e.contains("unknown profile") && e.contains("profile = \"nope\""),
+            e.contains("unknown profile") && e.contains("[[rules]]"),
             "{e}"
         );
         let e = cfg(&CFG.replace("fallback = \"sonnet\"", "fallback = \"devin\""))
@@ -2139,6 +2413,7 @@ profile = "devin"
                 lead: None,
                 worktree: None,
                 replaces: None,
+                in_place: false,
                 why: String::new(),
             };
             s.apply(
@@ -2225,6 +2500,224 @@ profile = "devin"
     }
 
     #[test]
+    fn a_rule_may_name_several_profiles() {
+        const LIST: &str = r#"
+brief = "b.md"
+[profiles.devin]
+kind = "devin"
+cap = 2
+prefix = "dv-"
+fallback = "sonnet"
+[profiles.codex]
+kind = "codex"
+cap = 2
+prefix = "cx-"
+[profiles.agy]
+kind = "agy"
+cap = 2
+prefix = "ag-"
+[profiles.sonnet]
+kind = "claude"
+prefix = "s-"
+[[rules]]
+profile = ["devin", "codex", "agy"]
+"#;
+        let c = cfg(LIST).unwrap();
+        // a single string still parses
+        assert!(cfg(&CFG.replace("profile = \"opus\"", "profile = [\"opus\"]")).is_ok());
+        // an unknown or empty list is refused
+        let e = cfg(&LIST.replace("\"agy\"]", "\"nope\"]"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("unknown profile") && e.contains("nope"), "{e}");
+        let e = cfg(&LIST.replace("[\"devin\", \"codex\", \"agy\"]", "[]"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("names no profile"), "{e}");
+
+        let mut s = State::default();
+        let pick = |s: &State| decide(&c, &issue("x", &[]), &Overrides::default(), s, "h");
+        let quota_out = |s: &mut State, kind: &str| {
+            s.quotas.insert(
+                format!("h:{kind}"),
+                crate::state::Quota {
+                    windows: vec![],
+                    plan: None,
+                    exhausted: true,
+                    read_at: Utc::now(),
+                    ts: Utc::now(),
+                    exhausted_since: Some(Utc::now()),
+                },
+            );
+        };
+        let up = |s: &mut State, name: &str, profile: &str, done: bool| {
+            let id = format!("agent:h/s/{name}");
+            s.agents.insert(
+                id.clone(),
+                crate::state::Agent {
+                    host: "h".into(),
+                    kind: None,
+                    pane: None,
+                    state: AgentState::Idle,
+                    since: Utc::now(),
+                    worked: None,
+                    finished: None,
+                    usage: None,
+                },
+            );
+            let req = SpawnRequested {
+                name: name.into(),
+                agent: id,
+                host: "h".into(),
+                session: "s".into(),
+                repo: "o/r".into(),
+                issue: Some(1),
+                branch: "b".into(),
+                profile: profile.into(),
+                brief: String::new(),
+                level: None,
+                lead: None,
+                worktree: None,
+                replaces: None,
+                in_place: false,
+                why: String::new(),
+            };
+            let req_ev = Envelope::new(
+                Actor {
+                    kind: ActorKind::Agent,
+                    id: "agent:h/s/x".into(),
+                },
+                "p",
+                Known::SpawnRequested(Box::new(req)),
+            )
+            .into_event();
+            s.apply(&req_ev);
+            let res = Envelope::new(
+                Actor {
+                    kind: ActorKind::Host,
+                    id: "host:h".into(),
+                },
+                "p",
+                Known::SpawnResult(SpawnResult {
+                    agent: format!("agent:h/s/{name}"),
+                    ok: true,
+                    pane: None,
+                    worktree: None,
+                    error: None,
+                }),
+            )
+            .re(&req_ev.id)
+            .into_event();
+            if done {
+                s.apply(&res);
+            }
+        };
+        // all idle: list order breaks the tie
+        assert_eq!(pick(&s).unwrap().profile, "devin");
+        // least-loaded wins: devin has one, codex and agy none → codex
+        up(&mut s, "a", "devin", true);
+        let d = pick(&s).unwrap();
+        assert_eq!(d.profile, "codex");
+        assert!(
+            d.why.contains("default rule") && d.why.contains("codex"),
+            "{}",
+            d.why
+        );
+        // a profile at cap is skipped, not fatal
+        up(&mut s, "b", "devin", true);
+        up(&mut s, "c", "codex", true);
+        up(&mut s, "d", "agy", true);
+        up(&mut s, "e", "agy", true);
+        let d = pick(&s).unwrap();
+        assert_eq!(d.profile, "codex");
+        assert!(d.why.contains("devin at cap 2"), "{}", d.why);
+        assert!(d.why.contains("agy at cap 2"), "{}", d.why);
+        // quota out is skipped
+        let mut s3 = State::default();
+        up(&mut s3, "f", "devin", true);
+        quota_out(&mut s3, "codex");
+        let d = pick(&s3).unwrap();
+        assert_eq!(d.profile, "agy");
+        assert!(
+            d.why.contains("codex skipped: codex quota exhausted on h"),
+            "{}",
+            d.why
+        );
+        // every listed profile full: no seat
+        up(&mut s, "g", "codex", true);
+        let e = pick(&s).unwrap_err().to_string();
+        assert!(e.contains("no seat"), "{e}");
+        // a pending request counts like a live agent
+        let mut sp = State::default();
+        up(&mut sp, "p1", "devin", false);
+        up(&mut sp, "p2", "devin", false);
+        up(&mut sp, "p3", "codex", false);
+        assert_eq!(pick(&sp).unwrap().profile, "agy");
+        // cap and quota in one decision: both reasons, then the free one
+        let mut mixed = State::default();
+        up(&mut mixed, "m1", "devin", true);
+        up(&mut mixed, "m2", "devin", true);
+        quota_out(&mut mixed, "codex");
+        let d = pick(&mixed).unwrap();
+        assert_eq!(d.profile, "agy");
+        assert!(
+            d.why.contains("devin at cap 2") && d.why.contains("codex skipped"),
+            "{}",
+            d.why
+        );
+        // full and out of quota: wait for the seat, never the fallback
+        up(&mut mixed, "m3", "agy", true);
+        up(&mut mixed, "m4", "agy", true);
+        let e = pick(&mixed).unwrap_err().to_string();
+        assert!(e.contains("no seat among [devin, codex, agy]"), "{e}");
+        // every one out of quota: the first one's fallback, and the line says why
+        let mut s2 = State::default();
+        for k in ["devin", "codex", "agy"] {
+            quota_out(&mut s2, k);
+        }
+        let d = pick(&s2).unwrap();
+        assert_eq!(d.profile, "sonnet");
+        assert!(
+            d.why.contains("agy skipped: agy quota exhausted on h"),
+            "{}",
+            d.why
+        );
+        // a one-element list is the single-name rule
+        let one = cfg(&LIST.replace("[\"devin\", \"codex\", \"agy\"]", "[\"codex\"]")).unwrap();
+        assert_eq!(one.rules[0].profile, ["codex"]);
+        assert_eq!(
+            decide(
+                &one,
+                &issue("x", &[]),
+                &Overrides::default(),
+                &State::default(),
+                "h"
+            )
+            .unwrap()
+            .profile,
+            "codex"
+        );
+        // a list names a profile twice: refused, on the rule's line
+        let e = cfg(&LIST.replace("\"codex\", \"agy\"]", "\"devin\"]"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("twice") && e.contains("[[rules]]"), "{e}");
+        // a wrong type names `profile`'s rule
+        assert!(cfg(&LIST.replace("[\"devin\", \"codex\", \"agy\"]", "5")).is_err());
+        // --profile still bypasses the list
+        let o = Overrides {
+            profile: Some("agy"),
+            ..Overrides::default()
+        };
+        assert_eq!(
+            decide(&c, &issue("x", &[]), &o, &State::default(), "h")
+                .unwrap()
+                .profile,
+            "agy"
+        );
+    }
+
+    #[test]
     fn brief_render_is_one_pass_and_names_missing_tokens() {
         let mut vals: BTreeMap<String, String> =
             [("A".into(), "@@B@@".into()), ("B".into(), "bee".into())]
@@ -2258,6 +2751,7 @@ profile = "devin"
             lead: None,
             worktree: None,
             replaces: None,
+            in_place: false,
             why: String::new(),
         };
         let actor = || Actor {
@@ -2419,6 +2913,7 @@ profile = "devin"
             config_dir: None,
             locks: Vec::new(),
             stall_min: 15,
+            waiting_min: 10,
             stuck_act,
         }
     }
@@ -2497,6 +2992,7 @@ profile = "devin"
             lead: Some("agent:h/s/me".into()),
             worktree: wt,
             replaces: None,
+            in_place: false,
             why: "t".into(),
         }
     }
@@ -2643,6 +3139,27 @@ profile = "devin"
         );
     }
     #[test]
+    fn a_handoff_of_an_in_place_agent_never_retires_the_checkout() {
+        let mut r = req(None);
+        r.in_place = true;
+        let s = state_with(vec![
+            answered(r, "agent:h/s/a", "/main", 0),
+            answered(req(Some("/main".into())), "agent:h/s/b", "/main", 10),
+        ]);
+        assert_eq!(s.retire_target("agent:h/s/a", "h"), None);
+        assert_eq!(s.retire_target("agent:h/s/b", "h"), None);
+    }
+    #[test]
+    fn an_in_place_agent_does_not_inherit_an_older_spawns_tree_of_the_same_name() {
+        let mut r = req(None);
+        r.in_place = true;
+        let s = state_with(vec![
+            answered(req(None), "agent:h/s/a", "/w/old", 0),
+            answered(r, "agent:h/s/a", "/main", 10),
+        ]);
+        assert_eq!(s.retire_target("agent:h/s/a", "h"), None);
+    }
+    #[test]
     fn retire_target_skips_a_tree_another_live_agent_works_in_or_a_handoff_still_pending() {
         let mut rv = answered(req(Some("/w".into())), "agent:h/s/rev", "/w", 20);
         let mut s = state_with(vec![
@@ -2772,6 +3289,34 @@ profile = "devin"
             r.ok && r.pane.as_deref() == Some("w:1")
                 && r.worktree.as_deref() == Some(wt.to_str().unwrap())
         );
+    }
+
+    #[tokio::test]
+    async fn an_in_place_spawn_opens_a_workspace_in_the_main_checkout_and_makes_no_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        let (host, stub) = run(
+            dir.path(),
+            &[("workspace.create", vec![ws_created("unused")])],
+        )
+        .await;
+        let mut r = req(None);
+        r.in_place = true;
+        execute(&host, "req1", &spawn_of(r), &State::default()).await;
+        let calls = stub.calls();
+        assert_eq!(calls[0], "workspace.create");
+        assert!(!calls.contains(&"worktree.create".to_string()));
+        let res = result(&host).unwrap();
+        assert!(res.ok, "{:?}", res.error);
+        assert_eq!(res.worktree.as_deref(), Some(co.to_str().unwrap()));
+    }
+
+    #[test]
+    fn an_in_place_spawn_is_never_a_retire_target() {
+        let mut r = req(None);
+        r.in_place = true;
+        let s = state_with(vec![answered(r, "agent:h/s/a", "/main", 0)]);
+        assert_eq!(s.retire_target("agent:h/s/a", "h"), None);
     }
 
     #[tokio::test]
@@ -2922,6 +3467,42 @@ profile = "devin"
         assert!(calls.contains(&"worktree.remove".into()), "{calls:?}");
         let r = result(&host).unwrap();
         assert!(!r.ok && r.error.as_deref().unwrap().contains("agent.start"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_in_place_spawn_closes_the_workspace_and_never_touches_the_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        let (host, stub) = run(
+            dir.path(),
+            &[
+                ("workspace.create", vec![ws_created("unused")]),
+                ("agent.start", vec![err("agent_broken")]),
+            ],
+        )
+        .await;
+        let mut r = req(None);
+        r.in_place = true;
+        execute(&host, "req1", &spawn_of(r), &State::default()).await;
+        let calls = stub.calls();
+        assert!(calls.contains(&"pane.close".into()), "{calls:?}");
+        assert!(calls.contains(&"workspace.close".into()), "{calls:?}");
+        assert!(!calls.contains(&"worktree.remove".into()), "{calls:?}");
+        assert!(co.join(".git").is_dir());
+        assert!(!result(&host).unwrap().ok);
+    }
+
+    #[tokio::test]
+    async fn in_place_with_a_worktree_is_refused_before_anything_is_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, stub) = run(dir.path(), &[]).await;
+        let mut r = req(Some("/w".into()));
+        r.in_place = true;
+        execute(&host, "req1", &spawn_of(r), &State::default()).await;
+        let res = result(&host).unwrap();
+        assert!(!res.ok && res.error.unwrap().contains("mutually exclusive"));
+        assert!(stub.calls().is_empty());
     }
 
     #[tokio::test]
@@ -3274,6 +3855,49 @@ profile = "devin"
     }
 
     #[test]
+    fn a_handed_off_root_coordinator_is_briefed_as_one() {
+        let c = cfg(CFG).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.md"), "implementer brief").unwrap();
+        let machine = tempfile::tempdir().unwrap();
+        crate::setup::init(machine.path(), &["claude"]).unwrap();
+        let mut r = req(Some("/w".into()));
+        r.level = Some(Level::RootCoordinator);
+        let sp = spawn_of(r);
+        let go = |m: Option<&Path>| {
+            handoff_request(&State::default(), &c, dir.path(), &sp, "sonnet", "", "", m)
+                .unwrap()
+                .brief
+        };
+        let b = go(Some(machine.path()));
+        assert!(
+            b.contains("name: coordinator") && !b.contains("implementer brief"),
+            "{b}"
+        );
+        assert_eq!(
+            go(None),
+            "implementer brief",
+            "no machine dir: the brief as before"
+        );
+        let mut r = req(Some("/w".into()));
+        r.level = Some(Level::Implementer);
+        let sp = spawn_of(r);
+        let b = handoff_request(
+            &State::default(),
+            &c,
+            dir.path(),
+            &sp,
+            "sonnet",
+            "",
+            "",
+            Some(machine.path()),
+        )
+        .unwrap()
+        .brief;
+        assert_eq!(b, "implementer brief", "only a root-coordinator changes");
+    }
+
+    #[test]
     fn lead_renders_coordinator_for_the_root_coordinator_and_the_id_otherwise() {
         let c = cfg(CFG).unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -3281,7 +3905,7 @@ profile = "devin"
         let sp = spawn_of(req(Some("/w".into())));
         let mut s = State::default();
         let brief = |s: &State| {
-            handoff_request(s, &c, dir.path(), &sp, "sonnet", "", "")
+            handoff_request(s, &c, dir.path(), &sp, "sonnet", "", "", None)
                 .unwrap()
                 .brief
         };
@@ -3325,9 +3949,18 @@ profile = "devin"
             answered: Some(Utc::now()),
         };
         // --to devin regenerates dv-7, the very agent being replaced.
-        let e = handoff_request(&State::default(), &c, dir.path(), &sp, "devin", "", "")
-            .unwrap_err()
-            .to_string();
+        let e = handoff_request(
+            &State::default(),
+            &c,
+            dir.path(),
+            &sp,
+            "devin",
+            "",
+            "",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("same agent"), "{e}");
     }
 
@@ -4359,7 +4992,9 @@ profile = "devin"
             .unwrap()
             .iter()
             .filter_map(|e| match &e.body {
-                Body::Known(Known::MsgSent(m)) => Some((m.kind.clone(), m.text.clone())),
+                Body::Known(Known::MsgSent(m)) if m.kind != "SPAWN-FAILED" => {
+                    Some((m.kind.clone(), m.text.clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -5003,6 +5638,394 @@ profile = "devin"
     }
 
     #[tokio::test]
+    async fn an_unanswered_ask_from_an_idle_agent_re_rings_its_lead_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run(dir.path(), &[]).await;
+        let mut s = State::default();
+        let a = "agent:h/s/a";
+        s.agents.insert(a.into(), live_agent());
+        s.agents.get_mut(a).unwrap().state = AgentState::Idle;
+        s.waiting.insert(
+            a.into(),
+            crate::state::Waiting {
+                id: "m1".into(),
+                to: "agent:h/s/lead".into(),
+                kind: "BLOCKED".into(),
+                text: "which way?".into(),
+                since: Utc::now() - chrono::Duration::minutes(30),
+                rung: false,
+            },
+        );
+        still_waiting(&host, &s).await;
+        let got: Vec<_> = msgs(&host)
+            .into_iter()
+            .filter(|m| m.kind == "STILL-WAITING")
+            .collect();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].to, "agent:h/s/lead");
+        assert_eq!(got[0].reference, "a");
+        assert_eq!(got[0].text, "which way?");
+    }
+
+    #[tokio::test]
+    async fn an_idle_agent_and_an_unmanaged_one_ring_their_lead() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run(dir.path(), &[]).await;
+        let prefix = agent_prefix(&host.cfg.host, &host.cfg.session);
+        let (a, lead) = (format!("{prefix}a"), format!("{prefix}lead"));
+        let mut s = State::default();
+        for id in [&a, &lead] {
+            s.agents.insert(id.clone(), live_agent());
+            s.agents.get_mut(id).unwrap().state = AgentState::Idle;
+            s.agents.get_mut(id).unwrap().since = Utc::now() - chrono::Duration::minutes(30);
+            s.agents.get_mut(id).unwrap().host = host.cfg.host.clone();
+        }
+        s.roles.insert(
+            a.clone(),
+            crate::state::Role {
+                level: crate::event::Level::Implementer,
+                lead: Some(lead.clone()),
+                domain: None,
+                by: "x".into(),
+                since: Utc::now(),
+            },
+        );
+        s.first_cwd.insert(a.clone(), "/w/a".into());
+        idle(&host, &s).await;
+        let got: Vec<_> = msgs(&host).into_iter().map(|m| m.kind).collect();
+        assert!(got.contains(&"IDLE".to_string()), "{got:?}");
+        assert!(got.contains(&"UNMANAGED".to_string()), "{got:?}");
+    }
+
+    const SHELL_FOOTER: &str =
+        "⏵⏵ bypass permissions on (shift+tab to cycle) · 1 shell still running";
+
+    /// A claude screen whose footer line is `footer`.
+    fn claude_screen(footer: &str) -> Value {
+        let rule = "─".repeat(40);
+        let text = format!("⏺ Eval started.\n\n{rule}\n❯ \n{rule}\n  {footer}\n");
+        json!({ "result": { "text": text } })
+    }
+
+    /// Agent `a`, led by `lead`, idle for `mins`.
+    fn idle_for(host: &Host, mins: i64) -> (State, String) {
+        let prefix = agent_prefix(&host.cfg.host, &host.cfg.session);
+        let (a, lead) = (format!("{prefix}a"), format!("{prefix}lead"));
+        let mut s = State::default();
+        for id in [&a, &lead] {
+            s.agents.insert(id.clone(), live_agent());
+            s.agents.get_mut(id).unwrap().state = AgentState::Idle;
+            s.agents.get_mut(id).unwrap().since = Utc::now() - chrono::Duration::minutes(mins);
+            s.agents.get_mut(id).unwrap().host = host.cfg.host.clone();
+        }
+        s.roles.insert(
+            a.clone(),
+            crate::state::Role {
+                level: crate::event::Level::Implementer,
+                lead: Some(lead),
+                domain: None,
+                by: "x".into(),
+                since: Utc::now(),
+            },
+        );
+        s.first_cwd.insert(a.clone(), "/w/a".into());
+        (s, a)
+    }
+
+    fn kinds(host: &Host) -> Vec<String> {
+        msgs(host).into_iter().map(|m| m.kind).collect()
+    }
+
+    #[tokio::test]
+    async fn an_agent_with_a_background_shell_running_is_not_rung_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run(
+            dir.path(),
+            &[("agent.read", vec![claude_screen(SHELL_FOOTER); 4])],
+        )
+        .await;
+        let (s, _) = idle_for(&host, 30);
+        idle(&host, &s).await;
+        let got = kinds(&host);
+        assert!(!got.contains(&"IDLE".to_string()), "{got:?}");
+        assert!(got.contains(&"UNMANAGED".to_string()), "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn the_ring_goes_through_once_the_footer_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run(
+            dir.path(),
+            &[(
+                "agent.read",
+                vec![
+                    claude_screen(SHELL_FOOTER),
+                    claude_screen("⏵⏵ bypass permissions on (shift+tab to cycle)"),
+                ],
+            )],
+        )
+        .await;
+        let (s, _) = idle_for(&host, 30);
+        idle(&host, &s).await;
+        assert!(!kinds(&host).contains(&"IDLE".to_string()));
+        idle(&host, &s).await;
+        assert!(
+            kinds(&host).contains(&"IDLE".to_string()),
+            "{:?}",
+            kinds(&host)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shell_that_never_ends_mutes_the_ring_only_for_held_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run(
+            dir.path(),
+            &[("agent.read", vec![claude_screen(SHELL_FOOTER); 4])],
+        )
+        .await;
+        let (s, _) = idle_for(&host, crate::idle::HELD_CAP.num_minutes() + 1);
+        idle(&host, &s).await;
+        assert!(
+            kinds(&host).contains(&"IDLE".to_string()),
+            "{:?}",
+            kinds(&host)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_agent_with_a_background_shell_running_is_not_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        let toml = co.join(".agent-fleet/fleet.toml");
+        let body = std::fs::read_to_string(&toml).unwrap();
+        std::fs::write(&toml, format!("{body}\n[idle]\nauto_retire = true\n")).unwrap();
+        let (host, _stub) = run(
+            dir.path(),
+            &[("agent.read", vec![claude_screen(SHELL_FOOTER); 4])],
+        )
+        .await;
+        let (mut s, a) = idle_for(&host, 30);
+        let mut r = req(None);
+        r.agent = a.clone();
+        r.name = "a".into();
+        r.issue = None;
+        s.apply(
+            &Envelope::new(
+                Actor {
+                    kind: ActorKind::Agent,
+                    id: "agent:h/s/lead".into(),
+                },
+                "p",
+                Known::SpawnRequested(Box::new(r)),
+            )
+            .into_event(),
+        );
+        s.reports.insert(
+            a,
+            crate::state::Report {
+                kind: "DONE".into(),
+                text: "shipped".into(),
+                since: Utc::now() - chrono::Duration::minutes(40),
+            },
+        );
+        idle(&host, &s).await;
+        let retires = host
+            .replica
+            .lock()
+            .unwrap()
+            .all()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(&e.body, Body::Known(Known::RetireRequested(_))))
+            .count();
+        assert_eq!(retires, 0);
+    }
+
+    #[tokio::test]
+    async fn fleet_toml_idle_drives_a_retire_asked_once_and_the_rings_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        let toml = co.join(".agent-fleet/fleet.toml");
+        let body = std::fs::read_to_string(&toml).unwrap();
+        std::fs::write(
+            &toml,
+            format!("{body}\n[idle]\nstale_min = 5\nauto_retire = true\n"),
+        )
+        .unwrap();
+        let (host, _stub) = run(dir.path(), &[]).await;
+        let (a, lead) = ("agent:h/s/a", "agent:h/s/lead");
+        let mut s = State::default();
+        let mut r = req(None);
+        r.agent = a.into();
+        r.name = "a".into();
+        r.issue = None;
+        s.apply(
+            &Envelope::new(
+                Actor {
+                    kind: ActorKind::Agent,
+                    id: lead.into(),
+                },
+                "p",
+                Known::SpawnRequested(Box::new(r)),
+            )
+            .into_event(),
+        );
+        for id in [a, lead] {
+            s.agents.insert(id.into(), live_agent());
+            s.agents.get_mut(id).unwrap().since = Utc::now() - chrono::Duration::minutes(11);
+        }
+        s.roles.insert(
+            a.into(),
+            crate::state::Role {
+                level: Level::Implementer,
+                lead: Some(lead.into()),
+                domain: None,
+                by: "x".into(),
+                since: Utc::now(),
+            },
+        );
+        s.reports.insert(
+            a.into(),
+            crate::state::Report {
+                kind: "DONE".into(),
+                text: "shipped".into(),
+                since: Utc::now() - chrono::Duration::minutes(12),
+            },
+        );
+        let fold = |s: &mut State| {
+            let all = host.replica.lock().unwrap().all().unwrap();
+            for e in all {
+                s.apply(&e);
+            }
+        };
+        let count = |kind: &str| msgs(&host).iter().filter(|m| m.kind == kind).count();
+        let retires = || {
+            host.replica
+                .lock()
+                .unwrap()
+                .all()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(&e.body, Body::Known(Known::RetireRequested(_))))
+                .count()
+        };
+        // finished + 11 min idle: retired (not rung); the agent has no spawn-less ring
+        idle(&host, &s).await;
+        fold(&mut s);
+        idle(&host, &s).await;
+        assert_eq!(retires(), 1);
+        assert_eq!(count("IDLE"), 0);
+        // an agent that asked to be retired is rung once past stale_min when auto_retire finds nothing
+        s.reports.clear();
+        s.retires.clear();
+        idle(&host, &s).await;
+        fold(&mut s);
+        idle(&host, &s).await;
+        assert_eq!(count("IDLE"), 1);
+        assert_eq!(retires(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_hand_started_agent_named_in_exempt_is_never_rung() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        let toml = co.join(".agent-fleet/fleet.toml");
+        let body = std::fs::read_to_string(&toml).unwrap();
+        std::fs::write(&toml, format!("{body}\n[idle]\nexempt = [\"asa-ads\"]\n")).unwrap();
+        let (host, _stub) = run(dir.path(), &[]).await;
+        let prefix = agent_prefix(&host.cfg.host, &host.cfg.session);
+        let (a, lead) = (format!("{prefix}a"), format!("{prefix}lead"));
+        let mut s = State::default();
+        for id in [&a, &lead] {
+            s.agents.insert(id.clone(), live_agent());
+            s.agents.get_mut(id).unwrap().since = Utc::now() - chrono::Duration::minutes(60);
+            s.agents.get_mut(id).unwrap().host = host.cfg.host.clone();
+        }
+        s.roles.insert(
+            a.clone(),
+            crate::state::Role {
+                level: Level::Implementer,
+                lead: Some(lead.clone()),
+                domain: None,
+                by: "x".into(),
+                since: Utc::now(),
+            },
+        );
+        s.first_cwd.insert(a.clone(), "/w/asa-ads".into());
+        idle(&host, &s).await;
+        assert!(msgs(&host).is_empty(), "{:?}", msgs(&host));
+    }
+
+    #[tokio::test]
+    async fn a_failed_spawn_rings_the_requester_and_the_lead_once_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run(dir.path(), &[("worktree.create", vec![err("boom")])]).await;
+        // lead and requester differ: both are told
+        let mut sp = spawn_of(req(None));
+        sp.by = "agent:h/s/boss".into();
+        execute(&host, "req1", &sp, &State::default()).await;
+        let got: Vec<_> = msgs(&host)
+            .into_iter()
+            .filter(|m| m.kind == "SPAWN-FAILED")
+            .collect();
+        let mut to: Vec<&str> = got.iter().map(|m| m.to.as_str()).collect();
+        to.sort();
+        assert_eq!(to, ["agent:h/s/boss", "agent:h/s/me"], "{got:?}");
+        assert!(
+            got.iter()
+                .all(|m| m.reference == "dv-7" && !m.text.is_empty())
+        );
+        // lead == requester: one ring, not two
+        let dir2 = tempfile::tempdir().unwrap();
+        let _co2 = checkout(dir2.path());
+        let (host, _stub) = run(dir2.path(), &[("worktree.create", vec![err("boom")])]).await;
+        execute(&host, "req1", &spawn_of(req(None)), &State::default()).await;
+        let n = msgs(&host)
+            .iter()
+            .filter(|m| m.kind == "SPAWN-FAILED")
+            .count();
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_spawn_with_no_agent_behind_it_rings_the_coordinator() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run(dir.path(), &[("worktree.create", vec![err("boom")])]).await;
+        let mut sp = spawn_of(req(None));
+        sp.by = "human:me".into();
+        sp.request.lead = None;
+        execute(&host, "req1", &sp, &State::default()).await;
+        let got = msgs(&host);
+        assert!(
+            got.iter()
+                .any(|m| m.kind == "SPAWN-FAILED" && m.to == "coordinator"),
+            "{got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_spawn_request_rings_the_requester() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run(dir.path(), &[]).await;
+        reject(&host, "req1", &spawn_of(req(None)), "expired").await;
+        let got = msgs(&host);
+        assert!(
+            got.iter()
+                .any(|m| m.kind == "SPAWN-FAILED" && m.text.contains("expired")),
+            "{got:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_never_started_agent_is_told_not_handed_off() {
         let dir = tempfile::tempdir().unwrap();
         let _co = checkout(dir.path());
@@ -5051,6 +6074,66 @@ profile = "devin"
                 && m.to == "agent:h/s/lead"
                 && m.text.contains("never reached working")),
             "the lead is told: {got:?}"
+        );
+        assert!(
+            got.iter()
+                .any(|m| m.kind == "SPAWN-FAILED" && m.to == "agent:h/s/x"),
+            "the requester is told too: {got:?}"
+        );
+        // the log dedupes a second pass of the same episode
+        let events: Vec<Event> = host.replica.lock().unwrap().all().unwrap().to_vec();
+        handoffs(&host, &s, &events, &mut handed, &mut HashSet::new()).await;
+        assert_eq!(msgs(&host).len(), got.len());
+    }
+
+    #[tokio::test]
+    async fn a_never_started_agent_with_no_lead_still_rings_its_requester() {
+        let dir = tempfile::tempdir().unwrap();
+        let _co = checkout(dir.path());
+        let (host, _stub) = run_act(dir.path(), &[]).await;
+        let mut s = stalled_state(None);
+        s.agents.get_mut("agent:h/s/a").unwrap().worked = None;
+        let mut r = req(None);
+        r.agent = "agent:h/s/a".into();
+        r.name = "a".into();
+        let req_ev = Envelope::new(actor(), "p", Known::SpawnRequested(Box::new(r))).into_event();
+        let mut res_ev = Envelope::new(
+            actor(),
+            "p",
+            Known::SpawnResult(SpawnResult {
+                agent: "agent:h/s/a".into(),
+                ok: true,
+                pane: Some("w:1".into()),
+                worktree: Some("/w/a".into()),
+                error: None,
+            }),
+        )
+        .re(&req_ev.id)
+        .into_event();
+        res_ev.ts = Utc::now() - chrono::Duration::minutes(10);
+        let events = [req_ev, res_ev];
+        for e in &events {
+            s.apply(e);
+        }
+        let reqs = |host: &Host| {
+            host.replica
+                .lock()
+                .unwrap()
+                .all()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(&e.body, Body::Known(Known::SpawnRequested(_))))
+                .count()
+        };
+        let mut handed = HashSet::new();
+        handoffs(&host, &s, &events, &mut handed, &mut HashSet::new()).await;
+        assert!(handed.is_empty(), "no automatic handoff");
+        assert_eq!(reqs(&host), 0);
+        let got = msgs(&host);
+        assert!(
+            got.iter()
+                .any(|m| m.kind == "SPAWN-FAILED" && m.to == "agent:h/s/x"),
+            "the requester is told too: {got:?}"
         );
         // the log dedupes a second pass of the same episode
         let events: Vec<Event> = host.replica.lock().unwrap().all().unwrap().to_vec();

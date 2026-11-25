@@ -22,6 +22,12 @@ pub const HUNG_TICKS: u32 = 2;
 /// A wait this long is reported: nothing waits more than 30 min.
 pub const WAIT_MAX: Duration = Duration::minutes(30);
 
+/// Readers at the end of a pipe: idle by design while their writer lives.
+const FILTERS: &[&str] = &[
+    "grep", "egrep", "fgrep", "rg", "awk", "gawk", "sed", "head", "tail", "cut", "tr", "tee", "jq",
+    "cat",
+];
+
 /// The shells an agent runs its commands in; their subtrees are what the agent started.
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
 
@@ -145,11 +151,30 @@ impl Watch {
                     // A pipeline's members are siblings: the reader is not hung while its
                     // producer works, so one busy member makes the whole command busy.
                     let mut ranges = Vec::new();
-                    for c in t.kids(shell).to_vec() {
+                    let members = t.kids(shell).to_vec();
+                    for &c in &members {
                         let begin = t.out.len();
                         t.worked = false;
                         t.visit(c, agent);
                         ranges.push((begin, t.out.len(), t.worked));
+                    }
+                    // A reader judged hung beside a live writer (another member of its
+                    // group that is not hung itself: too young, or waiting) is not hung: the
+                    // writer is the one to judge.
+                    let hung = |t: &Tick, r: &(usize, usize, bool)| {
+                        t.out[r.0..r.1]
+                            .iter()
+                            .any(|c| matches!(c.verdict, Verdict::Hung(_)))
+                    };
+                    for i in 0..ranges.len() {
+                        let group = now.0[&members[i]].pgid;
+                        let live_writer = (0..ranges.len()).any(|j| {
+                            j != i && now.0[&members[j]].pgid == group && !hung(&t, &ranges[j])
+                        });
+                        let reader = FILTERS.contains(&now.0[&members[i]].name.as_str());
+                        if group.is_some() && reader && live_writer && hung(&t, &ranges[i]) {
+                            t.revive(ranges[i].0, ranges[i].1);
+                        }
                     }
                     let busy = ranges.iter().any(|r| r.2);
                     let start = ranges.first().map_or(t.out.len(), |r| r.0);
@@ -166,7 +191,7 @@ impl Watch {
             }
         }
         for (&pid, (why, agent)) in &seen.orphans {
-            if now.0.contains_key(&pid) && !t.out.iter().any(|c| c.pid == pid) {
+            if now.0.get(&pid).is_some_and(|p| !p.zombie) && !t.out.iter().any(|c| c.pid == pid) {
                 t.out.push(Classified {
                     pid,
                     agent: agent.clone(),
@@ -220,6 +245,11 @@ impl<'a> Tick<'a> {
     ) -> Self {
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
         for (&pid, p) in &now.0 {
+            // A zombie (STAT Z) has exited: nothing to classify, kill or wait on, and no child
+            // that started. Only its parent can reap it.
+            if p.zombie {
+                continue;
+            }
             children.entry(p.ppid).or_default().push(pid);
         }
         Tick {
@@ -318,6 +348,58 @@ impl<'a> Tick<'a> {
         }
     }
 
+    /// `sleep 270` / `timeout 270 cmd`, still inside its own duration: it waits for its clock,
+    /// not for anything that can hang. Past it, the process is overdue and judged as any other.
+    /// `sleep infinity` has no end to be past, so it waits by design.
+    fn timed_wait(&self, p: &Proc) -> bool {
+        let Some(started) = p.started else {
+            return false;
+        };
+        let mut words = p.args.as_deref().unwrap_or("").split_whitespace();
+        let secs = |w: &str| -> Option<f64> {
+            let (num, unit) = match w.char_indices().last()? {
+                (i, 's' | 'm' | 'h' | 'd') => w.split_at(i),
+                _ => (w, "s"),
+            };
+            let n: f64 = num
+                .parse()
+                .ok()
+                .filter(|n: &f64| n.is_finite() && *n >= 0.0)?;
+            Some(
+                n * match unit {
+                    "m" => 60.0,
+                    "h" => 3600.0,
+                    "d" => 86400.0,
+                    _ => 1.0,
+                },
+            )
+        };
+        let total = match p.name.as_str() {
+            "sleep" => {
+                words.next();
+                let w: Vec<&str> = words.collect();
+                if w == ["infinity"] {
+                    return true;
+                }
+                w.iter().map(|w| secs(w)).sum::<Option<f64>>()
+            }
+            // The first word that is not a flag is the duration (`-s KILL` takes a value).
+            "timeout" => {
+                words.next();
+                let mut prev_takes_value = false;
+                words
+                    .find(|w| {
+                        let skip = prev_takes_value || w.starts_with('-');
+                        prev_takes_value = matches!(*w, "-s" | "--signal" | "-k" | "--kill-after");
+                        !skip
+                    })
+                    .and_then(secs)
+            }
+            _ => None,
+        };
+        total.is_some_and(|t| (self.at - started).num_milliseconds() as f64 / 1000.0 < t)
+    }
+
     /// A command whose hung members are all idle by design is not hung. A wrapper (`bash -c
     /// 'tail -f x'`) is hung beside its follower and is spared with it, when every hung process
     /// under it is one. Any other lone filter blocked on a pipe nobody writes is a real hang.
@@ -329,7 +411,8 @@ impl<'a> Tick<'a> {
             .map(|c| c.pid)
             .collect();
         let spared = |pid: u32| {
-            let by_design = |q: u32| Self::idle_by_design(&self.now.0[&q]);
+            let by_design =
+                |q: u32| Self::idle_by_design(&self.now.0[&q]) || self.timed_wait(&self.now.0[&q]);
             // A launcher that only runs another command: a shell, or an exec-style wrapper.
             let wrapper = |q: u32| {
                 let n = self.now.0[&q].name.as_str();
@@ -349,11 +432,7 @@ impl<'a> Tick<'a> {
             // ponytail: a non-job-control shell puts every sibling in one group, so only a known
             // filter counts as a reader; match the pipe's inode to cover any other reader.
             let pgid = self.now.0[&pid].pgid;
-            let filter = [
-                "grep", "egrep", "fgrep", "rg", "awk", "gawk", "sed", "head", "tail", "cut", "tr",
-                "tee", "jq",
-            ]
-            .contains(&self.now.0[&pid].name.as_str());
+            let filter = FILTERS.contains(&self.now.0[&pid].name.as_str());
             let piped = below.is_empty()
                 && filter
                 && pgid.is_some()
@@ -1263,6 +1342,7 @@ mod tests {
                             args: Some(args.into()),
                             started: Some(t0() - Duration::minutes(age)),
                             pgid: None,
+                            zombie: false,
                         },
                     )
                 })
@@ -1334,6 +1414,105 @@ mod tests {
         assert_eq!(e.deepest.as_deref(), Some("xcrun simctl bootstatus ABC -b"));
         assert!(matches!(verdict(&v, 31), Some(Verdict::Hung(_))));
         assert_eq!(v[0].agent.as_deref(), Some("agent:h/s/o-1"));
+    }
+
+    #[test]
+    fn a_zombie_is_never_classified_nor_counted_as_a_child() {
+        // STAT Z: already exited, only its parent can reap it; nothing to kill or wait on.
+        let mut w = Watch::default();
+        let run = || {
+            let mut t = tree(&[
+                (30, SHELL, "bun", "bun test", 0, 20),
+                (31, 30, "bun", "", 0, 20),
+            ]);
+            t.0.get_mut(&31).unwrap().zombie = true;
+            t
+        };
+        w.step(run(), at(0), &seen());
+        w.step(run(), at(2), &seen());
+        let v = w.step(run(), at(4), &seen());
+        assert!(v.iter().all(|c| c.pid != 31), "{v:#?}");
+        assert!(matches!(verdict(&v, 30), Some(Verdict::Hung(_))), "{v:#?}");
+        let hung = v.iter().find(|c| c.pid == 30).unwrap();
+        let Verdict::Hung(e) = &hung.verdict else {
+            panic!()
+        };
+        assert_eq!(e.deepest, None, "a zombie is no evidence");
+    }
+
+    #[test]
+    fn a_reader_beside_a_live_writer_is_not_hung_whatever_the_writer_is_doing() {
+        // `bun run check | tail -6`: same parent, one group. The writer is alive but not
+        // classified hung (too young to judge, or waiting in a queue): judge the writer.
+        let pipe = |writer_age: i64| {
+            let mut t = tree(&[
+                (50, SHELL, "bun", "bun run check", 0, writer_age),
+                (51, SHELL, "tail", "tail -6", 0, 20),
+            ]);
+            t.0.get_mut(&50).unwrap().pgid = Some(50);
+            t.0.get_mut(&51).unwrap().pgid = Some(50);
+            t
+        };
+        let run = |writer_age: i64, waiting: bool| {
+            let mut s = seen();
+            if waiting {
+                s.waiting.insert(50, ("sim lock".into(), at(0)));
+            }
+            let mut w = Watch::default();
+            w.step(pipe(writer_age), at(0), &s);
+            w.step(pipe(writer_age), at(2), &s);
+            w.step(pipe(writer_age), at(4), &s)
+        };
+        for v in [run(-3, false), run(20, true)] {
+            assert!(!matches!(verdict(&v, 51), Some(Verdict::Hung(_))), "{v:#?}");
+        }
+        // Both stuck: the pipeline is one hang, reader included.
+        let v = run(20, false);
+        assert!(matches!(verdict(&v, 51), Some(Verdict::Hung(_))), "{v:#?}");
+    }
+
+    #[test]
+    fn a_reader_outside_the_writers_group_or_with_no_group_is_still_hung() {
+        // A busy-or-young sibling that is not this pipeline's writer proves nothing.
+        let run = |writer_group: Option<u32>, reader_group: Option<u32>| {
+            let pipe = || {
+                let mut t = tree(&[
+                    (50, SHELL, "bun", "bun run check", 0, -3),
+                    (51, SHELL, "cat", "cat", 0, 20),
+                ]);
+                t.0.get_mut(&50).unwrap().pgid = writer_group;
+                t.0.get_mut(&51).unwrap().pgid = reader_group;
+                t
+            };
+            let mut w = Watch::default();
+            w.step(pipe(), at(0), &seen());
+            w.step(pipe(), at(2), &seen());
+            w.step(pipe(), at(4), &seen())
+        };
+        for (a, b) in [(Some(50), Some(51)), (None, None)] {
+            let v = run(a, b);
+            assert!(matches!(verdict(&v, 51), Some(Verdict::Hung(_))), "{v:#?}");
+        }
+        let v = run(Some(50), Some(50));
+        assert!(
+            !matches!(verdict(&v, 51), Some(Verdict::Hung(_))),
+            "cat: {v:#?}"
+        );
+    }
+
+    #[test]
+    fn a_zombie_with_an_orphan_proof_is_not_reported() {
+        let mut w = Watch::default();
+        let mut s = seen();
+        s.orphans.insert(31, ("dead owner".into(), None));
+        let run = || {
+            let mut t = tree(&[(31, SHELL, "bun", "", 0, 20)]);
+            t.0.get_mut(&31).unwrap().zombie = true;
+            t
+        };
+        w.step(run(), at(0), &s);
+        let v = w.step(run(), at(2), &s);
+        assert!(v.iter().all(|c| c.pid != 31), "{v:#?}");
     }
 
     #[test]
@@ -1429,8 +1608,54 @@ mod tests {
     }
 
     #[test]
+    fn a_sleep_or_timeout_is_idle_until_its_own_duration_has_passed() {
+        // `sleep 270` started 4 min before the third tick: 240 s of 270.
+        let layout = |name: &'static str, args: &'static str| {
+            vec![
+                (30, SHELL, "bash", "bash -c go", 0, 20),
+                (31, 30, name, args, 0, 0),
+            ]
+        };
+        for (name, args) in [
+            ("sleep", "sleep 270"),
+            ("sleep", "sleep 4m 30s"),
+            ("timeout", "timeout 270 true"),
+        ] {
+            let l = layout(name, args);
+            let mut w = Watch::default();
+            let t = || tree(&l);
+            w.step(t(), at(0), &seen());
+            w.step(t(), at(2), &seen());
+            let v = w.step(t(), at(4), &seen());
+            assert!(
+                v.iter().all(|c| !matches!(c.verdict, Verdict::Hung(_))),
+                "{args}: {v:#?}"
+            );
+        }
+        // still alive past its duration: that is a hang
+        let l = layout("sleep", "sleep 60");
+        let mut w = Watch::default();
+        let t = || tree(&l);
+        w.step(t(), at(0), &seen());
+        w.step(t(), at(2), &seen());
+        let v = w.step(t(), at(4), &seen());
+        assert!(matches!(verdict(&v, 31), Some(Verdict::Hung(_))), "{v:#?}");
+        // `sleep infinity` has no end to be past: idle by design
+        let l = layout("sleep", "sleep infinity");
+        let mut w = Watch::default();
+        let t = || tree(&l);
+        w.step(t(), at(0), &seen());
+        w.step(t(), at(2), &seen());
+        let v = w.step(t(), at(4), &seen());
+        assert!(
+            v.iter().all(|c| !matches!(c.verdict, Verdict::Hung(_))),
+            "{v:#?}"
+        );
+    }
+
+    #[test]
     fn a_real_hang_beside_a_follower_or_a_daemon_stays_hung() {
-        for (name, args) in [("sleep", "sleep 9999"), ("head", "head -3")] {
+        for (name, args) in [("python3", "python3 deadlock.py"), ("head", "head -3")] {
             for (fname, fargs) in [("tail", "tail -f x.log"), ("DTServiceHub", "DTServiceHub")] {
                 // A wrapper over both, and two siblings under the tool shell.
                 let layouts = [
@@ -1517,8 +1742,8 @@ mod tests {
                 "{reader}: {v:#?}"
             );
         }
-        // A stuck non-filter sibling in the follower's group (`tail -f X & sleep 3600`).
-        for stuck in ["sleep 3600", "curl http://localhost:9/x"] {
+        // A stuck non-filter sibling in the follower's group (`tail -f X & python3 stuck.py`).
+        for stuck in ["python3 deadlock.py", "curl http://localhost:9/x"] {
             let v = step(stuck, "tail -f /tmp/x/all.log", true);
             assert!(
                 matches!(verdict(&v, 41), Some(Verdict::Hung(_))),
@@ -1586,7 +1811,7 @@ mod tests {
         let t = || {
             tree(&[
                 (31, SHELL, "node", "node server.js", 0, 20),
-                (32, SHELL, "sleep", "sleep 9999", 0, 20),
+                (32, SHELL, "python3", "python3 deadlock.py", 0, 20),
             ])
         };
         w.step(t(), at(0), &sn);
@@ -1602,7 +1827,7 @@ mod tests {
             tree(&[
                 (30, SHELL, "bash", "bash dev.sh", 0, 20),
                 (31, 30, "java", "java Main", cpu, 20),
-                (32, 30, "sleep", "sleep 9999", 0, 20),
+                (32, 30, "python3", "python3 deadlock.py", 0, 20),
             ])
         };
         w.step(t(0), at(0), &seen());

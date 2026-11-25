@@ -93,12 +93,12 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | blocker | `blocker.raised` | what, owner?, unblocks_when?, pid?, started? (`pid`: a process on the raiser's host it waits on, `started` when that process started) | task | agent, host |
 | | `blocker.resolved` | note? (the raiser's host writes one once the blocker's `pid` is gone or started at another time) | re = the raise | agent, host |
 | question | `ask.raised` | question, options[], recommendation?, context? | task | agent |
-| comms | `msg.sent` | to (an agent id, or `coordinator`), kind, ref, text, closes? (a host's `DEADLETTER`) | re? (a `DEADLETTER`: the tell) | agent, host |
+| comms | `msg.sent` | to (an agent id, or `coordinator`), kind, ref, text, closes? (a host's `DEADLETTER`) | re? (a `DEADLETTER` or `UNREAD`: the tell) | agent, host |
 | | `ask.answered` | answer, approve?, approves?, msg — **human only**, via `POST /board/answer` | re = the ask | human |
 | | `msg.delivered` | to, observed, rung?, attempts? | re = the send | host |
 | | `msg.read` | — | re = the send | agent (the recipient) |
 | | `handoff` | to, next, done?, evidence[], learned? | task | agent |
-| spawn | `spawn.requested` | name, agent, host, session, repo, issue?, branch, profile, brief, level?, lead?, worktree?, replaces?, why | | agent, host |
+| spawn | `spawn.requested` | name, agent, host, session, repo, issue?, branch, profile, brief, level?, lead?, worktree?, in_place?, replaces?, why | | agent, host |
 | | `spawn.result` | agent, ok, pane?, worktree?, error? | re = the request | host |
 | | `retire.requested` | agent, host, decide? — the agent's host runs `retire` itself | | agent, host |
 | | `retire.result` | agent, ok, text | re = the request | host |
@@ -131,7 +131,9 @@ name or a pane. A role can be declared before the agent's first `agent.up`, surv
 going down and coming back, and only an `agent.role` without `level` removes it.
 
 `agent.quota` is the usage quota of one agent program on one host — each machine is logged in to
-its own account, so `kind` (`claude`, `codex`, `devin`, or anything new) is scoped per host.
+its own account, so `kind` (`claude`, `codex`, `devin`, `agy`, or anything new) is scoped per host. `agy` (Google Antigravity CLI) has no quota
+reader yet, so its kind reports none and counts as unknown. It checkpoints its own context, so
+there is no context-full footer to read, and `agy` is a native binary, so `ps` shows `agy`.
 The host samples three sources every minute: the newest session log under
 `~/.codex/sessions` for codex, the machine-wide `claude-rate-limits.json` in the fleet data
 directory root for claude (written by `agent-fleet hook statusline`, the status-line wrapper
@@ -262,7 +264,8 @@ first showed the account out) keyed by `<host>:<kind>`,
 `tasks` (state + since, owner, lead,
 blocked_by, handoffs), open `blockers` and `asks` (with their context link) keyed by their raising event id, undelivered
 `msgs` keyed by their `msg.sent` id, delivered-but-`unread` ones (with the last delivery and
-the ring count, kept until read or handed to the coordinator), `gone` (when each agent not up
+the ring count, kept until read or handed to the coordinator), `escalated` (tells handed back to
+their sender as `UNREAD`, while queued), `gone` (when each agent not up
 went down, 24 h), `read` ones (kept 24 h after the read), the id of the `last` event folded, and the `unknown` count.
 
 ## Doorbells
@@ -288,7 +291,14 @@ written once the doorbell's event id shows on its screen 2 s later. It is never 
 screen shows a selection dialog (`Do you want to…`, a `❯ 1.` option list, `Esc to cancel`): the tell
 stays pending, since an Enter there would answer the dialog. A ring whose text is not on the screen
 after 2 s (or whose screen cannot be read) is logged as an alert and left pending; it is never typed a
-second time, and is acknowledged if the text later shows. An unreadable screen blocks a queued ring like a dialog. Any other busy agent waits. A failed ring is retried at most once a
+second time, and is acknowledged if the text later shows. An unreadable screen blocks a queued ring like a dialog. Any other `working` agent (Devin CLI,
+Codex: they take no typed input mid-turn) gets the doorbell in its **mailbox** instead, a
+file in the host's data dir (`mail/<pane>/<agent name>/<event id>`, cleared when the host starts), and `agent-fleet hook mail`, its harness's
+`PostToolUse` hook, hands it to the agent at its next tool call as `additionalContext`; a turn
+made of tool calls never goes idle, so this is its turn boundary. A doorbell gone from the mailbox
+was taken, and the host then writes `msg.delivered` (`ack: true`). One still there when the agent
+stops working or leaves the pane is taken back (the hook renames a file before reading it, so only
+one of the two gets it) and the agent is rung as usual. A blocked agent waits. A failed ring is retried at most once a
 minute; if `msg.delivered` itself cannot be written, the message stays pending. `agent-fleet doctor`
 raises `undelivered` for an up recipient whose tell has waited 10 minutes.
 
@@ -310,6 +320,18 @@ retransmit, written as another `msg.delivered`) 5 min after its delivery, then 1
 retransmit follows the rules of a first ring, except that its old ring on the screen proves
 nothing: once typed it counts as rung, and it is typed at most once per backoff step, even when
 its `msg.delivered` has to be written again.
+A tell (delivered or not) to a `working` agent still unread 10 min after it was sent goes back to
+its sender, if the sender is up: the recipient's host writes, once, a `msg.sent` to the sender with
+kind `UNREAD`, `re` = the tell, the tell's ref, and the text `[unread <age>: <recipient> is working
+and has not read it] <TYPE> <ref>: <text>`. The tell stays queued; that one event only marks it
+(state `escalated`, dropped with the tell), and its id is derived from the tell's id and `UNREAD`,
+so a retry is the same event. Status reports and the fleet's own `DEADLETTER` and `UNREAD` never go
+back. A `DONE`, `MERGED`, `READY` or `REPORT` sent while its sender still has unread tells is refused:
+`tell` prints those tells to stderr and exits 1, nothing is written, so the agent reads and acts
+first. `tell --force` sends it anyway, with `[forced past <n> unread tell(s): <TYPE> <ref> from
+<sender>, ...]` appended to its text, which is how the override is logged. The gate counts the
+tells `agent-fleet read` shows (expired and stale ones do not count) and is skipped (with a
+note) when the hub is unreachable. `--force` goes before the text.
 `agent-fleet sent` shows the sender each of its tells as `sent`, `unread <age since the last
 delivery>`, or `read`; the board lists unread ones the same way. Read tells stay in the state for
 24 h after the read.
@@ -377,8 +399,21 @@ supervisor restarts it rather than leaving a host that looks healthy and no long
 ## Metrics
 
 The log is the record, so most numbers are read off it; the hub stamps each event's arrival
-time, and the host agent reports its own vitals in `host.health.stats`. `agent-fleet stats` shows
-them, `GET /stats` returns them as JSON.
+time, and the host agent reports its own vitals in `host.health.stats`. `agent-fleet stats --log`
+shows them, `GET /stats` returns them as JSON.
+
+`agent-fleet stats [--since 14d] [--by profile|kind] [--json]` is the scorecard: one row per
+routing profile (or agent program, from `agent.up`), read off the log by `src/scorecard.rs`. Spawns
+start at `spawn.requested`; `spawn.result` `ok: false` is a spawn failure and is left out of the
+rest. An agent's own `OPEN`, `MERGED`/`DONE`, `FIX` and `BLOCKED` tells give time to PR, time to
+done, review rounds and blocks. A failed `merge.result` answering a `merge.requested` for a PR the agent's own tells name (`#12`,
+`PR 12`, `pull/12`; the requester when none does) is a gate red. Review rounds and blocks are proxies: the
+agent's `FIX` and `BLOCKED` tells, as PR verdicts are not in the log. A later spawn on the same repo and issue within 7 days of a finish is a fix-up. A
+`handoff` by the agent, or a spawn that `replaces` it, is a handoff. IDLE and STALLED tells, UNREAD
+hand-backs, `proc.hung` and `agent.stuck` with a cause other than `waiting`, `held` or `resource` are interventions, divided by the hours from
+`agent.up` to `agent.down`. The quota proxy is the rise of the program's busiest `agent.quota`
+window over the agent's life; concurrent agents share it. A figure with no data prints `?` and is `null` in `--json`. A spawn with no
+`spawn.result` and no `agent.up` is `unconfirmed` and left out of every other figure.
 
 - **Doorbells.** Sent, delivered, pending, and lost (undelivered for over 10 minutes). Time to
   delivery splits into `wait` (sent until the ring that worked: the agent was busy) and
@@ -519,6 +554,56 @@ the host sends ONE `ESCALATED` `msg.sent` to the lead's own lead, and so on up t
 `agent.role` chain to an up root-coordinator, never past it. Each hop waits its own
 `--stall-min` and dedupes like every tell: once per episode, by the log.
 
+A `BLOCKED` or `QUESTION` an agent sends is tracked (`State.waiting`) until its lead sends that agent
+any tell, or the agent works again. Past `--waiting-min` (default 10) with the agent not working, the
+host re-rings the lead once with `STILL-WAITING <agent>: <original text>` (`re` = the ask), and
+`doctor` lists the agent as `unanswered` once that ring is out, until the lead answers. A `msg.read` ack is not an answer.
+
+## Idle agents
+
+A project's fleet.toml `[idle]` sets `stale_min` (default 20) and `auto_retire` (default false).
+An agent not `working` for `stale_min` gets its lead (else the up root coordinator) one
+`msg.sent` from the host: `IDLE <agent> <for>: <last report or task> — retire?`, or
+`HELD <agent>: <reason>` when its open task is held. The ring repeats every `2 x stale_min` while
+the agent stays idle, except that a `HELD` with unchanged text backs off (2x, 4x, 8x, ... the base
+gap, capped at 8 h, or at `2 x stale_min` when that is longer); new text, the agent working or changing state, or an `IDLE` ring starts over
+(`held_streak`). `ref` is the agent's full id and the host's ring is what the reducer
+remembers (`idle_rung`), so a restart rings once. With `auto_retire`, an agent that reported
+`DONE`/`MERGED` after it last worked (or whose task ended) and has idled 10 min gets a host
+`retire.requested`, asked once per idle stretch: the same locked retire, which stops on
+uncommitted work and rings the lead. A tell from its lead after that `DONE` (new work; the reducer's
+`told`) cancels it: the agent is not finished until it reports again (any tell counts, even a thanks; the
+lead is still rung `IDLE` and can retire it by hand). An agent in a pane with no spawn record (started by hand)
+gets one `UNMANAGED` ring and is listed by `doctor` as `unmanaged`; it is never auto-retired.
+An agent whose claude footer reads `N shell(s) still running` is waiting on its own background job: the host
+neither rings it `IDLE`/`HELD` nor retires it while the footer shows, for at most 8 h of idling (a shell that never
+ends does not mute it forever); an unreadable screen changes nothing.
+`[idle] exempt = ["name"]` lists agents the host never rings or retires, by agent name or by the
+basename of the worktree they work in; for a hand-started agent every project's list applies.
+
+## Chores
+
+A project's fleet.toml `[chores]` sets the host's housekeeping. Each table is off unless present;
+the host re-reads it each minute.
+
+- `[chores.nudge]` (`kinds`, default `devin`; `unsent_hints`): only under `host --stuck-act`, and
+  only for agents spawned for that project. An unsent prompt is seen on one pass, then gets an
+  Enter each 55 s, twice. If it still stands: one Escape and the same text again, only when the
+  text was read off the input box and no turn is busy behind it (an Escape would interrupt the
+  turn); otherwise one `BLOCKED` tell to the lead per 10 min and nothing typed. A rate limit gets
+  `continue` once its announced wait is over. "Send a message to continue" or "Something went
+  wrong" gets `continue` per 5 min, never while the agent is `working` (its own output may quote them). A spinner whose screen, timers aside, has not changed for 15
+  min gets two Escapes and a `continue`. Nothing is typed while a selection dialog is open.
+- `[chores.queue]` (`file`, `profile`, `aliases`: a short prefix for a repository, `"dv-" = "owner/repo"` makes `dv-12` mean `owner/repo#12`; the agent and branch are then named `dv-12`; `on`: only the host of that `--host-name` drains the queue (another host logs it once); `spawn_host`: where it spawns; `as`: the agent the spawns are written as and so the new agent's lead, `agent:<host>/<session>/<name>`: the host has no identity of its own, so without it `spawn` refuses): `owner/repo#N [scope]` per line, other lines left alone.
+  While the profile has fewer live or pending agents for this repository than its `cap` (one spawn per minute at most), the host runs
+  `agent-fleet spawn <ref> --no-wait --profile <profile>` in the project checkout. A line whose issue is closed (`gh issue view`) is dropped unspawned; one whose state cannot be read is held 10 min like a failed spawn and gives its seat to the next line. The line stays while
+  the request is in flight and leaves only when its agent is live, so a request nobody answers
+  (a host down 15 min) loses nothing; an issue whose request failed, expired unanswered, or whose agent is gone is not tried again for 10
+  min and gives its seat to the next line. The file is re-read before it is rewritten.
+- `[chores.sweep]` (`run` as an argument list, no shell; `every_min`, default 5; `on`: only that host runs it): run in the
+  checkout, in the background, with a 15 min limit.
+
+
 ## Signals
 
 `agent.signal` is the structured channel a program speaks through. `agent-fleet hook signal`
@@ -564,6 +649,19 @@ the `|| true` keeps an old binary from blocking the program it hooks.
   "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ] } }
 ```
 
+`agent-fleet hook mail` is a `PostToolUse` hook (every tool) for Claude Code and Devin CLI: it
+takes the doorbells in its own mailbox and prints them as
+`hookSpecificOutput.additionalContext`, which both harnesses add to the agent's context. Only when
+its pane (`HERDR_PANE_ID`) has mail does it ask herdr for the pane's agent (within 1 s), so a
+pane's next agent never gets the last one's. Under Claude Code (`CLAUDECODE` set), which needs no
+mailbox, it takes nothing: a `claude -p` a busy Devin runs would otherwise take the Devin's mail. With
+none, outside herdr or on any error it prints nothing and exits 0.
+
+```json
+{ "hooks": { "PostToolUse": [ { "hooks": [ { "type": "command",
+  "command": "agent-fleet hook mail || true" } ] } ] } }
+```
+
 `agent-fleet hook statusline` stays the status-line wrapper: it stores the `rate_limits`
 it is fed for the host's `agent.quota` read, emits `context_full` as above when the process
 sits in a herdr pane, and passes the input on to the command it wraps.
@@ -573,7 +671,7 @@ sits in a herdr pane, and passes the input on to the command it wraps.
 `agent-fleet kill <pid>…` is how an agent stops a process. It reads the process table (`ps`) and
 refuses, killing nothing, when any pid is:
 
-- a terminal multiplexer (`herdr`), a pane's shell, an agent (`claude`, `devin`, `codex`, or what
+- a terminal multiplexer (`herdr`), a pane's shell, an agent (`claude`, `devin`, `codex`, `agy`, or what
   a pane's shell runs), an `agent-fleet` daemon, or an ancestor of any of them;
 - the caller's own ancestor (its shell, its script's parent, its agent);
 - inside another agent's process tree, unless a `proc.hung` report names it and `kill`'s own
@@ -648,11 +746,11 @@ blocks the tool call when it is there.
 
 Agents are pane processes: the fleet knows an agent only because herdr hosts it. Two guards
 enforce it. `agent-fleet hook bash` (the Claude Code / Devin CLI `PreToolUse` hook) refuses a
-shell command that starts `claude`, `devin` or `codex` for a session — behind `sudo`, `nohup`,
+shell command that starts `claude`, `devin`, `codex` or `agy` for a session — behind `sudo`, `nohup`,
 `xargs`, `timeout`, `sh -c`, `eval`, `env` or `&` — and points at `agent-fleet spawn` and `herdr
 agent start`; the read-only and admin forms (`--version`, `--help`, `auth status`, `doctor`,
 `models`, `mcp list`/`mcp get`, `update --check`) pass, and so do one-shot runs that answer and
-exit (`claude -p`, `codex exec`) when the caller is itself in herdr (`HERDR_ENV=1`): they run in
+exit (`claude -p`, `codex exec`, `agy -p`) when the caller is itself in herdr (`HERDR_ENV=1`): they run in
 the caller's pane tree, so the host counts them as managed. And the host's process scan reports every
 agent-program process it finds outside all of herdr's pane trees as `agent.unmanaged` (a process
 is managed when any ancestor is `herdr`, the host's own process tree is excluded, and so is
@@ -719,6 +817,12 @@ established TCP connection anywhere under its shell (a network wait such as `gh 
   a tick after a gap of more than two intervals (the machine slept) only re-reads the table;
 - `orphan`: a `proc.orphaned` proof holds.
 
+A zombie (STAT `Z`) has exited and only its parent can reap it: it is never classified, never
+counts as a child, and is not evidence. A filter at the end of a pipe (`tail`, `grep`, `cat`, …)
+is not `hung` while another member of its process group is not hung (a writer that is too
+young to judge, or waiting): the writer is judged instead. If the writer is hung too, the
+pipeline is one report.
+
 The topmost hung process of a chain is reported as `proc.hung` with every hung pid under it
 (tops of one agent in one process group, the members of a pipeline, are one report: the
 lowest pid's),
@@ -757,11 +861,17 @@ work and never picks the worker; `label:x` matches only
 a label named x. Config errors name the line that is wrong: an unknown profile, a fallback
 cycle, two defaults, no default.
 
+A rule's `profile` is one name or a list (`profile = ["devin", "codex", "agy"]`). With a list, `spawn`
+takes the least-loaded listed profile that is under its `cap` and whose agent program has quota on
+the host; list order breaks ties, and the decision line (`spawn --dry-run` prints it) says which
+was skipped and why. When none of them can take it, the first one's `fallback` chain applies as for
+a single name. `--profile` still bypasses the list.
+
 The machine's rules are `fleet.toml` and its brief in the instance's config directory: the user
 config directory (`~/.config/agent-fleet` on Linux) for the default instance and `instances/<name>`
 under it for the others; `AGENT_FLEET_CONFIG_DIR` names the directory outright. `agent-fleet init`
 writes both from `docs/fleet.example.toml` and `docs/brief.example.md`, with a profile for each
-agent program on `PATH` (`claude`, `codex`, `devin`; all three when none is found) and a default
+agent program on `PATH` (`claude`, `codex`, `devin`, `agy`; all four when none is found) and a default
 rule on the first; it never overwrites a file. It also lists the user-level skills
 (`$CLAUDE_CONFIG_DIR` or `~/.claude`, `$CODEX_HOME` or `~/.codex`, each `/skills/*/SKILL.md`)
 that name herdr, tmux or cmux, and warns that in a fleet agents message each other with `tell`
@@ -814,7 +924,12 @@ configuration, and a handoff's worktree is not a config source — and refuses
 `origin`, calls `worktree.create` (label `<name> #<issue>`, no focus, trust the repository); a
 create that fails on an existing branch is retried once after reclaiming it, and only when it
 holds no work — no commit the remotes lack, a clean tree. With `worktree` set on the request (a
-handoff), it opens a `workspace.create` there instead and never removes the worktree. Then
+handoff), it opens a `workspace.create` there instead and never removes the worktree. With
+`in_place` it does the same in the host's own checkout of `repo` (no fetch, worktree or branch),
+and answers `spawn.result` with that checkout as `worktree`; `in_place` with `worktree` is
+refused. A retire of an in-place agent closes its pane and removes nothing (neither `retire`
+hook nor `git worktree remove` runs). `agent-fleet spawn --brief <file>` sends the file as
+`brief` as written: no token rendering, no coordinator prompt; an empty file is refused. Then
 `ready` runs (new worktrees only, 15 min), each `unset_env` is typed into the pane's shell,
 `TMPDIR`, `TMP` and `TEMP` are exported there as the agent's scratch dir, outside any checkout:
 `<cache dir>/agent-fleet/tmp/<session>/<name>` (`~/.cache/agent-fleet/tmp/...` on Linux,
@@ -830,7 +945,10 @@ that works: `agent.wait` for `idle` (2 min),
 stall, then one re-send — never twice to an agent that started working. On success the host
 writes `agent.role` (level, lead from the request) and `task.assigned` for
 `task:<repo name>/<issue>` (a 409 is not a failure), answers `spawn.result`, and closes a
-`replaces` agent's pane and workspace — never its worktree. `retire` runs (5 min) when an agent's
+`replaces` agent's pane and workspace — never its worktree. A failed or expired `spawn.result` sends `SPAWN-FAILED <name>: <reason>` to the requester and
+the agent's lead (the coordinator when neither is an agent). An agent that never reaches `working`
+sends the requester `SPAWN-FAILED` and the lead `NEVER_STARTED` (one message when they are the same
+agent). `retire` runs (5 min) when an agent's
 last pane is closed (`pane.closed`, `pane.exited`, `workspace.closed`; not an agent that left its
 pane, not a herdr listing gap), and on a failed spawn's new worktree before it is removed; only for
 a worktree a spawn made, and not while another agent holds it (a handoff, a reviewer). The script must itself refuse an
@@ -1058,7 +1176,7 @@ stale, with its `git worktree unlock` command; clean never unlocks or forces. Pr
 is in a worktree clean retires, read live (cwds from `/proc` on Linux, from one `lsof -a -d cwd
 -Fpn` elsewhere; when neither answers, every worktree is kept as "processes unknown"), are stopped before it goes: TERM, then KILL after 5 s, each re-read just before its signal so a
 pid reused by another process (another start time or cwd) is never hit. `ls` and the dry run list
-them, pid and command. A herdr pane, anything under an agent program (`claude`, `codex`, `devin`)
+them, pid and command. A herdr pane, anything under an agent program (`claude`, `codex`, `devin`, `agy`)
 and the caller and its ancestors are never stopped; one of them in the worktree keeps it. Without
 a hub or replica, no agent is known. `ls` shows each worktree's `dev` slot (`docs/DEV.md`), its
 ports and running services; `clean --execute` runs a worktree's `dev down --release` (its

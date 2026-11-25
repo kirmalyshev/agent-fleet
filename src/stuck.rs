@@ -695,16 +695,40 @@ pub struct Seen {
 
 /// The agent's visible screen, or `None` when herdr cannot read it.
 pub(crate) async fn screen(host: &Host, id: &str) -> Option<String> {
-    let name = crate::host::short(id);
+    screen_of(host, crate::host::short(id)).await
+}
+
+/// As `screen`, for a herdr target: a pane id names one agent, a short name may be missing or
+/// shared.
+pub(crate) async fn screen_of(host: &Host, target: &str) -> Option<String> {
     herdr_call(
         &host.cfg.herdr_socket,
         "agent.read",
-        json!({ "target": name, "source": "visible", "strip_ansi": true }),
+        json!({ "target": target, "source": "visible", "strip_ansi": true }),
     )
     .await
     .ok()?["text"]
         .as_str()
         .map(str::to_string)
+}
+
+/// Whether a claude footer says a background shell is still running (`· 1 shell still
+/// running`, `· 2 shells still running`): the agent is waiting on its own job, not idle.
+/// Only the program's own lines count, so prose quoting the phrase does not.
+pub(crate) fn background_shell(screen: &str) -> bool {
+    let chrome = chrome_lines(Some("claude"), screen);
+    screen.lines().zip(chrome).any(|(l, c)| {
+        c && l
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(4)
+            .any(|w| {
+                w[0].parse::<u32>().is_ok_and(|n| n > 0)
+                    && ["shell", "shells"].contains(&w[1])
+                    && w[2] == "still"
+                    && w[3] == "running"
+            })
+    })
 }
 
 /// Whether the bottom of `screen` shows a selection dialog (a permission prompt, an
@@ -968,6 +992,26 @@ async fn run(
 mod tests {
     use super::*;
     use crate::state::Quota;
+
+    #[test]
+    fn a_claude_footer_with_a_running_shell_is_background_work() {
+        let box_ = "─".repeat(40);
+        let screen = |footer: &str| {
+            format!("⏺ Started the eval in the background.\n\n{box_}\n❯ \n{box_}\n  {footer}\n")
+        };
+        for n in ["1 shell", "3 shells", "12 shells"] {
+            let f = format!("⏵⏵ bypass permissions on (shift+tab to cycle) · {n} still running");
+            assert!(background_shell(&screen(&f)), "{f}");
+        }
+        assert!(!background_shell(&screen(
+            "⏵⏵ bypass permissions on (shift+tab to cycle)"
+        )));
+        assert!(!background_shell(&screen("· 0 shells still running")));
+        // the agent's own prose quoting the phrase is not the footer
+        assert!(!background_shell(&format!(
+            "⏺ The footer reads 1 shell still running\n\n{box_}\n❯ \n{box_}\n  ? for shortcuts\n"
+        )));
+    }
 
     fn agent(state: AgentState, worked: bool) -> Agent {
         let now = Utc::now();
@@ -1679,6 +1723,26 @@ mod tests {
                 Self::Tell { kind, .. } => write!(f, "Tell({kind})"),
                 Self::Handoff { to, .. } => write!(f, "Handoff({to})"),
             }
+        }
+    }
+
+    /// Antigravity CLI (`agy` 1.3.6) screens captured from a live herdr pane: its idle and
+    /// working chrome names no stuck cause. It checkpoints its own context, so it has no
+    /// context footer to read.
+    #[test]
+    fn agy_idle_and_working_screens_are_not_stuck() {
+        let rule = "─".repeat(60);
+        let footer = "? for shortcuts            Gemini 3.8 Flash · high";
+        let idle = format!("Antigravity CLI 1.3.6\n\n{rule}\n>\n{rule}\n{footer}\n");
+        let working = format!(
+            "{rule}\n> Count from 1 to 40\n⣽  Generating...\n{rule}\n>\n{rule}\nesc to cancel            Gemini 3.8 Flash · high\n"
+        );
+        let now = Utc::now();
+        for screen in [idle, working] {
+            assert!(
+                stuck_cause(Some("agy"), &screen, None, now).is_none(),
+                "{screen}"
+            );
         }
     }
 }

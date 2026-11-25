@@ -19,7 +19,7 @@ pub type Table = HashMap<u32, Proc>;
 
 /// Programs that are agents wherever they run.
 /// The agent programs: anything running one of these outside a herdr pane is unmanaged.
-pub(crate) const AGENTS: &[&str] = &["claude", "devin", "codex"];
+pub(crate) const AGENTS: &[&str] = &["claude", "devin", "codex", "agy"];
 /// Terminal multiplexers whose panes hold agents.
 const MUX: &[&str] = &["herdr"];
 
@@ -555,11 +555,14 @@ fn agent_admin(args: &[String]) -> bool {
     }
 }
 
-/// A one-shot run that answers and exits: `claude -p|--print …`, `codex exec …`.
+/// A one-shot run that answers and exits: `claude -p|--print …`, `codex exec …`, `agy -p|--print|--prompt …`.
 fn agent_oneshot(w: &[String]) -> bool {
     match base(&w[0]) {
         "claude" => w[1..].iter().any(|a| a == "-p" || a == "--print"),
         "codex" => first_arg(&w[1..]).is_some_and(|a| a == "exec"),
+        "agy" => w[1..]
+            .iter()
+            .any(|a| matches!(a.as_str(), "-p" | "--print" | "--prompt")),
         _ => false,
     }
 }
@@ -589,7 +592,7 @@ fn first_arg(w: &[String]) -> Option<&String> {
     w.iter().find(|a| !a.starts_with('-'))
 }
 
-/// A command that starts an agent program outside herdr — `claude`, `devin` or `codex` run for a
+/// A command that starts an agent program outside herdr — `claude`, `devin`, `codex` or `agy` run for a
 /// session, or an agent package via npx/bunx/dlx, wherever it hides. `herdr agent start` and the
 /// admin forms pass, and so do one-shot runs from a caller that is itself in herdr.
 pub fn agent_start(line: &str, in_herdr: bool) -> Option<String> {
@@ -610,7 +613,7 @@ pub const UNMANAGED_REFUSAL: &str = "agent-fleet: every agent runs in herdr. Spa
 `agent-fleet spawn <owner/repo>#<issue>`, or start it in a pane with \
 `herdr agent start <name> --kind <program> --pane <pane>`. The read-only and admin forms \
 (--version, --help, auth status, doctor, models, mcp list|get, update --check) pass, and so \
-do one-shot `claude -p` and `codex exec` from an agent that is itself in herdr.";
+do one-shot `claude -p`, `codex exec` and `agy -p` from an agent that is itself in herdr.";
 
 /// The PreToolUse hook for Claude Code and Devin CLI (same format): the tool call on stdin,
 /// refused with exit 2 when it is a shell command running a raw kill or starting an agent
@@ -895,6 +898,9 @@ mod tests {
         );
         let why = judge(&t, ME, 400, |_| true).unwrap_err();
         assert!(why.contains("ancestor of an agent 401"), "{why}");
+        t.get_mut(&401).unwrap().name = "agy".into();
+        let why = judge(&t, ME, 400, |_| true).unwrap_err();
+        assert!(why.contains("ancestor of an agent 401"), "agy: {why}");
     }
 
     #[test]
@@ -1233,6 +1239,7 @@ mod tests {
             "bash -c \"claude -p x\"",
             "sudo claude",
             "timeout 10 codex exec go",
+            "agy -p x",
             "FOO=1 claude -p x",
             "eval claude -p x",
             "echo hi | xargs devin -p",
@@ -1290,11 +1297,21 @@ mod tests {
             "claude --model opus --print x",
             "codex exec 'audit'",
             "timeout 300 codex exec x",
+            "agy --print audit",
+            "agy --prompt audit",
+            "agy -p audit",
         ] {
             assert_eq!(agent_start(line, true), None, "{line}");
             assert!(agent_start(line, false).is_some(), "{line}");
         }
-        for line in ["devin -p x", "claude", "codex", "claude --resume"] {
+        for line in [
+            "devin -p x",
+            "claude",
+            "codex",
+            "agy",
+            "agy -m x",
+            "claude --resume",
+        ] {
             assert!(agent_start(line, true).is_some(), "{line}");
         }
     }

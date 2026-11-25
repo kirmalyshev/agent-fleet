@@ -1163,6 +1163,10 @@
             "host": {
               "type": "string"
             },
+            "in_place": {
+              "description": "Run in the host's own checkout of `repo`: no worktree, no branch, and retire only closes\nthe pane. Mutually exclusive with `worktree`.",
+              "type": "boolean"
+            },
             "issue": {
               "format": "uint64",
               "minimum": 0,
@@ -3084,6 +3088,27 @@
           ],
           "type": "object"
         },
+        "Report": {
+          "description": "An agent's last `msg.sent`.",
+          "properties": {
+            "kind": {
+              "type": "string"
+            },
+            "since": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "text",
+            "since"
+          ],
+          "type": "object"
+        },
         "Resource": {
           "properties": {
             "holder": {
@@ -3364,6 +3389,10 @@
             },
             "host": {
               "type": "string"
+            },
+            "in_place": {
+              "description": "Run in the host's own checkout of `repo`: no worktree, no branch, and retire only closes\nthe pane. Mutually exclusive with `worktree`.",
+              "type": "boolean"
             },
             "issue": {
               "format": "uint64",
@@ -3827,6 +3856,41 @@
           ],
           "type": "object"
         },
+        "Waiting": {
+          "description": "An agent's last `BLOCKED` or `QUESTION`, open until the lead tells it anything or it works.",
+          "properties": {
+            "id": {
+              "description": "The id of the `msg.sent`.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "rung": {
+              "default": false,
+              "description": "The host already re-rang the lead (`STILL-WAITING`).",
+              "type": "boolean"
+            },
+            "since": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "to",
+            "kind",
+            "text",
+            "since"
+          ],
+          "type": "object"
+        },
         "Worktree": {
           "properties": {
             "since": {
@@ -4006,6 +4070,15 @@
           "description": "Open blockers by the id of their `blocker.raised`.",
           "type": "object"
         },
+        "escalated": {
+          "default": [],
+          "description": "Tells handed back to their sender as `UNREAD` (`escalations`), kept while they are queued.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
         "first_cwd": {
           "additionalProperties": {
             "type": "string"
@@ -4023,6 +4096,26 @@
           "description": "When each agent that is not up went down (`agent.down`), kept 24 h: a tell to it goes to\nthe coordinator `GONE_AFTER` later, never on a listing flap.",
           "type": "object"
         },
+        "held_streak": {
+          "additionalProperties": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            ],
+            "type": "array"
+          },
+          "default": {},
+          "description": "The last `HELD` text rung per agent and how many times in a row: the host backs off an\nunchanged one. Gone once the agent works, changes state, goes down or is rung `IDLE`.",
+          "type": "object"
+        },
         "hosts": {
           "additionalProperties": {
             "$ref": "#/$defs/Host"
@@ -4035,6 +4128,15 @@
           },
           "default": {},
           "description": "Hung processes by `<host>:<pid>` of the topmost one, `since` always set.",
+          "type": "object"
+        },
+        "idle_rung": {
+          "additionalProperties": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "default": {},
+          "description": "When the host last rang an agent's lead `IDLE`/`HELD` (key: the agent id) or `UNMANAGED`\n(key: the id + `UNMANAGED_KEY`); gone once the agent works or goes down.",
           "type": "object"
         },
         "last": {
@@ -4107,6 +4209,14 @@
           },
           "type": "array"
         },
+        "reports": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Report"
+          },
+          "default": {},
+          "description": "Each up agent's last `msg.sent`, what `IDLE` quotes and `auto_retire` reads (`DONE`/`MERGED`).",
+          "type": "object"
+        },
         "resources": {
           "additionalProperties": {
             "$ref": "#/$defs/Resource"
@@ -4161,6 +4271,15 @@
           },
           "type": "object"
         },
+        "told": {
+          "additionalProperties": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "default": {},
+          "description": "When each agent's lead last told it anything: new work after a `DONE`, so `auto_retire`\nwaits for a fresh one. Gone when the agent goes down.",
+          "type": "object"
+        },
         "unknown": {
           "description": "Events this binary cannot fold (an unknown type, or a known type at a newer `v`): kept in\nthe log, skipped here.",
           "format": "uint64",
@@ -4189,6 +4308,14 @@
           },
           "default": {},
           "description": "Self-update requests by their `update.requested` id, kept for 24 h.",
+          "type": "object"
+        },
+        "waiting": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Waiting"
+          },
+          "default": {},
+          "description": "Each agent's open `BLOCKED`/`QUESTION` to its lead, until answered (see `Waiting`).",
           "type": "object"
         },
         "worktree_procs": {

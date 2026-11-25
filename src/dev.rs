@@ -1455,6 +1455,7 @@ env = { PORT = "{port.web}", API = "{port.api}" }
             args: None,
             started: t(started),
             pgid: Some(pgid),
+            zombie: false,
         };
         let run = Run {
             pid: 500,

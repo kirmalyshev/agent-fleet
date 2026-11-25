@@ -26,6 +26,10 @@ agent-fleet repo add owner/repo
 agent-fleet spawn owner/repo#123       # prints: agent:<host>/<session>/<name> is up (pane …, <worktree>)
 ```
 
+To run an agent in the repository's own checkout, with a brief you wrote (a release agent, say),
+add `--in-place --brief <file>`: no worktree is made, and `retire` closes the pane and leaves the
+checkout alone.
+
 Start more, then see the fleet:
 
 ```sh
@@ -81,11 +85,11 @@ agent-fleet --version                  # the crate version and the commit it was
 agent-fleet init
 ```
 
-`agent-fleet init` writes this machine's `fleet.toml` and `brief.md` into the user config dir
+`agent-fleet init` writes this machine's `fleet.toml`, `brief.md` and `coordinator.md` into the user config dir
 (`~/.config/agent-fleet` on Linux, `instances/<name>` under it for an instance other than
 `default`; `AGENT_FLEET_CONFIG_DIR` overrides it). They are the rules
 `spawn` uses for every repository: a profile for each agent program found on `PATH` (claude,
-codex, devin), one default rule, and a comment on every key. It never overwrites a file. It also
+codex, devin, agy), one default rule, and a comment on every key. It never overwrites a file. It also
 lists your Claude and Codex skills that drive terminals (herdr, tmux, cmux): in a fleet, agents
 talk through `agent-fleet tell` and `spawn`, so check that those skills do not tell them to type
 into each other's panes. Edit the two files, then start the hub and the host as in the quick
@@ -146,7 +150,8 @@ agent-fleet repo rm owner/repo
 that is not a git checkout and a checkout whose `origin` is another repository. The host re-reads
 the list at each spawn and scan, so no restart is needed. It lists the repository's own terminal-driving
 skills (`.claude/skills`, `.codex/skills`) the same way. A repository with its own
-`.agent-fleet/fleet.toml` uses that file instead of the machine's rules.
+`.agent-fleet/fleet.toml` uses that file instead of the machine's rules. `repo add` also writes the
+machine's `coordinator.md` if the config dir has none.
 
 `agent-fleet host --repo owner/repo=<checkout>` flags still work and merge with this list.
 Try a route without starting anything: `agent-fleet spawn owner/repo#123 --dry-run`. The
@@ -297,6 +302,7 @@ file) or to `~/.claude/settings.json`:
   "hooks": {
     "PreToolUse": [ { "matcher": "Bash|exec", "hooks": [ { "type": "command",
       "command": "command -v agent-fleet >/dev/null 2>&1 || exit 0; agent-fleet hook bash" } ] } ],
+    "PostToolUse":      [ { "hooks": [ { "type": "command", "command": "agent-fleet hook mail || true" } ] } ],
     "Stop":             [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ],
     "StopFailure":      [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ],
     "Notification":     [ { "hooks": [ { "type": "command", "command": "agent-fleet hook signal || true" } ] } ],
@@ -311,16 +317,35 @@ file) or to `~/.claude/settings.json`:
   kill another agent's work), an agent started outside herdr (use `agent-fleet spawn`) and a
   `herdr pane send-text|send-keys|run` or `herdr agent prompt|send-keys` into another agent's
   pane (use `agent-fleet tell`).
+- `hook mail` hands a busy agent that takes no typed input (Devin CLI) the tells that arrived
+  while it worked, at its next tool call.
 - `hook signal` reports rate limits, permission prompts, questions and turn ends as
   `agent.signal`, so `ps` and `doctor` can say why an agent is stuck.
 - `hook statusline` records Claude's rate limits for the host to publish as the agent's quota.
   To keep your own status line, wrap it: `agent-fleet hook statusline -- <your command>`.
 
-Tell the fleet who coordinates. Run this in the coordinating agent's pane (or with `--as`):
+Tell the fleet who coordinates. A hub has one coordinator, over every connected repository.
+`agent-fleet init` writes the generic coordinator agent (`agents/coordinator.md` in this repository)
+as `coordinator.md` in the config dir; edit that copy to change it for the machine.
+`agent-fleet coordinator` prints it followed by a "Connected repositories" section: for each
+repository, the project rules to read first (`.agent-fleet/coordinator.md`
+and `AGENTS.md`, whichever exist; a repository with none is listed as
+having none). Project rules extend the generic agent and never replace it. Start the coordinator
+with that prompt:
 
 ```sh
-agent-fleet role me root-coordinator
+agent-fleet coordinator claude              # in this terminal
+agent-fleet coordinator claude --pane <id>  # in a herdr pane at a shell prompt
 ```
+
+Its first message has it run `agent-fleet role me root-coordinator`. With no connected repository
+it still starts and tells you to `agent-fleet repo add`. Only `claude` takes a system prompt for now.
+
+To have the hub run it for you, spawn it: `agent-fleet spawn owner/repo --title coordinator
+--name coordinator --level root-coordinator`. A root-coordinator spawn gets this prompt as its
+brief in place of `brief.md`, and the level declares its role. This repository also ships the
+agent for other harnesses as `.agents/coordinator.md` and `.claude/agents/coordinator.md`, both
+links to `agents/coordinator.md`.
 
 `agent-fleet tell coordinator …` then reaches it, and the host tells it about hung and orphaned
 processes.
@@ -435,6 +460,99 @@ raised, a message was delivered) is a typed event. The state is computed from th
 6. **Every machine has a copy.** The host agent copies the whole log locally. When the hub is
    down, reads still work from that copy.
 
+## How a task is routed
+
+`agent-fleet spawn owner/repo#123` picks the profile and host from the rules in `fleet.toml`
+(the machine's file, or the repository's own `.agent-fleet/fleet.toml`, read from the base
+branch, so a PR cannot change the rules that route it).
+
+```
+ issue ──▶ rules, first match wins ──▶ profile (+ host) ──▶ agent in its own worktree
+                                          │
+                                          └─ at its cap or out of quota at spawn time
+                                             ──▶ the profile's `fallback`
+```
+
+- A rule's `match` words are compared with the issue's title and labels (`label:x` matches only a label named `x`);
+  `--scope` narrows the work and never picks the worker. A rule
+  with no `match` is the default and comes last. A rule's `host` says where the agent runs, for
+  work that needs a particular machine (a simulator, say).
+- A profile is one agent program with its arguments, prefix and `cap` (live agents per
+  repository). Two profiles can run the same program with different models, such as `claude`
+  with `--model opus`.
+- `profile` may be a list: the spawn takes the least-loaded profile that has a seat and quota,
+  and list order breaks ties.
+- A profile that no rule names is only started by hand: `agent-fleet spawn … --profile codex`.
+- `--dry-run` shows the choice and why, without starting anything. `agent-fleet stats` shows how
+  each profile has done, from the events the hub already logs: speed, quality, predictability.
+
+## The life of a task
+
+1. **Issue.** One issue, one branch, one pull request.
+2. **Spawn.** The host makes a worktree and a branch for the agent, runs the `ready` hook,
+   starts the program in a herdr pane and types the brief into it.
+3. **Work.** The agent reports through the CLI (`tell`, `block`, `ask`); the host reports what
+   it sees in the pane.
+4. **Pull request and verdict.** The agent opens a PR and a reviewer ends it with
+   `VERDICT: READY <full head sha>` as the last line of the PR's last comment. Without it,
+   or if the head has moved, `merge` refuses.
+5. **Check and merge.** `agent-fleet merge` runs the repository's gate, then squash-merges. A
+   red gate makes `merge` refuse and print the gate's output; the lead sends the agent back to
+   step 3.
+6. **Retire.** `agent-fleet retire` closes the pane and removes the worktree. Uncommitted work
+   is shown to the lead and kept until someone decides; it is never deleted silently.
+
+## When an agent stops
+
+The host classifies every stop and records it as `agent.stuck` with a cause. A question, a
+full context, an empty quota, an error, an account problem, a permission prompt, a rate
+limit, a wait on a shared resource, a deliberate hold, a plain wait or something unknown each
+get their own action: a message to the lead, a handoff to the profile's `on_quota`, or a
+`continue` once a rate limit lifts. Actions that touch an agent (the handoff, the `continue`)
+run only under `host --stuck-act`; without it the host records the cause and tells the lead what
+it would have done. An agent that never reached `working` after `handoff_min` minutes gets one
+message to its lead. Nothing acts before the state has lasted `--stall-min`, and each cause
+acts at most once per episode. The table of
+causes and actions is in [docs/PROTOCOL.md](docs/PROTOCOL.md).
+
+```
+working ──▶ idle or blocked ──cause read from the screen──▶ agent.stuck ──lead answers──▶ working
+   └──PR merged──▶ done ──▶ retire
+```
+
+(Simplified: `stuck` is a record on an idle or blocked agent, not a state of its own.)
+
+A process that is alive but not progressing is reported `HUNG`; a process whose agent is gone
+is `ORPHAN`. The messages carry the `agent-fleet kill` command that stops the process safely:
+it refuses agents, panes, the fleet's own daemons and your own ancestors, and signals another
+agent's process only when the watch reported it hung and a sample confirms it is idle. So an
+agent cannot kill itself or a neighbour's work.
+
+## Roles
+
+| Level | Does | Does not |
+|---|---|---|
+| `root-coordinator` | Normally one per hub; the latest declared gets the escalations. Routes work, answers agents, merges at a reviewed sha, asks the human through the board | Write code |
+| `domain-lead`, `implementation-lead` | Own a part of the work and the agents under it | |
+| `implementer` | One issue: code, tests, PR; reports to its lead in one line | |
+
+Set a level with `agent-fleet role` or `spawn --level`. A lead gets the messages about the
+agents under it, and a message nobody reads goes up the chain to the root coordinator.
+
+## Glossary
+
+| Term | Meaning |
+|---|---|
+| hub | The one process that keeps the event log and the folded state |
+| host | The watcher on one machine and herdr session; it feeds events to the hub and keeps a replica |
+| pane | A herdr terminal pane; one agent lives in each |
+| worktree | A git working copy in its own directory, so agents do not collide |
+| brief | The start instruction typed into an agent: the project's rules, its task, how to report |
+| doorbell | A message typed into the recipient's prompt, then confirmed with `msg.delivered` |
+| VERDICT | The last line of a PR's last comment, `VERDICT: READY <full head sha>`: ready at that commit |
+| gate | A check that must pass before `merge` |
+| retire | Closing an agent and removing its worktree; uncommitted work is shown, not deleted |
+
 ## Commands
 
 From `agent-fleet --help`; every command has its own `--help`.
@@ -448,7 +566,8 @@ From `agent-fleet --help`; every command has its own `--help`.
 | `ps` | What every agent is doing |
 | `self-update` | Every host that is up pulls `main` in the clone its binary was built from, rebuilds and restarts; prints the commit each one then runs. A dirty clone or one not on `main` refuses |
 | `instances` | The agent-fleet instances on this machine and the hub each one uses |
-| `init` | Write this machine's fleet.toml and brief.md into the instance's config dir (`AGENT_FLEET_CONFIG_DIR` overrides it): commented templates with a profile for each agent program on PATH and one default rule. Never overwrites an existing file. Lists the user-level Claude and Codex skills that drive terminals (herdr, tmux, cmux) |
+| `init` | Write this machine's fleet.toml, brief.md and coordinator.md into the instance's config dir (`AGENT_FLEET_CONFIG_DIR` overrides it): commented templates with a profile for each agent program on PATH and one default rule. Never overwrites an existing file. Lists the user-level Claude and Codex skills that drive terminals (herdr, tmux, cmux) |
+| `coordinator` | Print the coordinator prompt for this machine's hub: the generic coordinator agent (`coordinator.md` in the config dir, written by `init`), then each connected repository with the project rules to read for it. Start the one coordinator with it, e.g. `claude --append-system-prompt "$(agent-fleet coordinator)"`, then `agent-fleet role me root-coordinator`. With a program (`claude`) it starts that program with the prompt loaded, in this terminal or in the herdr pane named by `--pane`; its first message has it take the root-coordinator role |
 | `repo` | Connect a repository to the fleet on this machine: `add` records its checkout in the machine's fleet.toml, `ls` lists, `rm` disconnects. The host picks changes up without a restart |
 | `dev` | Per-worktree dev environments from the repository's `.agent-fleet/dev.toml` (`up`, `down`, `status` …: each worktree gets a slot with its own ports and values, runs its own services, and shares the infra; `db`, `test`), the worktrees of the connected repositories (`ls`, `clean`), and the agents and PRs on them (`agents`, `prs`) |
 | `tui` | The fleet on one screen, live: agents, worktrees, tasks, findings, resources, asks; `:` runs any command from it. `--all`: every instance on this machine |
@@ -468,7 +587,7 @@ From `agent-fleet --help`; every command has its own `--help`.
 | `tell` | Ring an agent's doorbell: `[agent-fleet <from>→<to>] TYPE ref: text (event <id>; ack: agent-fleet read)` |
 | `read` | Read your own tells: every one sent to you (or to a role you hold) not read yet, delivered or not, oldest first with its original sender and time; each is then acked (`msg.read`), so it stops being rung again. Run it at every turn start |
 | `sent` | Your tells and where each is: `sent` (waiting for a ring), `unread <age>` (delivered, not read yet), or `read` |
-| `stats` | Numbers about the fleet: doorbell latency and loss, event lag, host and hub vitals |
+| `stats` | Scorecard per routing profile (or agent program): speed, quality and predictability, computed from the events the hub already logs. `--log` prints the fleet's own vitals instead: doorbell latency and loss, event lag, host and hub load |
 | `proc` | What the log says of a process on this host: `hung`, `orphan`, `waiting` (in a lock's queue), `no report` (not hung, or not watched), or `gone` |
 | `doctor` | What needs a look: stale, hung or heavy agents, duplicate work, forgotten worktrees, unpushed commits |
 | `bench` | Load-test a throwaway in-process hub: post latency, throughput, follower lag, 409 races |
