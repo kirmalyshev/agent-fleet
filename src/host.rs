@@ -484,6 +484,50 @@ impl Host {
         epoch
     }
 
+    /// `agent-fleet adopt` renamed `pane` in herdr: register its agent under the new name.
+    pub(crate) async fn adopt(self: &Arc<Self>, pane: &str) {
+        match herdr_call(
+            &self.cfg.herdr_socket,
+            "agent.get",
+            json!({ "target": pane }),
+        )
+        .await
+        {
+            Ok(info) => self.adopted(pane, &info["agent"]).await,
+            Err(e) => {
+                bump(&self.n.herdr_errors);
+                eprintln!("agent-fleet host: adopt {pane}: {e:#}");
+            }
+        }
+    }
+
+    /// Up under the name `info` carries; the record it had in this pane (the pane-id stub, or
+    /// any other) goes down, `adopted as <name>`, unless another pane still holds that agent.
+    pub(crate) async fn adopted(self: &Arc<Self>, pane: &str, info: &Value) {
+        let old = self
+            .panes
+            .lock()
+            .unwrap()
+            .get(pane)
+            .map_or_else(|| self.agent_id(pane), |l| l.agent.clone());
+        let epoch = self.agent_up(pane, info).await;
+        let new = self
+            .panes
+            .lock()
+            .unwrap()
+            .get(pane)
+            .map(|l| l.agent.clone());
+        let held = self.panes.lock().unwrap().values().any(|l| l.agent == old);
+        if let Some(new) = new.filter(|n| *n != old && !held) {
+            self.publish(self.presence(Known::AgentDown(AgentDown {
+                agent: old,
+                reason: Some(format!("adopted as {}", crate::spawn::short(&new))),
+            })))
+            .await;
+        }
+        self.watch_pane(pane.to_string(), epoch);
+    }
+
     /// Forgets `pane`. `agent.down` is published only if that agent is not alive in another pane
     /// (a moved pane, or herdr restored with the agent elsewhere).
     pub(crate) async fn agent_down(self: &Arc<Self>, pane: &str, reason: &str) {
@@ -2856,6 +2900,31 @@ mod tests {
         assert_eq!(panes["w:9"].agent, "agent:h/s/w:9");
         assert!(fake.renames.lock().unwrap().is_empty());
         assert!(!types(&host).contains(&"agent.renamed".to_string()));
+    }
+
+    #[tokio::test]
+    async fn an_adopted_pane_is_up_under_its_new_name_and_the_old_record_goes_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, _fake, _) = host_on_fake(dir.path(), "working").await;
+        let info = json!({ "name": "b", "agent": "claude", "agent_status": "idle" });
+        host.adopted("w:1", &info).await;
+        assert_eq!(host.panes.lock().unwrap()["w:1"].agent, "agent:h/s/b");
+        let downs: Vec<_> = host
+            .replica
+            .lock()
+            .unwrap()
+            .all()
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.body {
+                Body::Known(Known::AgentDown(d)) => Some((d.agent, d.reason)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            downs,
+            [("agent:h/s/a".to_string(), Some("adopted as b".to_string()))]
+        );
     }
 
     #[tokio::test]

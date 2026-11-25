@@ -2188,6 +2188,7 @@ pub async fn spawn_loop(host: Arc<Host>) {
     let mut warned: HashSet<String> = HashSet::new();
     let mut stuck_seen = crate::stuck::Seen::default();
     let mut retire_seen: HashSet<String> = HashSet::new();
+    let mut adopt_seen: HashSet<String> = HashSet::new();
     let mut merge_seen: HashSet<String> = HashSet::new();
     let mut chores_seen = crate::chores::Seen::default();
     loop {
@@ -2223,6 +2224,7 @@ pub async fn spawn_loop(host: Arc<Host>) {
             }
         }
         crate::retire::serve(&host, &mut retire_seen).await;
+        crate::adopt::serve(&host, events, &mut adopt_seen).await;
         crate::merge::serve(&host, &mut merge_seen);
         handoffs(&host, state, events, &mut handed, &mut warned).await;
         stuck(&host, state, events, &mut stuck_seen, &handed).await;
