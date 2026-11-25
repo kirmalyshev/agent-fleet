@@ -644,6 +644,14 @@ enum HookCmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// PostToolUse hook for any harness that takes `additionalContext` (Claude Code, Devin CLI):
+    /// when the agent has unread tells, prints them and marks them read, so a tell sent during a
+    /// long turn arrives at the next tool call. Silent with none. Always exits 0.
+    Unread {
+        /// Ignored: a hook exits 0 on any error, argument errors included.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1087,6 +1095,26 @@ async fn main() -> Result<()> {
                         &input,
                     )
                     .await;
+                }
+                std::process::exit(0);
+            }
+            HookCmd::Unread { .. } => {
+                let mut input = String::new();
+                let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+                if let Some(paths) = &paths
+                    && let Some(out) = signal::unread_hook(
+                        paths,
+                        cli.hub.as_deref(),
+                        cli.token_file.as_deref(),
+                        &cli.project,
+                        &host_name(&cli),
+                    )
+                    .await
+                {
+                    let _ = std::io::Write::write_all(
+                        &mut std::io::stdout().lock(),
+                        format!("{out}\n").as_bytes(),
+                    );
                 }
                 std::process::exit(0);
             }
@@ -2229,7 +2257,7 @@ async fn main() -> Result<()> {
                 .await?;
             if busy {
                 let how = if recipient_queues {
-                    "queued, read at its next turn boundary"
+                    "queued, read at its next tool call (`hook unread`) or turn boundary"
                 } else {
                     "delivers at its next tool call (`hook mail`) or when idle"
                 };
@@ -2672,6 +2700,12 @@ mod tests {
             scorecard::By::Kind
         );
         assert!(Cli::try_parse_from(["agent-fleet", "stats", "--by", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn hook_unread_eats_any_arguments() {
+        assert!(Cli::try_parse_from(["agent-fleet", "hook", "unread"]).is_ok());
+        assert!(Cli::try_parse_from(["agent-fleet", "hook", "unread", "--bogus", "-f"]).is_ok());
     }
 
     #[test]

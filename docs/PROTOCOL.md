@@ -662,6 +662,24 @@ none, outside herdr or on any error it prints nothing and exits 0.
   "command": "agent-fleet hook mail || true" } ] } ] } }
 ```
 
+`agent-fleet hook unread` is a second `PostToolUse` hook (every tool) for the same two harnesses.
+A queued tell reaches a busy `claude` only at its turn boundary, and a turn can last minutes: at
+each tool call the hook reads the hub's `/state` once (1 s cap), and if the agent (its herdr
+pane's agent, found as `hook signal` finds it) has unread tells, it writes one `msg.read` per
+tell, as `agent-fleet read` does, then prints them as `hookSpecificOutput.additionalContext`
+(`hookEventName: PostToolUse`). The acks are queued in the spool before the tells are printed, so
+a failed ack shows a tell twice, never zero times, and a tell is shown once. With none, a hub that
+does not answer, outside herdr or on any error it prints nothing and exits 0 (never 2: it never
+blocks a tool). A check that found nothing is not repeated for 2 s (`unread.checked` in the data
+dir). Like `hook mail`, a `claude` run inside another program's pane takes nothing. Codex and
+Antigravity (`agy`) expose no tool-call hook that adds context for the agent, so their tells keep
+arriving by the mailbox/typed ring and `agent-fleet read`.
+
+```json
+{ "hooks": { "PostToolUse": [ { "hooks": [ { "type": "command",
+  "command": "agent-fleet hook unread || true" } ] } ] } }
+```
+
 `agent-fleet hook statusline` stays the status-line wrapper: it stores the `rate_limits`
 it is fed for the host's `agent.quota` read, emits `context_full` as above when the process
 sits in a herdr pane, and passes the input on to the command it wraps.
