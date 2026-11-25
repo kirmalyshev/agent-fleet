@@ -139,7 +139,7 @@ pub(crate) struct Host {
     panes: Mutex<HashMap<String, Local>>,
     /// herdr pane id → the name herdr last gave its agent. herdr forgets it when the agent
     /// restarts in the pane (#201); the next agent there gets it back. Dropped when the pane
-    /// closes. ponytail: lost when the host restarts; `agent-fleet adopt` covers that.
+    /// closes. ponytail: lost when the host restarts while an agent is between runs; persist under the data dir if that bites.
     names: Mutex<HashMap<String, String>>,
     next_epoch: AtomicU64,
     /// Wakes the delivery loop.

@@ -93,7 +93,7 @@
         },
         "AgentRenamed": {
           "additionalProperties": false,
-          "description": "An agent's name was set by the fleet, not by herdr: the host restored the name herdr dropped\nwhen the agent restarted in its pane, or `adopt` named a live pane. Written just before the\n`agent.up` that carries the name; `rule` says which.",
+          "description": "An agent's name was set by the fleet, not by herdr: the host restored the name herdr dropped\nwhen the agent restarted in its pane. Written just before the\n`agent.up` that carries the name; `rule` says which.",
           "properties": {
             "agent": {
               "description": "The agent's full id after the rename.",
@@ -110,7 +110,7 @@
               "type": "string"
             },
             "rule": {
-              "description": "The rule that did it, e.g. `pane-name-memory` or `adopt`.",
+              "description": "The rule that did it, e.g. `pane-name-memory`.",
               "type": "string"
             }
           },
@@ -4214,6 +4214,15 @@
           },
           "type": "array",
           "uniqueItems": true
+        },
+        "left_pane": {
+          "additionalProperties": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "default": {},
+          "description": "When each agent last left its pane without the pane closing (`agent.down` \"agent left the\npane\"): it is about to come back, so its spawn record outlives the usual 24 h meanwhile.",
+          "type": "object"
         },
         "limits": {
           "additionalProperties": {

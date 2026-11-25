@@ -314,7 +314,7 @@ pub struct AgentStateChanged {
 }
 
 /// An agent's name was set by the fleet, not by herdr: the host restored the name herdr dropped
-/// when the agent restarted in its pane, or `adopt` named a live pane. Written just before the
+/// when the agent restarted in its pane. Written just before the
 /// `agent.up` that carries the name; `rule` says which.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -325,7 +325,7 @@ pub struct AgentRenamed {
     /// The id it had until now (a pane-id name, `agent:<host>/<session>/<pane>`), when it had one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
-    /// The rule that did it, e.g. `pane-name-memory` or `adopt`.
+    /// The rule that did it, e.g. `pane-name-memory`.
     pub rule: String,
 }
 
