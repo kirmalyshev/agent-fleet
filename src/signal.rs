@@ -257,26 +257,53 @@ pub async fn unread_with(
     Some(out)
 }
 
-/// The `hook unread` entry. Only in a herdr pane whose agent herdr names; a nested `claude -p`
-/// (`CLAUDECODE`) inside another program's pane takes nothing, as with `hook mail`.
+/// The cache stamp of `pane`: one per pane, so one agent's empty check never silences another's.
+fn unread_stamp(paths: &Paths, pane: &str) -> std::path::PathBuf {
+    let safe: String = pane
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    paths.dir.join(format!("unread.checked.{safe}"))
+}
+
+/// Whether `stamp` is younger than `UNREAD_CACHE`.
+fn fresh(stamp: &Path) -> bool {
+    std::fs::metadata(stamp)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < UNREAD_CACHE)
+}
+
+/// The `hook unread` entry, for a `claude` agent in a herdr pane only: Devin's tells come by
+/// `hook mail` (both would show it twice), and a `claude` run inside another program's pane, or a
+/// Claude Code subagent (its hook input carries `agent_id`), must not take the pane agent's.
 pub async fn unread_hook(
     paths: &Paths,
     hub: Option<&str>,
     token_file: Option<&Path>,
     project: &str,
     host: &str,
+    input: &str,
 ) -> Option<String> {
-    let stamp = paths.dir.join("unread.checked");
-    if std::fs::metadata(&stamp)
-        .and_then(|m| m.modified())
+    if serde_json::from_str::<Value>(input)
         .ok()
-        .and_then(|t| t.elapsed().ok())
-        .is_some_and(|age| age < UNREAD_CACHE)
+        .is_some_and(|v| v.get("agent_id").is_some())
     {
         return None;
     }
+    let stamp = unread_stamp(paths, &std::env::var("HERDR_PANE_ID").ok()?);
+    if fresh(&stamp) {
+        return None;
+    }
     let (agent, program) = tokio::time::timeout(HOOK_BUDGET, who(host)).await.ok()??;
-    if std::env::var_os("CLAUDECODE").is_some_and(|v| !v.is_empty()) && program != "claude" {
+    if program != "claude" {
         return None;
     }
     let token = cli_token(paths, token_file)?;
@@ -642,6 +669,44 @@ mod tests {
         assert!(unread_output(&State::default(), &a, "p", chrono::Utc::now()).is_none());
         // the sender has nothing unread either
         assert!(unread_output(&fold(&es), &a, "p", chrono::Utc::now()).is_none());
+    }
+
+    #[test]
+    fn the_unread_cache_is_per_pane_and_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            dir: dir.path().to_path_buf(),
+        };
+        let (a, b) = (unread_stamp(&paths, "w1:p1"), unread_stamp(&paths, "w1:p2"));
+        assert_ne!(a, b);
+        assert!(!fresh(&a), "never checked");
+        std::fs::write(&a, "").unwrap();
+        assert!(
+            fresh(&a) && !fresh(&b),
+            "one pane's check leaves the other's due"
+        );
+        let old = std::time::SystemTime::now() - Duration::from_secs(30);
+        std::fs::File::options()
+            .write(true)
+            .open(&a)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(!fresh(&a), "expired");
+    }
+
+    #[tokio::test]
+    async fn a_subagent_hook_takes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            dir: dir.path().to_path_buf(),
+        };
+        let input = r#"{"hook_event_name":"PostToolUse","agent_id":"sub1"}"#;
+        assert!(
+            unread_hook(&paths, None, None, "p", "h", input)
+                .await
+                .is_none()
+        );
     }
 
     fn client(base: &str, dir: &Path) -> crate::client::Client {
