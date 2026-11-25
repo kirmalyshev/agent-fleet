@@ -1989,6 +1989,7 @@ async fn idle(host: &Host, state: &State) {
                         agent: agent.clone(),
                         host: host.cfg.host.clone(),
                         decide: None,
+                        rule: Some("idle.auto_retire".into()),
                     }),
                 ))
                 .await;

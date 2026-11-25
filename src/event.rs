@@ -212,6 +212,8 @@ pub enum Known {
     AgentUsage(AgentUsage),
     #[serde(rename = "agent.role")]
     AgentRole(AgentRole),
+    #[serde(rename = "agent.renamed")]
+    AgentRenamed(AgentRenamed),
     #[serde(rename = "agent.quota")]
     AgentQuota(AgentQuota),
     #[serde(rename = "worktree.state")]
@@ -309,6 +311,22 @@ pub struct AgentUp {
 pub struct AgentStateChanged {
     pub agent: String,
     pub state: AgentState,
+}
+
+/// An agent's name was set by the fleet, not by herdr: the host restored the name herdr dropped
+/// when the agent restarted in its pane. Written just before the
+/// `agent.up` that carries the name; `rule` says which.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRenamed {
+    /// The agent's full id after the rename.
+    pub agent: String,
+    pub pane: String,
+    /// The id it had until now (a pane-id name, `agent:<host>/<session>/<pane>`), when it had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// The rule that did it, e.g. `pane-name-memory`.
+    pub rule: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -858,6 +876,9 @@ pub struct RetireRequested {
     /// `delete`, `keep` or `stash`: what to do with real uncommitted changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decide: Option<String>,
+    /// The rule that asked, when a rule and not a person did: `idle.auto_retire`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
 }
 
 /// The `retire.requested` named by `re`, answered by the host that ran it.
@@ -960,6 +981,7 @@ impl Known {
             Self::HostHealth(_) => "host.health",
             Self::AgentUsage(_) => "agent.usage",
             Self::AgentRole(_) => "agent.role",
+            Self::AgentRenamed(_) => "agent.renamed",
             Self::AgentQuota(_) => "agent.quota",
             Self::WorktreeState(_) => "worktree.state",
             Self::WorktreeGone(_) => "worktree.gone",
@@ -1033,7 +1055,7 @@ impl Known {
                 &[Agent]
             }
             Self::AskAnswered(_) => &[Human],
-            Self::MsgSent(_) => &[Agent, Host, Human],
+            Self::MsgSent(_) | Self::AgentRenamed(_) => &[Agent, Host, Human],
             _ => &[Agent, Host],
         }
     }

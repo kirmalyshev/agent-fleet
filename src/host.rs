@@ -137,6 +137,10 @@ pub(crate) struct Host {
     view: Mutex<Arc<View>>,
     /// herdr pane id → the agent in it.
     panes: Mutex<HashMap<String, Local>>,
+    /// herdr pane id → the name herdr last gave its agent. herdr forgets it when the agent
+    /// restarts in the pane (#201); the next agent there gets it back. Dropped when the pane
+    /// closes. ponytail: lost when the host restarts while an agent is between runs; persist under the data dir if that bites.
+    names: Mutex<HashMap<String, String>>,
     next_epoch: AtomicU64,
     /// Wakes the delivery loop.
     pub(crate) wake: Notify,
@@ -252,6 +256,7 @@ impl Host {
             replica: Mutex::new(replica),
             view: Mutex::default(),
             panes: Mutex::default(),
+            names: Mutex::default(),
             next_epoch: AtomicU64::new(1),
             wake: Notify::new(),
             seen: Notify::new(),
@@ -426,7 +431,30 @@ impl Host {
 
     /// Records the agent in `pane` and publishes `agent.up`. Returns the generation to watch.
     pub(crate) async fn agent_up(&self, pane: &str, info: &Value) -> u64 {
-        let agent = self.agent_id(info["name"].as_str().unwrap_or(pane));
+        let named = info["name"].as_str().filter(|n| !n.is_empty());
+        let kept = match named {
+            Some(_) => None,
+            None => self.names.lock().unwrap().get(pane).cloned(),
+        };
+        let agent = self.agent_id(named.or(kept.as_deref()).unwrap_or(pane));
+        if let Some(n) = named {
+            self.names.lock().unwrap().insert(pane.into(), n.into());
+        }
+        if let Some(name) = &kept {
+            // Say who renamed and why before the `agent.up` that carries the name.
+            self.publish(self.presence(Known::AgentRenamed(AgentRenamed {
+                agent: agent.clone(),
+                pane: pane.into(),
+                from: Some(self.agent_id(pane)),
+                rule: "pane-name-memory".into(),
+            })))
+            .await;
+            let params = json!({ "target": pane, "name": name });
+            if let Err(e) = herdr_call(&self.cfg.herdr_socket, "agent.rename", params).await {
+                bump(&self.n.herdr_errors);
+                eprintln!("agent-fleet host: rename {pane} to {name}: {e:#}");
+            }
+        }
         let state = agent_state(&info["agent_status"]);
         let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed);
         {
@@ -459,6 +487,10 @@ impl Host {
     /// Forgets `pane`. `agent.down` is published only if that agent is not alive in another pane
     /// (a moved pane, or herdr restored with the agent elsewhere).
     pub(crate) async fn agent_down(self: &Arc<Self>, pane: &str, reason: &str) {
+        // The pane's name survives an agent that merely left it, not a closed or vanished pane.
+        if reason != "agent left the pane" {
+            self.names.lock().unwrap().remove(pane);
+        }
         let gone = {
             let mut panes = self.panes.lock().unwrap();
             let gone = panes.remove(pane);
@@ -1902,6 +1934,8 @@ mod tests {
         screen: Mutex<String>,
         echo: Mutex<bool>,
         subs: tokio::sync::Mutex<Vec<OwnedWriteHalf>>,
+        /// The `(target, name)` of each `agent.rename`.
+        renames: Mutex<Vec<(String, String)>>,
     }
 
     impl FakeHerdr {
@@ -1963,6 +1997,16 @@ mod tests {
                             )
                             .await
                             .unwrap();
+                        }
+                        "agent.rename" => {
+                            let p = &req["params"];
+                            fake.renames.lock().unwrap().push((
+                                p["target"].as_str().unwrap().into(),
+                                p["name"].as_str().unwrap().into(),
+                            ));
+                            wr.write_all(reply(json!({ "type": "ok" })).as_bytes())
+                                .await
+                                .unwrap();
                         }
                         m => panic!("unexpected herdr call {m}"),
                     }
@@ -2760,6 +2804,58 @@ mod tests {
         );
         host.agent_down("w:2", "pane closed").await;
         assert!(types(&host).contains(&"agent.down".to_string()));
+    }
+
+    /// #201: herdr drops an agent's name when the agent restarts in its pane; the host used to
+    /// log the next one as the pane id (`agent:h/s/w:1`), a different agent with no record.
+    #[tokio::test]
+    async fn a_restart_in_the_pane_keeps_the_agents_name_and_logs_the_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, fake, _) = host_on_fake(dir.path(), "working").await;
+        host.agent_down("w:1", "agent left the pane").await;
+        let nameless = json!({ "agent": "claude", "agent_status": "idle" });
+        host.agent_up("w:1", &nameless).await;
+        assert!(
+            host.panes
+                .lock()
+                .unwrap()
+                .get("w:1")
+                .is_some_and(|l| l.agent == "agent:h/s/a")
+        );
+        let renamed: Vec<_> = host
+            .replica
+            .lock()
+            .unwrap()
+            .all()
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.body {
+                Body::Known(Known::AgentRenamed(r)) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(renamed.len(), 1, "{renamed:?}");
+        assert_eq!(
+            (renamed[0].agent.as_str(), renamed[0].rule.as_str()),
+            ("agent:h/s/a", "pane-name-memory")
+        );
+        // herdr gets its name back, so `herdr agent list` and the fleet agree
+        assert_eq!(*fake.renames.lock().unwrap(), [("w:1".into(), "a".into())]);
+    }
+
+    #[tokio::test]
+    async fn a_closed_pane_forgets_its_name_and_an_unnamed_pane_never_had_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, fake, _) = host_on_fake(dir.path(), "working").await;
+        host.agent_down("w:1", "pane closed").await;
+        let nameless = json!({ "agent": "claude", "agent_status": "idle" });
+        host.agent_up("w:1", &nameless).await;
+        host.agent_up("w:9", &nameless).await;
+        let panes = host.panes.lock().unwrap();
+        assert_eq!(panes["w:1"].agent, "agent:h/s/w:1");
+        assert_eq!(panes["w:9"].agent, "agent:h/s/w:9");
+        assert!(fake.renames.lock().unwrap().is_empty());
+        assert!(!types(&host).contains(&"agent.renamed".to_string()));
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 
 use crate::doctor::{escalate, held, worktree_of};
-use crate::event::AgentState;
+use crate::event::{AgentState, Level};
 use crate::spawn::short;
 use crate::state::{State, UNMANAGED_KEY};
 use crate::ui::ago;
@@ -94,6 +94,13 @@ pub fn due(
             ));
         }
         let idle = now - a.since;
+        let level = s.roles.get(id).map(|r| r.level);
+        let is_lead = level == Some(Level::DomainLead);
+        // A lead is not finished while anyone it leads is up; a domain-lead never is (#201).
+        let leads_live = s
+            .reports(id)
+            .into_iter()
+            .any(|r| s.agents.contains_key(r.as_str()));
         let report = s
             .reports
             .get(id)
@@ -116,7 +123,13 @@ pub fn due(
             && (report.is_some_and(|r| ["DONE", "MERGED"].contains(&r.kind.as_str()))
                 || (!mine.is_empty() && mine.iter().all(|t| t.state.is_terminal())));
         // A retire is asked once per stretch since it last worked, not per state flip.
-        if c.auto_retire && finished && idle >= RETIRE_AFTER && sp.is_some() {
+        if c.auto_retire
+            && finished
+            && !is_lead
+            && !leads_live
+            && idle >= RETIRE_AFTER
+            && sp.is_some()
+        {
             let asked: Vec<_> = s
                 .retires
                 .values()
@@ -138,6 +151,10 @@ pub fn due(
         }
         let name = short(id);
         let held = held(s, id);
+        // A domain-lead idles on purpose: asked once since it came up, and never "retire?".
+        if is_lead && held.is_none() && s.lead_idled.contains(id) {
+            continue;
+        }
         // A wait that does not change is not news: the same HELD text backs off, 2x, 4x, 8x the
         // base gap, up to `HELD_CAP`. New text, or the agent working, starts over.
         let gap = match (&held, s.held_streak.get(id)) {
@@ -164,7 +181,11 @@ pub fn due(
                 );
                 (
                     "IDLE",
-                    format!("{name} {}: {what} — retire?", ago(now, a.since)),
+                    if is_lead {
+                        format!("{name} {}: {what}", ago(now, a.since))
+                    } else {
+                        format!("{name} {}: {what} — retire?", ago(now, a.since))
+                    },
                 )
             }
         };
@@ -556,6 +577,94 @@ mod tests {
         );
     }
 
+    fn merged(s: &mut State) {
+        s.reports.insert(
+            "agent:h/s/a".into(),
+            Report {
+                kind: "MERGED".into(),
+                text: "#5".into(),
+                since: t0(),
+            },
+        );
+    }
+
+    fn retiring() -> Config {
+        Config {
+            auto_retire: true,
+            ..Config::default()
+        }
+    }
+
+    fn is_retire(got: &[(String, Act)]) -> bool {
+        got.iter().any(|(_, a)| *a == Act::Retire)
+    }
+
+    #[test]
+    fn a_domain_lead_is_never_auto_retired() {
+        let mut s = state();
+        spawned(&mut s, "agent:h/s/a");
+        merged(&mut s);
+        assert!(is_retire(&acts(&s, 30, retiring())), "control: finished");
+        s.roles.get_mut("agent:h/s/a").unwrap().level = crate::event::Level::DomainLead;
+        assert!(!is_retire(&acts(&s, 30, retiring())));
+    }
+
+    #[test]
+    fn a_domain_lead_whose_one_task_ended_long_ago_stays() {
+        // #201: a domain-lead owned one task, completed days earlier; all-terminal finished it.
+        let mut s = state();
+        spawned(&mut s, "agent:h/s/a");
+        s.roles.get_mut("agent:h/s/a").unwrap().level = crate::event::Level::DomainLead;
+        s.tasks.insert(
+            "t".into(),
+            crate::state::Task {
+                project: "p".into(),
+                title: "T".into(),
+                url: None,
+                state: crate::event::TaskState::Completed,
+                since: t0(),
+                owner: Some("agent:h/s/a".into()),
+                lead: None,
+                blocked_by: Default::default(),
+                handoffs: vec![],
+            },
+        );
+        assert!(!is_retire(&acts(&s, 600, retiring())));
+    }
+
+    #[test]
+    fn an_agent_with_a_live_report_is_not_auto_retired() {
+        let mut s = state();
+        spawned(&mut s, "agent:h/s/a");
+        merged(&mut s);
+        let mut b = s.agents["agent:h/s/a"].clone();
+        b.state = AgentState::Working;
+        s.agents.insert("agent:h/s/b".into(), b);
+        let mut role = s.roles["agent:h/s/a"].clone();
+        role.lead = Some("agent:h/s/a".into());
+        s.roles.insert("agent:h/s/b".into(), role);
+        assert!(!is_retire(&acts(&s, 30, retiring())));
+        // its report is down (the role stays): the lead may go
+        s.agents.remove("agent:h/s/b");
+        assert!(is_retire(&acts(&s, 30, retiring())));
+    }
+
+    #[test]
+    fn a_domain_lead_is_asked_about_idle_once_and_not_about_retiring() {
+        let mut s = state();
+        spawned(&mut s, "agent:h/s/a");
+        s.roles.get_mut("agent:h/s/a").unwrap().level = crate::event::Level::DomainLead;
+        let got = acts(&s, 20, Config::default());
+        let Act::Ring { kind, text, .. } = &got[0].1 else {
+            panic!("{got:?}")
+        };
+        assert_eq!(*kind, "IDLE");
+        assert!(!text.contains("retire?"), "{text}");
+        // however long it idles, or flips state in between, never again
+        s.lead_idled.insert("agent:h/s/a".into());
+        assert!(acts(&s, 5000, Config::default()).is_empty());
+    }
+
     #[test]
     fn a_terminal_task_finishes_an_agent_and_a_live_one_does_not() {
         let mut s = state();
@@ -657,6 +766,7 @@ mod tests {
                     agent: "agent:h/s/a".into(),
                     host: "h".into(),
                     decide: None,
+                    rule: None,
                 },
                 by: "host:h".into(),
                 project: "p".into(),
@@ -717,6 +827,7 @@ mod tests {
                     agent: "agent:h/s/a".into(),
                     host: "h".into(),
                     decide: None,
+                    rule: None,
                 },
                 by: "host:h".into(),
                 project: "p".into(),

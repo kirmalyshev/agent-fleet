@@ -53,6 +53,14 @@ pub struct State {
     /// (key: the id + `UNMANAGED_KEY`); gone once the agent works or goes down.
     #[serde(default)]
     pub idle_rung: BTreeMap<String, DateTime<Utc>>,
+    /// Agents the host has rung `IDLE` since they came up. A domain-lead is asked once: this
+    /// outlives a state change, unlike `idle_rung`. Gone on `agent.down`.
+    #[serde(default)]
+    pub lead_idled: BTreeSet<String>,
+    /// When each agent last left its pane without the pane closing (`agent.down` "agent left the
+    /// pane"): it is about to come back, so its spawn record outlives the usual 24 h meanwhile.
+    #[serde(default)]
+    pub left_pane: BTreeMap<String, DateTime<Utc>>,
     /// The last `HELD` text rung per agent and how many times in a row: the host backs off an
     /// unchanged one. Gone once the agent works, changes state, goes down or is rung `IDLE`.
     #[serde(default)]
@@ -916,6 +924,7 @@ impl State {
         match k {
             Known::AgentUp(d) => {
                 self.gone.remove(&d.agent);
+                self.left_pane.remove(&d.agent);
                 // A re-up (host or herdr restart) keeps what the entry already knows: the last
                 // working time, the current stretch when the state did not change, the usage.
                 let old = self.agents.get(&d.agent);
@@ -1089,6 +1098,8 @@ impl State {
                     }
                 }
             }
+            // Only the log keeps a rename: the `agent.up` after it carries the new id.
+            Known::AgentRenamed(_) => {}
             Known::AgentDown(d) => {
                 clear_asks(
                     &mut self.waiting,
@@ -1098,6 +1109,10 @@ impl State {
                 );
                 self.reports.remove(&d.agent);
                 self.told.remove(&d.agent);
+                self.lead_idled.remove(&d.agent);
+                if d.reason.as_deref() == Some("agent left the pane") {
+                    self.left_pane.insert(d.agent.clone(), ts);
+                }
                 self.idle_rung
                     .remove(&format!("{}{UNMANAGED_KEY}", d.agent));
                 if self.agents.remove(&d.agent).is_some() {
@@ -1368,6 +1383,7 @@ impl State {
                                 self.held_streak.insert(key.clone(), (d.text.clone(), n));
                             }
                             "IDLE" => {
+                                self.lead_idled.insert(key.clone());
                                 self.held_streak.remove(&key);
                             }
                             _ => {}
@@ -1657,9 +1673,11 @@ impl State {
         // while its agent is still up, so cap counting cannot lose sight of it.
         self.retires.retain(|_, r| e.ts - r.since <= SPAWN_KEPT);
         self.merges.retain(|_, m| e.ts - m.since <= SPAWN_KEPT);
-        let agents = &self.agents;
+        self.left_pane.retain(|_, at| e.ts - *at <= SPAWN_KEPT);
+        let (agents, left) = (&self.agents, &self.left_pane);
         self.spawns.retain(|_, s| {
             agents.contains_key(&s.request.agent)
+                || left.contains_key(&s.request.agent)
                 || e.ts - s.answered.unwrap_or(s.since) <= SPAWN_KEPT
         });
     }
@@ -2512,6 +2530,8 @@ mod tests {
         s.apply(&at(4, ActorKind::Agent, a, state(AgentState::Working)));
         assert!(!s.idle_rung.contains_key(a));
         assert!(s.idle_rung.contains_key(&format!("{a}{UNMANAGED_KEY}")));
+        // but "rung IDLE once" outlives a state change: only `agent.down` ends it
+        assert!(s.lead_idled.contains(a));
         s.apply(&at(
             5,
             ActorKind::Host,
@@ -2521,7 +2541,7 @@ mod tests {
                 reason: None,
             }),
         ));
-        assert!(s.reports.is_empty() && s.idle_rung.is_empty());
+        assert!(s.reports.is_empty() && s.idle_rung.is_empty() && s.lead_idled.is_empty());
     }
 
     #[test]
@@ -3230,6 +3250,64 @@ mod tests {
         assert!(s.gone.is_empty());
     }
 
+    /// #201 review: a long-lived agent restarting in its pane must not lose its spawn record to
+    /// the 24 h prune while it is down for a moment.
+    #[test]
+    fn an_agent_that_left_its_pane_keeps_its_spawn_record_for_its_return() {
+        let t0 = Utc::now();
+        let at = |hours: i64, body| {
+            let mut e = ev(ActorKind::Host, body).into_event();
+            e.ts = t0 + chrono::Duration::hours(hours);
+            e
+        };
+        let a = "agent:h/s/a";
+        let up = || {
+            Known::AgentUp(AgentUp {
+                agent: a.into(),
+                host: "h".into(),
+                kind: None,
+                state: AgentState::Idle,
+                pane: None,
+            })
+        };
+        let down = |reason: &str| {
+            Known::AgentDown(AgentDown {
+                agent: a.into(),
+                reason: Some(reason.into()),
+            })
+        };
+        let spawn = |s: &mut State| {
+            let req: SpawnRequested = serde_json::from_value(serde_json::json!({
+                "name": "a", "agent": a, "host": "h", "session": "s", "repo": "o/r",
+                "branch": "b", "profile": "p", "brief": "", "why": "t"
+            }))
+            .unwrap();
+            s.spawns.insert(
+                "sp".into(),
+                Spawn {
+                    request: req,
+                    by: "x".into(),
+                    project: "p".into(),
+                    result: None,
+                    since: t0,
+                    answered: Some(t0),
+                },
+            );
+        };
+        let mut s = State::default();
+        spawn(&mut s);
+        s.apply(&at(0, up()));
+        s.apply(&at(25, down("agent left the pane")));
+        assert!(s.spawns.contains_key("sp"), "left, not closed");
+        s.apply(&at(26, up()));
+        assert!(s.spawns.contains_key("sp") && s.left_pane.is_empty());
+        // a real close still lets it go
+        s.apply(&at(27, down("pane closed")));
+        s.apply(&at(60, up()));
+        s.apply(&at(61, down("pane closed")));
+        assert!(!s.spawns.contains_key("sp"));
+    }
+
     #[test]
     fn a_message_to_coordinator_follows_the_role_to_its_current_holder() {
         let t0 = Utc::now();
@@ -3800,6 +3878,7 @@ mod tests {
                 agent: "agent:kir/s/dv-1".into(),
                 host: "kir".into(),
                 decide: None,
+                rule: None,
             }),
         );
         let id = req.id.clone();

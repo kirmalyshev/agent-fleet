@@ -72,6 +72,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | presence | `agent.up` | agent, host, kind?, state, pane? | | host |
 | | `agent.state` | agent, state (`idle` `working` `blocked` `done` `unknown`) | | host |
 | | `agent.down` | agent, reason? | | host |
+| | `agent.renamed` | agent, pane, from?, rule — the fleet, not herdr, set the agent's name (`pane-name-memory`: herdr dropped it when the agent restarted in its pane); written just before the `agent.up` that carries it | | agent, host, human |
 | | `host.health` | host, disk_free, disk_total, agents, stats?, commit? (the commit its binary was built from), behind_since? (since when its 5-minute fetch has found `origin/main` ahead of that commit; every minute) | | host |
 | | `agent.usage` | agent, rss_kb?, cpu_pct?, procs?, cwd? (each scan) | | host |
 | | `agent.role` | agent, level? (`root-coordinator` `domain-lead` `implementation-lead` `implementer`; absent `level` removes the role), lead?, domain? | | agent, host |
@@ -100,7 +101,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `handoff` | to, next, done?, evidence[], learned? | task | agent |
 | spawn | `spawn.requested` | name, agent, host, session, repo, issue?, branch, profile, brief, level?, lead?, worktree?, in_place?, replaces?, why | | agent, host |
 | | `spawn.result` | agent, ok, pane?, worktree?, error? | re = the request | host |
-| | `retire.requested` | agent, host, decide? — the agent's host runs `retire` itself | | agent, host |
+| | `retire.requested` | agent, host, decide?, rule? (set when a rule asked: `idle.auto_retire`) — the agent's host runs `retire` itself | | agent, host |
 | | `retire.result` | agent, ok, text | re = the request | host |
 | | `merge.requested` | repo, pr, sha, host, allow_pin_rewind? — `[merge] host` runs `merge` itself | | agent, host |
 | | `merge.result` | ok, text | re = the request | host |
@@ -570,10 +571,10 @@ gap, capped at 8 h, or at `2 x stale_min` when that is longer); new text, the ag
 (`held_streak`). `ref` is the agent's full id and the host's ring is what the reducer
 remembers (`idle_rung`), so a restart rings once. With `auto_retire`, an agent that reported
 `DONE`/`MERGED` after it last worked (or whose task ended) and has idled 10 min gets a host
-`retire.requested`, asked once per idle stretch: the same locked retire, which stops on
+`retire.requested` (`rule: idle.auto_retire`), asked once per idle stretch: the same locked retire, which stops on
 uncommitted work and rings the lead. A tell from its lead after that `DONE` (new work; the reducer's
 `told`) cancels it: the agent is not finished until it reports again (any tell counts, even a thanks; the
-lead is still rung `IDLE` and can retire it by hand). An agent in a pane with no spawn record (started by hand)
+lead is still rung `IDLE` and can retire it by hand). A domain-lead is never auto-retired, nor is an agent while any agent that reports to it is up (#201; a lead's own old task ending does not finish it). A domain-lead is rung `IDLE` once since it came up (`lead_idled`), without the `retire?`. An agent in a pane with no spawn record (started by hand)
 gets one `UNMANAGED` ring and is listed by `doctor` as `unmanaged`; it is never auto-retired.
 An agent whose claude footer reads `N shell(s) still running` is waiting on its own background job: the host
 neither rings it `IDLE`/`HELD` nor retires it while the footer shows, for at most 8 h of idling (a shell that never
