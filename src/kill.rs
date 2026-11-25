@@ -1,4 +1,5 @@
-//! `agent-fleet kill` and the Bash hook that sends agents to it. A process is killed only when it
+//! `agent-fleet kill`, and `hook bash`, which refuses raw kills, agents started outside herdr and
+//! herdr writes into another agent's pane. A process is killed only when it
 //! is the caller's own, an orphan doctor proved, or a process the watch reported hung and `kill`'s
 //! own sample finds idle; never an agent, a multiplexer pane, the fleet's own daemons, or anything
 //! above one of them.
@@ -443,10 +444,16 @@ fn is_assignment(w: &str) -> bool {
     })
 }
 
-/// Each simple command in `line` gets `hit` on its argv stripped of assignments and wrappers;
+/// Each simple command in `line` gets `hit` on its argv stripped of assignments and wrappers, and
+/// whether it runs on another machine (inside `ssh <host>`);
 /// `hit` also sees what `sh -c`, `eval`, `ssh <host>` and `find -exec` hide inside, recursed 4
 /// deep. Best effort, not a sandbox: it guards against a slip.
-fn scan_cmds(line: &str, depth: u32, hit: &impl Fn(&[String]) -> Option<String>) -> Option<String> {
+fn scan_cmds<T>(
+    line: &str,
+    depth: u32,
+    remote: bool,
+    hit: &impl Fn(&[String], bool) -> Option<T>,
+) -> Option<T> {
     if depth > 4 {
         return None;
     }
@@ -480,7 +487,7 @@ fn scan_cmds(line: &str, depth: u32, hit: &impl Fn(&[String]) -> Option<String>)
         let Some(first) = w.first().map(|s| base(s)) else {
             continue;
         };
-        if let Some(found) = hit(w) {
+        if let Some(found) = hit(w, remote) {
             return Some(found);
         }
         let inner: Vec<String> = if SHELLS.contains(&first) {
@@ -506,7 +513,11 @@ fn scan_cmds(line: &str, depth: u32, hit: &impl Fn(&[String]) -> Option<String>)
                 .map(|(i, _)| w[i + 1..].join(" "))
                 .collect()
         };
-        if let Some(found) = inner.iter().find_map(|s| scan_cmds(s, depth + 1, hit)) {
+        let remote = remote || first == "ssh";
+        if let Some(found) = inner
+            .iter()
+            .find_map(|s| scan_cmds(s, depth + 1, remote, hit))
+        {
             return Some(found);
         }
     }
@@ -517,7 +528,7 @@ fn scan_cmds(line: &str, depth: u32, hit: &impl Fn(&[String]) -> Option<String>)
 /// `sudo`/`xargs`/`timeout`…, inside `sh -c`, `eval`, `find -exec` and `ssh <host> …`. `kill -0`
 /// and `kill -l` signal nothing and pass.
 pub fn raw_kill(line: &str) -> Option<String> {
-    scan_cmds(line, 0, &|w: &[String]| {
+    scan_cmds(line, 0, false, &|w: &[String], _| {
         let first = base(&w[0]);
         let harmless = first == "kill"
             && w.get(1)
@@ -585,7 +596,7 @@ fn first_arg(w: &[String]) -> Option<&String> {
 /// session, or an agent package via npx/bunx/dlx, wherever it hides. `herdr agent start` and the
 /// admin forms pass, and so do one-shot runs from a caller that is itself in herdr.
 pub fn agent_start(line: &str, in_herdr: bool) -> Option<String> {
-    scan_cmds(line, 0, &|w: &[String]| {
+    scan_cmds(line, 0, false, &|w: &[String], _| {
         let program = AGENTS.contains(&base(&w[0]))
             && !agent_admin(&w[1..])
             && !(in_herdr && agent_oneshot(w));
@@ -621,9 +632,207 @@ pub fn hook(stdin: &str) -> Option<String> {
     Some(format!("{UNMANAGED_REFUSAL}\nBlocked: {hit}"))
 }
 
+/// A herdr command that types into a pane: `pane send-text|send-keys|run` or
+/// `agent prompt|send-keys`, with its `--session` and target as written, and its argv joined.
+#[derive(Debug, PartialEq)]
+pub struct HerdrWrite {
+    pub session: Option<String>,
+    pub target: String,
+    pub cmd: String,
+}
+
+/// Every herdr write in a shell line, in order, wherever it hides (as `raw_kill` finds kills).
+/// A write to `--current` is the caller's own pane, and one sent to another machine
+/// (`--machine`, `--remote`, `ssh <host> herdr …`) is out of this hook's reach: both pass.
+pub fn herdr_writes(line: &str) -> Vec<HerdrWrite> {
+    let found = std::cell::RefCell::new(Vec::new());
+    scan_cmds(line, 0, false, &|w: &[String], remote| {
+        if let Some(hit) = (!remote).then(|| herdr_argv(w)).flatten() {
+            found.borrow_mut().push(hit);
+        }
+        None::<()>
+    });
+    found.into_inner()
+}
+
+/// The keys `send-keys` may press in another agent's pane: they repair its input, typing nothing.
+const REPAIR_KEYS: &[&str] = &[
+    "enter",
+    "return",
+    "esc",
+    "escape",
+    "tab",
+    "backspace",
+    "up",
+    "down",
+    "left",
+    "right",
+];
+
+fn herdr_argv(w: &[String]) -> Option<HerdrWrite> {
+    if base(&w[0]) != "herdr" {
+        return None;
+    }
+    let mut session = None;
+    let mut i = 1;
+    while let Some(a) = w.get(i).filter(|a| a.starts_with('-')) {
+        if let Some(v) = a.strip_prefix("--session=") {
+            session = Some(v.to_string());
+        } else if a == "--session" {
+            session = w.get(i + 1).cloned();
+            i += 1;
+        } else if a.starts_with("--machine") || a.starts_with("--remote") {
+            return None;
+        }
+        i += 1;
+    }
+    let verb = (w.get(i)?.as_str(), w.get(i + 1)?.as_str());
+    if !matches!(
+        verb,
+        ("pane", "send-text" | "send-keys" | "run") | ("agent", "prompt" | "send-keys")
+    ) {
+        return None;
+    }
+    // herdr takes these global options after the verb too: `pane send-text p1 x --session s1`.
+    let mut tail = Vec::new();
+    let mut it = w[i + 2..].iter();
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix("--session=") {
+            session = Some(v.to_string());
+        } else if a == "--session" {
+            session = it.next().cloned();
+        } else if a.starts_with("--machine") || a.starts_with("--remote") {
+            return None;
+        } else {
+            tail.push(a);
+        }
+    }
+    let mut rest = tail.into_iter();
+    let target = loop {
+        let a = rest.next()?;
+        match a.as_str() {
+            "--current" => return None,
+            // The options of these verbs that take a value.
+            "--timeout" | "--until" => {
+                rest.next();
+            }
+            _ if !a.starts_with('-') => break a.clone(),
+            _ => {}
+        }
+    };
+    // Repairing a terminal's input (a queued message's Enter, a stray dialog's Esc) sends keys
+    // and no text: it passes.
+    let mut keys = rest.filter(|a| !a.starts_with('-')).peekable();
+    if verb.1 == "send-keys"
+        && keys.peek().is_some()
+        && keys.all(|k| REPAIR_KEYS.contains(&k.to_ascii_lowercase().as_str()))
+    {
+        return None;
+    }
+    Some(HerdrWrite {
+        session,
+        target,
+        cmd: w.join(" "),
+    })
+}
+
+/// The socket of herdr session `target`, from the caller's own: the default session's sits at
+/// `<root>/herdr.sock`, a named one's at `<root>/sessions/<name>/herdr.sock`.
+pub fn session_socket(
+    own: &std::path::Path,
+    own_session: &str,
+    target: &str,
+) -> Option<std::path::PathBuf> {
+    if target == own_session {
+        return Some(own.to_path_buf());
+    }
+    let dir = own.parent()?;
+    let root = if own_session == "default" {
+        dir
+    } else {
+        dir.parent()?.parent()?
+    };
+    Some(if target == "default" {
+        root.join("herdr.sock")
+    } else {
+        root.join("sessions").join(target).join("herdr.sock")
+    })
+}
+
+/// The agent and pane `w` would type into, from herdr's `agent.get` answer for its target, when
+/// that pane is not the caller's own (`me`: its session and pane). A pane no agent holds passes.
+pub fn pane_holder(
+    me: Option<(&str, &str)>,
+    w: &HerdrWrite,
+    got: &serde_json::Value,
+) -> Option<(String, String)> {
+    let a = got.get("agent")?;
+    let pane = a["pane_id"].as_str()?;
+    let mine = me.is_some_and(|(session, own)| {
+        own == pane && w.session.as_deref().is_none_or(|s| s == session)
+    });
+    (!mine).then(|| {
+        (
+            a["name"].as_str().unwrap_or("<agent>").to_string(),
+            pane.to_string(),
+        )
+    })
+}
+
+pub fn pane_refusal(w: &HerdrWrite, agent: &str, pane: &str) -> String {
+    format!(
+        "agent-fleet: typing into another agent's pane is blocked. Tell it instead: \
+`agent-fleet tell {agent} TYPE ref \"…\"` (queued, rung on its doorbell and acked when read). \
+Your own pane (`--current`) passes, and so does `send-keys` of named keys only, to repair its \
+input (`herdr agent send-keys {agent} enter`: {}); a spawn's first prompt comes from the host.\n\
+Blocked: {} (agent {agent} holds pane {pane})",
+        REPAIR_KEYS.join(" "),
+        w.cmd
+    )
+}
+
+/// The herdr half of `hook bash`: the first write in the line into a pane another agent holds,
+/// as herdr answers `agent.get` (`--session <name>` asks that session's socket). A caller
+/// without `HERDR_SESSION` is in herdr's default session. No socket, no answer, or no agent
+/// there: the write passes; every lookup together gets a second.
+pub async fn herdr_hook(stdin: &str) -> Option<(HerdrWrite, String, String)> {
+    let v: serde_json::Value = serde_json::from_str(stdin).ok()?;
+    if !matches!(v["tool_name"].as_str(), Some("Bash" | "exec")) {
+        return None;
+    }
+    let writes = herdr_writes(v["tool_input"]["command"].as_str()?);
+    if writes.is_empty() {
+        return None;
+    }
+    let env = |k: &str| std::env::var(k).ok();
+    let sock = std::path::PathBuf::from(env("HERDR_SOCKET_PATH")?);
+    let session = env("HERDR_SESSION").unwrap_or_else(|| "default".into());
+    let pane = env("HERDR_PANE_ID");
+    let me = pane.as_deref().map(|p| (session.as_str(), p));
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        for w in writes {
+            let target = w.session.as_deref().unwrap_or(&session);
+            let Some(sock) = session_socket(&sock, &session, target) else {
+                continue;
+            };
+            let params = serde_json::json!({ "target": w.target });
+            let Ok(got) = crate::host::herdr_call(&sock, "agent.get", params).await else {
+                continue;
+            };
+            if let Some((agent, pane)) = pane_holder(me, &w, &got) {
+                return Some((w, agent, pane));
+            }
+        }
+        None
+    })
+    .await
+    .ok()?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// herdr → pane shell → claude → Bash tool shell → script → agent-fleet kill, a second agent
     /// in another pane, and an unrelated daemon.
@@ -1153,5 +1362,138 @@ mod tests {
         assert_eq!(call("Bash", "agent-fleet kill 1"), None);
         assert_eq!(call("Read", "kill -9 1"), None);
         assert_eq!(hook("not json"), None);
+    }
+
+    #[test]
+    fn herdr_writes_into_a_pane_are_found_where_they_hide() {
+        let w = |line: &str| {
+            herdr_writes(line)
+                .into_iter()
+                .map(|w| (w.session, w.target))
+                .collect::<Vec<_>>()
+        };
+        let at = |s: Option<&str>, t: &str| vec![(s.map(str::to_string), t.to_string())];
+        // a write into another session's pane, as the coordinator typed it
+        assert_eq!(
+            w("herdr --session s1 pane send-text wY9:p1 hi"),
+            at(Some("s1"), "wY9:p1")
+        );
+        // `--session` and the remote options are accepted after the verb as well
+        assert_eq!(
+            w("herdr pane send-text --session s1 wY9:p1 hi"),
+            at(Some("s1"), "wY9:p1")
+        );
+        assert_eq!(
+            w("herdr agent prompt reviewer go --session=s1"),
+            at(Some("s1"), "reviewer")
+        );
+        assert_eq!(w("herdr pane send-text p1 x --machine box"), vec![]);
+        assert_eq!(w("herdr pane send-text p1 x --remote box"), vec![]);
+        assert_eq!(
+            w("herdr agent send-keys reviewer enter --session s1"),
+            vec![]
+        );
+        for (line, target) in [
+            ("herdr pane send-keys w1:p2 q", "w1:p2"),
+            ("herdr pane run w1:p2 'just test'", "w1:p2"),
+            (
+                "herdr agent prompt reviewer 'go' --wait --timeout 9",
+                "reviewer",
+            ),
+            (
+                "herdr agent prompt --wait --timeout 9 reviewer go",
+                "reviewer",
+            ),
+            ("herdr agent prompt --until idle reviewer go", "reviewer"),
+            ("herdr agent send-keys reviewer y", "reviewer"),
+            ("herdr pane send-keys w1:p2 enter h i enter", "w1:p2"),
+            ("herdr agent send-keys reviewer ctrl+c", "reviewer"),
+            ("/opt/homebrew/bin/herdr pane send-text p1 x", "p1"),
+            ("sleep 1 && sh -c 'herdr pane send-text p1 x'", "p1"),
+            ("HERDR_X=1 herdr pane send-text p1 x", "p1"),
+        ] {
+            assert_eq!(w(line), at(None, target), "{line}");
+        }
+        assert_eq!(
+            w("herdr --session=other pane send-text p1 x"),
+            at(Some("other"), "p1")
+        );
+        // every write in the line, so a harmless first one hides nothing
+        assert_eq!(
+            w("herdr pane run w1:p3 'npm test' && herdr agent prompt reviewer go"),
+            [at(None, "w1:p3"), at(None, "reviewer")].concat()
+        );
+        for line in [
+            "herdr pane read p1",
+            "herdr agent get reviewer",
+            "herdr agent start a --kind claude --pane p1",
+            "herdr pane send-text --current hi",
+            // repairing a terminal's input: named keys only, no text
+            "herdr agent send-keys reviewer enter",
+            "herdr pane send-keys w1:p2 Esc",
+            "herdr agent send-keys reviewer esc esc up enter",
+            "herdr --machine box pane send-text p1 x",
+            "herdr --remote box pane send-text p1 x",
+            "ssh box herdr agent prompt reviewer go",
+            "echo herdr pane send-text p1 x",
+            "herdr pane send-text",
+        ] {
+            assert_eq!(w(line), vec![], "false alarm: {line}");
+        }
+    }
+
+    #[test]
+    fn another_sessions_socket_sits_where_herdr_puts_it() {
+        let sock = |own: &str, me: &str, s: &str| {
+            session_socket(std::path::Path::new(own), me, s)
+                .map(|p| p.to_string_lossy().into_owned())
+        };
+        let named = "/h/sessions/s1/herdr.sock";
+        assert_eq!(sock(named, "s1", "s1").as_deref(), Some(named));
+        assert_eq!(
+            sock(named, "s1", "s2").as_deref(),
+            Some("/h/sessions/s2/herdr.sock")
+        );
+        assert_eq!(
+            sock(named, "s1", "default").as_deref(),
+            Some("/h/herdr.sock")
+        );
+        let default = "/h/herdr.sock";
+        assert_eq!(
+            sock(default, "default", "default").as_deref(),
+            Some(default)
+        );
+        assert_eq!(
+            sock(default, "default", "s1").as_deref(),
+            Some("/h/sessions/s1/herdr.sock")
+        );
+    }
+
+    #[test]
+    fn a_pane_another_agent_holds_is_refused_your_own_passes() {
+        let w = |s: Option<&str>| HerdrWrite {
+            session: s.map(str::to_string),
+            target: "dv".into(),
+            cmd: "herdr pane send-text dv hi".into(),
+        };
+        let held = |pane: &str| json!({ "agent": { "name": "dv", "pane_id": pane } });
+        let me = Some(("s1", "wA:p1"));
+        assert_eq!(
+            pane_holder(me, &w(None), &held("wB:p1")),
+            Some(("dv".to_string(), "wB:p1".to_string()))
+        );
+        assert_eq!(pane_holder(me, &w(None), &held("wA:p1")), None);
+        assert_eq!(pane_holder(me, &w(Some("s1")), &held("wA:p1")), None);
+        // the same pane id in another session is another pane
+        assert!(pane_holder(me, &w(Some("other")), &held("wA:p1")).is_some());
+        // a caller with no pane id of its own owns no pane
+        assert!(pane_holder(None, &w(None), &held("wA:p1")).is_some());
+        // a pane no agent holds (a dev server's shell) passes
+        assert_eq!(pane_holder(me, &w(None), &json!({})), None);
+        assert_eq!(pane_holder(me, &w(None), &json!({ "agent": null })), None);
+
+        let msg = pane_refusal(&w(None), "dv", "wB:p1");
+        assert!(msg.contains("agent-fleet tell dv TYPE"), "{msg}");
+        assert!(msg.contains("Blocked: herdr pane send-text dv hi"), "{msg}");
     }
 }

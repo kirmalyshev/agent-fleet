@@ -70,7 +70,7 @@ One crate, one binary. `docs/PROTOCOL.md` is the spec, `schema/` the generated J
 | `src/chores.rs` | `[chores]`: nudges for a stuck agent, the spawn queue, the sweep command. |
 | `src/stuck.rs` | Why a stuck agent is stuck, read off its screen, and the once-per-episode actions. |
 | `src/tmpdir.rs` | The per-agent scratch dir outside any checkout (`<cache dir>/agent-fleet/tmp/<session>/<name>`): TMPDIR export line, removal, size. |
-| `src/signal.rs` | `hook signal`: harness hook events become `agent.signal`. |
+| `src/signal.rs` | `hook signal`: harness hook events become `agent.signal`; `log` writes another hook's event as the hooked agent. |
 | `src/quota.rs` | Each agent program's usage quota and `hook statusline`. |
 | `src/spawn.rs` | `fleet.toml` routing, briefs, the host's spawn executor. |
 | `src/setup.rs` | `init` and `repo add`, `ls`, `rm`: the machine's `fleet.toml`, brief, coordinator and connected repos; `coordinator` prints the layered coordinator prompt, or with a program (`claude`) starts it with the prompt loaded. |

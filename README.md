@@ -314,7 +314,9 @@ file) or to `~/.claude/settings.json`:
 ```
 
 - `hook bash` refuses a raw `kill`, `pkill` or `killall` (use `agent-fleet kill`, which will not
-  kill another agent's work) and an agent started outside herdr (use `agent-fleet spawn`).
+  kill another agent's work), an agent started outside herdr (use `agent-fleet spawn`) and a
+  `herdr pane send-text|send-keys|run` or `herdr agent prompt|send-keys` into another agent's
+  pane (use `agent-fleet tell`).
 - `hook mail` hands a busy agent that takes no typed input (Devin CLI) the tells that arrived
   while it worked, at its next tool call.
 - `hook signal` reports rate limits, permission prompts, questions and turn ends as

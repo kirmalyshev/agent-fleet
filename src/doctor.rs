@@ -861,6 +861,20 @@ pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
             ),
         ));
     }
+    for p in s.refused_panes.iter().filter(|p| now - p.ts < REFUSED) {
+        out.push(finding(
+            "refused",
+            &p.by,
+            format!(
+                "tried to type into {}'s pane {} on {} {} ago instead of `agent-fleet tell`: {}",
+                p.agent,
+                p.pane,
+                p.host,
+                ago(now, p.ts),
+                p.command
+            ),
+        ));
+    }
     // A pane agent no `spawn` made (started by hand): nothing retires or caps it. Listed once
     // its host rang the lead (`UNMANAGED`), like `unanswered`.
     for (id, a) in &s.agents {
@@ -2362,6 +2376,28 @@ mod tests {
             f[0].kind == "refused" && f[0].detail.contains("pid 8"),
             "{f:#?}"
         );
+    }
+
+    #[test]
+    fn a_refused_pane_write_is_a_finding_for_an_hour() {
+        let now = Utc::now();
+        let mut s = State::default();
+        for (pane, ts) in [("wA:p1", now), ("wB:p1", now - REFUSED)] {
+            s.refused_panes.push(crate::state::RefusedPane {
+                by: "agent:h/s/coordinator".into(),
+                host: "h".into(),
+                pane: pane.into(),
+                agent: "dv".into(),
+                command: format!("herdr pane send-text {pane} hi"),
+                ts,
+            });
+        }
+        let f = findings(&s, now);
+        assert_eq!(f.len(), 1, "{f:#?}");
+        assert_eq!(f[0].kind, "refused");
+        assert_eq!(f[0].subject, "agent:h/s/coordinator");
+        assert!(f[0].detail.contains("dv's pane wA:p1"), "{f:#?}");
+        assert!(f[0].detail.contains("agent-fleet tell"), "{f:#?}");
     }
 
     #[test]

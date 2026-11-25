@@ -618,7 +618,8 @@ enum TaskCmd {
 #[derive(Subcommand)]
 enum HookCmd {
     /// PreToolUse hook for Claude Code and Devin CLI: reads the tool call on stdin and refuses
-    /// (exit 2) a shell command that runs a raw kill, pkill or killall.
+    /// (exit 2) a shell command that runs a raw kill, pkill or killall, starts an agent outside
+    /// herdr, or types into another agent's herdr pane (use `agent-fleet tell`).
     Bash,
     /// Claude Code status-line command: records the `rate_limits` it is fed for the host to
     /// publish as `agent.quota`, then runs an optional wrapped command on the same stdin and
@@ -1035,6 +1036,27 @@ async fn main() -> Result<()> {
                 std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
                 if let Some(msg) = kill::hook(&input) {
                     eprintln!("{msg}");
+                    std::process::exit(2);
+                }
+                if let Some((w, agent, pane)) = kill::herdr_hook(&input).await {
+                    eprintln!("{}", kill::pane_refusal(&w, &agent, &pane));
+                    if let Some(paths) = &paths {
+                        let body = Known::PaneRefused(PaneRefused {
+                            host: host_name(&cli),
+                            pane,
+                            agent,
+                            command: w.cmd.chars().take(300).collect(),
+                        });
+                        signal::log(
+                            paths,
+                            cli.hub.as_deref(),
+                            cli.token_file.as_deref(),
+                            &cli.project,
+                            &host_name(&cli),
+                            body,
+                        )
+                        .await;
+                    }
                     std::process::exit(2);
                 }
             }

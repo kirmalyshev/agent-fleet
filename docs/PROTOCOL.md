@@ -84,6 +84,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `resource.released` | host, resource, pid? (without `pid`: nobody holds or waits) | | host |
 | | `resource.limit` | host, name, resources[], max, until? (empty `resources` removes it) | | agent, host |
 | safety | `kill.refused` | host, pid, name, reason | | agent, host |
+| | `pane.refused` | host, pane, agent, command (the herdr argv found, joined; its first 300 characters) | | agent, host |
 | task | `task.created` | title, url? | task | agent, host |
 | | `task.assigned` | agent, lead? — **exclusive** | task | agent, host |
 | | `task.unassigned` | reason? | task | agent, host |
@@ -473,7 +474,7 @@ how many worktrees may hold any of a set of resources at once.
 | `breach` | more worktrees hold a rule's resources than its `max`, while the rule lasts |
 | `undelivered` | tells to an up recipient pending 10 min (a `coordinator` tell counts for its holder); one per recipient, with the count, the oldest, and what the recipient is doing |
 | `queued` | a process waiting 10 min for a resource, with who holds it |
-| `refused` | `agent-fleet kill` refused a pid in the last hour, with the reason; a pid already gone (`no such process`) is no finding |
+| `refused` | `agent-fleet kill` refused a pid in the last hour, with the reason; a pid already gone (`no such process`) is no finding. Also a herdr write into another agent's pane `hook bash` refused in the last hour (`pane.refused`), with the command |
 | `role` | an agent's declared lead is down, the lead's level is not above its own, or a second root coordinator is up |
 | `quota` | a program's quota is exhausted, or a window ≥ 90% used resets in the future |
 | `stalled` | an agent idle or blocked for 15 min after it last worked |
@@ -717,8 +718,20 @@ another agent's tree or not. TERM, then KILL after `--grace` seconds. Each refus
 `agent-fleet hook bash` is a PreToolUse hook for Claude Code (tool `Bash`) and Devin CLI (tool
 `exec`, which also reads hooks from `.claude/settings.json`) that refuses (exit 2) a shell command
 running a raw `kill`, `pkill` or `killall`, also behind `sudo`, `xargs`, `timeout`, `sh -c`,
-`eval`, `find -exec` or `ssh <host>`. `kill -0` and `kill -l` pass. It guards against a slip, not
-against an agent set on evading it.
+`eval`, `find -exec` or `ssh <host>`. `kill -0` and `kill -l` pass. It also refuses a herdr
+write (`herdr pane send-text|send-keys|run`, `herdr agent prompt|send-keys`) whose target pane
+another agent holds, as herdr answers `agent.get` (every write in the line, all lookups within a
+second; `--session <name>` asks that session's socket: `<root>/herdr.sock` for `default`,
+`<root>/sessions/<name>/herdr.sock` otherwise; a caller without `HERDR_SESSION` is in
+`default`), and points at `agent-fleet tell`. Each such refusal is logged, best effort, as
+`pane.refused` as the caller (nothing is logged from herdr's default session, where the caller
+has no agent id). The caller's own pane (any target herdr resolves to it, or `--current`)
+passes, and so does a `send-keys` of named keys only (`enter`, `return`, `esc`, `escape`, `tab`,
+`backspace`, `up`, `down`, `left`, `right`), which repairs an agent's input and types no text, a
+pane no agent holds, a write to another machine (`--machine`, `--remote`,
+`ssh <host> herdr …`) and any write the hook cannot check (no `HERDR_SOCKET_PATH`, no answer, a
+target in a shell variable). A spawn's first prompt comes from the host, not from Bash. It
+guards against a slip, not against an agent set on evading it.
 
 ```json
 { "hooks": { "PreToolUse": [ { "matcher": "Bash|exec",

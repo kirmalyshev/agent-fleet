@@ -83,6 +83,10 @@ pub struct State {
     /// The latest kills `agent-fleet kill` refused, oldest first; at most `MAX_REFUSED`.
     #[serde(default)]
     pub refused_kills: Vec<RefusedKill>,
+    /// The latest herdr writes into another agent's pane `hook bash` refused, oldest first; at
+    /// most `MAX_REFUSED`.
+    #[serde(default)]
+    pub refused_panes: Vec<RefusedPane>,
     /// Spawn requests by their `spawn.requested` id; answered ones are kept for 24 h.
     #[serde(default)]
     pub spawns: BTreeMap<String, Spawn>,
@@ -269,6 +273,16 @@ pub struct RefusedKill {
     pub pid: u32,
     pub name: String,
     pub reason: String,
+    pub ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RefusedPane {
+    pub by: String,
+    pub host: String,
+    pub pane: String,
+    pub agent: String,
+    pub command: String,
     pub ts: DateTime<Utc>,
 }
 
@@ -1035,6 +1049,18 @@ impl State {
                 });
                 let over = self.refused_kills.len().saturating_sub(MAX_REFUSED);
                 self.refused_kills.drain(..over);
+            }
+            Known::PaneRefused(d) => {
+                self.refused_panes.push(RefusedPane {
+                    by: e.actor.id.clone(),
+                    host: d.host.clone(),
+                    pane: d.pane.clone(),
+                    agent: d.agent.clone(),
+                    command: d.command.clone(),
+                    ts,
+                });
+                let over = self.refused_panes.len().saturating_sub(MAX_REFUSED);
+                self.refused_panes.drain(..over);
             }
             Known::WorktreeGone(d) => {
                 self.worktrees.remove(&worktree_key(&d.host, &d.path));
@@ -3367,6 +3393,25 @@ mod tests {
         let s = State::fold(&events);
         assert_eq!(s.refused_kills.len(), MAX_REFUSED);
         assert_eq!(s.refused_kills[0].pid, 3);
+    }
+
+    #[test]
+    fn refused_panes_keep_the_latest_with_who_typed() {
+        let events: Vec<Event> = (0..MAX_REFUSED + 3)
+            .map(|i| {
+                agent_ev(Known::PaneRefused(PaneRefused {
+                    host: "h".into(),
+                    pane: format!("w{i}:p1"),
+                    agent: "dv".into(),
+                    command: "herdr pane send-text w:p1 hi".into(),
+                }))
+                .into_event()
+            })
+            .collect();
+        let s = State::fold(&events);
+        assert_eq!(s.refused_panes.len(), MAX_REFUSED);
+        assert_eq!(s.refused_panes[0].pane, "w3:p1");
+        assert_eq!(s.refused_panes[0].by, events[0].actor.id);
     }
 
     #[test]
