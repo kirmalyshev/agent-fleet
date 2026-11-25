@@ -49,7 +49,7 @@ prefix = "x-"
 
 [profiles.devin]
 kind = "devin"
-args = []
+args = ["--model", "swe-2-1"]       # Devin's default model here: SWE-2.1
 prefix = "dv-"
 
 [profiles.agy]
