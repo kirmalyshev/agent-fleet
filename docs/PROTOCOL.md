@@ -954,22 +954,24 @@ refused. A retire of an in-place agent closes its pane and removes nothing (neit
 hook nor `git worktree remove` runs). `agent-fleet spawn --brief <file>` sends the file as
 `brief` as written: no token rendering, no coordinator prompt; an empty file is refused. Then
 `ready` runs (new worktrees only, 15 min). Before any real command is typed, the pane's shell
-proves it is reading complete input lines: the host sends disposable `printf` probes whose split
-marker is never whole in the echoed command, clears partial input with ctrl-c before every probe
-after the first, and requires two successful probes in a row (up to 30 probes, each waited on for
-2 s). The first probe can legitimately execute before a startup terminal-control reply that is
-still queued without a newline, so one success alone does not prove the queue is clean. Each
-`unset_env` is then typed into the pane's shell; `TMPDIR`, `TMP` and `TEMP` are exported there
-as the agent's scratch dir, outside any checkout:
+proves it is reading complete input lines: the host sends disposable arithmetic probes whose
+output is a sum never present in the echoed command (up to 30 probes, each waited on for 2 s,
+bounded by 60 s overall). It does not ctrl-c a shell that has not answered yet — that shell may
+still be running its startup files. Once a probe answers, the host lets already queued startup
+input settle for 250 ms and ctrl-cs the partial line it produced; the ctrl-c is itself checked.
+Required `unset_env` entries are then typed as one idempotent `unset` command ending in an
+attempt-specific arithmetic confirmation. Bytes accepted by herdr are not enough: only the
+confirmation proves the shell executed the scrub. On timeout the whole command is ctrl-c'd and retried, up to 5 tries.
+`TMPDIR`, `TMP` and `TEMP` are exported there as the agent's scratch dir, outside any checkout:
 `<cache dir>/agent-fleet/tmp/<session>/<name>` (`~/.cache/agent-fleet/tmp/...` on Linux,
-`~/Library/Caches/agent-fleet/tmp/...` on macOS), created by the same line. The host removes it when the agent's pane or workspace closes (not when
+`~/Library/Caches/agent-fleet/tmp/...` on macOS), created by the same confirmed line. The host removes it when the agent's pane or workspace closes (not when
 the agent only leaves its pane, nor when a pane it left closes later), so `agent-fleet retire`,
 which closes the pane, removes it too; and when its spawn fails. A retire itself never touches it: it may end minutes after the close,
 when a respawn under the same name already uses the dir. Best effort — a pane that
-refuses the line, or a machine with no home directory, is logged, the spawn goes on; the host does
-not check that the line ran),
-`agent.start` retries `agent_pane_busy` for 10 tries 2 s apart, and the brief goes out the way
-that works: `agent.wait` for `idle` (2 min),
+refuses the line, or a machine with no home directory, is logged, the spawn goes on. A final
+checked ctrl-c immediately precedes `agent.start`, which retries `agent_pane_busy` for 10 tries
+2 s apart. The brief goes out the way that
+works: `agent.wait` for `idle` (2 min),
 `agent.prompt` waiting for working|blocked|done (30 s), one Enter and another wait (15 s) on a
 stall, then one re-send — never twice to an agent that started working. On success the host
 writes `agent.role` (level, lead from the request) and `task.assigned` for
