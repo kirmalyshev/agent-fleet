@@ -907,6 +907,10 @@ pub const STALL_MIN: u64 = 15;
 const BUSY_TRIES: u32 = 10;
 const BUSY_WAIT: Duration = Duration::from_secs(2);
 const READY_PROBES: u32 = 30;
+const READY_WAIT: Duration = Duration::from_secs(60);
+const INPUT_SETTLE: Duration = Duration::from_millis(250);
+const INPUT_RETRY_WAIT: Duration = Duration::from_millis(100);
+const CONFIRM_TRIES: u32 = 5;
 /// The brief is sent only once an agent that never went `working` is re-sent to.
 const STARTED: [&str; 3] = ["working", "blocked", "done"];
 
@@ -1120,102 +1124,213 @@ pub(crate) async fn retire_in(host: &Host, repo: &str, worktree: &str, agent: &s
         None => Ok(()),
     }
 }
-/// `line` typed into the pane's shell as one input submission, retried while the shell is not
-/// ready. One submission keeps a terminal control reply from landing between the text and Enter.
-async fn pane_run(sock: &Path, pane: &str, line: &str) -> Result<()> {
-    let mut err = anyhow!("pane.send_input never ran");
-    for _ in 0..BUSY_TRIES {
-        match herdr_call(
-            sock,
-            "pane.send_input",
-            json!({ "pane_id": pane, "text": line, "keys": ["enter"] }),
-        )
-        .await
-        {
-            Ok(_) => return Ok(()),
+/// `line` typed into the pane's shell as one input submission. One submission keeps a terminal
+/// control reply from landing between the text and Enter. The caller retries: permanent herdr
+/// API errors must not hide inside a retry loop here.
+async fn pane_input(sock: &Path, pane: &str, line: &str) -> Result<()> {
+    herdr_call(
+        sock,
+        "pane.send_input",
+        json!({ "pane_id": pane, "text": line, "keys": ["enter"] }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// An error a retry cannot fix: the pane or method is gone, or herdr rejected the request shape.
+fn permanent_pane_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    [
+        "pane_not_found",
+        "unknown_method",
+        "invalid_params",
+        "invalid_key",
+        "invalid_request",
+    ]
+    .iter()
+    .any(|code| s.contains(code))
+}
+
+async fn pane_ctrl_c(sock: &Path, pane: &str) -> Result<()> {
+    herdr_call(
+        sock,
+        "pane.send_keys",
+        json!({ "pane_id": pane, "keys": ["ctrl+c"] }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// ctrl-c is load-bearing cleanup, so a transient submission failure is retried and a permanent
+/// one fails fast; its success is never silently ignored.
+async fn pane_ctrl_c_retried(sock: &Path, pane: &str) -> Result<()> {
+    let mut err = anyhow!("pane.send_keys never ran");
+    for _ in 0..CONFIRM_TRIES {
+        match pane_ctrl_c(sock, pane).await {
+            Ok(()) => return Ok(()),
+            Err(e) if permanent_pane_error(&e) => {
+                return Err(e.context("ctrl-c rejected permanently"));
+            }
             Err(e) => {
                 err = e;
-                tokio::time::sleep(BUSY_WAIT).await;
+                tokio::time::sleep(INPUT_RETRY_WAIT).await;
             }
         }
     }
-    Err(err.context("the pane's shell never took the command"))
+    Err(err.context("ctrl-c never reached the pane"))
 }
 
-/// A disposable readiness probe: the echoed command never contains the whole marker, so seeing
-/// the marker in the pane's output means the shell read and executed a complete line. Anything
-/// typed before a shell finished starting can be eaten by its terminal-control handshake; losing
-/// a probe that way is harmless, while losing the env scrub or the agent command is not.
-fn readiness_probe(agent: &str, attempt: u32) -> (String, String) {
-    let token: String = agent
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .take(24)
-        .collect();
-    let marker = format!("AFREADY{token}N{attempt}");
-    let split = marker.len() / 2;
+async fn pane_wait_marker(sock: &Path, pane: &str, marker: &str) -> Result<()> {
+    herdr_call(
+        sock,
+        "pane.wait_for_output",
+        json!({
+            "pane_id": pane,
+            "source": "recent_unwrapped",
+            "lines": 80,
+            "match": { "type": "substring", "value": marker },
+            "timeout_ms": 2_000,
+        }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// A confirmation whose output is arithmetic the shell performs, never text the typed command
+/// already contains. Split-string output can survive exactly the corruption it is meant to catch
+/// (two quoted halves losing their separating space still print the same concatenation); the sum
+/// cannot: the echoed command holds only the operands, and losing or corrupting the operator or an
+/// operand yields a different number or no output. A setup may add parameter expansions that make
+/// the arithmetic invalid unless the required shell state really holds, so a command separator
+/// smuggled in by a terminal reply cannot detach the confirmation from that state. Markers depend
+/// on the agent, use and attempt, so an old line is vanishingly unlikely to satisfy a new wait.
+fn arithmetic_confirmation(
+    agent: &str,
+    use_: &str,
+    attempt: u32,
+    arithmetic_guard: &str,
+) -> (String, String) {
+    let mut hash = 0xcbf29ce484222325u64;
+    for b in agent
+        .bytes()
+        .chain(use_.bytes())
+        .chain(attempt.to_be_bytes())
+    {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let target = 1_000_000_000_000_000 + hash % 7_000_000_000_000_000;
+    let left = target / 2 + 123_457;
+    let right = target - left;
     (
-        marker.clone(),
-        format!(
-            "printf '%s%s\\n' '{}' '{}'",
-            &marker[..split],
-            &marker[split..]
-        ),
+        target.to_string(),
+        format!("command printf '%s\\n' \"$(({left} + {right}{arithmetic_guard}))\""),
     )
 }
 
-/// Wait until the pane's shell has proved twice that it is reading complete input lines. The
-/// first probe can already be queued when a shell asks its terminal a startup question; it then
-/// answers before the terminal's reply, which is still waiting in the input queue without a
-/// newline. Every later probe is preceded by ctrl-c, which discards that partial reply (or any
-/// partial line an earlier mangled probe left behind). A second successful probe is therefore
-/// the point where the input queue is clean. Probe markers are unique per attempt so an old line
-/// can never satisfy a new wait.
+fn readiness_probe(agent: &str, attempt: u32) -> (String, String) {
+    arithmetic_confirmation(agent, "ready", attempt, "")
+}
+
+fn confirmed_line(
+    agent: &str,
+    use_: &str,
+    attempt: u32,
+    setup: &str,
+    arithmetic_guard: &str,
+) -> (String, String) {
+    let (marker, print) = arithmetic_confirmation(agent, use_, attempt, arithmetic_guard);
+    let line = if setup.is_empty() {
+        print
+    } else {
+        format!("{setup} && {print}")
+    };
+    (marker, line)
+}
+
+/// Wait until the pane's shell has executed one complete disposable probe, then let it consume
+/// whatever startup input was already queued and ctrl-c the resulting partial line. No ctrl-c is
+/// sent before that first success: a shell still running its startup files may be slow, and
+/// interrupting startup can remove the very PATH/environment setup the agent needs. The ctrl-c's
+/// result is checked, and the next real line is submitted immediately after it — a sleep here
+/// would only widen the race for a late terminal reply to land between cleanup and use.
 async fn pane_ready(sock: &Path, pane: &str, agent: &str) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + READY_WAIT;
     let mut err = anyhow!("pane readiness probe never ran");
-    let mut successes = 0;
     for attempt in 0..READY_PROBES {
-        if attempt > 0 {
-            let _ = herdr_call(
-                sock,
-                "pane.send_keys",
-                json!({ "pane_id": pane, "keys": ["ctrl+c"] }),
-            )
-            .await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        if tokio::time::Instant::now() >= deadline {
+            break;
         }
         let (marker, probe) = readiness_probe(agent, attempt);
-        if let Err(e) = pane_run(sock, pane, &probe).await {
-            err = e;
-            successes = 0;
-            continue;
-        }
-        match herdr_call(
-            sock,
-            "pane.wait_for_output",
-            json!({
-                "pane_id": pane,
-                "source": "recent_unwrapped",
-                "lines": 80,
-                "match": { "type": "substring", "value": marker },
-                "timeout_ms": 2_000,
-            }),
-        )
-        .await
-        {
-            Ok(_) => {
-                successes += 1;
-                if successes == 2 {
-                    return Ok(());
-                }
+        match pane_input(sock, pane, &probe).await {
+            Err(e) if permanent_pane_error(&e) => {
+                return Err(e.context("readiness probe rejected permanently"));
             }
             Err(e) => {
                 err = e;
-                successes = 0;
+                tokio::time::sleep(INPUT_RETRY_WAIT).await;
+                continue;
             }
+            Ok(()) => {}
+        }
+        match pane_wait_marker(sock, pane, &marker).await {
+            Ok(()) => {
+                tokio::time::sleep(INPUT_SETTLE).await;
+                pane_ctrl_c_retried(sock, pane)
+                    .await
+                    .context("ctrl-c after the readiness probe")?;
+                return Ok(());
+            }
+            Err(e) if permanent_pane_error(&e) => {
+                return Err(e.context("readiness wait rejected permanently"));
+            }
+            Err(e) => err = e,
         }
     }
     Err(err.context("the pane's shell never answered the readiness probe"))
+}
+
+/// Run one shell setup line and require its own arithmetic confirmation before believing it.
+/// `unset_env` is security-relevant: herdr accepting the bytes is not enough, because a late
+/// terminal-control reply can still corrupt or consume the line after readiness. On a timeout the
+/// whole line is cleared and retried. The caller's operations are idempotent, so a partial or
+/// corrupted attempt is corrected by a later one; the confirmation defines what must be true.
+async fn pane_run_confirmed(
+    sock: &Path,
+    pane: &str,
+    agent: &str,
+    use_: &str,
+    setup: &str,
+    arithmetic_guard: &str,
+) -> Result<()> {
+    let mut err = anyhow!("confirmed shell setup never ran");
+    for attempt in 0..CONFIRM_TRIES {
+        if attempt > 0 {
+            pane_ctrl_c_retried(sock, pane)
+                .await
+                .context("ctrl-c before shell setup retry")?;
+        }
+        let (marker, line) = confirmed_line(agent, use_, attempt, setup, arithmetic_guard);
+        match pane_input(sock, pane, &line).await {
+            Err(e) if permanent_pane_error(&e) => {
+                return Err(e.context("shell setup rejected permanently"));
+            }
+            Err(e) => {
+                err = e;
+                tokio::time::sleep(INPUT_RETRY_WAIT).await;
+                continue;
+            }
+            Ok(()) => {}
+        }
+        match pane_wait_marker(sock, pane, &marker).await {
+            Ok(()) => return Ok(()),
+            Err(e) if permanent_pane_error(&e) => {
+                return Err(e.context("shell setup confirmation rejected permanently"));
+            }
+            Err(e) => err = e,
+        }
+    }
+    Err(err.context(format!("the pane's shell never confirmed {use_}")))
 }
 
 async fn agent_start(host: &Host, name: &str, prof: &Profile, pane: &str) -> Result<()> {
@@ -1449,24 +1564,44 @@ async fn run_spawn(
         &r.name,
     )
     .await?;
-    for var in &prof.unset_env {
-        pane_run(
+    if !prof.unset_env.is_empty() {
+        let scrub = format!("unset {}", prof.unset_env.join(" "));
+        // Repeat each guard: the startup reply itself contains a command separator, so the
+        // confirmation must depend on the scrubbed state rather than merely on `&&` reaching
+        // printf. If a scrubbed variable is still set, its expansion inserts division by zero into the
+        // arithmetic and no confirmation can print. Duplication keeps one corrupted guard copy
+        // from silently becoming a check of some other, unset variable.
+        let arithmetic_guard = prof
+            .unset_env
+            .iter()
+            .flat_map(|var| {
+                let g = format!(" ${{{var}+/0}}");
+                [g.clone(), g]
+            })
+            .collect::<String>();
+        pane_run_confirmed(
             &host.cfg.herdr_socket,
             made.pane.as_deref().unwrap_or_default(),
-            &format!("unset {var}"),
+            &r.name,
+            "env scrub",
+            &scrub,
+            &arithmetic_guard,
         )
         .await
-        .with_context(|| format!("env scrub: unset {var}"))?;
+        .context("env scrub")?;
     }
     // Scratch outside any checkout, so nothing that walks the repo meets it; the pane close
     // (`Host::agent_down`) or a failed spawn removes it.
     // Best effort: a pane that refuses the line costs the isolation, not the spawn.
     match crate::tmpdir::dir(&r.agent) {
         Some(d) => {
-            if let Err(e) = pane_run(
+            if let Err(e) = pane_run_confirmed(
                 &host.cfg.herdr_socket,
                 made.pane.as_deref().unwrap_or_default(),
+                &r.name,
+                "TMPDIR export",
                 &crate::tmpdir::export_line(&d),
+                "",
             )
             .await
             {
@@ -1478,6 +1613,12 @@ async fn run_spawn(
             r.name, r.agent
         ),
     }
+    pane_ctrl_c_retried(
+        &host.cfg.herdr_socket,
+        made.pane.as_deref().unwrap_or_default(),
+    )
+    .await
+    .context("ctrl-c before agent.start")?;
     agent_start(
         host,
         &r.name,
@@ -3333,11 +3474,7 @@ profile = "devin"
                 ("worktree.create", vec![created(wt.to_str().unwrap())]),
                 (
                     "pane.send_input",
-                    vec![
-                        json!({"result": {}}),
-                        json!({"result": {}}),
-                        err("agent_pane_busy"),
-                    ],
+                    vec![json!({"result": {}}), err("agent_pane_busy")],
                 ),
             ],
         )
@@ -3368,7 +3505,7 @@ profile = "devin"
                 "pane.send_keys",
                 "pane.send_input",
                 "pane.wait_for_output",
-                "pane.send_input",
+                "pane.send_keys",
                 "agent.start",
                 "agent.wait",
                 "agent.prompt"
@@ -3477,6 +3614,50 @@ profile = "devin"
         assert!(!line.contains(&marker), "{line}");
         assert!(line.contains("printf"), "{line}");
         assert_ne!(readiness_probe("dv-7", 1).0, marker);
+
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&line)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), marker);
+
+        // Losing the arithmetic operator fuses two much longer decimal operands; unlike adjacent
+        // quoted marker halves, that cannot expand back to the short confirmation number.
+        let fused = line.replace(" + ", "");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&fused)
+            .output()
+            .unwrap();
+        assert_ne!(
+            String::from_utf8(out.stdout).unwrap().trim(),
+            marker,
+            "{fused}"
+        );
+    }
+
+    #[test]
+    fn the_env_confirmation_expands_only_while_the_scrubbed_variables_are_unset() {
+        let guard = " ${SCRUB_ME+/0} ${SCRUB_ME+/0}";
+        let (marker, print) = arithmetic_confirmation("s-7", "env scrub", 0, guard);
+        assert!(!print.contains(&marker), "{print}");
+        assert_eq!(print.matches("${SCRUB_ME+/0}").count(), 2, "{print}");
+
+        let run = |set: bool| {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-c").arg(&print).env_remove("SCRUB_ME");
+            if set {
+                cmd.env("SCRUB_ME", "x");
+            }
+            cmd.output().unwrap()
+        };
+        let unset = run(false);
+        assert!(unset.status.success(), "{unset:?}");
+        assert_eq!(String::from_utf8(unset.stdout).unwrap().trim(), marker);
+        let set = run(true);
+        assert_ne!(String::from_utf8(set.stdout).unwrap().trim(), marker);
     }
 
     #[tokio::test]
@@ -3503,13 +3684,69 @@ profile = "devin"
                 "worktree.create",
                 "pane.send_input",
                 "pane.wait_for_output",
-                "pane.send_keys",
                 "pane.send_input",
                 "pane.wait_for_output",
                 "pane.send_keys",
                 "pane.send_input",
                 "pane.wait_for_output",
+                "pane.send_keys",
+                "agent.start",
+                "agent.wait",
+                "agent.prompt"
+            ]
+        );
+        assert!(result(&host).unwrap().ok);
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_env_scrub_is_cleared_and_retried_before_the_agent_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        let wt = co.join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let (host, stub) = run(
+            dir.path(),
+            &[
+                ("worktree.create", vec![created(wt.to_str().unwrap())]),
+                (
+                    "pane.wait_for_output",
+                    vec![json!({"result": {}}), err("timeout"), json!({"result": {}})],
+                ),
+            ],
+        )
+        .await;
+        let mut r = req(None);
+        r.profile = "sonnet".into();
+        r.name = "s-7".into();
+        r.agent = "agent:h/s/s-7".into();
+        execute(&host, "req1", &spawn_of(r), &State::default()).await;
+        let got = stub.calls.lock().unwrap().clone();
+        let scrubs = got
+            .iter()
+            .filter(|(m, p)| {
+                m == "pane.send_input"
+                    && p["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .starts_with("unset SCRUB_ME &&")
+            })
+            .count();
+        assert_eq!(scrubs, 2, "{got:?}");
+        assert_eq!(
+            stub.calls(),
+            [
+                "worktree.create",
                 "pane.send_input",
+                "pane.wait_for_output",
+                "pane.send_keys",
+                "pane.send_input",
+                "pane.wait_for_output",
+                "pane.send_keys",
+                "pane.send_input",
+                "pane.wait_for_output",
+                "pane.send_input",
+                "pane.wait_for_output",
+                "pane.send_keys",
                 "agent.start",
                 "agent.wait",
                 "agent.prompt"
@@ -3567,7 +3804,7 @@ profile = "devin"
                 "pane.send_keys",
                 "pane.send_input",
                 "pane.wait_for_output",
-                "pane.send_input",
+                "pane.send_keys",
                 "agent.start",
                 "agent.wait",
                 "agent.prompt",
@@ -4333,7 +4570,8 @@ profile = "devin"
                 "pane.send_input",
                 "pane.wait_for_output",
                 "pane.send_input",
-                "pane.send_input",
+                "pane.wait_for_output",
+                "pane.send_keys",
                 "agent.start",
                 "agent.wait",
                 "agent.prompt"
@@ -4344,9 +4582,19 @@ profile = "devin"
             .iter()
             .filter(|(m, _)| m == "pane.send_input")
             .map(|(_, p)| p["text"].as_str().unwrap().to_string())
-            .filter(|line| !line.starts_with("printf "))
+            .filter(|line| !line.starts_with("command printf "))
             .collect();
-        assert_eq!(texts[0], "unset SCRUB_ME");
+        assert!(
+            texts[0].starts_with("unset SCRUB_ME && command printf "),
+            "{}",
+            texts[0]
+        );
+        assert_eq!(
+            texts[0].matches("${SCRUB_ME+/0}").count(),
+            2,
+            "{}",
+            texts[0]
+        );
         for v in ["TMPDIR", "TMP", "TEMP"] {
             assert!(
                 texts[1].contains(&format!("{v}='"))
@@ -4373,7 +4621,10 @@ profile = "devin"
             .map(|(_, p)| p["text"].as_str().unwrap())
             .find(|line| line.starts_with("unset "))
             .unwrap();
-        assert_eq!(text, "unset SCRUB_ME");
+        assert!(
+            text.starts_with("unset SCRUB_ME && command printf "),
+            "{text}"
+        );
         assert!(result(&host).unwrap().ok);
     }
 
