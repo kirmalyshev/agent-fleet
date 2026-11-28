@@ -1200,9 +1200,16 @@ async fn pane_wait_marker(sock: &Path, pane: &str, marker: &str) -> Result<()> {
 /// already contains. Split-string output can survive exactly the corruption it is meant to catch
 /// (two quoted halves losing their separating space still print the same concatenation); the sum
 /// cannot: the echoed command holds only the operands, and losing or corrupting the operator or an
-/// operand yields a different number or no output. Markers depend on the agent, use and attempt, so
-/// an old line is vanishingly unlikely to satisfy a new wait.
-fn arithmetic_confirmation(agent: &str, use_: &str, attempt: u32) -> (String, String) {
+/// operand yields a different number or no output. A setup may add parameter expansions that make
+/// the arithmetic invalid unless the required shell state really holds, so a command separator
+/// smuggled in by a terminal reply cannot detach the confirmation from that state. Markers depend
+/// on the agent, use and attempt, so an old line is vanishingly unlikely to satisfy a new wait.
+fn arithmetic_confirmation(
+    agent: &str,
+    use_: &str,
+    attempt: u32,
+    arithmetic_guard: &str,
+) -> (String, String) {
     let mut hash = 0xcbf29ce484222325u64;
     for b in agent
         .bytes()
@@ -1217,16 +1224,22 @@ fn arithmetic_confirmation(agent: &str, use_: &str, attempt: u32) -> (String, St
     let right = target - left;
     (
         target.to_string(),
-        format!("command printf '%s\\n' \"$(({left} + {right}))\""),
+        format!("command printf '%s\\n' \"$(({left} + {right}{arithmetic_guard}))\""),
     )
 }
 
 fn readiness_probe(agent: &str, attempt: u32) -> (String, String) {
-    arithmetic_confirmation(agent, "ready", attempt)
+    arithmetic_confirmation(agent, "ready", attempt, "")
 }
 
-fn confirmed_line(agent: &str, use_: &str, attempt: u32, setup: &str) -> (String, String) {
-    let (marker, print) = arithmetic_confirmation(agent, use_, attempt);
+fn confirmed_line(
+    agent: &str,
+    use_: &str,
+    attempt: u32,
+    setup: &str,
+    arithmetic_guard: &str,
+) -> (String, String) {
+    let (marker, print) = arithmetic_confirmation(agent, use_, attempt, arithmetic_guard);
     let line = if setup.is_empty() {
         print
     } else {
@@ -1288,6 +1301,7 @@ async fn pane_run_confirmed(
     agent: &str,
     use_: &str,
     setup: &str,
+    arithmetic_guard: &str,
 ) -> Result<()> {
     let mut err = anyhow!("confirmed shell setup never ran");
     for attempt in 0..CONFIRM_TRIES {
@@ -1296,7 +1310,7 @@ async fn pane_run_confirmed(
                 .await
                 .context("ctrl-c before shell setup retry")?;
         }
-        let (marker, line) = confirmed_line(agent, use_, attempt, setup);
+        let (marker, line) = confirmed_line(agent, use_, attempt, setup, arithmetic_guard);
         match pane_input(sock, pane, &line).await {
             Err(e) if permanent_pane_error(&e) => {
                 return Err(e.context("shell setup rejected permanently"));
@@ -1552,12 +1566,26 @@ async fn run_spawn(
     .await?;
     if !prof.unset_env.is_empty() {
         let scrub = format!("unset {}", prof.unset_env.join(" "));
+        // Repeat each guard: the startup reply itself contains a command separator, so the
+        // confirmation must depend on the scrubbed state rather than merely on `&&` reaching
+        // printf. If a scrubbed variable is still set, its expansion inserts `)` into the
+        // arithmetic and no confirmation can print. Duplication keeps one corrupted guard copy
+        // from silently becoming a check of some other, unset variable.
+        let arithmetic_guard = prof
+            .unset_env
+            .iter()
+            .flat_map(|var| {
+                let g = format!(" ${{{var}+)}}");
+                [g.clone(), g]
+            })
+            .collect::<String>();
         pane_run_confirmed(
             &host.cfg.herdr_socket,
             made.pane.as_deref().unwrap_or_default(),
             &r.name,
             "env scrub",
             &scrub,
+            &arithmetic_guard,
         )
         .await
         .context("env scrub")?;
@@ -1573,6 +1601,7 @@ async fn run_spawn(
                 &r.name,
                 "TMPDIR export",
                 &crate::tmpdir::export_line(&d),
+                "",
             )
             .await
             {
@@ -3607,6 +3636,28 @@ profile = "devin"
             marker,
             "{fused}"
         );
+    }
+
+    #[test]
+    fn the_env_confirmation_expands_only_while_the_scrubbed_variables_are_unset() {
+        let guard = " ${SCRUB_ME+)} ${SCRUB_ME+)}";
+        let (marker, print) = arithmetic_confirmation("s-7", "env scrub", 0, guard);
+        assert!(!print.contains(&marker), "{print}");
+        assert_eq!(print.matches("${SCRUB_ME+)}").count(), 2, "{print}");
+
+        let run = |set: bool| {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg("-c").arg(&print).env_remove("SCRUB_ME");
+            if set {
+                cmd.env("SCRUB_ME", "x");
+            }
+            cmd.output().unwrap()
+        };
+        let unset = run(false);
+        assert!(unset.status.success(), "{unset:?}");
+        assert_eq!(String::from_utf8(unset.stdout).unwrap().trim(), marker);
+        let set = run(true);
+        assert_ne!(String::from_utf8(set.stdout).unwrap().trim(), marker);
     }
 
     #[tokio::test]

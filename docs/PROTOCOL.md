@@ -961,8 +961,9 @@ a non-POSIX interactive shell fails closed at readiness. The host does not ctrl-
 still be running its startup files. Once a probe answers, the host lets already queued startup
 input settle for 250 ms and ctrl-cs the partial line it produced; the ctrl-c is itself checked.
 Required `unset_env` entries are then typed as one idempotent `unset` command ending in an
-attempt-specific arithmetic confirmation. Bytes accepted by herdr are not enough: only the
-confirmation proves the shell executed the scrub. On timeout the whole command is ctrl-c'd and retried, up to 5 tries.
+attempt-specific arithmetic confirmation whose expansion is valid only while those variables are
+unset. Bytes accepted by herdr are not enough: only the confirmation proves the scrubbed state,
+even if a terminal reply's semicolon split the typed command. On timeout the whole command is ctrl-c'd and retried, up to 5 tries.
 `TMPDIR`, `TMP` and `TEMP` are exported there as the agent's scratch dir, outside any checkout:
 `<cache dir>/agent-fleet/tmp/<session>/<name>` (`~/.cache/agent-fleet/tmp/...` on Linux,
 `~/Library/Caches/agent-fleet/tmp/...` on macOS), created by the same confirmed line. The host removes it when the agent's pane or workspace closes (not when
