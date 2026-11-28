@@ -1568,14 +1568,14 @@ async fn run_spawn(
         let scrub = format!("unset {}", prof.unset_env.join(" "));
         // Repeat each guard: the startup reply itself contains a command separator, so the
         // confirmation must depend on the scrubbed state rather than merely on `&&` reaching
-        // printf. If a scrubbed variable is still set, its expansion inserts `)` into the
+        // printf. If a scrubbed variable is still set, its expansion inserts division by zero into the
         // arithmetic and no confirmation can print. Duplication keeps one corrupted guard copy
         // from silently becoming a check of some other, unset variable.
         let arithmetic_guard = prof
             .unset_env
             .iter()
             .flat_map(|var| {
-                let g = format!(" ${{{var}+)}}");
+                let g = format!(" ${{{var}+/0}}");
                 [g.clone(), g]
             })
             .collect::<String>();
@@ -3640,10 +3640,10 @@ profile = "devin"
 
     #[test]
     fn the_env_confirmation_expands_only_while_the_scrubbed_variables_are_unset() {
-        let guard = " ${SCRUB_ME+)} ${SCRUB_ME+)}";
+        let guard = " ${SCRUB_ME+/0} ${SCRUB_ME+/0}";
         let (marker, print) = arithmetic_confirmation("s-7", "env scrub", 0, guard);
         assert!(!print.contains(&marker), "{print}");
-        assert_eq!(print.matches("${SCRUB_ME+)}").count(), 2, "{print}");
+        assert_eq!(print.matches("${SCRUB_ME+/0}").count(), 2, "{print}");
 
         let run = |set: bool| {
             let mut cmd = std::process::Command::new("sh");
@@ -4589,7 +4589,12 @@ profile = "devin"
             "{}",
             texts[0]
         );
-        assert_eq!(texts[0].matches("${SCRUB_ME+)}").count(), 2, "{}", texts[0]);
+        assert_eq!(
+            texts[0].matches("${SCRUB_ME+/0}").count(),
+            2,
+            "{}",
+            texts[0]
+        );
         for v in ["TMPDIR", "TMP", "TEMP"] {
             assert!(
                 texts[1].contains(&format!("{v}='"))
