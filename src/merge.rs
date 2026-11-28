@@ -1674,7 +1674,8 @@ esac
         let f = Fake::new();
         f.put("fleet.toml", "[merge]\ngate = \"gate.sh\"\n");
         f.put("base", "feat");
-        let dir = f.dir.path();
+        // Canonical: a macOS tempdir is /var/folders/… while a shell's $PWD resolves /private/var.
+        let dir = &f.dir.path().canonicalize().unwrap();
         let co = dir.join("checkout");
         std::fs::create_dir(&co).unwrap();
         sh(dir, &["init", "-q", "--bare", "origin"]);
