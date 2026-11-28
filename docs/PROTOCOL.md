@@ -956,7 +956,8 @@ hook nor `git worktree remove` runs). `agent-fleet spawn --brief <file>` sends t
 `ready` runs (new worktrees only, 15 min). Before any real command is typed, the pane's shell
 proves it is reading complete input lines: the host sends disposable arithmetic probes whose
 output is a sum never present in the echoed command (up to 30 probes, each waited on for 2 s,
-bounded by 60 s overall). It does not ctrl-c a shell that has not answered yet — that shell may
+bounded by 60 s overall). This typed setup uses POSIX-sh arithmetic, `unset` and `export`;
+a non-POSIX interactive shell fails closed at readiness. The host does not ctrl-c a shell that has not answered yet — that shell may
 still be running its startup files. Once a probe answers, the host lets already queued startup
 input settle for 250 ms and ctrl-cs the partial line it produced; the ctrl-c is itself checked.
 Required `unset_env` entries are then typed as one idempotent `unset` command ending in an
