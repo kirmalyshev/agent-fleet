@@ -1293,8 +1293,8 @@ async fn pane_ready(sock: &Path, pane: &str, agent: &str) -> Result<()> {
 /// Run one shell setup line and require its own arithmetic confirmation before believing it.
 /// `unset_env` is security-relevant: herdr accepting the bytes is not enough, because a late
 /// terminal-control reply can still corrupt or consume the line after readiness. On a timeout the
-/// whole line is cleared and retried; the operations are idempotent, so a partially executed
-/// corrupted attempt is harmless and a confirmed attempt proves the setup itself ran.
+/// whole line is cleared and retried. The caller's operations are idempotent, so a partial or
+/// corrupted attempt is corrected by a later one; the confirmation defines what must be true.
 async fn pane_run_confirmed(
     sock: &Path,
     pane: &str,
@@ -4589,6 +4589,7 @@ profile = "devin"
             "{}",
             texts[0]
         );
+        assert_eq!(texts[0].matches("${SCRUB_ME+)}").count(), 2, "{}", texts[0]);
         for v in ["TMPDIR", "TMP", "TEMP"] {
             assert!(
                 texts[1].contains(&format!("{v}='"))
