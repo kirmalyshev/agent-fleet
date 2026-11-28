@@ -269,6 +269,7 @@ async fn dust_scan(root: &Path, label: &str, lines: usize) -> Vec<DiskEntry> {
         .arg("-n")
         .arg(lines.to_string())
         .arg(root)
+        .kill_on_drop(true)
         .output();
     let Ok(Ok(out)) = tokio::time::timeout(DUST_TIMEOUT, run).await else {
         return Vec::new();
