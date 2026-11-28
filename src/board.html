@@ -610,9 +610,16 @@ function hostsTab(s) {
   const cards = hub ? `<div class="cards">${card(dur(hub.uptime_s * 1000), "hub up")}${card(mb(hub.max_rss_kb), "hub memory")}
     ${card(hub.events, "events in the log")}${card(hub.followers, "followers")}${card(dur(Math.round(hub.post_us.p50 / 1000)), "write, median")}</div>` : "";
   const rows = Object.entries(s.hosts).filter(([h]) => match(h));
-  return cards + table([["Host"], ["Agents", "r"], ["Disk free", "r"], ["Last report", "r"], ["Up", "r"], ["Memory", "r"], ["Rings", "r"], ["herdr errors", "r"], ["Spooled", "r"]], rows.map(([h, x]) => {
-    const l = hs[h]?.last, late = Date.now() - Date.parse(x.ts) > 180000, gb = b => (b / 1e9).toFixed(1);
-    return `<tr><td class="mono">${esc(h)}</td><td class="r num">${x.agents}</td><td class="r num">${gb(x.disk_free)} of ${gb(x.disk_total)} GB</td>
+  return cards + table([["Host"], ["Agents", "r"], ["Load 1/5/15", "r"], ["Memory", "r"], ["Disk free", "r"], ["Last report", "r"], ["Up", "r"], ["Host memory", "r"], ["Rings", "r"], ["herdr errors", "r"], ["Spooled", "r"]], rows.map(([h, x]) => {
+    const l = hs[h]?.last, late = Date.now() - Date.parse(x.ts) > 180000, gb = b => (b / 1e9).toFixed(1), m = x.machine;
+    const loadBad = m && m.cores > 0 && m.load5 > 2.0 * m.cores, diskBad = x.disk_total > 0 && x.disk_free < 5e9;
+    const load = m ? `${m.load1.toFixed(1)} / ${m.load5.toFixed(1)} / ${m.load15.toFixed(1)} · ${m.cores}c` : "";
+    const mem = m ? `${gb(m.memory_used)} of ${gb(m.memory_total)} GB` : "";
+    const top = (x.disk?.breakdown || []).slice().sort((a, b) => b.bytes - a.bytes).slice(0, 3)
+      .map(e => `${esc(e.path)} ${gb(e.bytes)} GB`).join(" · ");
+    return `<tr><td class="mono">${esc(h)}</td><td class="r num">${x.agents}</td>
+      <td class="r num">${loadBad ? `<span class="count-bad">${load}</span>` : load}</td><td class="r num">${mem}</td>
+      <td class="r num">${diskBad ? `<span class="count-bad">${gb(x.disk_free)} of ${gb(x.disk_total)} GB</span>` : `${gb(x.disk_free)} of ${gb(x.disk_total)} GB`}${top ? `<div class="dim">${top}</div>` : ""}</td>
       <td class="r num">${late ? `<span class="count-bad">${ago(x.ts)} ago</span>` : ago(x.ts) + " ago"}</td><td class="r num">${l ? dur(l.uptime_s * 1000) : ""}</td>
       <td class="r num">${l ? mb(l.max_rss_kb) : ""}</td><td class="r num">${l ? l.rings + (l.ring_failures ? ` <span class="count-bad">(${l.ring_failures} failed)</span>` : "") : ""}</td>
       <td class="r num">${l ? n0(l.herdr_errors, "count-warn") : ""}</td><td class="r num">${l ? n0(l.spooled, "count-warn") : ""}</td></tr>`;

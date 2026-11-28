@@ -207,7 +207,7 @@ pub enum Known {
     #[serde(rename = "agent.down")]
     AgentDown(AgentDown),
     #[serde(rename = "host.health")]
-    HostHealth(HostHealth),
+    HostHealth(Box<HostHealth>),
     #[serde(rename = "agent.usage")]
     AgentUsage(AgentUsage),
     #[serde(rename = "agent.role")]
@@ -341,10 +341,21 @@ pub struct AgentDown {
 #[serde(deny_unknown_fields)]
 pub struct HostHealth {
     pub host: String,
-    /// Bytes available to unprivileged users on the fleet data volume.
+    /// Bytes available to unprivileged users on the worktree volume, from the last disk sample.
     pub disk_free: u64,
     pub disk_total: u64,
     pub agents: u32,
+    /// The machine's load, core count and memory. Absent in reports from before host-load
+    /// heartbeats, or when the platform cannot read them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<MachineStats>,
+    /// When the disk numbers were sampled, and the cached `dust` breakdown of what uses them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<DiskReport>,
+    /// Repositories this host serves (`[repos]` merged with its `--repo` flags), so routing can
+    /// tell whether another host can take a spawn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<HostStats>,
     /// The commit the host's binary was built from; absent when built outside a git checkout.
@@ -354,6 +365,41 @@ pub struct HostHealth {
     /// not behind, or cannot tell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub behind_since: Option<DateTime<Utc>>,
+}
+
+/// One machine's load and memory at a `host.health` report. Load is the system load average;
+/// memory is bytes. `cores` is the online CPU count the load is compared against.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MachineStats {
+    pub load1: f64,
+    pub load5: f64,
+    pub load15: f64,
+    pub cores: u32,
+    pub memory_used: u64,
+    pub memory_total: u64,
+}
+
+/// One large directory in a host's cached disk-use breakdown.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DiskEntry {
+    /// Which scan produced it: `home`, `worktrees` or `cache`.
+    pub root: String,
+    pub path: String,
+    pub bytes: u64,
+}
+
+/// The disk sample `disk_free`/`disk_total` came from. Free space is statvfs, never a traversal;
+/// `breakdown` is the separate, cached `dust` answer to what uses the space.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DiskReport {
+    pub sampled_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breakdown_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub breakdown: Vec<DiskEntry>,
 }
 
 /// The host agent's own vitals. Counters run from the host's start, so a drop in `uptime_s`

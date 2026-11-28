@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -197,6 +198,12 @@ const QUEUE_CHECK: Duration = Duration::from_secs(2);
 /// How often the host reads each agent program's usage quota.
 const QUOTA_EVERY: Duration = Duration::from_secs(60);
 
+/// The expensive disk-use breakdown (`dust`, never du) is refreshed at most this often.
+const DUST_EVERY: Duration = Duration::from_secs(30 * 60);
+
+/// One `dust` scan may run this long before it is abandoned and the old breakdown kept.
+const DUST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
 /// `devin auth status` refreshes devin's cached quota; run at most this often.
 const DEVIN_STATUS_EVERY: Duration = Duration::from_secs(15 * 60);
 
@@ -246,6 +253,56 @@ async fn live_devices() -> Option<HashSet<String>> {
             .cloned()
             .collect(),
     )
+}
+
+async fn dust_scan(root: &Path, label: &str, lines: usize) -> Vec<DiskEntry> {
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let run = tokio::process::Command::new("dust")
+        .arg("-j")
+        .arg("-o")
+        .arg("b")
+        .arg("-P")
+        .arg("-d")
+        .arg("1")
+        .arg("-n")
+        .arg(lines.to_string())
+        .arg(root)
+        .kill_on_drop(true)
+        .output();
+    let Ok(Ok(out)) = tokio::time::timeout(DUST_TIMEOUT, run).await else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    crate::stats::parse_dust_json(label, &String::from_utf8_lossy(&out.stdout))
+}
+
+/// The cached answer to "what uses the disk": top directories under home, herdr's worktree
+/// directory and the platform cache directory. Empty when `dust` is absent or cannot scan one;
+/// free space itself is statvfs and does not depend on this.
+async fn dust_breakdown() -> Vec<DiskEntry> {
+    if !on_path("dust") {
+        return Vec::new();
+    }
+    let Some(base) = directories::BaseDirs::new() else {
+        return Vec::new();
+    };
+    let home = base.home_dir().to_path_buf();
+    let worktrees =
+        crate::scan::herdr_worktrees().unwrap_or_else(|| home.join(".herdr").join("worktrees"));
+    let cache = base.cache_dir().to_path_buf();
+    let mut out = Vec::new();
+    for (root, label, lines) in [
+        (home, "home", 12),
+        (worktrees, "worktrees", 8),
+        (cache, "cache", 8),
+    ] {
+        out.extend(dust_scan(&root, label, lines).await);
+    }
+    crate::stats::fit_disk_entries(out, 6 * 1024)
 }
 
 impl Host {
@@ -872,25 +929,63 @@ impl Host {
         let start = tokio::time::Instant::now() + Duration::from_secs(5);
         let every = Duration::from_secs(crate::stats::HEALTH_EVERY_S as u64);
         let mut tick = tokio::time::interval_at(start, every);
+        let worktree_volume = crate::scan::herdr_worktrees()
+            .and_then(|p| p.ancestors().find(|a| a.exists()).map(Path::to_path_buf))
+            .unwrap_or_else(|| self.cfg.data_dir.clone());
+        let mut disk: Option<(u64, u64, DateTime<Utc>)> = None;
+        let breakdown = Arc::new(Mutex::new(None::<(DateTime<Utc>, Vec<DiskEntry>)>));
+        let breakdown_running = Arc::new(AtomicBool::new(false));
+        let mut breakdown_sampled: Option<Instant> = None;
         loop {
             tick.tick().await;
-            match rustix::fs::statvfs(&self.cfg.data_dir) {
+            match rustix::fs::statvfs(&worktree_volume) {
                 Ok(s) => {
-                    let agents = self.panes.lock().unwrap().len() as u32;
-                    let behind_since = *self.behind_since.lock().unwrap();
-                    self.publish(self.presence(Known::HostHealth(HostHealth {
-                        host: self.cfg.host.clone(),
-                        disk_free: s.f_bavail * s.f_frsize,
-                        disk_total: s.f_blocks * s.f_frsize,
-                        agents,
-                        stats: Some(self.stats()),
-                        commit: crate::update::COMMIT.map(str::to_string),
-                        behind_since,
-                    })))
-                    .await;
+                    disk = Some((s.f_bavail * s.f_frsize, s.f_blocks * s.f_frsize, Utc::now()));
                 }
                 Err(err) => eprintln!("agent-fleet host: statvfs: {err}"),
             }
+            if breakdown_sampled.is_none_or(|t| t.elapsed() >= DUST_EVERY)
+                && !breakdown_running.swap(true, Ordering::Relaxed)
+            {
+                breakdown_sampled = Some(Instant::now());
+                let cache = breakdown.clone();
+                let running = breakdown_running.clone();
+                tokio::spawn(async move {
+                    let entries = dust_breakdown().await;
+                    if !entries.is_empty() {
+                        *cache.lock().unwrap() = Some((Utc::now(), entries));
+                    }
+                    running.store(false, Ordering::Relaxed);
+                });
+            }
+            let Some((disk_free, disk_total, sampled_at)) = disk else {
+                continue;
+            };
+            let cached = breakdown.lock().unwrap().clone();
+            let agents = self.panes.lock().unwrap().len() as u32;
+            let behind_since = *self.behind_since.lock().unwrap();
+            let repos = self
+                .cfg
+                .checkouts_now()
+                .map(|c| c.keys().cloned().collect())
+                .unwrap_or_default();
+            self.publish(self.presence(Known::HostHealth(Box::new(HostHealth {
+                host: self.cfg.host.clone(),
+                disk_free,
+                disk_total,
+                agents,
+                machine: Some(crate::stats::machine_usage()),
+                disk: Some(DiskReport {
+                    sampled_at,
+                    breakdown_at: cached.as_ref().map(|(ts, _)| *ts),
+                    breakdown: cached.map(|(_, entries)| entries).unwrap_or_default(),
+                }),
+                repos,
+                stats: Some(self.stats()),
+                commit: crate::update::COMMIT.map(str::to_string),
+                behind_since,
+            }))))
+            .await;
         }
     }
 

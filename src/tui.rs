@@ -48,15 +48,17 @@ enum Tab {
     Findings,
     Resources,
     Asks,
+    Hosts,
 }
 
-const TABS: [(Tab, &str); 6] = [
+const TABS: [(Tab, &str); 7] = [
     (Tab::Agents, "1 Agents"),
     (Tab::Worktrees, "2 Worktrees"),
     (Tab::Tasks, "3 Tasks"),
     (Tab::Findings, "4 Findings"),
     (Tab::Resources, "5 Resources"),
     (Tab::Asks, "6 Asks"),
+    (Tab::Hosts, "7 Hosts"),
 ];
 
 /// An action waiting for `y`.
@@ -167,7 +169,7 @@ fn summary(name: String, got: &Result<(State, Option<String>)>, now: DateTime<Ut
 
 struct App {
     tab: Tab,
-    tables: [TableState; 6],
+    tables: [TableState; 7],
     state: State,
     found: Vec<Finding>,
     warn: Option<String>,
@@ -300,6 +302,7 @@ impl App {
                 self.state.resources.len() + self.state.limits.len() + self.state.quotas.len()
             }
             Tab::Asks => self.state.inbox().len(),
+            Tab::Hosts => self.state.hosts.len(),
         }
     }
 
@@ -752,7 +755,7 @@ async fn key(app: &mut App, code: KeyCode, fleet: &impl Fleet) -> bool {
         KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
             app.tab = TABS[(app.tab as usize + TABS.len() - 1) % TABS.len()].0
         }
-        KeyCode::Char(c @ '1'..='6') => app.tab = TABS[(c as u8 - b'1') as usize].0,
+        KeyCode::Char(c @ '1'..='7') => app.tab = TABS[(c as u8 - b'1') as usize].0,
         KeyCode::Enter if app.tab == Tab::Findings => jump(app),
         KeyCode::Char(c) => action(app, c, fleet).await,
         _ => {}
@@ -1246,6 +1249,7 @@ fn draw<F: Fleet>(f: &mut Frame, app: &App, fleets: &[F], now: DateTime<Utc>) {
         Tab::Findings => found(app),
         Tab::Resources => resources(app, now),
         Tab::Asks => asks(app, now),
+        Tab::Hosts => hosts(app, now),
     };
     let rows: Vec<Row> = rows
         .into_iter()
@@ -1325,6 +1329,7 @@ fn draw<F: Fleet>(f: &mut Frame, app: &App, fleets: &[F], now: DateTime<Utc>) {
                 Tab::Findings => "Enter Go to · K Kill · ",
                 Tab::Resources => "L Limit · U Unlimit · ",
                 Tab::Asks => "a Answer · A Approve · ",
+                Tab::Hosts => "",
             };
             let switch = if app.multi() { "[ ] Instance · " } else { "" };
             Line::from(vec![
@@ -1587,6 +1592,112 @@ fn worktrees(app: &App, now: DateTime<Utc>) -> View<'_> {
             Constraint::Length(10),
             Constraint::Length(7),
             Constraint::Min(20),
+        ],
+        rows,
+        about,
+    )
+}
+
+fn hosts(app: &App, now: DateTime<Utc>) -> View<'_> {
+    let gb = |b: u64| b as f64 / 1e9;
+    let rows = app
+        .state
+        .hosts
+        .iter()
+        .map(|(name, h)| {
+            let pressure = h.pressure(
+                crate::spawn::DEFAULT_MAX_LOAD_PER_CORE,
+                crate::spawn::disk_floor_bytes(crate::spawn::DEFAULT_MIN_DISK_FREE_GB),
+            );
+            let bad = !pressure.is_empty();
+            let load_bad = h.machine.as_ref().is_some_and(|m| {
+                m.cores > 0 && m.load5 > crate::spawn::DEFAULT_MAX_LOAD_PER_CORE * m.cores as f64
+            });
+            let disk_bad = h.disk_total > 0
+                && h.disk_free
+                    < crate::spawn::disk_floor_bytes(crate::spawn::DEFAULT_MIN_DISK_FREE_GB);
+            let (load, mem) = h.machine.as_ref().map_or_else(
+                || ("-".into(), "-".into()),
+                |m| {
+                    (
+                        format!(
+                            "{:.1}/{:.1}/{:.1} · {}c",
+                            m.load1, m.load5, m.load15, m.cores
+                        ),
+                        format!("{:.1}/{:.1} GB", gb(m.memory_used), gb(m.memory_total)),
+                    )
+                },
+            );
+            Row::new(vec![
+                Cell::from(name.clone()),
+                Cell::from(load).fg(if load_bad { Color::Red } else { Color::Green }),
+                Cell::from(mem),
+                Cell::from(format!("{:.1}/{:.1} GB", gb(h.disk_free), gb(h.disk_total)))
+                    .fg(if disk_bad { Color::Red } else { DIM }),
+                Cell::from(ago(now, h.ts)),
+                Cell::from(if bad { "OVER" } else { "" }).fg(Color::Red),
+            ])
+        })
+        .collect();
+    let about = app
+        .state
+        .hosts
+        .iter()
+        .nth(app.at())
+        .map_or(vec![], |(name, h)| {
+            let mut l = vec![Line::from(vec![
+                Span::styled(name.clone(), Style::new().bold()),
+                Span::raw(format!(
+                    "  reported {} ago · agents {} · commit {}",
+                    ago(now, h.ts),
+                    h.agents,
+                    crate::update::short(h.commit.as_deref())
+                )),
+            ])];
+            if let Some(m) = &h.machine {
+                l.push(Line::raw(format!(
+                    "load {:.1} {:.1} {:.1} on {} cores · memory {:.1}/{:.1} GB",
+                    m.load1,
+                    m.load5,
+                    m.load15,
+                    m.cores,
+                    gb(m.memory_used),
+                    gb(m.memory_total)
+                )));
+            }
+            let pressure = h.pressure(
+                crate::spawn::DEFAULT_MAX_LOAD_PER_CORE,
+                crate::spawn::disk_floor_bytes(crate::spawn::DEFAULT_MIN_DISK_FREE_GB),
+            );
+            if !pressure.is_empty() {
+                l.push(Line::styled(
+                    format!("over spawn limits: {}", pressure.join("; ")),
+                    Style::new().fg(Color::Red),
+                ));
+            }
+            if let Some(d) = &h.disk {
+                l.push(Line::raw(format!(
+                    "disk sampled {} ago{}",
+                    ago(now, d.sampled_at),
+                    d.breakdown_at
+                        .map(|t| format!(" · breakdown {} ago", ago(now, t)))
+                        .unwrap_or_default()
+                )));
+                for e in h.disk_breakdown(8) {
+                    l.push(Line::raw(format!("  {e}")));
+                }
+            }
+            l
+        });
+    (
+        vec!["HOST", "LOAD 1/5/15", "MEMORY", "DISK FREE", "SEEN", "OVER"],
+        vec![
+            Constraint::Length(18),
+            Constraint::Length(22),
+            Constraint::Length(16),
+            Constraint::Length(16),
+            Constraint::Length(8),
+            Constraint::Min(5),
         ],
         rows,
         about,
@@ -2251,7 +2362,7 @@ mod tests {
         .map(ev)
         .collect();
         let state = State::fold(&events);
-        let mut tables: [TableState; 6] = Default::default();
+        let mut tables: [TableState; 7] = Default::default();
         tables[Tab::Resources as usize].select(Some(1));
         let mut app = App {
             tab: Tab::Resources,

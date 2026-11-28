@@ -30,6 +30,13 @@ pub struct FleetConfig {
     /// The branch point for a new worktree.
     #[serde(default = "default_base")]
     pub base: String,
+    /// Refuse a host whose 5-minute load per online core is above this; when the rule leaves
+    /// the host open, take a host under the limit instead. Default 2.0.
+    #[serde(default = "default_max_load_per_core")]
+    pub max_load_per_core: f64,
+    /// Refuse a host whose last statvfs sample leaves less than this many GB free. Default 5.
+    #[serde(default = "default_min_disk_free_gb")]
+    pub min_disk_free_gb: f64,
     /// The brief template next to fleet.toml; `@@KEY@@` placeholders.
     pub brief: String,
     /// A script run inside a NEW worktree with its path as $1, before the agent starts.
@@ -84,6 +91,22 @@ fn default_base() -> String {
     "origin/main".into()
 }
 
+pub const DEFAULT_MAX_LOAD_PER_CORE: f64 = 2.0;
+pub const DEFAULT_MIN_DISK_FREE_GB: f64 = 5.0;
+
+fn default_max_load_per_core() -> f64 {
+    DEFAULT_MAX_LOAD_PER_CORE
+}
+
+fn default_min_disk_free_gb() -> f64 {
+    DEFAULT_MIN_DISK_FREE_GB
+}
+
+/// `gb` as bytes, using the same decimal GB the host views print.
+pub fn disk_floor_bytes(gb: f64) -> u64 {
+    (gb * 1e9).max(0.0) as u64
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -126,9 +149,10 @@ pub struct Rule {
     /// `cap` and has quota on the host (list order breaks ties).
     #[serde(deserialize_with = "one_or_many")]
     pub profile: Vec<String>,
-    /// The host to spawn on [default: the host running the CLI].
-    #[serde(default)]
-    pub host: Option<String>,
+    /// The host to spawn on, or several hosts the rule allows [default: the host running the CLI].
+    /// A list routes away from one whose machine load or free disk is over the fleet's limits.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub host: Vec<String>,
     /// The `agent.role` level declared for the new agent [default: implementer].
     #[serde(default)]
     pub level: Option<Level>,
@@ -204,6 +228,18 @@ impl FleetConfig {
         if let Some(r) = &self.retire {
             check_ready(r)
                 .with_context(|| format!("fleet.toml: retire {r:?}{}", line_of(src, "retire")))?;
+        }
+        if !self.max_load_per_core.is_finite() || self.max_load_per_core <= 0.0 {
+            bail!(
+                "fleet.toml: max_load_per_core must be positive{}",
+                line_of(src, "max_load_per_core")
+            );
+        }
+        if !self.min_disk_free_gb.is_finite() || self.min_disk_free_gb < 0.0 {
+            bail!(
+                "fleet.toml: min_disk_free_gb cannot be negative{}",
+                line_of(src, "min_disk_free_gb")
+            );
         }
         self.chores
             .check(&self.profiles)
@@ -511,8 +547,124 @@ pub struct Overrides<'a> {
     pub level: Option<Level>,
 }
 
+#[derive(Debug)]
+enum HostRule {
+    /// `--host`, or a rule naming one host: overload refuses, never reroutes.
+    Strict(String),
+    /// The rule's open host choice: `preferred` first, then the other hosts it allows. Used only
+    /// when `preferred` is over the machine-pressure limits.
+    Open {
+        preferred: String,
+        allowed: Vec<String>,
+    },
+}
+
+impl HostRule {
+    fn preferred(&self) -> &str {
+        match self {
+            Self::Strict(h) => h,
+            Self::Open { preferred, .. } => preferred,
+        }
+    }
+}
+
+fn quota_exhausted(state: &State, host: &str, kind: &str) -> bool {
+    state
+        .quotas
+        .get(&format!("{host}:{kind}"))
+        .is_some_and(|q| q.exhausted_at(Utc::now()))
+}
+
+fn host_pressure(cfg: &FleetConfig, state: &State, host: &str) -> Vec<String> {
+    state.hosts.get(host).map_or_else(Vec::new, |h| {
+        h.pressure(
+            cfg.max_load_per_core,
+            disk_floor_bytes(cfg.min_disk_free_gb),
+        )
+    })
+}
+
+/// The host a spawn may use after machine pressure is applied. A strict host refuses; an open
+/// one reroutes to a fresh-reporting allowed host under the limits where this profile's kind is
+/// not out of quota. Missing measurements never condemn the preferred host (the fleet may be
+/// mid-upgrade), but an alternate must have machine stats to be provably under the limit.
+fn choose_host(
+    cfg: &FleetConfig,
+    state: &State,
+    repo: &str,
+    kind: &str,
+    rule: &HostRule,
+    why: &mut Vec<String>,
+) -> Result<String> {
+    let preferred = rule.preferred().to_string();
+    let preferred_pressure = host_pressure(cfg, state, &preferred);
+    if preferred_pressure.is_empty() {
+        return Ok(preferred);
+    }
+    let mut detail = format!(
+        "host {preferred} is over its spawn limits: {}",
+        preferred_pressure.join("; ")
+    );
+    if preferred_pressure
+        .iter()
+        .any(|r| r.starts_with("disk free"))
+        && let Some(h) = state.hosts.get(&preferred)
+    {
+        let top = h.disk_breakdown(3);
+        if !top.is_empty() {
+            detail += &format!("; largest: {}", top.join(", "));
+        }
+    }
+    if matches!(rule, HostRule::Strict(_)) {
+        bail!(detail);
+    }
+    let HostRule::Open { allowed, .. } = rule else {
+        unreachable!()
+    };
+    let mut candidates = allowed.clone();
+    candidates.sort_by_key(|h| {
+        state
+            .hosts
+            .get(h)
+            .map(|x| (x.load5_per_core().unwrap_or(f64::MAX) * 1000.0) as i64)
+            .unwrap_or(i64::MAX)
+    });
+    let fresh = chrono::Duration::minutes(3);
+    for host in candidates {
+        let Some(h) = state.hosts.get(&host) else {
+            continue;
+        };
+        if Utc::now() - h.ts > fresh || h.machine.is_none() {
+            continue;
+        }
+        // A new-format host reports the repositories it serves; an empty list means none. A
+        // pre-upgrade report has no machine stats and proves nothing either way.
+        if h.machine.is_some() && !h.repos.iter().any(|r| r == repo) {
+            continue;
+        }
+        let pressure = h.pressure(
+            cfg.max_load_per_core,
+            disk_floor_bytes(cfg.min_disk_free_gb),
+        );
+        if !pressure.is_empty() {
+            why.push(format!("{host} skipped: {}", pressure.join("; ")));
+            continue;
+        }
+        if quota_exhausted(state, &host, kind) {
+            why.push(format!("{host} skipped: {kind} quota exhausted"));
+            continue;
+        }
+        why.push(format!(
+            "{preferred} skipped: {}; rerouted to {host}",
+            preferred_pressure.join("; ")
+        ));
+        return Ok(host);
+    }
+    bail!("{detail}; no allowed host can take it")
+}
+
 /// Pick the rule (or the `--profile` override), then walk fallbacks past a profile at `cap` or
-/// out of quota on the target host.
+/// out of quota on the target host, and apply the target host's machine-pressure limits.
 pub fn decide(
     cfg: &FleetConfig,
     issue: &Issue,
@@ -527,7 +679,7 @@ pub fn decide(
                 bail!("no profile {p:?} in fleet.toml");
             }
             why.push(format!("--profile {p}"));
-            (p.to_string(), None, None, Vec::new())
+            (p.to_string(), Vec::new(), None, Vec::new())
         }
         None => {
             let (i, kw) = cfg
@@ -559,11 +711,24 @@ pub fn decide(
             )
         }
     };
-    let host = o
-        .host
-        .or(rule_host.as_deref())
-        .unwrap_or(local_host)
-        .to_string();
+    let host_rule = if let Some(h) = o.host {
+        HostRule::Strict(h.to_string())
+    } else if rule_host.len() == 1 {
+        HostRule::Strict(rule_host[0].clone())
+    } else if !rule_host.is_empty() {
+        HostRule::Open {
+            preferred: rule_host[0].clone(),
+            allowed: rule_host[1..].to_vec(),
+        }
+    } else {
+        HostRule::Open {
+            preferred: local_host.to_string(),
+            allowed: Vec::new(),
+        }
+    };
+    // Quota is read on the preferred host while the profile is chosen. Machine-pressure
+    // rerouting happens once the profile (and therefore its kind) is fixed.
+    let host = host_rule.preferred().to_string();
     let level = o.level.or(rule_level).unwrap_or(Level::Implementer);
     let load = |profile: &str| {
         let live = state
@@ -584,12 +749,7 @@ pub fn decide(
             .count();
         live + pending
     };
-    let no_quota = |profile: &str| {
-        state
-            .quotas
-            .get(&format!("{host}:{}", cfg.profiles[profile].kind))
-            .is_some_and(|q| q.exhausted_at(Utc::now()))
-    };
+    let no_quota = |profile: &str| quota_exhausted(state, &host, &cfg.profiles[profile].kind);
     // A rule that lists several profiles: the least-loaded one with a seat and quota; the list
     // order breaks ties. Load counts this repo's agents and pending requests on every host,
     // quota is the target host's.
@@ -620,8 +780,17 @@ pub fn decide(
                 "picked {p} ({n} in use) of [{}]",
                 listed.join(", ")
             ));
+            let profile = p.clone();
+            let host = choose_host(
+                cfg,
+                state,
+                &issue.repo,
+                &cfg.profiles[&profile].kind,
+                &host_rule,
+                &mut why,
+            )?;
             return Ok(Decision {
-                profile: p.clone(),
+                profile,
                 host,
                 level,
                 why: why.join("; "),
@@ -664,6 +833,14 @@ pub fn decide(
             None => bail!("no profile can take it ({})", why.join("; ")),
         }
     }
+    let host = choose_host(
+        cfg,
+        state,
+        &issue.repo,
+        &cfg.profiles[&profile].kind,
+        &host_rule,
+        &mut why,
+    )?;
     Ok(Decision {
         profile,
         host,
@@ -2579,6 +2756,18 @@ profile = "devin"
                 .to_string()
                 .contains("no [profiles]")
         );
+        assert!(
+            cfg(&format!("max_load_per_core = 0.0\n{CFG}"))
+                .unwrap_err()
+                .to_string()
+                .contains("max_load_per_core must be positive")
+        );
+        assert!(
+            cfg(&format!("min_disk_free_gb = -1.0\n{CFG}"))
+                .unwrap_err()
+                .to_string()
+                .contains("min_disk_free_gb cannot be negative")
+        );
     }
 
     #[test]
@@ -2599,6 +2788,120 @@ profile = "devin"
         assert_eq!(pick("x", &["mobile"]).host, "mac.local");
         assert_eq!(pick("x", &["design"]).profile, "devin"); // label:design needs rule's label
         assert_eq!(pick("do some research", &[]).profile, "opus");
+    }
+
+    #[test]
+    fn machine_pressure_refuses_or_reroutes_a_spawn_host() {
+        let host = |load5, cores, disk_free| crate::state::Host {
+            disk_free,
+            disk_total: 100_000_000_000,
+            agents: 0,
+            machine: Some(MachineStats {
+                load1: load5,
+                load5,
+                load15: load5,
+                cores,
+                memory_used: 1,
+                memory_total: 2,
+            }),
+            disk: Some(DiskReport {
+                sampled_at: Utc::now(),
+                breakdown_at: Some(Utc::now()),
+                breakdown: vec![DiskEntry {
+                    root: "home".into(),
+                    path: "/u/big".into(),
+                    bytes: 8_000_000_000,
+                }],
+            }),
+            repos: vec!["o/r".into()],
+            commit: None,
+            behind_since: None,
+            ts: Utc::now(),
+            started: None,
+        };
+        let c = cfg(CFG).unwrap();
+        let mut s = State::default();
+        s.hosts
+            .insert("laptop".into(), host(30.0, 8, 50_000_000_000));
+        s.hosts
+            .insert("backup".into(), host(1.0, 8, 50_000_000_000));
+
+        // The default rule names no other host: an overloaded local host refuses.
+        let e = decide(&c, &issue("x", &[]), &Overrides::default(), &s, "laptop")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("host laptop is over its spawn limits"), "{e}");
+
+        // A rule's host list permits the reroute: first choice first, then the others by load.
+        let open = cfg(&CFG.replace(
+            "[[rules]]
+profile = \"devin\"",
+            "[[rules]]
+profile = \"devin\"
+host = [\"laptop\", \"backup\"]",
+        ))
+        .unwrap();
+        let d = decide(&open, &issue("x", &[]), &Overrides::default(), &s, "laptop").unwrap();
+        assert_eq!(d.host, "backup");
+        assert!(d.why.contains("rerouted to backup"), "{}", d.why);
+
+        // A rule that names one host still means that host: it refuses instead of moving.
+        let strict_src = CFG.replace(
+            "[[rules]]\nprofile = \"devin\"",
+            "[[rules]]\nprofile = \"devin\"\nhost = \"backup\"",
+        );
+        let strict = cfg(&strict_src).unwrap();
+        s.hosts
+            .insert("backup".into(), host(30.0, 8, 50_000_000_000));
+        let e = decide(
+            &strict,
+            &issue("x", &[]),
+            &Overrides::default(),
+            &s,
+            "laptop",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("host backup is over its spawn limits")
+                && e.contains("5-minute load 30.0 on 8 cores"),
+            "{e}"
+        );
+
+        // A low-disk refusal carries the cached dust breakdown.
+        s.hosts.insert("backup".into(), host(1.0, 8, 1_000_000_000));
+        let e = decide(
+            &strict,
+            &issue("x", &[]),
+            &Overrides::default(),
+            &s,
+            "laptop",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("disk free 1.0 GB below 5.0 GB") && e.contains("/u/big 8.0 GB"),
+            "{e}"
+        );
+
+        // Both limits are fleet.toml settings.
+        let c = cfg(&format!(
+            "max_load_per_core = 4.0
+min_disk_free_gb = 0.5
+{strict_src}"
+        ))
+        .unwrap();
+        let d = decide(&c, &issue("x", &[]), &Overrides::default(), &s, "laptop").unwrap();
+        assert_eq!(d.host, "backup");
+
+        // An alternate must serve the repository when its new-format heartbeat says what it serves.
+        s.hosts
+            .insert("laptop".into(), host(30.0, 8, 50_000_000_000));
+        s.hosts.get_mut("backup").unwrap().repos = vec!["o/other".into()];
+        let e = decide(&open, &issue("x", &[]), &Overrides::default(), &s, "laptop")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("no allowed host can take it"), "{e}");
     }
 
     #[test]

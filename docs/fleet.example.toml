@@ -9,6 +9,8 @@
 
 # session = "work"               # herdr session agents run in; absent = the session the CLI runs in (HERDR_SESSION)
 # base = "origin/main"           # branch point for a new worktree
+# max_load_per_core = 2.0        # refuse/reroute a spawn when the target's 5-minute load per core is higher
+# min_disk_free_gb = 5           # and when its last statvfs sample leaves less free on the worktree volume
 brief = "brief.md"               # brief template next to this file; @@KEY@@ placeholders: NAME, KIND, PROGRAM,
                                  # SLUG, ISSUE, TITLE, BRANCH, SCOPE, HOST, LEVEL, LEAD, HANDOFF, REF, TASK,
                                  # each [vars] key and each `spawn --set KEY=VALUE`
@@ -70,7 +72,8 @@ prefix = "ag-"
 # Rules route an issue to a profile: the first rule that matches wins, so the default rule
 # (no `match`) comes last. `match` keywords are OR'd, case-insensitive whole words against the
 # issue's title and labels; `label:x` matches only a label named x. Optional keys:
-#   host   the host to spawn on (default: the host running the CLI)
+#   host   the host to spawn on (default: the host running the CLI), or an ordered list: the first
+#          is preferred, the others may take it when the first is over the load/disk limit
 #   level  the agent.role level of the new agent (default implementer)
 # [[rules]]
 # match = ["research", "design", "label:design"]

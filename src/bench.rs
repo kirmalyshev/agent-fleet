@@ -22,15 +22,18 @@ fn health(n: usize) -> Envelope<Known> {
             id: "host:bench".into(),
         },
         "bench",
-        Known::HostHealth(HostHealth {
+        Known::HostHealth(Box::new(HostHealth {
             host: "bench".into(),
             disk_free: n as u64,
             disk_total: 1,
             agents: 0,
+            machine: None,
+            disk: None,
+            repos: Vec::new(),
             stats: None,
             commit: None,
             behind_since: None,
-        }),
+        })),
     )
 }
 
