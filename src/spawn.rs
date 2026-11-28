@@ -2824,7 +2824,7 @@ profile = "devin"
         s.hosts
             .insert("laptop".into(), host(30.0, 8, 50_000_000_000));
         s.hosts
-            .insert("mac.local".into(), host(1.0, 8, 50_000_000_000));
+            .insert("backup".into(), host(1.0, 8, 50_000_000_000));
 
         // The default rule names no other host: an overloaded local host refuses.
         let e = decide(&c, &issue("x", &[]), &Overrides::default(), &s, "laptop")
@@ -2838,19 +2838,24 @@ profile = "devin"
 profile = \"devin\"",
             "[[rules]]
 profile = \"devin\"
-host = [\"laptop\", \"mac.local\"]",
+host = [\"laptop\", \"backup\"]",
         ))
         .unwrap();
         let d = decide(&open, &issue("x", &[]), &Overrides::default(), &s, "laptop").unwrap();
-        assert_eq!(d.host, "mac.local");
-        assert!(d.why.contains("rerouted to mac.local"), "{}", d.why);
+        assert_eq!(d.host, "backup");
+        assert!(d.why.contains("rerouted to backup"), "{}", d.why);
 
         // A rule that names one host still means that host: it refuses instead of moving.
+        let strict_src = CFG.replace(
+            "[[rules]]\nprofile = \"devin\"",
+            "[[rules]]\nprofile = \"devin\"\nhost = \"backup\"",
+        );
+        let strict = cfg(&strict_src).unwrap();
         s.hosts
-            .insert("mac.local".into(), host(30.0, 8, 50_000_000_000));
+            .insert("backup".into(), host(30.0, 8, 50_000_000_000));
         let e = decide(
-            &c,
-            &issue("ios fix", &[]),
+            &strict,
+            &issue("x", &[]),
             &Overrides::default(),
             &s,
             "laptop",
@@ -2858,17 +2863,16 @@ host = [\"laptop\", \"mac.local\"]",
         .unwrap_err()
         .to_string();
         assert!(
-            e.contains("host mac.local is over its spawn limits")
+            e.contains("host backup is over its spawn limits")
                 && e.contains("5-minute load 30.0 on 8 cores"),
             "{e}"
         );
 
         // A low-disk refusal carries the cached dust breakdown.
-        s.hosts
-            .insert("mac.local".into(), host(1.0, 8, 1_000_000_000));
+        s.hosts.insert("backup".into(), host(1.0, 8, 1_000_000_000));
         let e = decide(
-            &c,
-            &issue("ios fix", &[]),
+            &strict,
+            &issue("x", &[]),
             &Overrides::default(),
             &s,
             "laptop",
@@ -2884,23 +2888,16 @@ host = [\"laptop\", \"mac.local\"]",
         let c = cfg(&format!(
             "max_load_per_core = 4.0
 min_disk_free_gb = 0.5
-{CFG}"
+{strict_src}"
         ))
         .unwrap();
-        let d = decide(
-            &c,
-            &issue("ios fix", &[]),
-            &Overrides::default(),
-            &s,
-            "laptop",
-        )
-        .unwrap();
-        assert_eq!(d.host, "mac.local");
+        let d = decide(&c, &issue("x", &[]), &Overrides::default(), &s, "laptop").unwrap();
+        assert_eq!(d.host, "backup");
 
         // An alternate must serve the repository when its new-format heartbeat says what it serves.
         s.hosts
             .insert("laptop".into(), host(30.0, 8, 50_000_000_000));
-        s.hosts.get_mut("mac.local").unwrap().repos = vec!["o/other".into()];
+        s.hosts.get_mut("backup").unwrap().repos = vec!["o/other".into()];
         let e = decide(&open, &issue("x", &[]), &Overrides::default(), &s, "laptop")
             .unwrap_err()
             .to_string();
