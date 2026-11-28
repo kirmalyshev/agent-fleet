@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Notify;
@@ -207,6 +207,15 @@ const DUST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// `devin auth status` refreshes devin's cached quota; run at most this often.
 const DEVIN_STATUS_EVERY: Duration = Duration::from_secs(15 * 60);
 
+/// agy's `/usage` probe starts a CLI process; five minutes is fresh enough for the ten-minute
+/// spawn gate without multiplying its logs or process churn. The probe's own log goes to the
+/// null device, so it does not write one `cli-*.log` per read.
+const AGY_PROBE_EVERY: Duration = Duration::from_secs(5 * 60);
+#[cfg(not(windows))]
+const NULL_DEVICE: &str = "/dev/null";
+#[cfg(windows)]
+const NULL_DEVICE: &str = "NUL";
+
 fn backoff(d: Duration) -> Duration {
     (d * 2).min(Duration::from_secs(60))
 }
@@ -220,6 +229,10 @@ struct Quotas {
     missing: HashSet<String>,
     /// When `devin auth status` last ran.
     devin_status: Option<Instant>,
+    /// The asynchronous `agy /usage` probe; joining it never blocks the scan loop.
+    agy_probe: Option<tokio::task::JoinHandle<Option<AgentQuota>>>,
+    /// When the last agy probe started.
+    agy_probe_started: Option<Instant>,
 }
 
 /// `name` is a runnable file on PATH.
@@ -303,6 +316,85 @@ async fn dust_breakdown() -> Vec<DiskEntry> {
         out.extend(dust_scan(&root, label, lines).await);
     }
     crate::stats::fit_disk_entries(out, 6 * 1024)
+}
+
+struct ProbeOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Collect a child process's output, keeping what it already wrote when the timeout has to kill
+/// it. `Command::output` would drop the partial output with the future; a logged-out agy prints
+/// its authentication failure and then stays alive waiting for a code.
+async fn command_output_partial(
+    mut command: tokio::process::Command,
+    wait: Duration,
+) -> Option<ProbeOutput> {
+    async fn read_pipe<R>(mut pipe: R, into: Arc<Mutex<Vec<u8>>>)
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut chunk = [0; 8192];
+        loop {
+            match pipe.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => into.lock().unwrap().extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+
+    let mut child = command.spawn().ok()?;
+    let stdout_pipe = child.stdout.take()?;
+    let stderr_pipe = child.stderr.take()?;
+    let stdout_bytes = Arc::new(Mutex::new(Vec::new()));
+    let stderr_bytes = Arc::new(Mutex::new(Vec::new()));
+    let mut stdout = tokio::spawn(read_pipe(stdout_pipe, stdout_bytes.clone()));
+    let mut stderr = tokio::spawn(read_pipe(stderr_pipe, stderr_bytes.clone()));
+    if tokio::time::timeout(wait, child.wait()).await.is_err() {
+        let _ = child.kill().await;
+    }
+    // A killed shell can leave a child behind holding the pipes open. Give the readers a short
+    // grace to drain what is already there, but never let that descendant outwait the probe.
+    let collect = futures_util::future::join(&mut stdout, &mut stderr);
+    let _ = tokio::time::timeout(Duration::from_millis(200), collect).await;
+    stdout.abort();
+    stderr.abort();
+    Some(ProbeOutput {
+        stdout: std::mem::take(&mut *stdout_bytes.lock().unwrap()),
+        stderr: std::mem::take(&mut *stderr_bytes.lock().unwrap()),
+    })
+}
+
+/// One `agy -p "/usage"` probe. stdin is /dev/null because a logged-out CLI otherwise waits for
+/// an authentication code; the timeout kills the process rather than letting it hold the host's
+/// quota loop.
+async fn agy_probe(host: String) -> Option<AgentQuota> {
+    agy_probe_cmd(Path::new("agy"), host, Duration::from_secs(20)).await
+}
+
+async fn agy_probe_cmd(program: &Path, host: String, wait: Duration) -> Option<AgentQuota> {
+    // Stamp the read when the probe starts, not when the process exits: a cap line written while
+    // the probe was in flight is newer evidence than the answer that probe had already received.
+    let read_at = Utc::now();
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args([
+            "-p",
+            "/usage",
+            "--output-format",
+            "json",
+            "--log-file",
+            NULL_DEVICE,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let out = command_output_partial(command, wait).await?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    crate::quota::agy_output(&host, &stdout, read_at)
+        .or_else(|| crate::quota::agy_output(&host, &stderr, read_at))
 }
 
 impl Host {
@@ -1011,6 +1103,38 @@ impl Host {
         }
     }
 
+    /// Publish one program's quota when it changed (or always, for a probe whose `read_at` is
+    /// itself the freshness signal), and track sources missing once per host run.
+    async fn publish_quota(
+        &self,
+        q: &mut Quotas,
+        kind: &str,
+        quota: Option<AgentQuota>,
+        always: bool,
+    ) {
+        match quota {
+            Some(quota) => {
+                q.missing.remove(kind);
+                let new = always
+                    || q.published
+                        .get(kind)
+                        .is_none_or(|was| crate::quota::changed(was, &quota));
+                if new
+                    && self
+                        .publish(self.presence(Known::AgentQuota(quota.clone())))
+                        .await
+                {
+                    q.published.insert(kind.to_string(), quota);
+                }
+            }
+            None => {
+                if q.missing.insert(kind.to_string()) {
+                    eprintln!("agent-fleet host: no {kind} quota source on this machine");
+                }
+            }
+        }
+    }
+
     /// Every `QUOTA_EVERY`: each agent program's usage quota on this machine, sent when
     /// anything but `read_at` changed — and once at start. A source that is not there is
     /// skipped; each is logged as missing at most once per host start.
@@ -1050,27 +1174,25 @@ impl Host {
                 crate::quota::devin_cache().map(|d| crate::quota::devin(host, &d)),
             ),
         ] {
-            match read.flatten() {
-                Some(quota) => {
-                    q.missing.remove(kind);
-                    let new = q
-                        .published
-                        .get(kind)
-                        .is_none_or(|was| crate::quota::changed(was, &quota));
-                    if new
-                        && self
-                            .publish(self.presence(Known::AgentQuota(quota.clone())))
-                            .await
-                    {
-                        q.published.insert(kind.to_string(), quota);
-                    }
-                }
-                None => {
-                    if q.missing.insert(kind.to_string()) {
-                        eprintln!("agent-fleet host: no {kind} quota source on this machine");
-                    }
-                }
-            }
+            self.publish_quota(q, kind, read.flatten(), false).await;
+        }
+        if q.agy_probe.is_none()
+            && q.agy_probe_started
+                .is_none_or(|t| t.elapsed() >= AGY_PROBE_EVERY)
+            && on_path("agy")
+        {
+            q.agy_probe_started = Some(Instant::now());
+            q.agy_probe = Some(tokio::spawn(agy_probe(host.clone())));
+        }
+        if q.agy_probe.as_ref().is_some_and(|p| p.is_finished()) {
+            let read = match q.agy_probe.take() {
+                Some(p) => p.await.ok().flatten(),
+                None => None,
+            };
+            // Unlike the file/cache readers, this probe's `read_at` is the only freshness fact
+            // the fleet has. Publish it even when the buckets are unchanged; a suppressed
+            // heartbeat would look exactly like a dead probe ten minutes later.
+            self.publish_quota(q, "agy", read, true).await;
         }
     }
 
@@ -2010,6 +2132,32 @@ pub(crate) fn short(id: &str) -> &str {
     id.rsplit('/').next().unwrap_or(id)
 }
 
+/// The agy log `spawn` gives the program and `stuck::agy_logs` watches. One file per agent name
+/// under the host's data dir, truncated at spawn so its contents belong to that agent's run.
+pub(crate) fn agy_log_path(data_dir: &Path, name: &str) -> PathBuf {
+    let clean: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut hash = 0xcbf29ce484222325u64;
+    for b in name.bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let file = if clean == name {
+        clean
+    } else {
+        format!("{clean}-{hash:x}")
+    };
+    data_dir.join("agy").join(format!("{file}.log"))
+}
+
 /// The text typed into the agent. The `[agent-fleet …]` prefix marks it as machine-sent, never a human turn.
 pub fn doorbell(from: &str, to: &str, kind: &str, reference: &str, text: &str, id: &str) -> String {
     format!(
@@ -2064,6 +2212,29 @@ mod tests {
         assert_eq!(
             d,
             "[agent-fleet lead→impl] REVIEW task:p/7: please look (event 01ABC; ack: agent-fleet read)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_agy_probe_keeps_output_when_the_login_wait_is_killed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("agy");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf '%s' '{\"status\":\"ERROR\",\"response\":\"\",\"error\":\"authentication failed or timed out\"}'\nexec sleep 30\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&program).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&program, perms).unwrap();
+        let q = agy_probe_cmd(&program, "h".into(), Duration::from_millis(100))
+            .await
+            .unwrap();
+        assert!(
+            q.exhausted && q.windows.is_empty(),
+            "the partial output still proves the host is logged out"
         );
     }
 

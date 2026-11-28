@@ -51,7 +51,7 @@
         },
         "AgentQuota": {
           "additionalProperties": false,
-          "description": "The usage quota one agent program reports on a host, e.g. claude's `5h` and `week` windows.\nEach machine is logged in to its own account, so the quota is per host. Sent when anything\nbut `read_at` changes, and once at host start.",
+          "description": "The usage quota one agent program reports on a host, e.g. claude's `5h` and `week` windows.\nEach machine is logged in to its own account, so the quota is per host. Sent when anything\nbut `read_at` changes, and once at host start; agy's probe is the exception, republished so\nits `read_at` keeps proving freshness.",
           "properties": {
             "exhausted": {
               "description": "The program reports it is out of quota.",
@@ -160,7 +160,7 @@
         },
         "AgentSignal": {
           "additionalProperties": false,
-          "description": "A structured signal from the agent's own program — a harness hook (`agent-fleet hook\nsignal` / the statusline wrapper) writes it. `prompt` and `turn_end` open a new episode:\nthe fold drops the agent's stored signal on them. `detail` carries the program's own\ntext (an error message, a question) when there is one.",
+          "description": "A structured signal from the agent's own program — a harness hook (`agent-fleet hook\nsignal` / the statusline wrapper) writes it, or the host does for a program whose log is\nthe structured stream (agy). `prompt` and `turn_end` open a new episode:\nthe fold drops the agent's stored signal on them. `detail` carries the program's own\ntext (an error message, a question) when there is one.",
           "properties": {
             "agent": {
               "type": "string"

@@ -135,6 +135,10 @@ pub struct Profile {
     /// or it is handed to the fallback profile. Default 5.
     #[serde(default)]
     pub handoff_min: Option<u64>,
+    /// Pin this profile to one host. An explicit `--host` still wins; without one the pin is
+    /// strict — a pinned host over its spawn limits refuses rather than rerouting.
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -269,6 +273,22 @@ impl FleetConfig {
                         line_of(src, &format!("\"{v}\""))
                     );
                 }
+            }
+            if p.kind == "agy"
+                && p.args
+                    .iter()
+                    .any(|a| a == "--log-file" || a.starts_with("--log-file="))
+            {
+                bail!(
+                    "fleet.toml: profile {name:?} may not choose agy's --log-file: the host assigns one it can watch{}",
+                    line_of(src, "--log-file")
+                );
+            }
+            if p.host.as_deref().is_some_and(str::is_empty) {
+                bail!(
+                    "fleet.toml: profile {name:?} has an empty host{}",
+                    line_of(src, "host = \"\"")
+                );
             }
             if !p.prefix.is_empty()
                 && let Some(other) = by_prefix.insert(p.prefix.as_str(), name)
@@ -547,7 +567,7 @@ pub struct Overrides<'a> {
     pub level: Option<Level>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum HostRule {
     /// `--host`, or a rule naming one host: overload refuses, never reroutes.
     Strict(String),
@@ -568,11 +588,68 @@ impl HostRule {
     }
 }
 
-fn quota_exhausted(state: &State, host: &str, kind: &str) -> bool {
-    state
-        .quotas
-        .get(&format!("{host}:{kind}"))
-        .is_some_and(|q| q.exhausted_at(Utc::now()))
+/// agy's 5-hour Gemini bucket must have at least this much left to start a session when its
+/// reset is far away. The weekly bucket must have at least 15% left. The figures are the issue's
+/// measured operating floor: two heavy agents can drain half a 5-hour bucket in under an hour.
+pub const AGY_5H_MIN_REMAINING_PCT: f64 = 50.0;
+pub const AGY_WEEK_MIN_REMAINING_PCT: f64 = 15.0;
+pub const AGY_FAR_RESET: chrono::Duration = chrono::Duration::minutes(30);
+pub const AGY_QUOTA_STALE: chrono::Duration = chrono::Duration::minutes(10);
+
+fn agy_window<'a>(q: &'a crate::state::Quota, name: &str) -> Option<&'a QuotaWindow> {
+    q.windows.iter().find(|w| w.name == name)
+}
+
+/// Why `kind` cannot start on `host` for lack of quota or login. Most kinds are blocked only by
+/// their generic exhausted state. agy is stricter because its account is shared per host and its
+/// CLI tells us both buckets: no fresh login/quota row, a logged-out probe, a 5-hour Gemini bucket
+/// under 50% with a reset over 30 minutes away, or a Gemini week under 15% all refuse the spawn.
+pub(crate) fn quota_block_reason(
+    state: &State,
+    host: &str,
+    kind: &str,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let q = state.quotas.get(&format!("{host}:{kind}"));
+    if kind == "agy" && q.is_none() {
+        return Some("no agy quota/login report on this host".into());
+    }
+    let q = q?;
+    if kind != "agy" {
+        return q
+            .exhausted_at(now)
+            .then(|| format!("{kind} quota exhausted"));
+    }
+    if now - q.read_at > AGY_QUOTA_STALE {
+        return Some("agy quota report is stale".into());
+    }
+    if q.windows.is_empty() && q.exhausted {
+        return Some("agy is not logged in".into());
+    }
+    // Claude/GPT buckets share the report but not this profile's model: only the Gemini rows
+    // gate an agy spawn.
+    let Some(five_h) = agy_window(q, "gemini 5h") else {
+        return Some("agy quota report has no Gemini 5-hour bucket".into());
+    };
+    let five_h_remaining = 100.0 - five_h.used_pct;
+    let far = five_h
+        .resets_at
+        .is_none_or(|reset| reset - now > AGY_FAR_RESET);
+    if five_h_remaining < AGY_5H_MIN_REMAINING_PCT && far {
+        return Some(format!(
+            "agy Gemini 5-hour quota has {five_h_remaining:.0}% left and resets too far out"
+        ));
+    }
+    let Some(week) = agy_window(q, "gemini week") else {
+        return Some("agy quota report has no Gemini weekly bucket".into());
+    };
+    let week_remaining = 100.0 - week.used_pct;
+    if week_remaining < AGY_WEEK_MIN_REMAINING_PCT {
+        return Some(format!(
+            "agy Gemini weekly quota has {week_remaining:.0}% left"
+        ));
+    }
+    None
 }
 
 fn host_pressure(cfg: &FleetConfig, state: &State, host: &str) -> Vec<String> {
@@ -650,8 +727,8 @@ fn choose_host(
             why.push(format!("{host} skipped: {}", pressure.join("; ")));
             continue;
         }
-        if quota_exhausted(state, &host, kind) {
-            why.push(format!("{host} skipped: {kind} quota exhausted"));
+        if let Some(reason) = quota_block_reason(state, &host, kind, Utc::now()) {
+            why.push(format!("{host} skipped: {reason}"));
             continue;
         }
         why.push(format!(
@@ -726,9 +803,19 @@ pub fn decide(
             allowed: Vec::new(),
         }
     };
-    // Quota is read on the preferred host while the profile is chosen. Machine-pressure
-    // rerouting happens once the profile (and therefore its kind) is fixed.
-    let host = host_rule.preferred().to_string();
+    // A profile may pin its host. An explicit `--host` wins; otherwise the pin replaces the
+    // rule's host choice for that profile and is strict. Quota is read on each candidate's
+    // effective preferred host while the profile is chosen. Machine-pressure rerouting happens
+    // once the profile (and therefore its kind) is fixed.
+    let rule_for = |profile: &str| {
+        if let Some(h) = o.host {
+            HostRule::Strict(h.to_string())
+        } else if let Some(h) = cfg.profiles[profile].host.as_ref() {
+            HostRule::Strict(h.clone())
+        } else {
+            host_rule.clone()
+        }
+    };
     let level = o.level.or(rule_level).unwrap_or(Level::Implementer);
     let load = |profile: &str| {
         let live = state
@@ -749,7 +836,10 @@ pub fn decide(
             .count();
         live + pending
     };
-    let no_quota = |profile: &str| quota_exhausted(state, &host, &cfg.profiles[profile].kind);
+    let no_quota = |profile: &str| {
+        let host = rule_for(profile).preferred().to_string();
+        quota_block_reason(state, &host, &cfg.profiles[profile].kind, Utc::now())
+    };
     // A rule that lists several profiles: the least-loaded one with a seat and quota; the list
     // order breaks ties. Load counts this repo's agents and pending requests on every host,
     // quota is the target host's.
@@ -765,13 +855,13 @@ pub fn decide(
                 any_full = true;
                 why.push(format!("{p} at cap {}", cap.unwrap_or(0)));
             }
-            if out {
+            if let Some(reason) = &out {
                 why.push(format!(
-                    "{p} skipped: {} quota exhausted on {host}",
-                    cfg.profiles[p].kind
+                    "{p} skipped: {reason} on {}",
+                    rule_for(p).preferred()
                 ));
             }
-            if !full && !out && pick.is_none_or(|(m, _)| n < m) {
+            if !full && out.is_none() && pick.is_none_or(|(m, _)| n < m) {
                 pick = Some((n, p));
             }
         }
@@ -786,7 +876,7 @@ pub fn decide(
                 state,
                 &issue.repo,
                 &cfg.profiles[&profile].kind,
-                &host_rule,
+                &rule_for(&profile),
                 &mut why,
             )?;
             return Ok(Decision {
@@ -814,7 +904,7 @@ pub fn decide(
         let p = &cfg.profiles[&profile];
         let full = p.cap.is_some_and(|cap| load(&profile) >= cap as usize);
         let out = no_quota(&profile);
-        if !full && !out {
+        if !full && out.is_none() {
             break;
         }
         if full {
@@ -822,8 +912,9 @@ pub fn decide(
             bail!("no seat: {}; wait for one to free", why.join("; "));
         }
         why.push(format!(
-            "{profile} skipped: {} quota exhausted on {host}",
-            p.kind
+            "{profile} skipped: {} on {}",
+            out.unwrap_or_else(|| "quota unavailable".into()),
+            rule_for(&profile).preferred()
         ));
         if o.profile.is_some() {
             bail!("--profile {profile} cannot start: {}", why.join("; "));
@@ -838,7 +929,7 @@ pub fn decide(
         state,
         &issue.repo,
         &cfg.profiles[&profile].kind,
-        &host_rule,
+        &rule_for(&profile),
         &mut why,
     )?;
     Ok(Decision {
@@ -943,6 +1034,15 @@ pub fn handoff_request(
     let Some(p) = cfg.profiles.get(to) else {
         bail!("no profile {to:?} in fleet.toml");
     };
+    if let Some(pin) = p.host.as_ref()
+        && pin != &old.host
+    {
+        bail!(
+            "profile {to:?} is pinned to host {pin}; a handoff cannot move {}'s worktree from {}",
+            old.name,
+            old.host
+        );
+    }
     let suffix = old
         .issue
         .map_or_else(|| old.name.clone(), |i| i.to_string());
@@ -1510,6 +1610,27 @@ async fn pane_run_confirmed(
     Err(err.context(format!("the pane's shell never confirmed {use_}")))
 }
 
+/// agy writes the quota failure the host acts on only to its log. Give every agy a stable
+/// host-owned log path; the file is truncated so a previous run's line cannot be mistaken for
+/// this agent's.
+fn agy_log_arg(host: &Host, name: &str, prof: &mut Profile) -> Result<()> {
+    if prof
+        .args
+        .iter()
+        .any(|a| a == "--log-file" || a.starts_with("--log-file="))
+    {
+        bail!("agy profile already chooses --log-file");
+    }
+    let path = crate::host::agy_log_path(&host.cfg.data_dir, name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::write(&path, "").with_context(|| format!("truncate {}", path.display()))?;
+    prof.args.push("--log-file".into());
+    prof.args.push(path.to_string_lossy().into_owned());
+    Ok(())
+}
+
 async fn agent_start(host: &Host, name: &str, prof: &Profile, pane: &str) -> Result<()> {
     let mut err = anyhow!("agent.start never ran");
     for _ in 0..BUSY_TRIES {
@@ -1644,7 +1765,10 @@ async fn run_spawn(
     };
     // The profile and its launch config always come from the HOST's checkout — a handoff's
     // worktree is the agent's own tree and is never read for config.
-    let (cfg, prof) = host_profile(&checkout, host.cfg.config_dir.as_deref(), r)?;
+    let (cfg, mut prof) = host_profile(&checkout, host.cfg.config_dir.as_deref(), r)?;
+    if prof.kind == "agy" {
+        agy_log_arg(host, &r.name, &mut prof)?;
+    }
     check_wire_fields(&checkout, r).await?;
     if r.in_place && r.worktree.is_some() {
         bail!("in_place and worktree are mutually exclusive");
@@ -2581,6 +2705,7 @@ pub async fn spawn_loop(host: Arc<Host>) {
     let mut handed: HashSet<String> = HashSet::new();
     let mut warned: HashSet<String> = HashSet::new();
     let mut stuck_seen = crate::stuck::Seen::default();
+    let mut agy_logs = crate::stuck::AgyLogs::default();
     let mut retire_seen: HashSet<String> = HashSet::new();
     let mut adopt_seen: HashSet<String> = HashSet::new();
     let mut merge_seen: HashSet<String> = HashSet::new();
@@ -2620,6 +2745,7 @@ pub async fn spawn_loop(host: Arc<Host>) {
         crate::retire::serve(&host, &mut retire_seen).await;
         crate::adopt::serve(&host, events, &mut adopt_seen).await;
         crate::merge::serve(&host, &mut merge_seen);
+        crate::stuck::agy_logs(&host, state, &mut agy_logs).await;
         handoffs(&host, state, events, &mut handed, &mut warned).await;
         stuck(&host, state, events, &mut stuck_seen, &handed).await;
         still_waiting(&host, state).await;
@@ -2710,6 +2836,51 @@ profile = "devin"
             repo: "o/r".into(),
             title: title.into(),
             labels: labels.iter().map(|l| l.to_string()).collect(),
+        }
+    }
+
+    fn machine_host(load5: f64) -> crate::state::Host {
+        crate::state::Host {
+            disk_free: 50_000_000_000,
+            disk_total: 100_000_000_000,
+            agents: 0,
+            machine: Some(MachineStats {
+                load1: load5,
+                load5,
+                load15: load5,
+                cores: 8,
+                memory_used: 1,
+                memory_total: 2,
+            }),
+            disk: None,
+            repos: vec!["o/r".into()],
+            commit: None,
+            behind_since: None,
+            ts: Utc::now(),
+            started: None,
+        }
+    }
+
+    fn agy_valid(_host: &str) -> crate::state::Quota {
+        let reset = Utc::now() + chrono::Duration::hours(3);
+        crate::state::Quota {
+            windows: vec![
+                QuotaWindow {
+                    name: "gemini 5h".into(),
+                    used_pct: 20.0,
+                    resets_at: Some(reset),
+                },
+                QuotaWindow {
+                    name: "gemini week".into(),
+                    used_pct: 20.0,
+                    resets_at: Some(reset),
+                },
+            ],
+            plan: None,
+            exhausted: false,
+            read_at: Utc::now(),
+            ts: Utc::now(),
+            exhausted_since: None,
         }
     }
 
@@ -2905,6 +3076,133 @@ min_disk_free_gb = 0.5
     }
 
     #[test]
+    fn a_profile_host_pin_is_strict_and_an_explicit_host_wins() {
+        let src = r#"
+session = "s"
+brief = "b.md"
+[profiles.agy]
+kind = "agy"
+prefix = "ag-"
+host = "pin-host"
+[[rules]]
+profile = "agy"
+host = ["rule-a", "rule-b"]
+"#;
+        let c = cfg(src).unwrap();
+        let e = cfg(&src.replace("host = \"pin-host\"", "host = \"\""))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("empty host"), "{e}");
+        let mut s = State::default();
+        s.quotas
+            .insert("pin-host:agy".into(), agy_valid("pin-host"));
+        s.quotas
+            .insert("other-host:agy".into(), agy_valid("other-host"));
+        let o = Overrides {
+            profile: Some("agy"),
+            ..Overrides::default()
+        };
+        let d = decide(&c, &issue("x", &[]), &o, &s, "local").unwrap();
+        assert_eq!(d.host, "pin-host");
+        let d = decide(&c, &issue("x", &[]), &Overrides::default(), &s, "local").unwrap();
+        assert_eq!(d.host, "pin-host", "the pin beats the rule's host list");
+        let explicit = Overrides {
+            profile: Some("agy"),
+            host: Some("other-host"),
+            ..Overrides::default()
+        };
+        let d = decide(&c, &issue("x", &[]), &explicit, &s, "local").unwrap();
+        assert_eq!(d.host, "other-host");
+        // Strict means strict: pressure on the pin refuses instead of using the rule's hosts.
+        s.hosts.insert("pin-host".into(), machine_host(30.0));
+        let e = decide(&c, &issue("x", &[]), &Overrides::default(), &s, "local")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("host pin-host is over its spawn limits"), "{e}");
+    }
+
+    #[test]
+    fn agy_spawn_quota_requires_login_and_gemini_headroom() {
+        let now = Utc::now();
+        let far = now + chrono::Duration::hours(2);
+        let near = now + chrono::Duration::minutes(10);
+        let q = |five_left: f64, five_reset, week_left: f64, read_at| crate::state::Quota {
+            windows: vec![
+                QuotaWindow {
+                    name: "gemini 5h".into(),
+                    used_pct: 100.0 - five_left,
+                    resets_at: Some(five_reset),
+                },
+                QuotaWindow {
+                    name: "gemini week".into(),
+                    used_pct: 100.0 - week_left,
+                    resets_at: Some(far),
+                },
+            ],
+            plan: None,
+            exhausted: false,
+            read_at,
+            ts: now,
+            exhausted_since: None,
+        };
+        let mut s = State::default();
+        assert_eq!(
+            quota_block_reason(&s, "h", "agy", now).as_deref(),
+            Some("no agy quota/login report on this host")
+        );
+        s.quotas.insert(
+            "h:agy".into(),
+            crate::state::Quota {
+                windows: vec![],
+                plan: None,
+                exhausted: true,
+                read_at: now,
+                ts: now,
+                exhausted_since: Some(now),
+            },
+        );
+        assert_eq!(
+            quota_block_reason(&s, "h", "agy", now).as_deref(),
+            Some("agy is not logged in")
+        );
+        s.quotas.insert("h:agy".into(), q(60.0, far, 30.0, now));
+        assert_eq!(quota_block_reason(&s, "h", "agy", now), None);
+        s.quotas.insert(
+            "h:agy".into(),
+            q(60.0, far, 30.0, now - chrono::Duration::minutes(11)),
+        );
+        assert_eq!(
+            quota_block_reason(&s, "h", "agy", now).as_deref(),
+            Some("agy quota report is stale")
+        );
+        s.quotas.insert("h:agy".into(), q(49.0, far, 30.0, now));
+        assert!(
+            quota_block_reason(&s, "h", "agy", now)
+                .unwrap()
+                .contains("5-hour quota has 49% left")
+        );
+        // Near the reset the same headroom is enough: waiting beats moving the work.
+        s.quotas.insert("h:agy".into(), q(49.0, near, 30.0, now));
+        assert_eq!(quota_block_reason(&s, "h", "agy", now), None);
+        s.quotas.insert("h:agy".into(), q(80.0, far, 14.0, now));
+        assert!(
+            quota_block_reason(&s, "h", "agy", now)
+                .unwrap()
+                .contains("weekly quota has 14% left")
+        );
+        // A Claude/GPT bucket at zero does not gate a Gemini agy spawn.
+        let mut mixed = q(80.0, far, 30.0, now);
+        mixed.windows.push(QuotaWindow {
+            name: "claude/gpt 5h".into(),
+            used_pct: 100.0,
+            resets_at: Some(far),
+        });
+        mixed.exhausted = true;
+        s.quotas.insert("h:agy".into(), mixed);
+        assert_eq!(quota_block_reason(&s, "h", "agy", now), None);
+    }
+
+    #[test]
     fn fallbacks_skip_cap_and_quota() {
         let c = cfg(CFG).unwrap();
         let mut s = State::default();
@@ -3059,12 +3357,36 @@ profile = ["devin", "codex", "agy"]
         assert!(e.contains("names no profile"), "{e}");
 
         let mut s = State::default();
-        let pick = |s: &State| decide(&c, &issue("x", &[]), &Overrides::default(), s, "h");
+        let pick = |s: &State| {
+            // agy is conservative without a fresh account report; the list test is about load,
+            // so every state that does not deliberately set one carries a valid report.
+            let mut s = s.clone();
+            s.quotas
+                .entry("h:agy".into())
+                .or_insert_with(|| agy_valid("h"));
+            decide(&c, &issue("x", &[]), &Overrides::default(), &s, "h")
+        };
         let quota_out = |s: &mut State, kind: &str| {
+            let windows = if kind == "agy" {
+                vec![
+                    QuotaWindow {
+                        name: "gemini 5h".into(),
+                        used_pct: 100.0,
+                        resets_at: Some(Utc::now() + chrono::Duration::hours(2)),
+                    },
+                    QuotaWindow {
+                        name: "gemini week".into(),
+                        used_pct: 20.0,
+                        resets_at: Some(Utc::now() + chrono::Duration::days(2)),
+                    },
+                ]
+            } else {
+                vec![]
+            };
             s.quotas.insert(
                 format!("h:{kind}"),
                 crate::state::Quota {
-                    windows: vec![],
+                    windows,
                     plan: None,
                     exhausted: true,
                     read_at: Utc::now(),
@@ -3201,7 +3523,8 @@ profile = ["devin", "codex", "agy"]
         let d = pick(&s2).unwrap();
         assert_eq!(d.profile, "sonnet");
         assert!(
-            d.why.contains("agy skipped: agy quota exhausted on h"),
+            d.why
+                .contains("agy skipped: agy Gemini 5-hour quota has 0% left"),
             "{}",
             d.why
         );
@@ -3232,8 +3555,10 @@ profile = ["devin", "codex", "agy"]
             profile: Some("agy"),
             ..Overrides::default()
         };
+        let mut fresh = State::default();
+        fresh.quotas.insert("h:agy".into(), agy_valid("h"));
         assert_eq!(
-            decide(&c, &issue("x", &[]), &o, &State::default(), "h")
+            decide(&c, &issue("x", &[]), &o, &fresh, "h")
                 .unwrap()
                 .profile,
             "agy"
@@ -3389,6 +3714,71 @@ profile = ["devin", "codex", "agy"]
             "type": "workspace_created",
             "root_pane": { "pane_id": "w:2" },
             "workspace": { "workspace_id": "ws2", "worktree": { "checkout_path": wt } } } })
+    }
+
+    #[test]
+    fn agy_gets_a_host_owned_per_agent_log_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_at(dir.path(), dir.path().join("sock"), false);
+        let mut prof = Profile {
+            kind: "agy".into(),
+            args: Vec::new(),
+            unset_env: Vec::new(),
+            prefix: String::new(),
+            cap: None,
+            fallback: None,
+            on_quota: None,
+            handoff_min: None,
+            host: None,
+        };
+        agy_log_arg(&host, "ag-7", &mut prof).unwrap();
+        assert_eq!(prof.args[0], "--log-file");
+        let path = PathBuf::from(&prof.args[1]);
+        assert!(path.starts_with(dir.path().join("agy")));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        std::fs::write(&path, "old").unwrap();
+        let mut next = Profile {
+            kind: "agy".into(),
+            args: Vec::new(),
+            unset_env: Vec::new(),
+            prefix: String::new(),
+            cap: None,
+            fallback: None,
+            on_quota: None,
+            handoff_min: None,
+            host: None,
+        };
+        agy_log_arg(&host, "ag-7", &mut next).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "",
+            "each spawn truncates the run's log"
+        );
+        let mut custom = Profile {
+            args: vec!["--log-file".into(), "/chosen.log".into()],
+            ..prof
+        };
+        assert!(agy_log_arg(&host, "ag-8", &mut custom).is_err());
+        let src = CFG.replace(
+            "[profiles.devin]",
+            "[profiles.devin]\nargs = [\"--log-file\", \"x\"]",
+        );
+        assert!(
+            cfg(&src).is_ok(),
+            "another kind may use an unrelated args list"
+        );
+        let agy_src = r#"
+session = "s"
+brief = "b.md"
+[profiles.agy]
+kind = "agy"
+args = ["--log-file", "x"]
+prefix = "ag-"
+[[rules]]
+profile = "agy"
+"#;
+        let e = cfg(agy_src).unwrap_err().to_string();
+        assert!(e.contains("may not choose agy's --log-file"), "{e}");
     }
 
     #[test]
@@ -4643,6 +5033,37 @@ profile = "devin"
         .unwrap_err()
         .to_string();
         assert!(e.contains("same agent"), "{e}");
+        // A profile pinned elsewhere cannot take a handoff: the worktree stays on the old host.
+        let pinned =
+            cfg(&CFG.replace("[profiles.sonnet]", "[profiles.sonnet]\nhost = \"other\"")).unwrap();
+        let e = handoff_request(
+            &State::default(),
+            &pinned,
+            dir.path(),
+            &sp,
+            "sonnet",
+            "",
+            "",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("pinned to host other"), "{e}");
+        let pinned_here =
+            cfg(&CFG.replace("[profiles.sonnet]", "[profiles.sonnet]\nhost = \"h\"")).unwrap();
+        assert!(
+            handoff_request(
+                &State::default(),
+                &pinned_here,
+                dir.path(),
+                &sp,
+                "sonnet",
+                "",
+                "",
+                None,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -5057,6 +5478,220 @@ profile = "devin"
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn an_agy_quota_log_line_becomes_one_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, _stub) = run(dir.path(), &[]).await;
+        let mut s = stalled_state(None);
+        s.agents.get_mut("agent:h/s/a").unwrap().kind = Some("agy".into());
+        let path = crate::host::agy_log_path(dir.path(), "a");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let stamp = chrono::Local::now().format("%m%d %H:%M:%S");
+        let line = format!(
+            "E{stamp}.123456 99 errorreport.go:282] agent executor error: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 4h2m29s.\n"
+        );
+        std::fs::write(&path, &line).unwrap();
+        let mut logs = crate::stuck::AgyLogs::default();
+        crate::stuck::agy_logs(&host, &s, &mut logs).await;
+        let signals = || {
+            host.replica
+                .lock()
+                .unwrap()
+                .all()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(&e.body, Body::Known(Known::AgentSignal(sig)) if sig.signal == "quota"))
+                .count()
+        };
+        assert_eq!(signals(), 1, "the line is the program's quota signal");
+        let quota_rows = || {
+            host.replica
+                .lock()
+                .unwrap()
+                .all()
+                .unwrap()
+                .iter()
+                .filter_map(|e| match &e.body {
+                    Body::Known(Known::AgentQuota(q)) if q.kind == "agy" => Some(q.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let rows = quota_rows();
+        assert_eq!(rows.len(), 1, "the line spends the account row at once");
+        let five_h = rows[0]
+            .windows
+            .iter()
+            .find(|w| w.name == "gemini 5h")
+            .unwrap();
+        assert_eq!(five_h.used_pct, 100.0);
+        assert!(
+            five_h
+                .resets_at
+                .is_some_and(|r| r > Utc::now() + chrono::Duration::hours(3)),
+            "the reset the line names is kept: {rows:?}"
+        );
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, "{line}").unwrap();
+        crate::stuck::agy_logs(&host, &s, &mut logs).await;
+        assert_eq!(
+            signals(),
+            1,
+            "retries in the same outage do not spam the log"
+        );
+        assert_eq!(quota_rows().len(), 1, "nor duplicate the account row");
+
+        // An old line whose named reset has already passed stays dead even when a restart
+        // makes the scanner read the file from byte zero again.
+        let mut s2 = stalled_state(None);
+        let b = s2.agents.get("agent:h/s/a").unwrap().clone();
+        s2.agents.insert("agent:h/s/b".into(), b);
+        s2.agents.get_mut("agent:h/s/b").unwrap().kind = Some("agy".into());
+        s2.agents.remove("agent:h/s/a");
+        let old = chrono::Local::now() - chrono::Duration::hours(2);
+        let path = crate::host::agy_log_path(dir.path(), "b");
+        std::fs::write(
+            &path,
+            format!(
+                "E{}.123456 99 x] RESOURCE_EXHAUSTED: Individual quota reached. Resets in 30m.\n",
+                old.format("%m%d %H:%M:%S")
+            ),
+        )
+        .unwrap();
+        let mut logs = crate::stuck::AgyLogs::default();
+        crate::stuck::agy_logs(&host, &s2, &mut logs).await;
+        assert_eq!(signals(), 1, "an expired reset is not a live quota signal");
+
+        // Age alone does not kill a reread line: a host restart hours later still needs the
+        // handoff while the reset the line names remains ahead.
+        let mut s3 = stalled_state(None);
+        let c = s3.agents.get("agent:h/s/a").unwrap().clone();
+        s3.agents.insert("agent:h/s/c".into(), c);
+        s3.agents.get_mut("agent:h/s/c").unwrap().kind = Some("agy".into());
+        s3.agents.remove("agent:h/s/a");
+        let old = chrono::Local::now() - chrono::Duration::hours(3);
+        let path = crate::host::agy_log_path(dir.path(), "c");
+        std::fs::write(
+            &path,
+            format!(
+                "E{}.123456 99 x] RESOURCE_EXHAUSTED: Individual quota reached. Resets in 4h.\n",
+                old.format("%m%d %H:%M:%S")
+            ),
+        )
+        .unwrap();
+        let mut logs = crate::stuck::AgyLogs::default();
+        crate::stuck::agy_logs(&host, &s3, &mut logs).await;
+        assert_eq!(signals(), 2, "a live reset survives a late reread");
+
+        // A partial final line is not evidence yet: its reset duration may still be on the way.
+        let mut s4 = stalled_state(None);
+        let d = s4.agents.get("agent:h/s/a").unwrap().clone();
+        s4.agents.insert("agent:h/s/d".into(), d);
+        s4.agents.get_mut("agent:h/s/d").unwrap().kind = Some("agy".into());
+        s4.agents.remove("agent:h/s/a");
+        let path = crate::host::agy_log_path(dir.path(), "d");
+        let start = format!(
+            "E{}.123456 99 x] RESOURCE_EXHAUSTED: Individual quota reached. Resets in 4h",
+            chrono::Local::now().format("%m%d %H:%M:%S")
+        );
+        std::fs::write(&path, &start).unwrap();
+        let mut logs = crate::stuck::AgyLogs::default();
+        crate::stuck::agy_logs(&host, &s4, &mut logs).await;
+        assert_eq!(signals(), 2, "an unterminated line waits for its end");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, "2m29s.").unwrap();
+        crate::stuck::agy_logs(&host, &s4, &mut logs).await;
+        assert_eq!(signals(), 3, "the completed line is read whole");
+
+        // A truncated file is written again from byte zero; clamping the old offset to its
+        // shorter end would skip exactly the new lines.
+        let mut s5 = stalled_state(None);
+        let e = s5.agents.get("agent:h/s/a").unwrap().clone();
+        s5.agents.insert("agent:h/s/e".into(), e);
+        s5.agents.get_mut("agent:h/s/e").unwrap().kind = Some("agy".into());
+        s5.agents.remove("agent:h/s/a");
+        let path = crate::host::agy_log_path(dir.path(), "e");
+        std::fs::write(&path, format!("{}\n", "x".repeat(400))).unwrap();
+        crate::stuck::agy_logs(&host, &s5, &mut logs).await;
+        assert_eq!(signals(), 3, "the filler line is only consumed");
+        let stamp = chrono::Local::now().format("%m%d %H:%M:%S");
+        std::fs::write(
+            &path,
+            format!(
+                "E{stamp}.123456 99 x] RESOURCE_EXHAUSTED: Individual quota reached. Resets in 4h.\n"
+            ),
+        )
+        .unwrap();
+        crate::stuck::agy_logs(&host, &s5, &mut logs).await;
+        assert_eq!(signals(), 4, "the short truncated file is reread from zero");
+    }
+
+    #[tokio::test]
+    async fn an_agy_quota_signal_hands_off_without_the_stall_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        std::fs::write(
+            co.join(".agent-fleet/fleet.toml"),
+            "session = \"s\"\nbrief = \"b.md\"\n[profiles.ag]\nkind = \"agy\"\non_quota = \"dv\"\nprefix = \"ag-\"\n[profiles.dv]\nkind = \"devin\"\nprefix = \"dv-\"\n[[rules]]\nprofile = \"ag\"\n",
+        )
+        .unwrap();
+        std::fs::write(co.join(".agent-fleet/b.md"), "do it").unwrap();
+        let (host, _stub) = run_act(dir.path(), &[]).await;
+        let mut s = stalled_state(Some("agent:h/s/lead"));
+        {
+            let a = s.agents.get_mut("agent:h/s/a").unwrap();
+            a.kind = Some("agy".into());
+            // Freshly idle: without the agy exception the stall grace would defer every action.
+            a.since = Utc::now() - chrono::Duration::minutes(1);
+        }
+        s.stuck.clear();
+        s.signals.insert(
+            "agent:h/s/a".into(),
+            crate::state::Signal {
+                signal: "quota".into(),
+                detail: Some(
+                    "RESOURCE_EXHAUSTED: Individual quota reached. Resets in 4h2m29s.".into(),
+                ),
+                program: "agy".into(),
+                since: Utc::now(),
+            },
+        );
+        let mut r = req(None);
+        r.agent = "agent:h/s/a".into();
+        r.name = "a".into();
+        r.profile = "ag".into();
+        r.issue = None;
+        r.worktree = Some("/w/a".into());
+        s.apply(&Envelope::new(actor(), "p", Known::SpawnRequested(Box::new(r))).into_event());
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
+        let handoffs = host
+            .replica
+            .lock()
+            .unwrap()
+            .all()
+            .unwrap()
+            .iter()
+            .filter(
+                |e| matches!(&e.body, Body::Known(Known::SpawnRequested(sp)) if sp.profile == "dv"),
+            )
+            .count();
+        assert_eq!(handoffs, 1, "a far agy quota reset hands off immediately");
     }
 
     #[tokio::test]
@@ -6068,6 +6703,61 @@ profile = "devin"
         )
         .await;
         assert_eq!(reqs(&host), 1, "the handoff went to the other account");
+        // A target pinned elsewhere cannot take the worktree: the lead is told instead.
+        let pinned = cfg("dv", "devin").replace("[profiles.dv]", "[profiles.dv]\nhost = \"other\"");
+        let dir = tempfile::tempdir().unwrap();
+        scene(dir.path(), &pinned);
+        let (host, _stub) = run_act(dir.path(), &[]).await;
+        let mut s = quota_state();
+        signal(&mut s, "agent:h/s/a", "quota", None);
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
+        assert_eq!(
+            reqs(&host),
+            0,
+            "no handoff onto a host the worktree cannot move to"
+        );
+        // agy as the target obeys the same login/freshness gate as a spawn: no report, no handoff.
+        let dir = tempfile::tempdir().unwrap();
+        scene(dir.path(), &cfg("ag", "agy"));
+        let (host, _stub) = run_act(dir.path(), &[]).await;
+        let mut s = quota_state();
+        signal(&mut s, "agent:h/s/a", "quota", None);
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
+        assert_eq!(
+            reqs(&host),
+            0,
+            "agy without a fresh quota report is not a target"
+        );
+        // With a fresh report the same target is eligible.
+        let dir = tempfile::tempdir().unwrap();
+        scene(dir.path(), &cfg("ag", "agy"));
+        let (host, _stub) = run_act(dir.path(), &[]).await;
+        let mut s = quota_state();
+        s.quotas.insert("h:agy".into(), agy_valid("h"));
+        signal(&mut s, "agent:h/s/a", "quota", None);
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
+        assert_eq!(reqs(&host), 1, "agy with fresh quota is a target");
     }
 
     #[tokio::test]
