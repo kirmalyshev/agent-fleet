@@ -209,22 +209,32 @@ fn agy_window_name(group: &str, window: &str) -> String {
     format!("{} {}", group.to_lowercase(), window)
 }
 
+fn agy_logged_out(host: &str, read_at: DateTime<Utc>) -> AgentQuota {
+    AgentQuota {
+        host: host.into(),
+        kind: "agy".into(),
+        windows: Vec::new(),
+        plan: None,
+        exhausted: true,
+        read_at,
+    }
+}
+
 /// Parse `agy -p "/usage" --output-format json`: a successful, authenticated read is the rows
 /// under `command.groups`. An authentication failure is still information: it yields an exhausted
 /// row with no windows, so the views and spawn routing can say the host is not logged in. Epoch
 /// resets mean a bucket has not started yet and are omitted.
 pub fn agy_output(host: &str, output: &str, read_at: DateTime<Utc>) -> Option<AgentQuota> {
     if output.contains("Authentication required") {
-        return Some(AgentQuota {
-            host: host.into(),
-            kind: "agy".into(),
-            windows: Vec::new(),
-            plan: None,
-            exhausted: true,
-            read_at,
-        });
+        return Some(agy_logged_out(host, read_at));
     }
     let v: Value = serde_json::from_str(output).ok()?;
+    if v["error"].as_str().is_some_and(|e| {
+        let e = e.to_lowercase();
+        e.contains("authentication") || e.contains("unauthenticated") || e.contains("not logged in")
+    }) {
+        return Some(agy_logged_out(host, read_at));
+    }
     if v["status"] != "SUCCESS" {
         return None;
     }
@@ -655,6 +665,17 @@ mod tests {
         )
         .unwrap();
         assert!(q.exhausted && q.windows.is_empty());
+        let err = json!({
+            "status": "ERROR",
+            "response": "",
+            "error": "authentication failed or timed out"
+        })
+        .to_string();
+        let q = agy_output("h", &err, read_at).unwrap();
+        assert!(
+            q.exhausted && q.windows.is_empty(),
+            "the JSON login failure is a logged-out report"
+        );
         assert!(agy_output("h", "{}", read_at).is_none());
 
         // Older builds carry only the TSV rendering, not the structured command object.

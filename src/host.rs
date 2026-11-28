@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Notify;
@@ -318,14 +318,66 @@ async fn dust_breakdown() -> Vec<DiskEntry> {
     crate::stats::fit_disk_entries(out, 6 * 1024)
 }
 
+struct ProbeOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Collect a child process's output, keeping what it already wrote when the timeout has to kill
+/// it. `Command::output` would drop the partial output with the future; a logged-out agy prints
+/// its authentication failure and then stays alive waiting for a code.
+async fn command_output_partial(
+    mut command: tokio::process::Command,
+    wait: Duration,
+) -> Option<ProbeOutput> {
+    async fn read_pipe<R>(mut pipe: R, into: Arc<Mutex<Vec<u8>>>)
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut chunk = [0; 8192];
+        loop {
+            match pipe.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => into.lock().unwrap().extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+
+    let mut child = command.spawn().ok()?;
+    let stdout_pipe = child.stdout.take()?;
+    let stderr_pipe = child.stderr.take()?;
+    let stdout_bytes = Arc::new(Mutex::new(Vec::new()));
+    let stderr_bytes = Arc::new(Mutex::new(Vec::new()));
+    let mut stdout = tokio::spawn(read_pipe(stdout_pipe, stdout_bytes.clone()));
+    let mut stderr = tokio::spawn(read_pipe(stderr_pipe, stderr_bytes.clone()));
+    if tokio::time::timeout(wait, child.wait()).await.is_err() {
+        let _ = child.kill().await;
+    }
+    // A killed shell can leave a child behind holding the pipes open. Give the readers a short
+    // grace to drain what is already there, but never let that descendant outwait the probe.
+    let collect = futures_util::future::join(&mut stdout, &mut stderr);
+    let _ = tokio::time::timeout(Duration::from_millis(200), collect).await;
+    stdout.abort();
+    stderr.abort();
+    Some(ProbeOutput {
+        stdout: std::mem::take(&mut *stdout_bytes.lock().unwrap()),
+        stderr: std::mem::take(&mut *stderr_bytes.lock().unwrap()),
+    })
+}
+
 /// One `agy -p "/usage"` probe. stdin is /dev/null because a logged-out CLI otherwise waits for
 /// an authentication code; the timeout kills the process rather than letting it hold the host's
 /// quota loop.
 async fn agy_probe(host: String) -> Option<AgentQuota> {
+    agy_probe_cmd(Path::new("agy"), host, Duration::from_secs(20)).await
+}
+
+async fn agy_probe_cmd(program: &Path, host: String, wait: Duration) -> Option<AgentQuota> {
     // Stamp the read when the probe starts, not when the process exits: a cap line written while
     // the probe was in flight is newer evidence than the answer that probe had already received.
     let read_at = Utc::now();
-    let run = tokio::process::Command::new("agy")
+    let mut command = tokio::process::Command::new(program);
+    command
         .args([
             "-p",
             "/usage",
@@ -336,15 +388,13 @@ async fn agy_probe(host: String) -> Option<AgentQuota> {
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let out = tokio::time::timeout(Duration::from_secs(20), run)
-        .await
-        .ok()?
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    crate::quota::agy_output(&host, &text, read_at)
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let out = command_output_partial(command, wait).await?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    crate::quota::agy_output(&host, &stdout, read_at)
+        .or_else(|| crate::quota::agy_output(&host, &stderr, read_at))
 }
 
 impl Host {
@@ -2162,6 +2212,29 @@ mod tests {
         assert_eq!(
             d,
             "[agent-fleet lead→impl] REVIEW task:p/7: please look (event 01ABC; ack: agent-fleet read)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_agy_probe_keeps_output_when_the_login_wait_is_killed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("agy");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf '%s' '{\"status\":\"ERROR\",\"response\":\"\",\"error\":\"authentication failed or timed out\"}'\nsleep 30\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&program).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&program, perms).unwrap();
+        let q = agy_probe_cmd(&program, "h".into(), Duration::from_millis(100))
+            .await
+            .unwrap();
+        assert!(
+            q.exhausted && q.windows.is_empty(),
+            "the partial output still proves the host is logged out"
         );
     }
 
