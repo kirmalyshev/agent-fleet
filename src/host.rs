@@ -2223,7 +2223,7 @@ mod tests {
         let program = dir.path().join("agy");
         std::fs::write(
             &program,
-            "#!/bin/sh\nprintf '%s' '{\"status\":\"ERROR\",\"response\":\"\",\"error\":\"authentication failed or timed out\"}'\nsleep 30\n",
+            "#!/bin/sh\nprintf '%s' '{\"status\":\"ERROR\",\"response\":\"\",\"error\":\"authentication failed or timed out\"}'\nexec sleep 30\n",
         )
         .unwrap();
         let mut perms = std::fs::metadata(&program).unwrap().permissions();
