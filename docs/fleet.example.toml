@@ -27,9 +27,9 @@ brief = "brief.md"               # brief template next to this file; @@KEY@@ pla
 
 # Profiles: how to start one agent program. One profile per program found on PATH; add more,
 # e.g. one per model. Keys:
-#   kind        the program: claude, codex, devin or agy (agent.start's kind and agent.quota's kind;
-#               agy has no quota reader yet)
-#   args        extra arguments for the program, e.g. ["--model", "opus"]
+#   kind        the program: claude, codex, devin or agy (agent.start's kind and agent.quota's kind)
+#   args        extra arguments for the program, e.g. ["--model", "opus"]; an agy profile may
+#               not choose --log-file, because the host assigns one it can watch
 #   unset_env   variables cleared in the pane's shell before the agent starts
 #   prefix      the default agent name is prefix + issue number; profiles never share a prefix
 #   cap         live agents of this profile per repository; absent = no cap
@@ -38,6 +38,8 @@ brief = "brief.md"               # brief template next to this file; @@KEY@@ pla
 #               is out of quota with a KNOWN reset >30m away moves to this profile, if its kind
 #               still has quota on this host
 #   handoff_min minutes a spawned agent has to reach `working` before its lead is told (default 5)
+#   host        pin this profile to one host; strict unless an explicit --host overrides it.
+#               A handoff keeps the old worktree, so a profile pinned elsewhere cannot take it
 
 [profiles.claude]
 kind = "claude"
@@ -58,6 +60,9 @@ prefix = "dv-"
 kind = "agy"
 args = []
 prefix = "ag-"
+# host = "linux-box"              # agy is installed only there; an explicit --host can override
+# Spawning agy is refused when its host has no fresh quota/login report, is logged out, has under
+# 50% of the Gemini 5-hour bucket with a reset over 30m away, or under 15% of the Gemini week.
 # agy (Google Antigravity CLI) asks "Do you trust this folder?" in every new folder and stays
 # blocked until answered: a `ready` script can add the worktree path to the
 # `trustedWorkspaces` list in its settings.json.

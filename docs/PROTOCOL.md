@@ -110,7 +110,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `proc.orphaned` | host, pid, cwd?, why?, since? — no `why` clears the report | | host |
 | | `proc.hung` | host, pid, pids[]?, agent?, command?, started?, evidence?, since?, checked? — the topmost hung process an agent started and the hung ones under it (the watch tick, every 2 min); no `evidence` clears the report; folded only from the host actor it names (`host:<host>`) | | host |
 | | `agent.stuck` | agent, cause?, detail, until? — no `cause` clears the record | | host |
-| | `agent.signal` | agent, program, signal, detail? — `prompt`/`turn_end` clear the agent's stored signal | | agent |
+| | `agent.signal` | agent, program, signal, detail? — `prompt`/`turn_end` clear the agent's stored signal | | agent, host |
 | update | `update.requested` | host? — every host (or only `host`) pulls, rebuilds and restarts; written by `agent-fleet self-update` as `host:<this machine>`, and by a host's own timer for itself | | host |
 | | `update.result` | host, ok, commit?, error? — folded only from the host actor it names, first answer per host | re = the request | host |
 
@@ -132,15 +132,23 @@ name or a pane. A role can be declared before the agent's first `agent.up`, surv
 going down and coming back, and only an `agent.role` without `level` removes it.
 
 `agent.quota` is the usage quota of one agent program on one host — each machine is logged in to
-its own account, so `kind` (`claude`, `codex`, `devin`, `agy`, or anything new) is scoped per host. `agy` (Google Antigravity CLI) has no quota
-reader yet, so its kind reports none and counts as unknown. It checkpoints its own context, so
-there is no context-full footer to read, and `agy` is a native binary, so `ps` shows `agy`.
-The host samples three sources every minute: the newest session log under
+its own account, so `kind` (`claude`, `codex`, `devin`, `agy`, or anything new) is scoped per host.
+The host samples three file/cache sources every minute: the newest session log under
 `~/.codex/sessions` for codex, the machine-wide `claude-rate-limits.json` in the fleet data
 directory root for claude (written by `agent-fleet hook statusline`, the status-line wrapper
 that stores the `rate_limits` it is fed and passes the input on to the command it wraps), and
-the newest cached `devin auth status` under `~/.cache/devin/cli` for devin. `read_at` stamps the
-data itself, not the scan, so the views can say how stale the numbers are.
+the newest cached `devin auth status` under `~/.cache/devin/cli` for devin. For agy (Google
+Antigravity CLI) it runs a 20-second `agy -p "/usage" --output-format json` probe every five
+minutes, with stdin closed so a logged-out CLI cannot wait for an authentication code and with
+`--log-file` pointed at the null device so the probe itself does not fill agy's log directory.
+agy's rows are normalized to
+`gemini 5h`, `gemini week`, `claude/gpt 5h` and `claude/gpt week`; epoch reset times mean the
+bucket has not started and are omitted. An authentication failure is a report with no windows and
+`exhausted: true`. Unlike the file/cache reads, a successful agy probe is published even when its
+numbers are unchanged: its `read_at` is the probe time and is the freshness fact spawn routing
+uses. `read_at` stamps the data itself, not the scan, so the views can say how stale the numbers
+are. agy checkpoints its own context, so there is no context-full footer to read, and
+`agy` is a native binary, so `ps` shows `agy`.
 
 ## Rules the hub enforces
 
@@ -418,7 +426,8 @@ done, review rounds and blocks. A failed `merge.result` answering a `merge.reque
 agent's `FIX` and `BLOCKED` tells, as PR verdicts are not in the log. A later spawn on the same repo and issue within 7 days of a finish is a fix-up. A
 `handoff` by the agent, or a spawn that `replaces` it, is a handoff. IDLE and STALLED tells, UNREAD
 hand-backs, `proc.hung` and `agent.stuck` with a cause other than `waiting`, `held` or `resource` are interventions, divided by the hours from
-`agent.up` to `agent.down`. The quota proxy is the rise of the program's busiest `agent.quota`
+`agent.up` to `agent.down`; those records with cause `quota` are also counted apart as quota
+stops. The quota proxy is the rise of the program's busiest `agent.quota`
 window over the agent's life; concurrent agents share it. A figure with no data prints `?` and is `null` in `--json`. A spawn with no
 `spawn.result` and no `agent.up` is `unconfirmed` and left out of every other figure.
 
@@ -509,7 +518,9 @@ belongs to this episode, and one older than the last working stretch is a replay
 `blocked` and the fleet's own holds. For Devin, which
 emits no hooks, an exhausted `agent.quota` for `<host>:devin` plus the agent sitting idle
 *is* the structured quota signal — but only when the agent's current stop began after the
-account ran out and its task is still open: an agent already idle or finished is just idle. The screen is still read, but only as a hint: it may
+account ran out and its task is still open: an agent already idle or finished is just idle.
+For agy the host watches the per-agent `--log-file` it launches with; an `Individual quota
+reached` line becomes the same structured `quota` signal a hook would write. The screen is still read, but only as a hint: it may
 ride along in the message to the lead ("screen hints …"), and it never decides a cause or
 drives an action. The result lands in `agent.stuck` (`cause`, `detail`, `until`), written
 when the cause appears or changes, and once with no `cause` when the agent works again.
@@ -519,7 +530,7 @@ state, `doctor` puts it in the `hung`/`stalled` detail, and the push names it to
 
 | Cause | Signal |
 |---|---|
-| `quota` | `agent.signal` `quota`, or for Devin an exhausted `agent.quota` for `<host>:devin`. `until` is the spent window's `resets_at` (from `agent.quota`) when known. |
+| `quota` | `agent.signal` `quota` (for agy, host-read from its log), or for Devin an exhausted `agent.quota` for `<host>:devin`. `until` is the spent window's `resets_at` (from `agent.quota`) or the reset the signal names when known. |
 | `rate_limit` | `agent.signal` `rate_limit`. `until` is the wait named in `detail` (5 min when unparseable). |
 | `question` | `agent.signal` `question` — the program is asking the principal; `detail` is its text. |
 | `context_full` | `agent.signal` `context_full` (the statusline wrapper at ≥ 90% context) or `compacting`. |
@@ -536,7 +547,9 @@ Each cause earns at most one action per episode, logged as events (`msg.sent`,
 task is finished. Actions that touch an agent — a `continue` doorbell, a handoff — only
 run under `host --stuck-act`; without it the host still classifies and records `agent.stuck`,
 and every would-be action becomes one tell to the lead naming what it would have done. And
-nothing acts or tells before the state has lasted `--stall-min`:
+nothing acts or tells before the state has lasted `--stall-min` — except an agy `quota` signal,
+whose log line is the program's final answer for the turn and is acted on on the next 5-second
+pass:
 
 - `quota` with `until` KNOWN and more than 30 min away: hand the work to the profile's
   `on_quota` (a fleet.toml key), but only when that profile's kind still has quota on this
@@ -886,7 +899,8 @@ processes still in the tree and unpushed submodule work, and forces only past ch
 `--decide` accepted or clean, pushed submodules; the host's retire of a closed pane runs nothing), `[merge]` for `agent-fleet merge` (see Merging),
 `[vars]` for extra tokens, `[profiles]` —
 a `kind` (the `agent.start`/`agent.quota` program), `args`, `unset_env`, a `prefix` for agent
-names, an optional per-repo `cap`, a `fallback`, and `handoff_min` — and `[[rules]]`, first
+names, an optional per-repo `cap`, a `fallback`, `handoff_min`, and an optional profile-level
+`host` pin — and `[[rules]]`, first
 match wins, a rule with no `match` being the default. A rule's `host` is one host or a list of
 hosts it allows: the first is preferred and the rest are reroute candidates. `match` keywords are
 case-insensitive whole words against the issue's title and labels — never the `--scope` text, which narrows the
@@ -898,7 +912,19 @@ A rule's `profile` is one name or a list (`profile = ["devin", "codex", "agy"]`)
 takes the least-loaded listed profile that is under its `cap` and whose agent program has quota on
 the host; list order breaks ties, and the decision line (`spawn --dry-run` prints it) says which
 was skipped and why. When none of them can take it, the first one's `fallback` chain applies as for
-a single name. `--profile` still bypasses the list.
+a single name. `--profile` still bypasses the list. A profile's `host` pin overrides the rule's
+host choice for that profile and is strict: pressure on the pinned host refuses rather than
+rerouting. An explicit `--host` still wins over the pin. A handoff stays in the old worktree on
+the old host, so a profile pinned elsewhere cannot take the handoff.
+
+Quota means more than "not already at zero" for agy, because the account is shared by every agy
+on the host. An agy spawn is refused when the host has no fresh quota/login report (10 min), the
+probe says the CLI is logged out, the Gemini 5-hour bucket has under 50% remaining with its reset
+more than 30 min away, or the Gemini weekly bucket has under 15% remaining. The Claude/GPT buckets
+in the same report do not gate a Gemini agy spawn. Every agy spawn is launched with
+`--log-file <host data dir>/agy/<agent>.log`; a profile may not choose another path, because
+the host can watch only the log it assigns. The host reads that file for the program's own
+`Individual quota reached` line.
 
 The machine's rules are `fleet.toml` and its brief in the instance's config directory: the user
 config directory (`~/.config/agent-fleet` on Linux) for the default instance and `instances/<name>`

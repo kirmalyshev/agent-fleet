@@ -460,7 +460,8 @@ pub struct AgentRole {
 
 /// The usage quota one agent program reports on a host, e.g. claude's `5h` and `week` windows.
 /// Each machine is logged in to its own account, so the quota is per host. Sent when anything
-/// but `read_at` changes, and once at host start.
+/// but `read_at` changes, and once at host start; agy's probe is the exception, republished so
+/// its `read_at` keeps proving freshness.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentQuota {
@@ -834,7 +835,8 @@ pub struct AgentStuck {
 }
 
 /// A structured signal from the agent's own program — a harness hook (`agent-fleet hook
-/// signal` / the statusline wrapper) writes it. `prompt` and `turn_end` open a new episode:
+/// signal` / the statusline wrapper) writes it, or the host does for a program whose log is
+/// the structured stream (agy). `prompt` and `turn_end` open a new episode:
 /// the fold drops the agent's stored signal on them. `detail` carries the program's own
 /// text (an error message, a question) when there is one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1097,9 +1099,8 @@ impl Known {
             | Self::MergeResult(_)
             | Self::UpdateRequested(_)
             | Self::UpdateResult(_) => &[Host],
-            Self::AskRaised(_) | Self::Handoff(_) | Self::AgentSignal(_) | Self::MsgRead(_) => {
-                &[Agent]
-            }
+            Self::AskRaised(_) | Self::Handoff(_) | Self::MsgRead(_) => &[Agent],
+            Self::AgentSignal(_) => &[Agent, Host],
             Self::AskAnswered(_) => &[Human],
             Self::MsgSent(_) | Self::AgentRenamed(_) => &[Agent, Host, Human],
             _ => &[Agent, Host],

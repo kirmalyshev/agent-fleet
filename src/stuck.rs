@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, Utc};
 use serde_json::json;
 
 use crate::event::*;
@@ -35,6 +35,38 @@ impl Cause {
 pub const QUOTA_WAIT: Duration = Duration::minutes(30);
 /// A rate-limit line without a number waits this long before the `continue`.
 const RL_DEFAULT: Duration = Duration::minutes(5);
+
+/// The reset of the spent window that matters to this program. agy's report carries the
+/// separate Claude/GPT buckets too; they never set the deadline for a Gemini quota stop.
+fn spent_reset(
+    program: Option<&str>,
+    quota: Option<&Quota>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let q = quota?;
+    let spent = q
+        .windows
+        .iter()
+        .filter(|w| w.used_pct >= 100.0)
+        .filter_map(|w| w.resets_at)
+        .filter(|r| *r > now);
+    if program == Some("agy") {
+        for name in ["gemini 5h", "gemini week"] {
+            if let Some(r) = q
+                .windows
+                .iter()
+                .filter(|w| w.name == name && w.used_pct >= 100.0)
+                .filter_map(|w| w.resets_at)
+                .filter(|r| *r > now)
+                .min()
+            {
+                return Some(r);
+            }
+        }
+        return None;
+    }
+    spent.min()
+}
 
 /// The last `n` non-empty screen lines, joined for a one-line message.
 fn last_n(s: &str, n: usize) -> String {
@@ -174,9 +206,10 @@ fn chrome_lines(program: Option<&str>, screen: &str) -> Vec<bool> {
     out
 }
 
-/// "reset(s) in ~?N", "retry after N" and friends: the short wait a rate-limit line names.
+/// "reset(s) in ~?N", "retry after N" and friends: the wait a rate-limit line names,
+/// including a compound one such as `4h2m29s`.
 /// Only a line that is itself about a limit — "git reset in 3 steps" is not one.
-fn retry_in(line: &str) -> Option<Duration> {
+pub(crate) fn retry_in(line: &str) -> Option<Duration> {
     let low = line.to_lowercase();
     if !(low.contains("limit") || low.contains("retry") || low.contains("quota")) {
         return None;
@@ -196,14 +229,40 @@ fn retry_in(line: &str) -> Option<Duration> {
         } else {
             rest
         };
-        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        let Ok(n) = digits.parse() else { continue };
-        let unit = rest[digits.len()..].trim_start();
-        return Some(match unit.chars().next() {
-            Some('s') => Duration::seconds(n),
-            Some('h') => Duration::hours(n),
-            _ => Duration::minutes(n),
-        });
+        let mut rest = rest;
+        let mut total = Duration::zero();
+        let mut parts = 0;
+        loop {
+            let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+            if digits == 0 {
+                break;
+            }
+            let Ok(n) = rest[..digits].parse::<i64>() else {
+                break;
+            };
+            let after = &rest[digits..];
+            let unit = after.trim_start();
+            let letters = unit.chars().take_while(|c| c.is_ascii_alphabetic()).count();
+            let (wait, word) = match unit.chars().next() {
+                Some('s') => (Duration::seconds(n), true),
+                Some('h') => (Duration::hours(n), true),
+                Some('m') => (Duration::minutes(n), true),
+                _ => (Duration::minutes(n), false),
+            };
+            total += wait;
+            parts += 1;
+            if !word {
+                break;
+            }
+            let letters = letters.max(1);
+            rest = unit[letters..].trim_start();
+            if !rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                break;
+            }
+        }
+        if parts > 0 {
+            return Some(total);
+        }
     }
     None
 }
@@ -375,14 +434,7 @@ pub fn stuck_cause(
         .skip(t14)
         .any(|(i, l)| ui(i) && quota_on_screen(program, l))
     {
-        let until = quota.and_then(|q| {
-            q.windows
-                .iter()
-                .filter(|w| w.used_pct >= 100.0)
-                .filter_map(|w| w.resets_at)
-                .filter(|r| *r > now)
-                .min()
-        });
+        let until = spent_reset(program, quota, now);
         return Some(Cause {
             kind: StuckCause::Quota,
             detail: "the program says its account is out of quota".into(),
@@ -471,7 +523,11 @@ fn signal_cause(s: &State, id: &str, a: &Agent, now: DateTime<Utc>) -> Option<Ca
         "quota" => Cause {
             kind: StuckCause::Quota,
             detail: "the program reported its quota exhausted".into(),
-            until: None,
+            until: sig
+                .detail
+                .as_deref()
+                .and_then(retry_in)
+                .map(|wait| sig.since + wait),
         },
         "rate_limit" => Cause {
             kind: StuckCause::RateLimit,
@@ -762,6 +818,196 @@ pub(crate) fn dialog_open(screen: &str) -> bool {
             .any(|l| l.trim_start().starts_with('❯') && option(l))
 }
 
+/// The agy log scanner's memory: bytes already read per agent, and when a quota signal was last
+/// published for it. The byte offsets are in-memory on purpose: a truncated file rewinds them,
+/// and a host restart may reread an old line only when its own reset arithmetic still says the
+/// outage is live.
+#[derive(Default)]
+pub struct AgyLogs {
+    offsets: HashMap<String, u64>,
+    reported: HashMap<String, DateTime<Utc>>,
+}
+
+/// The local timestamp a klog line opens with (`E1128 07:12:19.834909`): month-day, time and
+/// microseconds, no year. The year is the current one unless that puts the line more than a day
+/// in the future (the New Year's Eve case). agy writes in the machine's local zone.
+fn agy_line_time(line: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let mut parts = line.split_whitespace();
+    let day = parts.next()?;
+    let clock = parts.next()?;
+    let b = day.as_bytes();
+    if b.len() != 5 || !matches!(b[0], b'E' | b'W' | b'I' | b'F') {
+        return None;
+    }
+    let month = day.get(1..3)?.parse().ok()?;
+    let dom = day.get(3..5)?.parse().ok()?;
+    let (hms, frac) = clock.split_once('.').unwrap_or((clock, "0"));
+    let mut units = hms.split(':');
+    let hour = units.next()?.parse().ok()?;
+    let minute = units.next()?.parse().ok()?;
+    let second = units.next()?.parse().ok()?;
+    if units.next().is_some() {
+        return None;
+    }
+    let mut micro = frac.chars().take(6).collect::<String>();
+    while micro.len() < 6 {
+        micro.push('0');
+    }
+    let micro: u32 = micro.parse().ok()?;
+    let at = |year: i32| {
+        chrono::NaiveDate::from_ymd_opt(year, month, dom)?
+            .and_hms_micro_opt(hour, minute, second, micro)?
+            .and_local_timezone(chrono::Local)
+            .single()
+            .map(|t| t.to_utc())
+    };
+    let first = at(now.with_timezone(&chrono::Local).year())?;
+    if first <= now + Duration::days(1) {
+        Some(first)
+    } else {
+        at(now.with_timezone(&chrono::Local).year() - 1)
+    }
+}
+
+fn agy_quota_line(line: &str) -> Option<&str> {
+    let needle = b"individual quota reached";
+    let at = line
+        .as_bytes()
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle))?;
+    line.get(at..).map(str::trim)
+}
+
+/// The quota row a live `Individual quota reached` line proves: the shared Gemini 5-hour bucket
+/// is spent until the reset the line named. The other buckets keep the probe's last numbers.
+fn agy_capped_quota(
+    state: &State,
+    host: &str,
+    until: Option<DateTime<Utc>>,
+    read_at: DateTime<Utc>,
+) -> AgentQuota {
+    let key = format!("{host}:agy");
+    let old = state.quotas.get(&key);
+    let mut windows = old.map(|q| q.windows.clone()).unwrap_or_default();
+    match windows.iter_mut().find(|w| w.name == "gemini 5h") {
+        Some(w) => {
+            w.used_pct = 100.0;
+            if until.is_some() {
+                w.resets_at = until;
+            }
+        }
+        None => windows.push(QuotaWindow {
+            name: "gemini 5h".into(),
+            used_pct: 100.0,
+            resets_at: until,
+        }),
+    }
+    AgentQuota {
+        host: host.into(),
+        kind: "agy".into(),
+        windows,
+        plan: old.and_then(|q| q.plan.clone()),
+        exhausted: true,
+        read_at,
+    }
+}
+
+/// agy has no harness hooks, but its `--log-file` is the program's own structured output. Read
+/// only bytes appended since the last pass; a line saying `Individual quota reached` becomes the
+/// same `quota` signal a hook would write, and `stuck` acts on it in this loop's next step.
+pub async fn agy_logs(host: &Host, state: &State, logs: &mut AgyLogs) {
+    use std::io::{Read, Seek, SeekFrom};
+    let now = Utc::now();
+    logs.offsets.retain(|id, _| state.agents.contains_key(id));
+    logs.reported.retain(|id, _| state.agents.contains_key(id));
+    for (id, a) in &state.agents {
+        if a.host != host.cfg.host || a.kind.as_deref() != Some("agy") {
+            continue;
+        }
+        let path = crate::host::agy_log_path(&host.cfg.data_dir, crate::host::short(id));
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let Ok(len) = file.metadata().map(|m| m.len()) else {
+            continue;
+        };
+        let offset = logs.offsets.get(id).copied().unwrap_or(0).min(len);
+        if offset == len {
+            continue;
+        }
+        if file.seek(SeekFrom::Start(offset)).is_err() {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        if file.read_to_end(&mut bytes).is_err() {
+            continue;
+        }
+        // Only complete lines are evidence: a final line still being written keeps its bytes for
+        // the next pass, when the reset duration it ends with may have arrived.
+        let complete = if bytes.last() == Some(&b'\n') {
+            bytes.len()
+        } else {
+            match bytes.iter().rposition(|b| *b == b'\n') {
+                Some(p) => p + 1,
+                None => continue,
+            }
+        };
+        let next_offset = offset + complete as u64;
+        // Repeated executor retries can print the line every few seconds. One signal per ten
+        // minutes is enough; a newer `prompt`/`turn_end` does not exist for agy.
+        let deduped = logs
+            .reported
+            .get(id)
+            .is_some_and(|at| now - *at < Duration::minutes(10));
+        let mut consumed = true;
+        if !deduped {
+            let text = String::from_utf8_lossy(&bytes[..complete]);
+            for line in text.lines() {
+                let Some(detail) = agy_quota_line(line) else {
+                    continue;
+                };
+                let at = agy_line_time(line, now).unwrap_or(now);
+                let wait = retry_in(detail);
+                // A reread after a restart is evidence only while the outage it names still lives.
+                // A line that names no reset is evidence only fresh: it may be a retry of a stop
+                // the fleet already handled.
+                let live = wait.is_some_and(|wait| at + wait > now)
+                    || (wait.is_none() && now - at <= Duration::minutes(10));
+                if !live {
+                    continue;
+                }
+                let detail: String = detail.chars().take(240).collect();
+                if self_publish_signal(host, id, &detail).await {
+                    logs.reported.insert(id.clone(), now);
+                    // The account-level row follows the line at once: a spawn in the minutes before
+                    // the next `/usage` probe must not read the pre-cap remainder as headroom.
+                    let until = wait.map(|wait| at + wait);
+                    let quota = agy_capped_quota(state, &a.host, until, now);
+                    host.publish(host.presence(Known::AgentQuota(quota))).await;
+                } else {
+                    // A signal that never reached the log must not be consumed with the bytes:
+                    // the next pass rereads them and tries the publish again.
+                    consumed = false;
+                }
+                break;
+            }
+        }
+        if consumed {
+            logs.offsets.insert(id.clone(), next_offset);
+        }
+    }
+}
+
+async fn self_publish_signal(host: &Host, id: &str, detail: &str) -> bool {
+    host.publish(host.presence(Known::AgentSignal(AgentSignal {
+        agent: id.to_string(),
+        program: "agy".into(),
+        signal: "quota".into(),
+        detail: Some(detail.to_string()),
+    })))
+    .await
+}
+
 /// `minute` precision is enough for `until`: a countdown re-parses to the same instant.
 fn minute(t: Option<DateTime<Utc>>) -> Option<i64> {
     t.map(|t| t.timestamp() / 60)
@@ -769,7 +1015,8 @@ fn minute(t: Option<DateTime<Utc>>) -> Option<i64> {
 
 /// The `on_quota` profile `id` may be handed to, when this host can use it: never a profile
 /// whose kind is the agent's own — a haiku shares the claude account, so a claude agent is
-/// never handed to it here — or one out on this host. `None` while a replacement is open.
+/// never handed to it here — or one spawn routing refuses for quota or login. `None` while a
+/// replacement is open.
 pub fn on_quota(host: &Host, s: &State, id: &str, now: DateTime<Utc>) -> Option<String> {
     if crate::spawn::replacement_open(s, id) {
         return None;
@@ -786,9 +1033,7 @@ pub fn on_quota(host: &Host, s: &State, id: &str, now: DateTime<Utc>) -> Option<
         .and_then(|a| a.kind.as_deref())
         .unwrap_or(&prof.kind);
     if target.kind == mine
-        || s.quotas
-            .get(&format!("{}:{}", host.cfg.host, target.kind))
-            .is_some_and(|q| q.exhausted_at(now))
+        || crate::spawn::quota_block_reason(s, &host.cfg.host, &target.kind, now).is_some()
     {
         return None;
     }
@@ -833,16 +1078,12 @@ pub async fn check(
     // decide the cause or drive an action.
     let hint = stuck_cause(a.kind.as_deref(), &screen, quota, now);
     let mut cause = cause_of(s, id, a, signal_cause(s, id, a, now));
-    // A quota cause takes `until` from the spent window's `resets_at`.
-    if cause.kind == StuckCause::Quota && cause.until.is_none() {
-        cause.until = quota.and_then(|q| {
-            q.windows
-                .iter()
-                .filter(|w| w.used_pct >= 100.0)
-                .filter_map(|w| w.resets_at)
-                .filter(|r| *r > now)
-                .min()
-        });
+    // A quota cause takes `until` from the spent window's `resets_at` when there is one: the
+    // account row is absolute, while a signal detail is only the countdown as first read.
+    if cause.kind == StuckCause::Quota
+        && let Some(spent) = spent_reset(a.kind.as_deref(), quota, now)
+    {
+        cause.until = Some(spent);
     }
     // The deadline is first-seen: while the cause stands, `s.stuck`'s `until` wins — a
     // recomputed countdown would republish `agent.stuck` every pass and push the wait out
@@ -873,7 +1114,17 @@ pub async fn check(
         || (cause.kind == StuckCause::Quota && crate::spawn::replacement_open(s, id));
     // A grace stretch: the cause is classified and recorded from the first pass, but the
     // host acts or tells only once the agent has sat in this state for --stall-min.
-    if closed || busy || now - a.since < Duration::minutes(host.cfg.stall_min as i64) {
+    // agy's quota line is the program's own final answer for the turn: unlike a screen hint,
+    // waiting out the usual stall grace only leaves the issue parked.
+    let immediate = cause.kind == StuckCause::Quota
+        && a.kind.as_deref() == Some("agy")
+        && s.signals
+            .get(id)
+            .is_some_and(|sig| sig.signal == "quota" && a.worked.is_none_or(|w| sig.since >= w));
+    if closed
+        || busy
+        || (!immediate && now - a.since < Duration::minutes(host.cfg.stall_min as i64))
+    {
         return Some((cause, tail));
     }
     let handoff = (cause.kind == StuckCause::Quota)
@@ -1044,6 +1295,51 @@ mod tests {
 
     fn kind(c: Option<Cause>) -> Option<StuckCause> {
         c.map(|c| c.kind)
+    }
+
+    #[test]
+    fn retry_in_reads_compound_durations() {
+        assert_eq!(
+            retry_in("RESOURCE_EXHAUSTED: Individual quota reached. Resets in 4h2m29s."),
+            Some(Duration::hours(4) + Duration::minutes(2) + Duration::seconds(29))
+        );
+        assert_eq!(
+            retry_in("rate limit, retry after 30s"),
+            Some(Duration::seconds(30))
+        );
+        assert_eq!(
+            retry_in("quota resets in ~45 minutes"),
+            Some(Duration::minutes(45))
+        );
+        assert_eq!(retry_in("git reset in 3 steps"), None);
+    }
+
+    #[test]
+    fn agy_spent_reset_ignores_the_claude_gpt_buckets() {
+        let now = Utc::now();
+        let near = now + Duration::minutes(10);
+        let far = now + Duration::hours(4);
+        let q = Quota {
+            windows: vec![
+                crate::event::QuotaWindow {
+                    name: "claude/gpt 5h".into(),
+                    used_pct: 100.0,
+                    resets_at: Some(near),
+                },
+                crate::event::QuotaWindow {
+                    name: "gemini 5h".into(),
+                    used_pct: 100.0,
+                    resets_at: Some(far),
+                },
+            ],
+            plan: None,
+            exhausted: true,
+            read_at: now,
+            ts: now,
+            exhausted_since: Some(now),
+        };
+        assert_eq!(spent_reset(Some("agy"), Some(&q), now), Some(far));
+        assert_eq!(spent_reset(Some("devin"), Some(&q), now), Some(near));
     }
 
     #[test]

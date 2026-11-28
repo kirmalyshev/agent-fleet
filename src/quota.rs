@@ -1,6 +1,7 @@
 //! Where the host reads each agent program's usage quota: codex's newest session log, the file
-//! `agent-fleet hook statusline` keeps current for claude, and the devin CLI's cached
-//! `devin auth status`. The I/O is thin; the parsing is pure and tested on fixtures.
+//! `agent-fleet hook statusline` keeps current for claude, the devin CLI's cached
+//! `devin auth status`, and the JSON agy's `/usage` probe prints. The I/O is thin; the parsing is
+//! pure and tested on fixtures.
 
 use std::path::{Path, PathBuf};
 
@@ -92,10 +93,14 @@ fn ts(v: &Value) -> Option<DateTime<Utc>> {
         };
         DateTime::from_timestamp(s, n as u32)
     } else {
-        DateTime::parse_from_rfc3339(v.as_str()?)
-            .ok()
-            .map(|t| t.with_timezone(&Utc))
+        ts_str(v.as_str()?)
     }
+}
+
+fn ts_str(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
 }
 
 // ---------- codex ----------
@@ -181,6 +186,94 @@ fn claude_quota(host: &str, stored: &str) -> Option<AgentQuota> {
         windows,
         plan: None,
         exhausted,
+        read_at,
+    })
+}
+
+// ---------- agy (Antigravity) ----------
+
+/// agy's bucket name in a QUOTA row: the model group and its window. The names are part of the
+/// spawn policy's vocabulary, so keep them stable.
+fn agy_window_name(group: &str, window: &str) -> String {
+    let group = if group.eq_ignore_ascii_case("Gemini Models") {
+        "gemini"
+    } else if group.eq_ignore_ascii_case("Claude and GPT models") {
+        "claude/gpt"
+    } else {
+        group
+    };
+    let window = match window {
+        "weekly" => "week",
+        w => w,
+    };
+    format!("{} {}", group.to_lowercase(), window)
+}
+
+/// Parse `agy -p "/usage" --output-format json`: a successful, authenticated read is the rows
+/// under `command.groups`. An authentication failure is still information: it yields an exhausted
+/// row with no windows, so the views and spawn routing can say the host is not logged in. Epoch
+/// resets mean a bucket has not started yet and are omitted.
+pub fn agy_output(host: &str, output: &str, read_at: DateTime<Utc>) -> Option<AgentQuota> {
+    if output.contains("Authentication required") {
+        return Some(AgentQuota {
+            host: host.into(),
+            kind: "agy".into(),
+            windows: Vec::new(),
+            plan: None,
+            exhausted: true,
+            read_at,
+        });
+    }
+    let v: Value = serde_json::from_str(output).ok()?;
+    if v["status"] != "SUCCESS" {
+        return None;
+    }
+    let mut windows = Vec::new();
+    if let Some(groups) = v["command"]["data"]["groups"].as_array() {
+        for g in groups {
+            let group = g["name"].as_str()?;
+            for b in g["buckets"].as_array()? {
+                let remaining = b["remaining_fraction"].as_f64()?;
+                let resets_at = ts(&b["reset_time"]).filter(|t| t.timestamp() > 0);
+                windows.push(QuotaWindow {
+                    name: agy_window_name(group, b["window"].as_str()?),
+                    used_pct: (100.0 - remaining * 100.0).clamp(0.0, 100.0),
+                    resets_at,
+                });
+            }
+        }
+    }
+    if windows.is_empty()
+        && let Some(response) = v["response"].as_str()
+    {
+        // Older agy builds print only the TSV rendering:
+        // `group <tab> bucket <tab> NN% <tab> reset-at`.
+        for line in response.lines().filter(|l| !l.trim().is_empty()) {
+            let mut fields = line.split('\t');
+            let group = fields.next()?;
+            let bucket = fields.next()?;
+            let remaining: f64 = fields.next()?.trim_end_matches('%').parse().ok()?;
+            let resets_at = fields.next().and_then(ts_str).filter(|t| t.timestamp() > 0);
+            let window = if bucket.contains("Weekly") {
+                "week"
+            } else if bucket.contains("Five Hour") {
+                "5h"
+            } else {
+                continue;
+            };
+            windows.push(QuotaWindow {
+                name: agy_window_name(group, window),
+                used_pct: (100.0 - remaining).clamp(0.0, 100.0),
+                resets_at,
+            });
+        }
+    }
+    (!windows.is_empty()).then(|| AgentQuota {
+        host: host.into(),
+        kind: "agy".into(),
+        exhausted: windows.iter().any(|w| w.used_pct >= 100.0),
+        windows,
+        plan: None,
         read_at,
     })
 }
@@ -522,6 +615,66 @@ mod tests {
         assert!(claude_quota("h", &full).unwrap().exhausted);
         // No rate_limits key: an API-key user has no quota to report.
         assert!(claude_quota("h", "{\"read_at\":1}").is_none());
+    }
+
+    #[test]
+    fn agy_reads_every_group_and_marks_logged_out_hosts() {
+        let read_at = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let out = json!({
+            "status": "SUCCESS",
+            "command": {"data": {"groups": [
+                {"name": "Gemini Models", "buckets": [
+                    {"window": "weekly", "remaining_fraction": 0.4, "reset_time": "2027-01-03T09:28:03Z"},
+                    {"window": "5h", "remaining_fraction": 1, "reset_time": "1970-01-01T00:00:00Z"}
+                ]},
+                {"name": "Claude and GPT models", "buckets": [
+                    {"window": "weekly", "remaining_fraction": 1, "reset_time": "1970-01-01T00:00:00Z"},
+                    {"window": "5h", "remaining_fraction": 0, "reset_time": "2027-01-01T12:00:00Z"}
+                ]}
+            ]}}
+        }).to_string();
+        let q = agy_output("h", &out, read_at).unwrap();
+        assert_eq!(q.kind, "agy");
+        assert_eq!(
+            q.windows
+                .iter()
+                .map(|w| (w.name.as_str(), w.used_pct as u32, w.resets_at.is_some()))
+                .collect::<Vec<_>>(),
+            [
+                ("gemini week", 60, true),
+                ("gemini 5h", 0, false),
+                ("claude/gpt week", 0, false),
+                ("claude/gpt 5h", 100, true)
+            ]
+        );
+        assert!(q.exhausted);
+        let q = agy_output(
+            "h",
+            "Authentication required. Please visit the URL",
+            read_at,
+        )
+        .unwrap();
+        assert!(q.exhausted && q.windows.is_empty());
+        assert!(agy_output("h", "{}", read_at).is_none());
+
+        // Older builds carry only the TSV rendering, not the structured command object.
+        let old = json!({
+            "status": "SUCCESS",
+            "response": "Gemini Models\tWeekly Limit Remaining\t43%\t2027-01-03T09:28:03Z\nGemini Models\tFive Hour Limit Remaining\t100%\t1970-01-01T00:00:00Z\nClaude and GPT models\tFive Hour Limit Remaining\t0%\t2027-01-01T12:00:00Z\n"
+        })
+        .to_string();
+        let q = agy_output("h", &old, read_at).unwrap();
+        assert_eq!(
+            q.windows
+                .iter()
+                .map(|w| (w.name.as_str(), w.used_pct as u32, w.resets_at.is_some()))
+                .collect::<Vec<_>>(),
+            [
+                ("gemini week", 57, true),
+                ("gemini 5h", 0, false),
+                ("claude/gpt 5h", 100, true)
+            ]
+        );
     }
 
     #[test]

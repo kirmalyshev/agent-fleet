@@ -35,6 +35,8 @@ pub struct Row {
     pub fixups: usize,
     /// `BLOCKED` reports.
     pub blocks: usize,
+    /// Times the agent stopped with `agent.stuck` cause `quota`.
+    pub quota_stops: usize,
     /// Percent of spawns not handed off to another agent.
     pub no_handoff_pct: Option<f64>,
     /// IDLE, STALLED, HUNG, stuck and UNREAD events per agent-hour; `None` with no hours.
@@ -78,6 +80,7 @@ struct Run {
     done: Option<DateTime<Utc>>,
     fixes: usize,
     blocks: usize,
+    quota_stops: usize,
     gate_reds: usize,
     handed_off: bool,
     interventions: usize,
@@ -150,6 +153,7 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
                     done: None,
                     fixes: 0,
                     blocks: 0,
+                    quota_stops: 0,
                     gate_reds: 0,
                     handed_off: false,
                     interventions: 0,
@@ -195,6 +199,7 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
             {
                 if let Some(i) = resolve(&s.agent) {
                     runs[i].interventions += 1;
+                    runs[i].quota_stops += usize::from(s.cause == Some(StuckCause::Quota));
                 }
             }
             Known::ProcessHung(h) => {
@@ -370,6 +375,7 @@ pub fn compute(events: &[Event], now: DateTime<Utc>, window: Duration, by: By) -
                 },
                 fixups: started.iter().map(|(i, _)| fixups[*i]).sum(),
                 blocks: started.iter().map(|(_, r)| r.blocks).sum(),
+                quota_stops: started.iter().map(|(_, r)| r.quota_stops).sum(),
                 no_handoff_pct: (n > 0)
                     .then(|| 100.0 * per(started.iter().filter(|(_, r)| !r.handed_off).count(), n)),
                 interventions_per_hour: (hours > 0.0).then(|| {
@@ -447,11 +453,12 @@ pub fn render(s: &Scorecard) -> String {
         );
         let _ = writeln!(
             out,
-            "  quality      fix rounds {} | gate reds/merge {} | fix-up PRs {} | BLOCKED {}",
+            "  quality      fix rounds {} | gate reds/merge {} | fix-up PRs {} | BLOCKED {} | quota stops {}",
             opt(r.fix_rounds, |v| format!("{v:.1}")),
             opt(r.gate_reds, |v| format!("{v:.2}")),
             r.fixups,
-            r.blocks
+            r.blocks,
+            r.quota_stops
         );
         let _ = writeln!(
             out,
@@ -463,7 +470,8 @@ pub fn render(s: &Scorecard) -> String {
     }
     out.push_str(
         "\nlegend: speed = minutes from spawn to the first OPEN / MERGED|DONE tell. fix rounds = FIX tells per\n\
-         spawn (a proxy: PR verdicts are not in the log). BLOCKED = BLOCKED tells. gate reds = failed `merge.requested` results per spawn that opened a PR (a local merge writes no such event). fix-up = a newer spawn on the same issue\n\
+         spawn (a proxy: PR verdicts are not in the log). BLOCKED = BLOCKED tells. quota stops = `agent.stuck` records with cause quota.\n\
+         gate reds = failed `merge.requested` results per spawn that opened a PR (a local merge writes no such event). fix-up = a newer spawn on the same issue\n\
          within 7d of a finish. interventions = IDLE, STALLED, UNREAD, HUNG and stuck (not waiting, held or resource) events per agent-hour.\n\
          quota = points the program's busiest quota window rose over the agent's life (shared by concurrent\n\
          agents, a rough proxy; ? = no data; reset = agents whose quota window reset mid-life, left out). Agent-hours run from agent.up to agent.down, else to the newest event about the agent. Failed and unconfirmed spawns (no result, never up) count only in their own columns.\n\
@@ -726,6 +734,10 @@ mod tests {
         assert!(
             (r.interventions_per_hour.unwrap() - 5.0 / (154.0 / 60.0)).abs() < 1e-6,
             "{r:?}"
+        );
+        assert_eq!(
+            r.quota_stops, 1,
+            "the quota stuck record is counted per profile"
         );
     }
 

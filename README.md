@@ -484,7 +484,9 @@ branch, so a PR cannot change the rules that route it).
 - A rule's `match` words are compared with the issue's title and labels (`label:x` matches only a label named `x`);
   `--scope` narrows the work and never picks the worker. A rule
   with no `match` is the default and comes last. A rule's `host` says where the agent runs, for
-  work that needs a particular machine (a simulator, say).
+  work that needs a particular machine (a simulator, say). A profile can pin its own `host`
+  (useful when only one machine has the program or login); the pin is strict unless an explicit
+  `--host` overrides it.
 - A profile is one agent program with its arguments, prefix and `cap` (live agents per
   repository). Two profiles can run the same program with different models, such as `claude`
   with `--model opus`.
@@ -519,7 +521,8 @@ get their own action: a message to the lead, a handoff to the profile's `on_quot
 `continue` once a rate limit lifts. Actions that touch an agent (the handoff, the `continue`)
 run only under `host --stuck-act`; without it the host records the cause and tells the lead what
 it would have done. An agent that never reached `working` after `handoff_min` minutes gets one
-message to its lead. Nothing acts before the state has lasted `--stall-min`, and each cause
+message to its lead. Nothing acts before the state has lasted `--stall-min` (an agy quota stop,
+read from the program's own log, is the one exception), and each cause
 acts at most once per episode. The table of
 causes and actions is in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
