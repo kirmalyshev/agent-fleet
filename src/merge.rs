@@ -546,13 +546,41 @@ async fn pins(a: &Ask<'_>, base: &str, say: &(dyn Fn(String) + Sync)) -> Result<
     Ok(())
 }
 
+/// Environment that would point git at another repository or inject configuration. SSH and
+/// credential helpers stay inherited; these never do.
+fn scrub_git_env(cmd: &mut tokio::process::Command) {
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+    ] {
+        cmd.env_remove(key);
+    }
+    for (key, _) in std::env::vars_os() {
+        let key = key.to_string_lossy();
+        if key.starts_with("GIT_CONFIG_KEY_") || key.starts_with("GIT_CONFIG_VALUE_") {
+            cmd.env_remove(key.as_ref());
+        }
+    }
+}
+
 /// `git -C dir args`: Ok(stdout) on exit 0, Err(stderr) otherwise.
 async fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = tokio::process::Command::new("git")
-        .arg("-C")
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("-C")
         .arg(dir)
         .args(args)
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
+    scrub_git_env(&mut cmd);
+    let out = cmd
         .kill_on_drop(true)
         .output()
         .await
@@ -565,10 +593,106 @@ async fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// The checkout's gate is one the base branch held: its HEAD is on `origin/<base>` (freshly
-/// fetched) and the script has no local changes. A PR's own worktree is not, so the PR cannot
-/// rewrite the gate that judges it. Ok is the checkout's short HEAD.
-async fn gate_from_base(checkout: &Path, base: &str, gate: &str) -> Result<String> {
+/// Where a gate runs: the connected checkout when it is itself on the base branch, else a
+/// scratch worktree detached at `origin/<base>`. The scratch tree is what makes a non-main base
+/// independent of what the connected checkout happens to hold.
+enum GateTree {
+    Checkout,
+    Scratch(PathBuf),
+}
+
+impl GateTree {
+    fn path<'a>(&'a self, checkout: &'a Path) -> &'a Path {
+        match self {
+            Self::Checkout => checkout,
+            Self::Scratch(path) => path,
+        }
+    }
+
+    /// Remove the scratch tree and, when git cannot, its administrative entry too. The entry is
+    /// unique to this run, so deleting it directly is safe; `worktree prune` would keep one fresh
+    /// entry for months. Err names what is left, because a leftover base tree must never be silent.
+    async fn cleanup(self, checkout: &Path) -> Result<(), String> {
+        let Self::Scratch(path) = self else {
+            return Ok(());
+        };
+        let name = path.display().to_string();
+        if git(checkout, &["worktree", "remove", "--force", &name])
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        let mut problems = Vec::new();
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => problems.push(format!("remove {}: {e}", path.display())),
+        }
+        if path.exists() {
+            problems.push(format!("{} still exists", path.display()));
+        }
+        let common = git(
+            checkout,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .await;
+        match (common, path.file_name()) {
+            (Ok(common), Some(leaf)) => {
+                let admin = PathBuf::from(common).join("worktrees").join(leaf);
+                if admin.exists() {
+                    match tokio::fs::remove_dir_all(&admin).await {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => problems.push(format!("remove {}: {e}", admin.display())),
+                    }
+                    if admin.exists() {
+                        problems.push(format!("{} still exists", admin.display()));
+                    }
+                }
+            }
+            (Err(e), _) => problems.push(format!("read the git common dir: {e}")),
+            (_, None) => problems.push(format!("{} has no leaf name", path.display())),
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("; "))
+        }
+    }
+}
+
+/// Every `merge-gate.base.*` worktree still registered once the repository lock is held is a
+/// crashed gate's, never a live one's. Remove it before making this run's own.
+async fn reap_scratch(checkout: &Path) -> Result<()> {
+    let list = git(checkout, &["worktree", "list", "--porcelain"])
+        .await
+        .map_err(|e| anyhow!("git worktree list in {}: {e}", checkout.display()))?;
+    let mut paths = Vec::new();
+    for line in list.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            paths.push(PathBuf::from(path));
+        }
+    }
+    for path in paths {
+        let scratch = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("merge-gate.base."));
+        if scratch {
+            GateTree::Scratch(path.clone())
+                .cleanup(checkout)
+                .await
+                .map_err(|e| anyhow!("a previous merge gate's {} is left: {e}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// The gate tree for `base`: the checkout when its own branch is `base`, with the same
+/// provenance checks as before; otherwise a fresh detached worktree of `origin/<base>`, clean
+/// by construction. Ok is the tree and the short commit the gate script comes from.
+async fn gate_tree(checkout: &Path, base: &str, gate: &str) -> Result<(GateTree, String)> {
     let remote = format!("refs/remotes/origin/{base}");
     git(
         checkout,
@@ -581,6 +705,35 @@ async fn gate_from_base(checkout: &Path, base: &str, gate: &str) -> Result<Strin
     )
     .await
     .map_err(|e| anyhow!("git fetch origin {base} in {}: {e}", checkout.display()))?;
+    reap_scratch(checkout).await?;
+    let branch = git(checkout, &["symbolic-ref", "-q", "--short", "HEAD"])
+        .await
+        .ok()
+        .filter(|b| !b.is_empty());
+    if branch.as_deref() != Some(base) {
+        let parent = checkout.parent().unwrap_or_else(|| Path::new("/"));
+        let path = parent.join(format!(
+            "merge-gate.base.{}",
+            ulid::Ulid::new().to_string().to_lowercase()
+        ));
+        let name = path.display().to_string();
+        if let Err(e) = git(checkout, &["worktree", "add", "--detach", &name, &remote]).await {
+            let _ = tokio::fs::remove_dir_all(&path).await;
+            bail!("git worktree add {remote} in {}: {e}", checkout.display());
+        }
+        let at = match git(&path, &["rev-parse", "--short", "HEAD"]).await {
+            Ok(at) => at,
+            Err(e) => {
+                let cleanup = GateTree::Scratch(path).cleanup(checkout).await;
+                if let Err(c) = cleanup {
+                    bail!("the detached base worktree has no HEAD: {e}; cleanup: {c}");
+                }
+                bail!("the detached base worktree has no HEAD: {e}");
+            }
+        };
+        return Ok((GateTree::Scratch(path), at));
+    }
+
     let at = git(checkout, &["rev-parse", "--short", "HEAD"])
         .await
         .map_err(|e| anyhow!("{} has no HEAD: {e}", checkout.display()))?;
@@ -602,11 +755,56 @@ async fn gate_from_base(checkout: &Path, base: &str, gate: &str) -> Result<Strin
             checkout.display()
         );
     }
-    Ok(at)
+    Ok((GateTree::Checkout, at))
 }
 
-/// The repository's gate, `<checkout>/<gate> <head>`, in the checkout as it is now, once
-/// `gate_from_base` holds.
+/// The gate process itself, in its own process group. The caller owns any worktree cleanup,
+/// so an error here cannot skip it.
+async fn gate_output(
+    script: &Path,
+    cwd: &Path,
+    gate: &str,
+    head: &str,
+    merge_pr: &str,
+    allow_pin_rewind: Option<&str>,
+    pr: u64,
+) -> Result<std::process::Output> {
+    let mut cmd = tokio::process::Command::new(script);
+    cmd.arg(head)
+        .current_dir(cwd)
+        .env("AGENT_FLEET_MERGE_PR", merge_pr)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Its own group, so a timeout stops what it started (a test run) too.
+        .process_group(0)
+        .kill_on_drop(true);
+    if let Some(r) = allow_pin_rewind {
+        cmd.env("AGENT_FLEET_ALLOW_PIN_REWIND", r);
+    }
+    scrub_git_env(&mut cmd);
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("the merge gate {gate} did not start"))?;
+    let pgid = child.id();
+    match tokio::time::timeout(GATE_MAX, child.wait_with_output()).await {
+        Ok(out) => out.context("the merge gate"),
+        Err(_) => {
+            if let Some(g) = pgid {
+                // SAFETY: killpg only sends a signal.
+                unsafe { libc::killpg(g as libc::pid_t, libc::SIGKILL) };
+            }
+            bail!(
+                "#{}: the merge gate timed out (60 min); its process group was killed",
+                pr
+            );
+        }
+    }
+}
+
+/// The repository's gate, `<base tree>/<gate> <head>`. A checkout already on the base branch is
+/// proven and used in place; any other checkout only lends its git objects to a detached
+/// worktree of the base, so neither its branch nor its local edits can judge the PR.
 async fn run_gate(
     a: &Ask<'_>,
     gate: &str,
@@ -615,59 +813,58 @@ async fn run_gate(
     say: &(dyn Fn(String) + Sync),
 ) -> Result<()> {
     let checkout = (a.checkout)()?;
+    let checkout = checkout
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", checkout.display()))?;
     // One gate at a time per repository on this machine, the checkout read only once it is
     // held: gates share the checkout, and one that moved it would otherwise hand this one a
     // tree (and a gate script) nobody checked.
-    let common = git(&checkout, &["rev-parse", "--git-common-dir"])
-        .await
-        .map_err(|e| anyhow!("git rev-parse in {}: {e}", checkout.display()))?;
-    let lock = checkout.join(common).join("agent-fleet-merge.lock");
+    let common = git(
+        &checkout,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .await
+    .map_err(|e| anyhow!("git rev-parse in {}: {e}", checkout.display()))?;
+    let lock = PathBuf::from(common).join("agent-fleet-merge.lock");
     let _held = crate::retire::lock_file(&lock, GATE_MAX, "another merge gate").await?;
-    let script = checkout.join(gate);
-    if !script.is_file() {
-        bail!(
-            "#{}: the merge gate {gate} is not in {}",
-            a.pr,
-            checkout.display()
-        );
-    }
-    let at = gate_from_base(&checkout, base, gate)
+    let (tree, at) = gate_tree(&checkout, base, gate)
         .await
         .map_err(|e| e.context(format!("#{}: refused", a.pr)))?;
+    let gate_root = tree.path(&checkout).to_path_buf();
+    let script = gate_root.join(gate);
+    if !script.is_file() {
+        let missing = format!(
+            "#{}: the merge gate {gate} is not in {}",
+            a.pr,
+            gate_root.display()
+        );
+        if let Err(c) = tree.cleanup(&checkout).await {
+            bail!("{missing}; base worktree cleanup: {c}");
+        }
+        bail!(missing);
+    }
     say(format!(
         "#{}: merge gate {gate} at {head} (in {}, at {at})",
         a.pr,
-        checkout.display()
+        gate_root.display()
     ));
-    let mut cmd = tokio::process::Command::new(&script);
-    cmd.arg(head)
-        .current_dir(&checkout)
-        .env("AGENT_FLEET_MERGE_PR", format!("{}#{}", a.repo, a.pr))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        // Its own group, so a timeout stops what it started (a test run) too.
-        .process_group(0)
-        .kill_on_drop(true);
-    if let Some(r) = a.allow_pin_rewind {
-        cmd.env("AGENT_FLEET_ALLOW_PIN_REWIND", r);
-    }
-    let child = cmd
-        .spawn()
-        .with_context(|| format!("the merge gate {gate} did not start"))?;
-    let pgid = child.id();
-    let out = match tokio::time::timeout(GATE_MAX, child.wait_with_output()).await {
-        Ok(out) => out.context("the merge gate")?,
-        Err(_) => {
-            if let Some(g) = pgid {
-                // SAFETY: killpg only sends a signal.
-                unsafe { libc::killpg(g as libc::pid_t, libc::SIGKILL) };
-            }
-            bail!(
-                "#{}: the merge gate timed out (60 min); its process group was killed",
-                a.pr
-            );
-        }
+    let merge_pr = format!("{}#{}", a.repo, a.pr);
+    let out = gate_output(
+        &script,
+        &gate_root,
+        gate,
+        head,
+        &merge_pr,
+        a.allow_pin_rewind,
+        a.pr,
+    )
+    .await;
+    let cleanup = tree.cleanup(&checkout).await;
+    let out = match (out, cleanup) {
+        (Err(gate), Err(c)) => bail!("{gate:#}; base worktree cleanup: {c}"),
+        (Err(gate), Ok(())) => return Err(gate),
+        (Ok(_), Err(c)) => bail!("#{}: base worktree cleanup: {c}", a.pr),
+        (Ok(out), Ok(())) => out,
     };
     let said = format!(
         "{}{}",
@@ -1047,17 +1244,18 @@ mod tests {
                 r#"#!/bin/sh
 d={d}
 echo "$*" >> $d/calls
+base=$(cat $d/base 2>/dev/null || echo main)
 case "$*" in
   "pr view 7 -R o/r --json state,headRefOid,baseRefName,mergeable,mergeCommit")
     h=$(cat $d/head); [ -f $d/head2 ] && [ -f $d/gated ] && h=$(cat $d/head2)
     st=OPEN; mc=null; [ -f $d/merged ] && {{ st=MERGED; mc='{{"oid":"m1"}}'; }}
-    echo "{{\"state\":\"$st\",\"headRefOid\":\"$h\",\"baseRefName\":\"main\",\"mergeable\":\"MERGEABLE\",\"mergeCommit\":$mc}}" ;;
-  "api -H Accept: application/vnd.github.raw+json repos/o/r/contents/.agent-fleet/fleet.toml?ref=main")
+    echo "{{\"state\":\"$st\",\"headRefOid\":\"$h\",\"baseRefName\":\"$base\",\"mergeable\":\"MERGEABLE\",\"mergeCommit\":$mc}}" ;;
+  "api -H Accept: application/vnd.github.raw+json repos/o/r/contents/.agent-fleet/fleet.toml?ref="*)
     [ -f $d/config_err ] && {{ cat $d/config_err >&2; exit 1; }}
     [ -f $d/fleet.toml ] && cat $d/fleet.toml || {{ echo "gh: Not Found (HTTP 404)" >&2; exit 1; }} ;;
   "api --paginate repos/o/r/issues/7/comments"*) cat $d/comment ;;
   "api --paginate repos/o/r/pulls/7/files"*) cat $d/files 2>/dev/null; true ;;
-  "api repos/o/r/contents/sub?ref=main"*) cat $d/sub ;;
+  "api repos/o/r/contents/sub?ref="*) cat $d/sub ;;
   "api repos/o/sub/compare/"*) [ -f $d/compare ] && cat $d/compare || {{ echo "gh: No commit found (HTTP 404)" >&2; exit 1; }} ;;
   "pr checks 7 -R o/r --required --json name,bucket") cat $d/checks; exit $(cat $d/checks_rc 2>/dev/null || echo 0) ;;
   "pr merge 7"*) touch $d/merged; echo merged ;;
@@ -1545,7 +1743,8 @@ esac
         assert!(format!("{:#}", r.unwrap_err()).contains("last comment"));
         assert!(!f.calls().contains("pr merge"));
 
-        // The PR's own branch rewrote the gate: a checkout off the base branch does not judge.
+        // The PR's own branch rewrote the gate: a checkout off the base branch still does not
+        // judge. The merge runs the base branch's gate from a detached worktree instead.
         let f = gated(0);
         let co = f.dir.path().join("checkout");
         git(&co, &["checkout", "-q", "-b", "pr"]);
@@ -1562,9 +1761,17 @@ esac
                 "pass",
             ],
         );
-        let (r, _) = f.run(H, None).await;
-        assert!(format!("{:#}", r.unwrap_err()).contains("not on origin/main"));
-        assert!(!f.calls().contains("pr merge"));
+        let (r, said) = f.run(H, None).await;
+        assert!(r.is_ok(), "{r:?}");
+        assert!(
+            f.dir.path().join("gated").exists(),
+            "the base gate did not run"
+        );
+        assert!(
+            said.iter().any(|l| l == &format!("gate {H} o/r#7")),
+            "{said:?}"
+        );
+        assert!(f.calls().contains("pr merge"));
 
         let f = gated(0);
         std::fs::write(f.dir.path().join("checkout/gate.sh"), "#!/bin/sh\nexit 0\n").unwrap();
@@ -1573,7 +1780,121 @@ esac
     }
 
     #[tokio::test]
-    async fn a_gate_waiting_on_another_reads_the_checkout_only_once_it_holds_the_lock() {
+    async fn git_children_do_not_inherit_repository_environment() {
+        const CHILD: &str = "AGENT_FLEET_TEST_GIT_ENV_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .arg("merge::tests::git_children_do_not_inherit_repository_environment")
+                .arg("--exact")
+                .env(CHILD, "1")
+                .env("GIT_DIR", "elsewhere")
+                .env("GIT_WORK_TREE", "elsewhere")
+                .env("GIT_INDEX_FILE", "elsewhere")
+                .env("GIT_COMMON_DIR", "elsewhere")
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_7", "core.hooksPath")
+                .env("GIT_CONFIG_VALUE_7", "elsewhere")
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "child: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("[ -z \"$GIT_DIR\" ] && [ -z \"$GIT_WORK_TREE\" ] && [ -z \"$GIT_INDEX_FILE\" ] && [ -z \"$GIT_COMMON_DIR\" ] && [ -z \"$GIT_CONFIG_COUNT\" ] && [ -z \"$GIT_CONFIG_KEY_7\" ] && [ -z \"$GIT_CONFIG_VALUE_7\" ]");
+        scrub_git_env(&mut cmd);
+        assert!(cmd.status().await.unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn a_non_main_base_is_judged_from_a_detached_base_worktree() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fake::new();
+        f.put("fleet.toml", "[merge]\ngate = \"gate.sh\"\n");
+        f.put("base", "feat/calai-meals");
+        // Canonical: a macOS tempdir is /var/folders/… while a shell's $PWD resolves /private/var.
+        let dir = &f.dir.path().canonicalize().unwrap();
+        let co = dir.join("checkout");
+        std::fs::create_dir(&co).unwrap();
+        sh(dir, &["init", "-q", "--bare", "origin"]);
+        sh(&co, &["init", "-q", "-b", "main"]);
+        sh(&co, &["remote", "add", "origin", "../origin"]);
+        std::fs::write(co.join("gate.sh"), "#!/bin/sh\nexit 3\n").unwrap();
+        std::fs::set_permissions(co.join("gate.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        sh(&co, &["add", "gate.sh"]);
+        sh(&co, &["commit", "-qm", "main gate"]);
+        sh(&co, &["push", "-q", "origin", "main"]);
+        sh(&co, &["checkout", "-q", "-b", "feat/calai-meals"]);
+        std::fs::write(
+            co.join("gate.sh"),
+            format!(
+                "#!/bin/sh\ngit worktree lock .\necho \"gate $1 $PWD\"\nprintf %s \"$PWD\" > {d}/gate-pwd\nexit 0\n",
+                d = dir.display()
+            ),
+        )
+        .unwrap();
+        sh(&co, &["add", "gate.sh"]);
+        sh(&co, &["commit", "-qm", "feat gate"]);
+        sh(&co, &["push", "-q", "origin", "feat/calai-meals"]);
+        sh(&co, &["checkout", "-q", "main"]);
+        let stale = dir.join("merge-gate.base.stale");
+        sh(
+            &co,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                stale.to_str().unwrap(),
+                "origin/main",
+            ],
+        );
+        let orphan = dir.join("merge-gate.base.orphan");
+        std::fs::create_dir(&orphan).unwrap();
+
+        let (r, said) = f.run(H, None).await;
+        assert!(r.is_ok(), "{r:?}; said {said:?}");
+        let used = std::fs::read_to_string(dir.join("gate-pwd")).unwrap();
+        assert_ne!(used, co.display().to_string());
+        assert!(
+            used.contains("merge-gate.base."),
+            "the gate ran outside a detached base worktree: {used}"
+        );
+        assert!(
+            said.iter()
+                .any(|l| l.contains("merge gate gate.sh") && l.contains(&used)),
+            "{said:?}"
+        );
+        assert!(
+            !Path::new(&used).exists(),
+            "the base worktree was not cleaned up"
+        );
+        assert!(
+            !sh(&co, &["worktree", "list", "--porcelain"]).contains(&used),
+            "the base worktree is still registered"
+        );
+        assert!(
+            !stale.exists(),
+            "the crashed gate's worktree was not reaped"
+        );
+        assert!(
+            !sh(&co, &["worktree", "list", "--porcelain"]).contains("merge-gate.base.stale"),
+            "the crashed gate's worktree is still registered"
+        );
+        assert!(
+            orphan.exists(),
+            "an unregistered sibling is not this repository's to remove"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_checkout_moved_under_another_gate_still_cannot_inject_its_gate() {
         use std::os::unix::fs::PermissionsExt;
         let f = Fake::new();
         f.put("fleet.toml", "[merge]\ngate = \"gate.sh\"\n");
@@ -1597,7 +1918,8 @@ esac
         git(&["add", "gate.sh"]);
         git(&["commit", "-qm", "gate"]);
         git(&["remote", "add", "origin", co.to_str().unwrap()]);
-        // Another gate holds the lock, and moves the checkout to a PR's branch meanwhile.
+        // Another gate holds the lock, then moves the checkout to a PR branch with a red gate.
+        // The waiting merge must still use origin/main's gate, never that checkout's.
         let lock = co.join(".git/agent-fleet-merge.lock");
         let held = crate::retire::lock_file(&lock, Duration::ZERO, "test")
             .await
@@ -1605,13 +1927,13 @@ esac
         let other = async {
             tokio::time::sleep(Duration::from_millis(500)).await;
             git(&["checkout", "-q", "-b", "pr"]);
-            git(&["commit", "-q", "--allow-empty", "-m", "pr"]);
+            std::fs::write(co.join("gate.sh"), "#!/bin/sh\nexit 1\n").unwrap();
+            git(&["commit", "-qam", "red gate"]);
             drop(held);
         };
         let ((r, _), ()) = tokio::join!(f.run(H, None), other);
-        let e = format!("{:#}", r.unwrap_err());
-        assert!(e.contains("not on origin/main"), "{e}");
-        assert!(!f.calls().contains("pr merge"));
+        assert!(r.is_ok(), "{r:?}");
+        assert!(f.calls().contains("pr merge"));
     }
 
     #[tokio::test]

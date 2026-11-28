@@ -1077,13 +1077,19 @@ approved PR merges, its author's own included. Any failure refuses with nothing 
 6. `mergeable` is not `CONFLICTING` (`UNKNOWN` is read again 5 times, 6 s apart, then let through:
    GitHub refuses a conflicting merge itself).
 7. With a `gate`: this machine's checkout (the connected one, `agent-fleet repo add`, else the
-   current one, or a host's `--repo`, when its `origin` is the repository) must be at a commit on
-   a freshly fetched `origin/<base>` with the script unmodified, so a PR's own branch never
-   judges itself. One gate runs at a time per repository on a machine (a lock in its git common
-   dir, taken before the checkout is read); a gate must leave the checkout where it found it. `<checkout>/<gate> <head sha>` runs there with `AGENT_FLEET_MERGE_PR=<owner/repo>#<pr>`
-   and, when given, `AGENT_FLEET_ALLOW_PIN_REWIND`, in its own process group; exit 0 passes,
-   60 min kills the group. Without a gate: `gh pr checks --required`, waited on while they run
-   (9 min); each must `pass` or be `skipping` and at least one must pass; anything else refuses.
+   current one, or a host's `--repo`, when its `origin` is the repository) is only the source of
+   the repository's objects and locks. When that checkout is itself on `<base>`, it must be at a
+   commit on a freshly fetched `origin/<base>` with the script unmodified. On any other branch
+   (or detached), the gate runs in a fresh detached worktree of `origin/<base>` instead, removed
+   after the run; a `merge-gate.base.*` worktree still registered there once the lock is held is
+   a crashed gate's and is removed first. Either way a PR's own branch never judges itself. One
+   gate runs at a time per repository on a machine (a lock in its git common dir, taken before the
+   checkout is read); a
+   gate must leave the checkout where it found it. `<base tree>/<gate> <head sha>` runs there with
+   `AGENT_FLEET_MERGE_PR=<owner/repo>#<pr>` and, when given, `AGENT_FLEET_ALLOW_PIN_REWIND`, in its
+   own process group; exit 0 passes, 60 min kills the group. Without a gate: `gh pr checks
+   --required`, waited on while they run (9 min); each must `pass` or be `skipping` and at least
+   one must pass; anything else refuses.
 8. The head and the verdict are read again (a push or a later comment during the gate refuses),
    then `gh pr merge --squash --match-head-commit <head>`, never `--admin`, and `merge.done`.
    Not seen `MERGED` within 15 s (a merge queue): reported as issued, `commit` absent.
