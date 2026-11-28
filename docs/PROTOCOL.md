@@ -147,8 +147,9 @@ bucket has not started and are omitted. An authentication failure is a report wi
 `exhausted: true`. Unlike the file/cache reads, a successful agy probe is published even when its
 numbers are unchanged: its `read_at` is the probe time and is the freshness fact spawn routing
 uses. `read_at` stamps the data itself, not the scan, so the views can say how stale the numbers
-are. agy checkpoints its own context, so there is no context-full footer to read, and
-`agy` is a native binary, so `ps` shows `agy`.
+are; a quota event whose `read_at` is older than the folded row does not overwrite it, however
+late the event arrives. agy checkpoints its own context, so there is no context-full footer to
+read, and `agy` is a native binary, so `ps` shows `agy`.
 
 ## Rules the hub enforces
 

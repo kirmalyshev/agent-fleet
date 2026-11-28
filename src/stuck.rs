@@ -51,19 +51,14 @@ fn spent_reset(
         .filter_map(|w| w.resets_at)
         .filter(|r| *r > now);
     if program == Some("agy") {
-        for name in ["gemini 5h", "gemini week"] {
-            if let Some(r) = q
-                .windows
-                .iter()
-                .filter(|w| w.name == name && w.used_pct >= 100.0)
-                .filter_map(|w| w.resets_at)
-                .filter(|r| *r > now)
-                .min()
-            {
-                return Some(r);
-            }
-        }
-        return None;
+        return q
+            .windows
+            .iter()
+            .filter(|w| matches!(w.name.as_str(), "gemini 5h" | "gemini week"))
+            .filter(|w| w.used_pct >= 100.0)
+            .filter_map(|w| w.resets_at)
+            .filter(|r| *r > now)
+            .max();
     }
     spent.min()
 }
@@ -931,7 +926,10 @@ pub async fn agy_logs(host: &Host, state: &State, logs: &mut AgyLogs) {
         let Ok(len) = file.metadata().map(|m| m.len()) else {
             continue;
         };
-        let offset = logs.offsets.get(id).copied().unwrap_or(0).min(len);
+        let previous = logs.offsets.get(id).copied().unwrap_or(0);
+        // A file shorter than the remembered offset was truncated and is being written from
+        // byte zero again; clamping to its new end would skip exactly the lines written since.
+        let offset = if previous > len { 0 } else { previous };
         if offset == len {
             continue;
         }
@@ -1015,8 +1013,8 @@ fn minute(t: Option<DateTime<Utc>>) -> Option<i64> {
 
 /// The `on_quota` profile `id` may be handed to, when this host can use it: never a profile
 /// whose kind is the agent's own — a haiku shares the claude account, so a claude agent is
-/// never handed to it here — or one spawn routing refuses for quota or login. `None` while a
-/// replacement is open.
+/// never handed to it here — one pinned to another host (the worktree cannot move), or one
+/// spawn routing refuses for quota or login. `None` while a replacement is open.
 pub fn on_quota(host: &Host, s: &State, id: &str, now: DateTime<Utc>) -> Option<String> {
     if crate::spawn::replacement_open(s, id) {
         return None;
@@ -1033,6 +1031,10 @@ pub fn on_quota(host: &Host, s: &State, id: &str, now: DateTime<Utc>) -> Option<
         .and_then(|a| a.kind.as_deref())
         .unwrap_or(&prof.kind);
     if target.kind == mine
+        || target
+            .host
+            .as_ref()
+            .is_some_and(|pin| pin != &host.cfg.host)
         || crate::spawn::quota_block_reason(s, &host.cfg.host, &target.kind, now).is_some()
     {
         return None;
@@ -1319,6 +1321,7 @@ mod tests {
         let now = Utc::now();
         let near = now + Duration::minutes(10);
         let far = now + Duration::hours(4);
+        let weekly = now + Duration::hours(30);
         let q = Quota {
             windows: vec![
                 crate::event::QuotaWindow {
@@ -1331,6 +1334,11 @@ mod tests {
                     used_pct: 100.0,
                     resets_at: Some(far),
                 },
+                crate::event::QuotaWindow {
+                    name: "gemini week".into(),
+                    used_pct: 100.0,
+                    resets_at: Some(weekly),
+                },
             ],
             plan: None,
             exhausted: true,
@@ -1338,7 +1346,7 @@ mod tests {
             ts: now,
             exhausted_since: Some(now),
         };
-        assert_eq!(spent_reset(Some("agy"), Some(&q), now), Some(far));
+        assert_eq!(spent_reset(Some("agy"), Some(&q), now), Some(weekly));
         assert_eq!(spent_reset(Some("devin"), Some(&q), now), Some(near));
     }
 

@@ -5611,6 +5611,28 @@ profile = "devin"
         writeln!(f, "2m29s.").unwrap();
         crate::stuck::agy_logs(&host, &s4, &mut logs).await;
         assert_eq!(signals(), 3, "the completed line is read whole");
+
+        // A truncated file is written again from byte zero; clamping the old offset to its
+        // shorter end would skip exactly the new lines.
+        let mut s5 = stalled_state(None);
+        let e = s5.agents.get("agent:h/s/a").unwrap().clone();
+        s5.agents.insert("agent:h/s/e".into(), e);
+        s5.agents.get_mut("agent:h/s/e").unwrap().kind = Some("agy".into());
+        s5.agents.remove("agent:h/s/a");
+        let path = crate::host::agy_log_path(dir.path(), "e");
+        std::fs::write(&path, format!("{}\n", "x".repeat(400))).unwrap();
+        crate::stuck::agy_logs(&host, &s5, &mut logs).await;
+        assert_eq!(signals(), 3, "the filler line is only consumed");
+        let stamp = chrono::Local::now().format("%m%d %H:%M:%S");
+        std::fs::write(
+            &path,
+            format!(
+                "E{stamp}.123456 99 x] RESOURCE_EXHAUSTED: Individual quota reached. Resets in 4h.\n"
+            ),
+        )
+        .unwrap();
+        crate::stuck::agy_logs(&host, &s5, &mut logs).await;
+        assert_eq!(signals(), 4, "the short truncated file is reread from zero");
     }
 
     #[tokio::test]
@@ -6681,6 +6703,26 @@ profile = "devin"
         )
         .await;
         assert_eq!(reqs(&host), 1, "the handoff went to the other account");
+        // A target pinned elsewhere cannot take the worktree: the lead is told instead.
+        let pinned = cfg("dv", "devin").replace("[profiles.dv]", "[profiles.dv]\nhost = \"other\"");
+        let dir = tempfile::tempdir().unwrap();
+        scene(dir.path(), &pinned);
+        let (host, _stub) = run_act(dir.path(), &[]).await;
+        let mut s = quota_state();
+        signal(&mut s, "agent:h/s/a", "quota", None);
+        stuck(
+            &host,
+            &s,
+            &[],
+            &mut crate::stuck::Seen::default(),
+            &HashSet::new(),
+        )
+        .await;
+        assert_eq!(
+            reqs(&host),
+            0,
+            "no handoff onto a host the worktree cannot move to"
+        );
         // agy as the target obeys the same login/freshness gate as a spawn: no report, no handoff.
         let dir = tempfile::tempdir().unwrap();
         scene(dir.path(), &cfg("ag", "agy"));

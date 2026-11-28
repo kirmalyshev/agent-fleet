@@ -322,6 +322,9 @@ async fn dust_breakdown() -> Vec<DiskEntry> {
 /// an authentication code; the timeout kills the process rather than letting it hold the host's
 /// quota loop.
 async fn agy_probe(host: String) -> Option<AgentQuota> {
+    // Stamp the read when the probe starts, not when the process exits: a cap line written while
+    // the probe was in flight is newer evidence than the answer that probe had already received.
+    let read_at = Utc::now();
     let run = tokio::process::Command::new("agy")
         .args([
             "-p",
@@ -341,7 +344,7 @@ async fn agy_probe(host: String) -> Option<AgentQuota> {
         .ok()?
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    crate::quota::agy_output(&host, &text, Utc::now())
+    crate::quota::agy_output(&host, &text, read_at)
 }
 
 impl Host {

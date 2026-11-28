@@ -1217,23 +1217,29 @@ impl State {
             },
             Known::AgentQuota(d) => {
                 let key = worktree_key(&d.host, &d.kind);
-                let out = d.exhausted || d.windows.iter().any(|w| w.used_pct >= 100.0);
-                self.quotas.insert(
-                    key.clone(),
-                    Quota {
-                        windows: d.windows.clone(),
-                        plan: d.plan.clone(),
-                        exhausted: d.exhausted,
-                        read_at: d.read_at,
-                        ts,
-                        exhausted_since: out.then(|| {
-                            self.quotas
-                                .get(&key)
-                                .and_then(|q| q.exhausted_since)
-                                .unwrap_or(ts)
-                        }),
-                    },
-                );
+                // Quota events cross network and spool boundaries: an older measurement that
+                // arrives late must not overwrite the newer one (a cap line may have spent the
+                // account after that measurement was taken).
+                let stale = self.quotas.get(&key).is_some_and(|q| q.read_at > d.read_at);
+                if !stale {
+                    let out = d.exhausted || d.windows.iter().any(|w| w.used_pct >= 100.0);
+                    self.quotas.insert(
+                        key.clone(),
+                        Quota {
+                            windows: d.windows.clone(),
+                            plan: d.plan.clone(),
+                            exhausted: d.exhausted,
+                            read_at: d.read_at,
+                            ts,
+                            exhausted_since: out.then(|| {
+                                self.quotas
+                                    .get(&key)
+                                    .and_then(|q| q.exhausted_since)
+                                    .unwrap_or(ts)
+                            }),
+                        },
+                    );
+                }
             }
             Known::AgentRole(d) => {
                 if let Some(level) = d.level {
@@ -2152,6 +2158,40 @@ mod tests {
             .into_event(),
         );
         assert!(s.signals.is_empty());
+    }
+
+    #[test]
+    fn older_quota_read_never_overwrites_a_newer_one() {
+        let quota = |pct: f64, ts: DateTime<Utc>| {
+            let mut e = ev(
+                ActorKind::Host,
+                Known::AgentQuota(AgentQuota {
+                    host: "h".into(),
+                    kind: "agy".into(),
+                    windows: vec![QuotaWindow {
+                        name: "gemini 5h".into(),
+                        used_pct: pct,
+                        resets_at: None,
+                    }],
+                    plan: None,
+                    exhausted: pct >= 100.0,
+                    read_at: ts,
+                }),
+            )
+            .into_event();
+            e.ts = ts;
+            e
+        };
+        let t0 = Utc::now();
+        let mut s = State::default();
+        s.apply(&quota(20.0, t0 + chrono::Duration::minutes(5)));
+        s.apply(&quota(100.0, t0));
+        assert_eq!(
+            s.quotas["h:agy"].windows[0].used_pct, 20.0,
+            "the late older measurement is folded as a no-op"
+        );
+        s.apply(&quota(100.0, t0 + chrono::Duration::minutes(6)));
+        assert_eq!(s.quotas["h:agy"].windows[0].used_pct, 100.0);
     }
 
     #[test]
