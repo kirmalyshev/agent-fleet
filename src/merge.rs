@@ -546,16 +546,41 @@ async fn pins(a: &Ask<'_>, base: &str, say: &(dyn Fn(String) + Sync)) -> Result<
     Ok(())
 }
 
+/// Environment that would point git at another repository or inject configuration. SSH and
+/// credential helpers stay inherited; these never do.
+fn scrub_git_env(cmd: &mut tokio::process::Command) {
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+    ] {
+        cmd.env_remove(key);
+    }
+    for (key, _) in std::env::vars_os() {
+        let key = key.to_string_lossy();
+        if key.starts_with("GIT_CONFIG_KEY_") || key.starts_with("GIT_CONFIG_VALUE_") {
+            cmd.env_remove(key.as_ref());
+        }
+    }
+}
+
 /// `git -C dir args`: Ok(stdout) on exit 0, Err(stderr) otherwise.
 async fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = tokio::process::Command::new("git")
-        .arg("-C")
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("-C")
         .arg(dir)
         .args(args)
-        .stdin(std::process::Stdio::null())
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
+        .stdin(std::process::Stdio::null());
+    scrub_git_env(&mut cmd);
+    let out = cmd
         .kill_on_drop(true)
         .output()
         .await
@@ -607,11 +632,14 @@ impl GateTree {
         if path.exists() {
             problems.push(format!("{} still exists", path.display()));
         }
-        let common = git(checkout, &["rev-parse", "--git-common-dir"]).await;
+        let common = git(
+            checkout,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .await;
         match (common, path.file_name()) {
             (Ok(common), Some(leaf)) => {
-                let common = git_path(checkout, &common);
-                let admin = common.join("worktrees").join(leaf);
+                let admin = PathBuf::from(common).join("worktrees").join(leaf);
                 if admin.exists() {
                     match tokio::fs::remove_dir_all(&admin).await {
                         Ok(()) => {}
@@ -634,16 +662,6 @@ impl GateTree {
     }
 }
 
-/// `common` resolved the way git resolved it: absolute stays absolute, relative is the checkout's.
-fn git_path(checkout: &Path, common: &str) -> PathBuf {
-    let path = Path::new(common);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        checkout.join(path)
-    }
-}
-
 /// Every `merge-gate.base.*` worktree still registered once the repository lock is held is a
 /// crashed gate's, never a live one's. Remove it before making this run's own.
 async fn reap_scratch(checkout: &Path) -> Result<()> {
@@ -656,16 +674,6 @@ async fn reap_scratch(checkout: &Path) -> Result<()> {
             paths.push(PathBuf::from(path));
         }
     }
-    if let Some(parent) = checkout.parent() {
-        let mut entries = tokio::fs::read_dir(parent)
-            .await
-            .map_err(|e| anyhow!("read {}: {e}", parent.display()))?;
-        while let Some(entry) = entries.next_entry().await? {
-            paths.push(entry.path());
-        }
-    }
-    paths.sort();
-    paths.dedup();
     for path in paths {
         let scratch = path
             .file_name()
@@ -765,9 +773,6 @@ async fn gate_output(
     cmd.arg(head)
         .current_dir(cwd)
         .env("AGENT_FLEET_MERGE_PR", merge_pr)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -777,6 +782,7 @@ async fn gate_output(
     if let Some(r) = allow_pin_rewind {
         cmd.env("AGENT_FLEET_ALLOW_PIN_REWIND", r);
     }
+    scrub_git_env(&mut cmd);
     let child = cmd
         .spawn()
         .with_context(|| format!("the merge gate {gate} did not start"))?;
@@ -813,10 +819,13 @@ async fn run_gate(
     // One gate at a time per repository on this machine, the checkout read only once it is
     // held: gates share the checkout, and one that moved it would otherwise hand this one a
     // tree (and a gate script) nobody checked.
-    let common = git(&checkout, &["rev-parse", "--git-common-dir"])
-        .await
-        .map_err(|e| anyhow!("git rev-parse in {}: {e}", checkout.display()))?;
-    let lock = git_path(&checkout, &common).join("agent-fleet-merge.lock");
+    let common = git(
+        &checkout,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .await
+    .map_err(|e| anyhow!("git rev-parse in {}: {e}", checkout.display()))?;
+    let lock = PathBuf::from(common).join("agent-fleet-merge.lock");
     let _held = crate::retire::lock_file(&lock, GATE_MAX, "another merge gate").await?;
     let (tree, at) = gate_tree(&checkout, base, gate)
         .await
@@ -1771,6 +1780,39 @@ esac
     }
 
     #[tokio::test]
+    async fn git_children_do_not_inherit_repository_environment() {
+        const CHILD: &str = "AGENT_FLEET_TEST_GIT_ENV_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .arg("merge::tests::git_children_do_not_inherit_repository_environment")
+                .arg("--exact")
+                .env(CHILD, "1")
+                .env("GIT_DIR", "elsewhere")
+                .env("GIT_WORK_TREE", "elsewhere")
+                .env("GIT_INDEX_FILE", "elsewhere")
+                .env("GIT_COMMON_DIR", "elsewhere")
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_7", "core.hooksPath")
+                .env("GIT_CONFIG_VALUE_7", "elsewhere")
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "child: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("[ -z \"$GIT_DIR\" ] && [ -z \"$GIT_WORK_TREE\" ] && [ -z \"$GIT_INDEX_FILE\" ] && [ -z \"$GIT_COMMON_DIR\" ] && [ -z \"$GIT_CONFIG_COUNT\" ] && [ -z \"$GIT_CONFIG_KEY_7\" ] && [ -z \"$GIT_CONFIG_VALUE_7\" ]");
+        scrub_git_env(&mut cmd);
+        assert!(cmd.status().await.unwrap().success());
+    }
+
+    #[tokio::test]
     async fn a_non_main_base_is_judged_from_a_detached_base_worktree() {
         use std::os::unix::fs::PermissionsExt;
         let f = Fake::new();
@@ -1846,8 +1888,8 @@ esac
             "the crashed gate's worktree is still registered"
         );
         assert!(
-            !orphan.exists(),
-            "the unregistered gate worktree was not reaped"
+            orphan.exists(),
+            "an unregistered sibling is not this repository's to remove"
         );
     }
 
