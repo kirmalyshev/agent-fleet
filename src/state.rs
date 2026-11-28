@@ -133,6 +133,15 @@ pub struct Host {
     pub disk_free: u64,
     pub disk_total: u64,
     pub agents: u32,
+    /// Machine load and memory from its last `host.health`; absent before host-load heartbeats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<crate::event::MachineStats>,
+    /// When the disk numbers were sampled, and the cached breakdown of what uses them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<crate::event::DiskReport>,
+    /// Repositories the host says it serves.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<String>,
     /// The commit its binary was built from, as its last `host.health` said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
@@ -143,6 +152,54 @@ pub struct Host {
     /// When the host process started: that report's time less its `uptime_s`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started: Option<DateTime<Utc>>,
+}
+
+impl Host {
+    /// The 5-minute load average divided by online cores; absent when the host cannot read it.
+    pub fn load5_per_core(&self) -> Option<f64> {
+        let m = self.machine.as_ref()?;
+        (m.cores > 0).then_some(m.load5 / m.cores as f64)
+    }
+
+    /// Why this host is under too much pressure for a new spawn. Empty means the measurements
+    /// present in its last heartbeat are under both limits; missing measurements do not condemn it.
+    pub fn pressure(&self, max_load_per_core: f64, min_disk_free: u64) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(m) = &self.machine
+            && m.cores > 0
+            && m.load5 > max_load_per_core * m.cores as f64
+        {
+            out.push(format!(
+                "5-minute load {:.1} on {} cores ({:.1}/core, limit {:.1}/core)",
+                m.load5,
+                m.cores,
+                m.load5 / m.cores as f64,
+                max_load_per_core
+            ));
+        }
+        if self.disk_total > 0 && self.disk_free < min_disk_free {
+            out.push(format!(
+                "disk free {:.1} GB below {:.1} GB",
+                self.disk_free as f64 / 1e9,
+                min_disk_free as f64 / 1e9
+            ));
+        }
+        out
+    }
+
+    /// The largest cached disk-use entries, as `path 1.2 GB`.
+    pub fn disk_breakdown(&self, n: usize) -> Vec<String> {
+        let Some(d) = &self.disk else {
+            return Vec::new();
+        };
+        let mut entries = d.breakdown.clone();
+        entries.sort_by_key(|e| std::cmp::Reverse(e.bytes));
+        entries
+            .into_iter()
+            .take(n)
+            .map(|e| format!("{} {:.1} GB", e.path, e.bytes as f64 / 1e9))
+            .collect()
+    }
 }
 
 /// An `update.requested` and each host's `update.result`.
@@ -1201,6 +1258,9 @@ impl State {
                         disk_free: d.disk_free,
                         disk_total: d.disk_total,
                         agents: d.agents,
+                        machine: d.machine.clone(),
+                        disk: d.disk.clone(),
+                        repos: d.repos.clone(),
                         commit: d.commit.clone(),
                         behind_since: d.behind_since,
                         ts,
@@ -3994,18 +4054,21 @@ mod tests {
         let health = |uptime_s: Option<u64>| {
             ev(
                 ActorKind::Host,
-                Known::HostHealth(HostHealth {
+                Known::HostHealth(Box::new(HostHealth {
                     host: "h".into(),
                     disk_free: 1,
                     disk_total: 2,
                     agents: 0,
+                    machine: None,
+                    disk: None,
+                    repos: Vec::new(),
                     commit: None,
                     behind_since: None,
                     stats: uptime_s.map(|u| HostStats {
                         uptime_s: u,
                         ..HostStats::default()
                     }),
-                }),
+                })),
             )
             .into_event()
         };
@@ -4079,15 +4142,18 @@ mod tests {
         let health = |commit: &str, plus: i64| {
             let mut e = ev(
                 ActorKind::Host,
-                Known::HostHealth(HostHealth {
+                Known::HostHealth(Box::new(HostHealth {
                     host: "h".into(),
                     disk_free: 1,
                     disk_total: 2,
                     agents: 0,
+                    machine: None,
+                    disk: None,
+                    repos: Vec::new(),
                     commit: Some(commit.into()),
                     behind_since: None,
                     stats: None,
-                }),
+                })),
             );
             e.ts += chrono::Duration::seconds(plus);
             e.into_event()
@@ -4122,15 +4188,18 @@ mod tests {
         let health = |plus: i64| {
             let mut e = ev(
                 ActorKind::Host,
-                Known::HostHealth(HostHealth {
+                Known::HostHealth(Box::new(HostHealth {
                     host: "h".into(),
                     disk_free: 1,
                     disk_total: 2,
                     agents: 0,
+                    machine: None,
+                    disk: None,
+                    repos: Vec::new(),
                     commit: Some("aaa".into()),
                     behind_since: None,
                     stats: None,
-                }),
+                })),
             );
             e.ts += chrono::Duration::seconds(plus);
             e.into_event()
@@ -4170,22 +4239,28 @@ mod tests {
     fn the_newest_failure_is_kept_per_host_and_only_one_on_the_hosts_current_commit() {
         let trigger = ev(
             ActorKind::Host,
-            Known::HostHealth(HostHealth {
+            Known::HostHealth(Box::new(HostHealth {
                 host: "other".into(),
                 disk_free: 1,
                 disk_total: 2,
                 agents: 0,
+                machine: None,
+                disk: None,
+                repos: Vec::new(),
                 commit: None,
                 behind_since: None,
                 stats: None,
-            }),
+            })),
         )
         .into_event();
         let now = trigger.ts;
         let host = |commit: &str| Host {
-            disk_free: 0,
-            disk_total: 0,
+            disk_free: 50_000_000_000,
+            disk_total: 100_000_000_000,
             agents: 0,
+            machine: None,
+            disk: None,
+            repos: Vec::new(),
             commit: Some(commit.into()),
             behind_since: None,
             ts: now,
@@ -4247,15 +4322,18 @@ mod tests {
     fn a_later_success_ends_the_retention_of_an_older_failure() {
         let trigger = ev(
             ActorKind::Host,
-            Known::HostHealth(HostHealth {
+            Known::HostHealth(Box::new(HostHealth {
                 host: "a".into(),
                 disk_free: 1,
                 disk_total: 2,
                 agents: 0,
+                machine: None,
+                disk: None,
+                repos: Vec::new(),
                 commit: Some("aaa".into()),
                 behind_since: None,
                 stats: None,
-            }),
+            })),
         )
         .into_event();
         let now = trigger.ts;
@@ -4292,18 +4370,40 @@ mod tests {
 
     #[test]
     fn host_health_carries_the_commit() {
-        let health = Known::HostHealth(HostHealth {
+        let health = Known::HostHealth(Box::new(HostHealth {
             host: "h1".into(),
             disk_free: 1,
             disk_total: 2,
             agents: 0,
+            machine: Some(MachineStats {
+                load1: 1.0,
+                load5: 2.0,
+                load15: 3.0,
+                cores: 8,
+                memory_used: 4,
+                memory_total: 8,
+            }),
+            disk: Some(DiskReport {
+                sampled_at: Utc::now(),
+                breakdown_at: None,
+                breakdown: vec![DiskEntry {
+                    root: "home".into(),
+                    path: "/u/big".into(),
+                    bytes: 9,
+                }],
+            }),
+            repos: vec!["o/r".into()],
             stats: None,
             commit: Some("abc".into()),
             behind_since: None,
-        });
+        }));
         let mut s = State::default();
         s.apply(&by("host:h1", health).into_event());
-        assert_eq!(s.hosts["h1"].commit.as_deref(), Some("abc"));
+        let h = &s.hosts["h1"];
+        assert_eq!(h.commit.as_deref(), Some("abc"));
+        assert_eq!(h.machine.as_ref().map(|m| m.cores), Some(8));
+        assert_eq!(h.disk_breakdown(1), vec!["/u/big 0.0 GB".to_string()]);
+        assert_eq!(h.repos, vec!["o/r".to_string()]);
     }
 
     #[test]

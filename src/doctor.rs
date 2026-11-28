@@ -69,8 +69,8 @@ const SHARED_BY_ALL: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Finding {
     /// `stale`, `hung`, `heavy`, `duplicate`, `forgotten`, `unpushed`, `orphan`, `breach`,
-    /// `queued`, `undelivered`, `refused`, `role`, `quota`, `spawn`, `unanswered`, `unmanaged`, `stalled`, `build`, `update`, `orphan-pr`, `tmp`, `unknown-pane`
-    /// (the last three added by `main`).
+    /// `queued`, `undelivered`, `refused`, `role`, `quota`, `spawn`, `unanswered`, `unmanaged`, `stalled`, `build`, `update`, `orphan-pr`, `tmp`, `unknown-pane`, `host`.
+    /// `orphan-pr`, `tmp` and `unknown-pane` are added by `main`.
     pub kind: &'static str,
     /// The agent id or `<host>:<path>` it is about.
     pub subject: String,
@@ -496,6 +496,23 @@ fn hung_pids_of(s: &State, id: &str, now: DateTime<Utc>) -> bool {
 
 pub fn findings(s: &State, now: DateTime<Utc>) -> Vec<Finding> {
     let mut out = Vec::new();
+    for (name, h) in &s.hosts {
+        if now - h.ts > HOST_LIVE {
+            continue;
+        }
+        let pressure = h.pressure(
+            crate::spawn::DEFAULT_MAX_LOAD_PER_CORE,
+            crate::spawn::disk_floor_bytes(crate::spawn::DEFAULT_MIN_DISK_FREE_GB),
+        );
+        if !pressure.is_empty() {
+            let mut detail = pressure.join("; ");
+            let top = h.disk_breakdown(3);
+            if pressure.iter().any(|r| r.starts_with("disk free")) && !top.is_empty() {
+                detail += &format!("; largest: {}", top.join(", "));
+            }
+            out.push(finding("host", name, detail));
+        }
+    }
     for (id, w) in &s.waiting {
         if s.agents
             .get(id)
@@ -1220,9 +1237,12 @@ mod tests {
         s.hosts.insert(
             "mac".into(),
             crate::state::Host {
-                disk_free: 0,
-                disk_total: 0,
+                disk_free: 50_000_000_000,
+                disk_total: 100_000_000_000,
                 agents: 0,
+                machine: None,
+                disk: None,
+                repos: Vec::new(),
                 commit: None,
                 behind_since: None,
                 ts: now,
@@ -1267,9 +1287,12 @@ mod tests {
         use crate::event::UpdateResult;
         let now = Utc::now();
         let host = |ago_min: i64| crate::state::Host {
-            disk_free: 0,
-            disk_total: 0,
+            disk_free: 50_000_000_000,
+            disk_total: 100_000_000_000,
             agents: 0,
+            machine: None,
+            disk: None,
+            repos: Vec::new(),
             commit: None,
             behind_since: None,
             ts: now - Duration::minutes(ago_min),
@@ -1328,9 +1351,12 @@ mod tests {
         let now = Utc::now();
         let mut s = State::default();
         let host = |commit: &str| crate::state::Host {
-            disk_free: 0,
-            disk_total: 0,
+            disk_free: 50_000_000_000,
+            disk_total: 100_000_000_000,
             agents: 0,
+            machine: None,
+            disk: None,
+            repos: Vec::new(),
             commit: Some(commit.into()),
             behind_since: None,
             ts: now,
@@ -1375,9 +1401,12 @@ mod tests {
         s.hosts.insert(
             "mac".into(),
             crate::state::Host {
-                disk_free: 0,
-                disk_total: 0,
+                disk_free: 50_000_000_000,
+                disk_total: 100_000_000_000,
                 agents: 0,
+                machine: None,
+                disk: None,
+                repos: Vec::new(),
                 commit: Some("aaa".into()),
                 behind_since: None,
                 ts: now,
@@ -1436,9 +1465,12 @@ mod tests {
         let now = Utc::now();
         let mut s = State::default();
         let host = |reported_ago: Duration| crate::state::Host {
-            disk_free: 0,
-            disk_total: 0,
+            disk_free: 50_000_000_000,
+            disk_total: 100_000_000_000,
             agents: 0,
+            machine: None,
+            disk: None,
+            repos: Vec::new(),
             commit: Some("aaa".into()),
             behind_since: None,
             ts: now - reported_ago,
@@ -1487,9 +1519,12 @@ mod tests {
         let now = Utc::now();
         let mut s = State::default();
         let host = |started_min_ago: i64| crate::state::Host {
-            disk_free: 0,
-            disk_total: 0,
+            disk_free: 50_000_000_000,
+            disk_total: 100_000_000_000,
             agents: 0,
+            machine: None,
+            disk: None,
+            repos: Vec::new(),
             commit: None,
             behind_since: None,
             ts: now,
@@ -1700,9 +1735,12 @@ mod tests {
         let mut s = State::default();
         let host = |s: &mut State, name: &str, commit: Option<&str>, age: i64| {
             let h = crate::state::Host {
-                disk_free: 1,
-                disk_total: 1,
+                disk_free: 50_000_000_000,
+                disk_total: 100_000_000_000,
                 agents: 0,
+                machine: None,
+                disk: None,
+                repos: Vec::new(),
                 commit: commit.map(str::to_string),
                 behind_since: None,
                 ts: now - Duration::minutes(age),
@@ -1736,9 +1774,12 @@ mod tests {
         let mut s = State::default();
         let host = |s: &mut State, name: &str, behind_min: Option<i64>| {
             let h = crate::state::Host {
-                disk_free: 1,
-                disk_total: 1,
+                disk_free: 50_000_000_000,
+                disk_total: 100_000_000_000,
                 agents: 0,
+                machine: None,
+                disk: None,
+                repos: Vec::new(),
                 commit: Some("1111111aaaa".into()),
                 behind_since: behind_min.map(|m| now - Duration::minutes(m)),
                 ts: now,
@@ -2522,6 +2563,58 @@ mod tests {
         );
         s.spawns.insert("e2".into(), spawn(true, now));
         assert_eq!(kinds(&findings(&s, now)), [], "a later spawn succeeded");
+    }
+
+    #[test]
+    fn a_host_over_spawn_limits_is_a_finding_with_the_disk_breakdown() {
+        let now = Utc::now();
+        let mut s = State::default();
+        s.hosts.insert(
+            "h".into(),
+            crate::state::Host {
+                disk_free: 1_000_000_000,
+                disk_total: 100_000_000_000,
+                agents: 0,
+                machine: Some(crate::event::MachineStats {
+                    load1: 30.0,
+                    load5: 30.0,
+                    load15: 30.0,
+                    cores: 8,
+                    memory_used: 1,
+                    memory_total: 2,
+                }),
+                disk: Some(crate::event::DiskReport {
+                    sampled_at: now,
+                    breakdown_at: Some(now),
+                    breakdown: vec![crate::event::DiskEntry {
+                        root: "home".into(),
+                        path: "/u/big".into(),
+                        bytes: 8_000_000_000,
+                    }],
+                }),
+                repos: Vec::new(),
+                commit: None,
+                behind_since: None,
+                ts: now,
+                started: None,
+            },
+        );
+        let f = findings(&s, now);
+        assert_eq!(kinds(&f), [("host", "h")]);
+        assert!(
+            f[0].detail.contains("5-minute load 30.0 on 8 cores")
+                && f[0].detail.contains("disk free 1.0 GB below 5.0 GB")
+                && f[0].detail.contains("largest: /u/big 8.0 GB"),
+            "{}",
+            f[0].detail
+        );
+        // A silent host is already reported by the update checks as unreachable/absent; pressure
+        // is a live-host finding, not another reason to blame a dead one.
+        s.hosts.get_mut("h").unwrap().ts = now - Duration::minutes(11);
+        assert!(
+            !findings(&s, now).iter().any(|f| f.kind == "host"),
+            "no pressure finding for a silent host"
+        );
     }
 
     #[test]

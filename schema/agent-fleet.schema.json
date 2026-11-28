@@ -499,6 +499,57 @@
           ],
           "type": "object"
         },
+        "DiskEntry": {
+          "additionalProperties": false,
+          "description": "One large directory in a host's cached disk-use breakdown.",
+          "properties": {
+            "bytes": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "path": {
+              "type": "string"
+            },
+            "root": {
+              "description": "Which scan produced it: `home`, `worktrees` or `cache`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "root",
+            "path",
+            "bytes"
+          ],
+          "type": "object"
+        },
+        "DiskReport": {
+          "additionalProperties": false,
+          "description": "The disk sample `disk_free`/`disk_total` came from. Free space is statvfs, never a traversal;\n`breakdown` is the separate, cached `dust` answer to what uses the space.",
+          "properties": {
+            "breakdown": {
+              "items": {
+                "$ref": "#/$defs/DiskEntry"
+              },
+              "type": "array"
+            },
+            "breakdown_at": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sampled_at": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sampled_at"
+          ],
+          "type": "object"
+        },
         "Handoff": {
           "additionalProperties": false,
           "properties": {
@@ -558,8 +609,19 @@
                 "null"
               ]
             },
+            "disk": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DiskReport"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "When the disk numbers were sampled, and the cached `dust` breakdown of what uses them."
+            },
             "disk_free": {
-              "description": "Bytes available to unprivileged users on the fleet data volume.",
+              "description": "Bytes available to unprivileged users on the worktree volume, from the last disk sample.",
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
@@ -571,6 +633,24 @@
             },
             "host": {
               "type": "string"
+            },
+            "machine": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/MachineStats"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The machine's load, core count and memory. Absent in reports from before host-load\nheartbeats, or when the platform cannot read them."
+            },
+            "repos": {
+              "description": "Repositories this host serves (`[repos]` merged with its `--repo` flags), so routing can\ntell whether another host can take a spawn.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             },
             "stats": {
               "anyOf": [
@@ -691,6 +771,48 @@
             "root-coordinator"
           ],
           "type": "string"
+        },
+        "MachineStats": {
+          "additionalProperties": false,
+          "description": "One machine's load and memory at a `host.health` report. Load is the system load average;\nmemory is bytes. `cores` is the online CPU count the load is compared against.",
+          "properties": {
+            "cores": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "load1": {
+              "format": "double",
+              "type": "number"
+            },
+            "load15": {
+              "format": "double",
+              "type": "number"
+            },
+            "load5": {
+              "format": "double",
+              "type": "number"
+            },
+            "memory_total": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "memory_used": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "load1",
+            "load5",
+            "load15",
+            "cores",
+            "memory_used",
+            "memory_total"
+          ],
+          "type": "object"
         },
         "MergeDone": {
           "additionalProperties": false,
@@ -2634,6 +2756,57 @@
           ],
           "type": "object"
         },
+        "DiskEntry": {
+          "additionalProperties": false,
+          "description": "One large directory in a host's cached disk-use breakdown.",
+          "properties": {
+            "bytes": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "path": {
+              "type": "string"
+            },
+            "root": {
+              "description": "Which scan produced it: `home`, `worktrees` or `cache`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "root",
+            "path",
+            "bytes"
+          ],
+          "type": "object"
+        },
+        "DiskReport": {
+          "additionalProperties": false,
+          "description": "The disk sample `disk_free`/`disk_total` came from. Free space is statvfs, never a traversal;\n`breakdown` is the separate, cached `dust` answer to what uses the space.",
+          "properties": {
+            "breakdown": {
+              "items": {
+                "$ref": "#/$defs/DiskEntry"
+              },
+              "type": "array"
+            },
+            "breakdown_at": {
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sampled_at": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sampled_at"
+          ],
+          "type": "object"
+        },
         "Hold": {
           "properties": {
             "cwd": {
@@ -2686,6 +2859,17 @@
                 "null"
               ]
             },
+            "disk": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DiskReport"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "When the disk numbers were sampled, and the cached breakdown of what uses them."
+            },
             "disk_free": {
               "format": "uint64",
               "minimum": 0,
@@ -2695,6 +2879,24 @@
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
+            },
+            "machine": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/MachineStats"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Machine load and memory from its last `host.health`; absent before host-load heartbeats."
+            },
+            "repos": {
+              "description": "Repositories the host says it serves.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             },
             "started": {
               "description": "When the host process started: that report's time less its `uptime_s`.",
@@ -2726,6 +2928,48 @@
             "root-coordinator"
           ],
           "type": "string"
+        },
+        "MachineStats": {
+          "additionalProperties": false,
+          "description": "One machine's load and memory at a `host.health` report. Load is the system load average;\nmemory is bytes. `cores` is the online CPU count the load is compared against.",
+          "properties": {
+            "cores": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "load1": {
+              "format": "double",
+              "type": "number"
+            },
+            "load15": {
+              "format": "double",
+              "type": "number"
+            },
+            "load5": {
+              "format": "double",
+              "type": "number"
+            },
+            "memory_total": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "memory_used": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "load1",
+            "load5",
+            "load15",
+            "cores",
+            "memory_used",
+            "memory_total"
+          ],
+          "type": "object"
         },
         "Merge": {
           "description": "A `merge.requested` and the `merge.result` that answered it.",

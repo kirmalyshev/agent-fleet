@@ -1766,9 +1766,12 @@ chmod +x "$root/bin/agent-fleet"
             s.hosts.insert(
                 h.to_string(),
                 crate::state::Host {
-                    disk_free: 0,
-                    disk_total: 0,
+                    disk_free: 50_000_000_000,
+                    disk_total: 100_000_000_000,
                     agents: 0,
+                    machine: None,
+                    disk: None,
+                    repos: Vec::new(),
                     commit: commit.map(String::from),
                     behind_since: None,
                     ts,

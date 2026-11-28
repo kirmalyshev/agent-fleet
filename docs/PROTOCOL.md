@@ -30,8 +30,8 @@ Three rules carry the design:
   single sequencer for the one exclusive operation in v1, `task.assigned`. It binds a specific
   address (default `127.0.0.1:7710`) and refuses `0.0.0.0` / `::`.
 - **Host agent** (`agent-fleet host`): one per machine and herdr session. It publishes presence from
-  herdr's push events, reports disk health, keeps a full local replica of the log, and delivers
-  doorbells to its agents.
+  herdr's push events, reports machine load, memory and disk health, keeps a full local replica
+  of the log, and delivers doorbells to its agents.
 - **CLI** (`agent-fleet …`): what agents use. Ordinary writes go to a local spool when the hub is down
   and replay later. Exclusive writes refuse instead.
 
@@ -73,7 +73,7 @@ allowed writers, ULID ids, `v: 1`, no unknown envelope keys, and a size limit.
 | | `agent.state` | agent, state (`idle` `working` `blocked` `done` `unknown`) | | host |
 | | `agent.down` | agent, reason? | | host |
 | | `agent.renamed` | agent, pane, from?, rule — the fleet, not herdr, set the agent's name (`pane-name-memory`: herdr dropped it when the agent restarted in its pane; `adopt`: `agent-fleet adopt <pane> <name>`, which the pane's host registers as an `agent.up` and takes the pane-id record down, reason `adopted as <name>`); written just before the `agent.up` that carries it | | agent, host, human |
-| | `host.health` | host, disk_free, disk_total, agents, stats?, commit? (the commit its binary was built from), behind_since? (since when its 5-minute fetch has found `origin/main` ahead of that commit; every minute) | | host |
+| | `host.health` | host, disk_free (worktree volume), disk_total, agents, machine? (load1/load5/load15, cores, memory_used/memory_total), disk? (the statvfs sample time and cached `dust` breakdown), repos[]?, stats?, commit? (the commit its binary was built from), behind_since? (since when its 5-minute fetch has found `origin/main` ahead of that commit; every minute) | | host |
 | | `agent.usage` | agent, rss_kb?, cpu_pct?, procs?, cwd? (each scan) | | host |
 | | `agent.role` | agent, level? (`root-coordinator` `domain-lead` `implementation-lead` `implementer`; absent `level` removes the role), lead?, domain? | | agent, host |
 | machine | `worktree.state` | host, path, repo, branch?, head, unpushed, dirty, dirty_submodules? (of dirty, moved submodule pointers), files[] (only what still differs from the default branch), last_commit, in_main?, herdr? (a linked worktree under herdr's worktree directory: `[worktrees] directory` in its config, default `~/.herdr/worktrees`) (on change) | | host |
@@ -378,6 +378,12 @@ retries with backoff instead of misreading events; replica sync and delivery kee
 If any of the host agent's loops stops (a panic, a poisoned lock), the process exits, so a
 supervisor restarts it rather than leaving a host that looks healthy and no longer delivers.
 
+Machine load and memory are read with every minute's `host.health` (`/proc` on Linux, `sysctl` and
+`vm_stat` on macOS). Free disk is a statvfs read of the worktree volume, never a traversal. The
+separate answer to what uses the disk is a cached `dust` scan refreshed at most every 30 minutes;
+it is absent when `dust` is not installed or a scan fails, and never decides whether free space is
+low.
+
 ## Spool and replica
 
 - **Spool.** When the hub is unreachable, or answers with anything that is not a verdict on the
@@ -425,7 +431,10 @@ window over the agent's life; concurrent agents share it. A figure with no data 
 - **Lag.** Hub arrival minus the writer's `ts`; spooled events are the long tail.
 - **Hosts.** Reports received against those expected, the longest silence, restarts (a drop
   in `uptime_s`), and the last vitals: memory, CPU, rings and failed rings, herdr errors,
-  events spooled or not written at all.
+  events spooled or not written at all. Machine load, memory, disk free space and the cached
+  breakdown are in `host.health` itself; `agent-fleet ps` prints a HOSTS section with them and
+  their pressure reasons, the board and TUI mark a host over either default limit red, and
+  `agent-fleet doctor` reports a live host currently over one.
 - **Hub.** Uptime, memory, CPU, log size, followers, the time each recent `POST /events`
   spent in the hub (lock wait included), and posts by outcome (accepted, duplicate, 400, 409…).
 
@@ -878,8 +887,9 @@ processes still in the tree and unpushed submodule work, and forces only past ch
 `[vars]` for extra tokens, `[profiles]` —
 a `kind` (the `agent.start`/`agent.quota` program), `args`, `unset_env`, a `prefix` for agent
 names, an optional per-repo `cap`, a `fallback`, and `handoff_min` — and `[[rules]]`, first
-match wins, a rule with no `match` being the default. `match` keywords are case-insensitive
-whole words against the issue's title and labels — never the `--scope` text, which narrows the
+match wins, a rule with no `match` being the default. A rule's `host` is one host or a list of
+hosts it allows: the first is preferred and the rest are reroute candidates. `match` keywords are
+case-insensitive whole words against the issue's title and labels — never the `--scope` text, which narrows the
 work and never picks the worker; `label:x` matches only
 a label named x. Config errors name the line that is wrong: an unknown profile, a fallback
 cycle, two defaults, no default.
@@ -914,8 +924,16 @@ checkout's project-level skills that name a terminal multiplexer the same way, f
 `init` first.
 
 `agent-fleet spawn <owner/repo>#<issue>` reads the issue with `gh issue view` (`AGENT_FLEET_GH`
-names the binary), picks the rule — `--profile`, `--host` and `--level` override it. A profile at
-`cap` (live agents of the profile for this repo plus pending requests) has no seat: the spawn is
+names the binary), picks the rule — `--profile`, `--host` and `--level` override it. The target
+host must also be under its machine-pressure limits before the request is written: the 5-minute
+load per online core of its last `host.health` at or below fleet.toml `max_load_per_core` (default
+2.0), and statvfs free bytes on the worktree volume at or above `min_disk_free_gb` (default 5). A
+host whose heartbeat omits machine numbers is not condemned for load; its disk numbers are part of
+every heartbeat. A rule with one host (or an explicit `--host`) refuses with the exact pressure;
+a rule's ordered host list skips an over-limit host for another listed host under the limits, and
+the decision line says why. A low-disk reason includes the largest entries of the host's cached
+`dust` breakdown when it has one. A profile at `cap`
+(live agents of the profile for this repo plus pending requests) has no seat: the spawn is
 refused, never moved to another profile. A profile whose kind's quota on the target host is
 exhausted — while a 100% window's reset is still ahead or the `exhausted` read is under 30 min
 old — passes to its `fallback`, unless `--profile` named it: an explicit profile is started as

@@ -108,8 +108,8 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Run the host agent for one herdr session: presence, disk, replica, doorbell delivery,
-    /// and spawn requests for this host.
+    /// Run the host agent for one herdr session: presence, machine load/memory/disk, replica,
+    /// doorbell delivery, and spawn requests for this host.
     Host {
         #[arg(long, env = "HERDR_SOCKET_PATH")]
         herdr_socket: PathBuf,
@@ -181,7 +181,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: dev::Cmd,
     },
-    /// The fleet on one screen, live: agents, worktrees, tasks, findings, resources, asks; `:` runs
+    /// The fleet on one screen, live: agents, hosts, worktrees, tasks, findings, resources, asks; `:` runs
     /// any command from it. `--all`: every instance on this machine.
     Tui {
         /// Every instance `agent-fleet instances` lists, each read from its own hub with its own

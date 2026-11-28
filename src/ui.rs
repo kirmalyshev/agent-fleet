@@ -151,6 +151,46 @@ pub fn kind_profile(s: &State, id: &str, kind: Option<&str>) -> String {
     }
 }
 
+/// The fleet's hosts for `ps`: machine load, memory and disk, with the pressure reason when
+/// either default spawn limit is exceeded. Detailed limits live in fleet.toml; this compact view
+/// marks the defaults so an operator sees the same red flag the board and doctor show.
+pub fn hosts(s: &State, now: DateTime<Utc>) -> String {
+    let mut out = format!(
+        "{:<18} {:>15} {:>15} {:>17} {:>8}  NOTE
+",
+        "HOST", "LOAD5", "MEMORY", "DISK FREE", "REPORTED"
+    );
+    for (name, h) in &s.hosts {
+        let gb = |b: u64| b as f64 / 1e9;
+        let (load, mem) = h.machine.as_ref().map_or_else(
+            || ("-".into(), "-".into()),
+            |m| {
+                (
+                    format!(
+                        "{:.1}/{} ({:.1}/c)",
+                        m.load5,
+                        m.cores,
+                        m.load5 / m.cores.max(1) as f64
+                    ),
+                    format!("{:.1}/{:.1} GB", gb(m.memory_used), gb(m.memory_total)),
+                )
+            },
+        );
+        let pressure = h.pressure(
+            crate::spawn::DEFAULT_MAX_LOAD_PER_CORE,
+            crate::spawn::disk_floor_bytes(crate::spawn::DEFAULT_MIN_DISK_FREE_GB),
+        );
+        let _ = writeln!(
+            out,
+            "{name:<18} {load:>15} {mem:>15} {:>17} {:>8}  {}",
+            format!("{:.1}/{:.1} GB", gb(h.disk_free), gb(h.disk_total)),
+            ago(now, h.ts),
+            pressure.join("; ")
+        );
+    }
+    out
+}
+
 pub fn ps(s: &State, now: DateTime<Utc>) -> String {
     let mut out = format!(
         "{:<44} {:<8} {:<13} {:>7}  {:<14} {:<9} {:<12} {:<10} TASK\n",
@@ -185,6 +225,15 @@ pub fn ps(s: &State, now: DateTime<Utc>) -> String {
     }
     if s.agents.is_empty() {
         out.push_str("(no agents up)\n");
+    }
+    if !s.hosts.is_empty() {
+        let _ = write!(
+            out,
+            "
+HOSTS
+{}",
+            hosts(s, now)
+        );
     }
     let res = resources(s, now);
     if !res.is_empty() {
@@ -418,9 +467,29 @@ pub fn board(s: &State, now: DateTime<Utc>) -> String {
     let _ = writeln!(out, "\n== hosts ({})", s.hosts.len());
     for (h, x) in &s.hosts {
         let gb = |b: u64| b as f64 / 1e9;
+        let machine = x.machine.as_ref().map_or_else(String::new, |m| {
+            format!(
+                "  load {:.1}/{:.1}/{:.1} on {} cores  mem {:.1}/{:.1} GB",
+                m.load1,
+                m.load5,
+                m.load15,
+                m.cores,
+                gb(m.memory_used),
+                gb(m.memory_total)
+            )
+        });
+        let pressure = x.pressure(
+            crate::spawn::DEFAULT_MAX_LOAD_PER_CORE,
+            crate::spawn::disk_floor_bytes(crate::spawn::DEFAULT_MIN_DISK_FREE_GB),
+        );
+        let pressure = if pressure.is_empty() {
+            String::new()
+        } else {
+            format!("  OVER: {}", pressure.join("; "))
+        };
         let _ = writeln!(
             out,
-            "{h}  disk {:.1}/{:.1} GB free  agents {}  commit {}  ({} ago)",
+            "{h}  disk {:.1}/{:.1} GB free  agents {}  commit {}  ({} ago){machine}{pressure}",
             gb(x.disk_free),
             gb(x.disk_total),
             x.agents,
@@ -661,6 +730,41 @@ mod tests {
             !row("agent:h/s/spare").contains("impl"),
             "no role, empty cells"
         );
+    }
+
+    #[test]
+    fn ps_hosts_section_shows_machine_numbers_and_pressure() {
+        let now = Utc::now();
+        let mut s = State::default();
+        s.hosts.insert(
+            "h".into(),
+            crate::state::Host {
+                disk_free: 1_000_000_000,
+                disk_total: 100_000_000_000,
+                agents: 2,
+                machine: Some(crate::event::MachineStats {
+                    load1: 10.0,
+                    load5: 20.0,
+                    load15: 30.0,
+                    cores: 8,
+                    memory_used: 12_000_000_000,
+                    memory_total: 32_000_000_000,
+                }),
+                disk: None,
+                repos: Vec::new(),
+                commit: None,
+                behind_since: None,
+                ts: now,
+                started: None,
+            },
+        );
+        let out = ps(&s, now);
+        assert!(out.contains("HOSTS"), "{out}");
+        assert!(out.contains("20.0/8 (2.5/c)"), "{out}");
+        assert!(out.contains("12.0/32.0 GB"), "{out}");
+        assert!(out.contains("1.0/100.0 GB"), "{out}");
+        assert!(out.contains("5-minute load 20.0 on 8 cores"), "{out}");
+        assert!(out.contains("disk free 1.0 GB below 5.0 GB"), "{out}");
     }
 
     #[test]

@@ -363,7 +363,7 @@ Other levels are `domain-lead`, `implementation-lead` and `implementer`, each wi
 
 `agent-fleet tui` shows the whole fleet on one screen and refreshes every 2 s. The top lines
 count agents, tasks, worktrees, findings and undelivered messages; below them, in red, up to
-three hung or orphaned processes, duplicate work or capacity breaches. Pick a tab with `1`–`6` or
+three hung or orphaned processes, duplicate work or capacity breaches. Pick a tab with `1`–`7` or
 `←`/`→`, move with `↑`/`↓` or `j`/`k`, and read the selected row's details in the bottom panel.
 The footer lists the keys of the current tab; `?` shows them all, `q` quits.
 
@@ -569,7 +569,7 @@ From `agent-fleet --help`; every command has its own `--help`.
 |---|---|
 | `hub` | Run the hub: the log, the fold and the sequencer, over HTTP + SSE |
 | `mint-token` | Mint a token that may post only as `host:<name>` (and its agents) or `agent:<name>` (the agents on that host), into the hub's token table. Run it where the hub runs |
-| `host` | Run the host agent for one herdr session: presence, disk, replica, doorbell delivery, and spawn requests for this host |
+| `host` | Run the host agent for one herdr session: presence, machine load/memory/disk, replica, doorbell delivery, and spawn requests for this host |
 | `api` | Protocol metadata |
 | `ps` | What every agent is doing |
 | `self-update` | Every host that is up pulls `main` in the clone its binary was built from, rebuilds and restarts; prints the commit each one then runs. A dirty clone or one not on `main` refuses |
@@ -578,7 +578,7 @@ From `agent-fleet --help`; every command has its own `--help`.
 | `coordinator` | Print the coordinator prompt for this machine's hub: the generic coordinator agent (`coordinator.md` in the config dir, written by `init`), then each connected repository with the project rules to read for it. Start the one coordinator with it, e.g. `claude --append-system-prompt "$(agent-fleet coordinator)"`, then `agent-fleet role me root-coordinator`. With a program (`claude`) it starts that program with the prompt loaded, in this terminal or in the herdr pane named by `--pane`; its first message has it take the root-coordinator role |
 | `repo` | Connect a repository to the fleet on this machine: `add` records its checkout in the machine's fleet.toml, `ls` lists, `rm` disconnects. The host picks changes up without a restart |
 | `dev` | Per-worktree dev environments from the repository's `.agent-fleet/dev.toml` (`up`, `down`, `status` …: each worktree gets a slot with its own ports and values, runs its own services, and shares the infra; `db`, `test`), the worktrees of the connected repositories (`ls`, `clean`), and the agents and PRs on them (`agents`, `prs`) |
-| `tui` | The fleet on one screen, live: agents, worktrees, tasks, findings, resources, asks; `:` runs any command from it. `--all`: every instance on this machine |
+| `tui` | The fleet on one screen, live: agents, hosts, worktrees, tasks, findings, resources, asks; `:` runs any command from it. `--all`: every instance on this machine |
 | `task` | Tasks: `add` claims (exclusive), `done` finishes, `rm` cancels or releases |
 | `dep` | Dependencies between tasks: <task> is blocked by <on> |
 | `block` | Raise a blocker on a task. Prints the blocker id |

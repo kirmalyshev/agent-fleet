@@ -7,7 +7,7 @@ use chrono::{DateTime, Duration, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::event::{AgentState, Body, Event, HostStats, Known};
+use crate::event::{AgentState, Body, DiskEntry, Event, HostStats, Known, MachineStats};
 
 /// A doorbell still undelivered after this long counts as lost.
 pub const LOST_AFTER_S: i64 = 600;
@@ -205,6 +205,170 @@ pub fn compute(rows: &[(Event, Option<i64>)], now: DateTime<Utc>, window: Durati
     s
 }
 
+/// The machine's load average, online core count and memory use. Linux reads `/proc/meminfo`;
+/// macOS uses `sysctl` for total memory and `vm_stat` for the working set. A counter the
+/// platform cannot read is zero rather than a failed heartbeat.
+pub fn machine_usage() -> MachineStats {
+    let mut loads = [0.0; 3];
+    // SAFETY: getloadavg writes at most the array length it is given.
+    let n = unsafe { libc::getloadavg(loads.as_mut_ptr(), loads.len() as i32) };
+    if n < 0 {
+        loads = [0.0; 3];
+    }
+    // SAFETY: sysconf only reads configuration.
+    let cores = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1) as u32;
+    let (memory_used, memory_total) = memory_usage();
+    MachineStats {
+        load1: loads[0],
+        load5: loads[1],
+        load15: loads[2],
+        cores,
+        memory_used,
+        memory_total,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn memory_usage() -> (u64, u64) {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| parse_meminfo(&s))
+        .unwrap_or((0, 0))
+}
+
+/// `/proc/meminfo` as (used, total) bytes. `MemAvailable` is the free measure that matters;
+/// without it fall back to the older free+buffers+cached approximation.
+#[cfg(any(target_os = "linux", test))]
+fn parse_meminfo(s: &str) -> Option<(u64, u64)> {
+    let (mut total, mut available) = (None, None);
+    let (mut free, mut buffers, mut cached) = (0, 0, 0);
+    for line in s.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(key) = parts.next().map(|k| k.trim_end_matches(':')) else {
+            continue;
+        };
+        let Some(kb) = parts.next().and_then(|n| n.parse::<u64>().ok()) else {
+            continue;
+        };
+        let bytes = kb * 1024;
+        match key {
+            "MemTotal" => total = Some(bytes),
+            "MemAvailable" => available = Some(bytes),
+            "MemFree" => free = bytes,
+            "Buffers" => buffers = bytes,
+            "Cached" => cached = bytes,
+            _ => {}
+        }
+    }
+    let total = total?;
+    let avail = available.unwrap_or(free + buffers + cached);
+    Some((total.saturating_sub(avail), total))
+}
+
+#[cfg(target_os = "macos")]
+fn memory_usage() -> (u64, u64) {
+    let total = sysctl_u64("hw.memsize").unwrap_or(0);
+    let used = std::process::Command::new("vm_stat")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| parse_vm_stat(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or(0);
+    (used, total)
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_u64(name: &str) -> Option<u64> {
+    let c = std::ffi::CString::new(name).ok()?;
+    // SAFETY: sysctlbyname writes the value and length of the type passed here.
+    unsafe {
+        let mut value: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        (libc::sysctlbyname(
+            c.as_ptr(),
+            &mut value as *mut u64 as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        ) == 0)
+            .then_some(value)
+    }
+}
+
+/// `vm_stat` as bytes in use: active + wired + compressed pages. Free, inactive and speculative
+/// pages are cheaply reclaimable and do not count as used here.
+#[cfg(any(target_os = "macos", test))]
+fn parse_vm_stat(s: &str) -> Option<u64> {
+    let page = s.lines().next().and_then(|l| {
+        let start = l.find("page size of ")? + "page size of ".len();
+        l[start..].split_whitespace().next()?.parse::<u64>().ok()
+    })?;
+    let mut pages = std::collections::BTreeMap::new();
+    for line in s.lines().skip(1) {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if let Ok(n) = value.trim().trim_end_matches('.').parse::<u64>() {
+            pages.insert(key.trim().to_string(), n);
+        }
+    }
+    let get = |k: &str| pages.get(k).copied().unwrap_or(0);
+    Some(
+        (get("Pages active") + get("Pages wired down") + get("Pages occupied by compressor"))
+            * page,
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn memory_usage() -> (u64, u64) {
+    (0, 0)
+}
+
+/// The direct children in one `dust -j -o b -d 1` report, as byte entries labelled with the
+/// scan root (`home`, `worktrees` or `cache`). `dust` prints sizes like `8192B` with `-o b`.
+pub(crate) fn parse_dust_json(root: &str, s: &str) -> Vec<DiskEntry> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
+        return Vec::new();
+    };
+    v.get("children")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let bytes = c
+                .get("size")?
+                .as_str()?
+                .strip_suffix('B')?
+                .parse::<u64>()
+                .ok()?;
+            Some(DiskEntry {
+                root: root.into(),
+                path: c.get("name")?.as_str()?.to_string(),
+                bytes,
+            })
+        })
+        .collect()
+}
+
+/// Keep a cached disk-use breakdown small enough that its `host.health` stays far below the
+/// event-size limit, however long the paths are. The first entry is kept even when it alone fills
+/// the budget: the largest directory is exactly what a low-disk refusal needs.
+pub(crate) fn fit_disk_entries(mut entries: Vec<DiskEntry>, budget: usize) -> Vec<DiskEntry> {
+    entries.sort_by_key(|e| std::cmp::Reverse(e.bytes));
+    let mut out = Vec::new();
+    let mut used = 0;
+    for e in entries {
+        // root, path, punctuation and the decimal byte count; a conservative JSON-size proxy.
+        let cost = e.root.len() + e.path.len() + e.bytes.to_string().len() + 40;
+        if !out.is_empty() && used + cost > budget {
+            break;
+        }
+        used += cost;
+        out.push(e);
+    }
+    out
+}
+
 /// Peak resident memory (KiB) and user + system CPU time (ms) of this process.
 pub fn self_usage() -> (u64, u64) {
     // SAFETY: getrusage only writes the struct it is given.
@@ -246,18 +410,21 @@ mod tests {
     }
 
     fn health(uptime_s: u64) -> Known {
-        Known::HostHealth(HostHealth {
+        Known::HostHealth(Box::new(HostHealth {
             host: "h".into(),
             disk_free: 1,
             disk_total: 2,
             agents: 1,
+            machine: None,
+            disk: None,
+            repos: Vec::new(),
             stats: Some(HostStats {
                 uptime_s,
                 ..Default::default()
             }),
             commit: None,
             behind_since: None,
-        })
+        }))
     }
 
     #[test]
@@ -353,5 +520,43 @@ mod tests {
             (p.agents, p.state_changes, p.flaps, p.unknown_states),
             (1, 3, 1, 1)
         );
+    }
+    #[test]
+    fn meminfo_and_vm_stat_parse_memory_used() {
+        let meminfo = "MemTotal:       16384 kB
+MemFree:         1024 kB
+MemAvailable:    4096 kB
+Buffers:          512 kB
+Cached:          1024 kB
+";
+        assert_eq!(
+            parse_meminfo(meminfo),
+            Some((12 * 1024 * 1024, 16 * 1024 * 1024))
+        );
+        let vm = "Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free: 10.
+Pages active: 20.
+Pages inactive: 30.
+Pages wired down: 40.
+Pages occupied by compressor: 50.
+";
+        assert_eq!(parse_vm_stat(vm), Some(110 * 16384));
+    }
+
+    #[test]
+    fn machine_usage_and_dust_json_are_readable() {
+        let m = machine_usage();
+        assert!(m.cores >= 1 && m.load5 >= 0.0, "{m:?}");
+        let j = r#"{"size":"3B","name":"/h","children":[{"size":"2B","name":"/h/a","children":[]},{"size":"1B","name":"/h/b","children":[]}]}"#;
+        let d = parse_dust_json("home", j);
+        assert_eq!(d.len(), 2);
+        assert_eq!((d[0].root.as_str(), d[0].bytes), ("home", 2));
+        let fit = fit_disk_entries(d.clone(), 1);
+        assert_eq!(
+            (fit.len(), fit[0].path.as_str()),
+            (1, "/h/a"),
+            "the largest stays"
+        );
+        assert_eq!(fit_disk_entries(d, 10_000).len(), 2);
     }
 }
