@@ -553,6 +553,9 @@ async fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
         .arg(dir)
         .args(args)
         .stdin(std::process::Stdio::null())
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .kill_on_drop(true)
         .output()
         .await
@@ -581,19 +584,101 @@ impl GateTree {
         }
     }
 
-    async fn cleanup(self, checkout: &Path) {
+    /// Remove the scratch tree and, when git cannot, its administrative entry too. The entry is
+    /// unique to this run, so deleting it directly is safe; `worktree prune` would keep one fresh
+    /// entry for months. Err names what is left, because a leftover base tree must never be silent.
+    async fn cleanup(self, checkout: &Path) -> Result<(), String> {
         let Self::Scratch(path) = self else {
-            return;
+            return Ok(());
         };
         let name = path.display().to_string();
         if git(checkout, &["worktree", "remove", "--force", &name])
             .await
-            .is_err()
+            .is_ok()
         {
-            let _ = tokio::fs::remove_dir_all(&path).await;
-            let _ = git(checkout, &["worktree", "prune"]).await;
+            return Ok(());
+        }
+        let mut problems = Vec::new();
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => problems.push(format!("remove {}: {e}", path.display())),
+        }
+        if path.exists() {
+            problems.push(format!("{} still exists", path.display()));
+        }
+        let common = git(checkout, &["rev-parse", "--git-common-dir"]).await;
+        match (common, path.file_name()) {
+            (Ok(common), Some(leaf)) => {
+                let common = git_path(checkout, &common);
+                let admin = common.join("worktrees").join(leaf);
+                if admin.exists() {
+                    match tokio::fs::remove_dir_all(&admin).await {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => problems.push(format!("remove {}: {e}", admin.display())),
+                    }
+                    if admin.exists() {
+                        problems.push(format!("{} still exists", admin.display()));
+                    }
+                }
+            }
+            (Err(e), _) => problems.push(format!("read the git common dir: {e}")),
+            (_, None) => problems.push(format!("{} has no leaf name", path.display())),
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("; "))
         }
     }
+}
+
+/// `common` resolved the way git resolved it: absolute stays absolute, relative is the checkout's.
+fn git_path(checkout: &Path, common: &str) -> PathBuf {
+    let path = Path::new(common);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        checkout.join(path)
+    }
+}
+
+/// Every `merge-gate.base.*` worktree still registered once the repository lock is held is a
+/// crashed gate's, never a live one's. Remove it before making this run's own.
+async fn reap_scratch(checkout: &Path) -> Result<()> {
+    let list = git(checkout, &["worktree", "list", "--porcelain"])
+        .await
+        .map_err(|e| anyhow!("git worktree list in {}: {e}", checkout.display()))?;
+    let mut paths = Vec::new();
+    for line in list.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            paths.push(PathBuf::from(path));
+        }
+    }
+    if let Some(parent) = checkout.parent() {
+        let mut entries = tokio::fs::read_dir(parent)
+            .await
+            .map_err(|e| anyhow!("read {}: {e}", parent.display()))?;
+        while let Some(entry) = entries.next_entry().await? {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        let scratch = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("merge-gate.base."));
+        if scratch {
+            GateTree::Scratch(path.clone())
+                .cleanup(checkout)
+                .await
+                .map_err(|e| anyhow!("a previous merge gate's {} is left: {e}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// The gate tree for `base`: the checkout when its own branch is `base`, with the same
@@ -612,6 +697,7 @@ async fn gate_tree(checkout: &Path, base: &str, gate: &str) -> Result<(GateTree,
     )
     .await
     .map_err(|e| anyhow!("git fetch origin {base} in {}: {e}", checkout.display()))?;
+    reap_scratch(checkout).await?;
     let branch = git(checkout, &["symbolic-ref", "-q", "--short", "HEAD"])
         .await
         .ok()
@@ -630,7 +716,10 @@ async fn gate_tree(checkout: &Path, base: &str, gate: &str) -> Result<(GateTree,
         let at = match git(&path, &["rev-parse", "--short", "HEAD"]).await {
             Ok(at) => at,
             Err(e) => {
-                GateTree::Scratch(path).cleanup(checkout).await;
+                let cleanup = GateTree::Scratch(path).cleanup(checkout).await;
+                if let Err(c) = cleanup {
+                    bail!("the detached base worktree has no HEAD: {e}; cleanup: {c}");
+                }
                 bail!("the detached base worktree has no HEAD: {e}");
             }
         };
@@ -676,6 +765,9 @@ async fn gate_output(
     cmd.arg(head)
         .current_dir(cwd)
         .env("AGENT_FLEET_MERGE_PR", merge_pr)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -715,13 +807,16 @@ async fn run_gate(
     say: &(dyn Fn(String) + Sync),
 ) -> Result<()> {
     let checkout = (a.checkout)()?;
+    let checkout = checkout
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", checkout.display()))?;
     // One gate at a time per repository on this machine, the checkout read only once it is
     // held: gates share the checkout, and one that moved it would otherwise hand this one a
     // tree (and a gate script) nobody checked.
     let common = git(&checkout, &["rev-parse", "--git-common-dir"])
         .await
         .map_err(|e| anyhow!("git rev-parse in {}: {e}", checkout.display()))?;
-    let lock = checkout.join(common).join("agent-fleet-merge.lock");
+    let lock = git_path(&checkout, &common).join("agent-fleet-merge.lock");
     let _held = crate::retire::lock_file(&lock, GATE_MAX, "another merge gate").await?;
     let (tree, at) = gate_tree(&checkout, base, gate)
         .await
@@ -734,7 +829,9 @@ async fn run_gate(
             a.pr,
             gate_root.display()
         );
-        tree.cleanup(&checkout).await;
+        if let Err(c) = tree.cleanup(&checkout).await {
+            bail!("{missing}; base worktree cleanup: {c}");
+        }
         bail!(missing);
     }
     say(format!(
@@ -753,8 +850,13 @@ async fn run_gate(
         a.pr,
     )
     .await;
-    tree.cleanup(&checkout).await;
-    let out = out?;
+    let cleanup = tree.cleanup(&checkout).await;
+    let out = match (out, cleanup) {
+        (Err(gate), Err(c)) => bail!("{gate:#}; base worktree cleanup: {c}"),
+        (Err(gate), Ok(())) => return Err(gate),
+        (Ok(_), Err(c)) => bail!("#{}: base worktree cleanup: {c}", a.pr),
+        (Ok(out), Ok(())) => out,
+    };
     let said = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -1673,7 +1775,7 @@ esac
         use std::os::unix::fs::PermissionsExt;
         let f = Fake::new();
         f.put("fleet.toml", "[merge]\ngate = \"gate.sh\"\n");
-        f.put("base", "feat");
+        f.put("base", "feat/calai-meals");
         // Canonical: a macOS tempdir is /var/folders/… while a shell's $PWD resolves /private/var.
         let dir = &f.dir.path().canonicalize().unwrap();
         let co = dir.join("checkout");
@@ -1687,19 +1789,32 @@ esac
         sh(&co, &["add", "gate.sh"]);
         sh(&co, &["commit", "-qm", "main gate"]);
         sh(&co, &["push", "-q", "origin", "main"]);
-        sh(&co, &["checkout", "-q", "-b", "feat"]);
+        sh(&co, &["checkout", "-q", "-b", "feat/calai-meals"]);
         std::fs::write(
             co.join("gate.sh"),
             format!(
-                "#!/bin/sh\necho \"gate $1 $PWD\"\nprintf %s \"$PWD\" > {d}/gate-pwd\nexit 0\n",
+                "#!/bin/sh\ngit worktree lock .\necho \"gate $1 $PWD\"\nprintf %s \"$PWD\" > {d}/gate-pwd\nexit 0\n",
                 d = dir.display()
             ),
         )
         .unwrap();
         sh(&co, &["add", "gate.sh"]);
         sh(&co, &["commit", "-qm", "feat gate"]);
-        sh(&co, &["push", "-q", "origin", "feat"]);
+        sh(&co, &["push", "-q", "origin", "feat/calai-meals"]);
         sh(&co, &["checkout", "-q", "main"]);
+        let stale = dir.join("merge-gate.base.stale");
+        sh(
+            &co,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                stale.to_str().unwrap(),
+                "origin/main",
+            ],
+        );
+        let orphan = dir.join("merge-gate.base.orphan");
+        std::fs::create_dir(&orphan).unwrap();
 
         let (r, said) = f.run(H, None).await;
         assert!(r.is_ok(), "{r:?}; said {said:?}");
@@ -1721,6 +1836,18 @@ esac
         assert!(
             !sh(&co, &["worktree", "list", "--porcelain"]).contains(&used),
             "the base worktree is still registered"
+        );
+        assert!(
+            !stale.exists(),
+            "the crashed gate's worktree was not reaped"
+        );
+        assert!(
+            !sh(&co, &["worktree", "list", "--porcelain"]).contains("merge-gate.base.stale"),
+            "the crashed gate's worktree is still registered"
+        );
+        assert!(
+            !orphan.exists(),
+            "the unregistered gate worktree was not reaped"
         );
     }
 

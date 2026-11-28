@@ -112,7 +112,7 @@ profile = "claude"
 # `agent-fleet merge`, in a repository's own .agent-fleet/fleet.toml: read from the PR's base
 # branch, so a PR cannot change its own gate.
 # [merge]
-# gate = "scripts/merge-gate.sh"  # run in this machine's checkout (on the base branch) with the head sha as $1; absent = the required CI checks
+# gate = "scripts/merge-gate.sh"  # run in the base branch's tree (a detached origin/<base> worktree when the checkout is not on it) with the head sha as $1; absent = the required CI checks
 # host = "laptop"                # the fleet host that runs the merge and its gate; absent = where the CLI runs
 
 # Repositories connected on this machine: "owner/repo" = "<checkout>". Edit with
