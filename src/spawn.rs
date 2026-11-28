@@ -906,6 +906,7 @@ pub const STALL_MIN: u64 = 15;
 /// `agent.start` retries on `agent_pane_busy`: a fresh pane's shell needs a moment first.
 const BUSY_TRIES: u32 = 10;
 const BUSY_WAIT: Duration = Duration::from_secs(2);
+const READY_PROBES: u32 = 30;
 /// The brief is sent only once an agent that never went `working` is re-sent to.
 const STARTED: [&str; 3] = ["working", "blocked", "done"];
 
@@ -1119,25 +1120,18 @@ pub(crate) async fn retire_in(host: &Host, repo: &str, worktree: &str, agent: &s
         None => Ok(()),
     }
 }
-/// `line` typed into the pane's shell, retried while the shell is not ready.
+/// `line` typed into the pane's shell as one input submission, retried while the shell is not
+/// ready. One submission keeps a terminal control reply from landing between the text and Enter.
 async fn pane_run(sock: &Path, pane: &str, line: &str) -> Result<()> {
-    let mut err = anyhow!("pane.send_text never ran");
+    let mut err = anyhow!("pane.send_input never ran");
     for _ in 0..BUSY_TRIES {
-        let send = async {
-            herdr_call(
-                sock,
-                "pane.send_text",
-                json!({ "pane_id": pane, "text": line }),
-            )
-            .await?;
-            herdr_call(
-                sock,
-                "pane.send_keys",
-                json!({ "pane_id": pane, "keys": ["enter"] }),
-            )
-            .await
-        };
-        match send.await {
+        match herdr_call(
+            sock,
+            "pane.send_input",
+            json!({ "pane_id": pane, "text": line, "keys": ["enter"] }),
+        )
+        .await
+        {
             Ok(_) => return Ok(()),
             Err(e) => {
                 err = e;
@@ -1146,6 +1140,82 @@ async fn pane_run(sock: &Path, pane: &str, line: &str) -> Result<()> {
         }
     }
     Err(err.context("the pane's shell never took the command"))
+}
+
+/// A disposable readiness probe: the echoed command never contains the whole marker, so seeing
+/// the marker in the pane's output means the shell read and executed a complete line. Anything
+/// typed before a shell finished starting can be eaten by its terminal-control handshake; losing
+/// a probe that way is harmless, while losing the env scrub or the agent command is not.
+fn readiness_probe(agent: &str, attempt: u32) -> (String, String) {
+    let token: String = agent
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(24)
+        .collect();
+    let marker = format!("AFREADY{token}N{attempt}");
+    let split = marker.len() / 2;
+    (
+        marker.clone(),
+        format!(
+            "printf '%s%s\\n' '{}' '{}'",
+            &marker[..split],
+            &marker[split..]
+        ),
+    )
+}
+
+/// Wait until the pane's shell has proved twice that it is reading complete input lines. The
+/// first probe can already be queued when a shell asks its terminal a startup question; it then
+/// answers before the terminal's reply, which is still waiting in the input queue without a
+/// newline. Every later probe is preceded by ctrl-c, which discards that partial reply (or any
+/// partial line an earlier mangled probe left behind). A second successful probe is therefore
+/// the point where the input queue is clean. Probe markers are unique per attempt so an old line
+/// can never satisfy a new wait.
+async fn pane_ready(sock: &Path, pane: &str, agent: &str) -> Result<()> {
+    let mut err = anyhow!("pane readiness probe never ran");
+    let mut successes = 0;
+    for attempt in 0..READY_PROBES {
+        if attempt > 0 {
+            let _ = herdr_call(
+                sock,
+                "pane.send_keys",
+                json!({ "pane_id": pane, "keys": ["ctrl+c"] }),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let (marker, probe) = readiness_probe(agent, attempt);
+        if let Err(e) = pane_run(sock, pane, &probe).await {
+            err = e;
+            successes = 0;
+            continue;
+        }
+        match herdr_call(
+            sock,
+            "pane.wait_for_output",
+            json!({
+                "pane_id": pane,
+                "source": "recent_unwrapped",
+                "lines": 80,
+                "match": { "type": "substring", "value": marker },
+                "timeout_ms": 2_000,
+            }),
+        )
+        .await
+        {
+            Ok(_) => {
+                successes += 1;
+                if successes == 2 {
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                err = e;
+                successes = 0;
+            }
+        }
+    }
+    Err(err.context("the pane's shell never answered the readiness probe"))
 }
 
 async fn agent_start(host: &Host, name: &str, prof: &Profile, pane: &str) -> Result<()> {
@@ -1373,6 +1443,12 @@ async fn run_spawn(
     {
         run_ready(&checkout, &wt, ready).await?;
     }
+    pane_ready(
+        &host.cfg.herdr_socket,
+        made.pane.as_deref().unwrap_or_default(),
+        &r.name,
+    )
+    .await?;
     for var in &prof.unset_env {
         pane_run(
             &host.cfg.herdr_socket,
@@ -3255,7 +3331,14 @@ profile = "devin"
             dir.path(),
             &[
                 ("worktree.create", vec![created(wt.to_str().unwrap())]),
-                ("pane.send_text", vec![err("agent_pane_busy")]),
+                (
+                    "pane.send_input",
+                    vec![
+                        json!({"result": {}}),
+                        json!({"result": {}}),
+                        err("agent_pane_busy"),
+                    ],
+                ),
             ],
         )
         .await;
@@ -3280,8 +3363,12 @@ profile = "devin"
             stub.calls(),
             [
                 "worktree.create",
-                "pane.send_text",
+                "pane.send_input",
+                "pane.wait_for_output",
                 "pane.send_keys",
+                "pane.send_input",
+                "pane.wait_for_output",
+                "pane.send_input",
                 "agent.start",
                 "agent.wait",
                 "agent.prompt"
@@ -3384,6 +3471,53 @@ profile = "devin"
         assert!(cwd.to_string().contains(co.to_str().unwrap()), "{cwd}");
     }
 
+    #[test]
+    fn the_readiness_probe_never_echoes_its_own_marker() {
+        let (marker, line) = readiness_probe("dv-7", 0);
+        assert!(!line.contains(&marker), "{line}");
+        assert!(line.contains("printf"), "{line}");
+        assert_ne!(readiness_probe("dv-7", 1).0, marker);
+    }
+
+    #[tokio::test]
+    async fn a_not_ready_shell_is_probed_until_it_reads_a_complete_line_before_the_agent_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let co = checkout(dir.path());
+        let wt = co.join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let (host, stub) = run(
+            dir.path(),
+            &[
+                ("worktree.create", vec![created(wt.to_str().unwrap())]),
+                (
+                    "pane.wait_for_output",
+                    vec![err("timeout"), json!({"result": {}})],
+                ),
+            ],
+        )
+        .await;
+        execute(&host, "req1", &spawn_of(req(None)), &State::default()).await;
+        assert_eq!(
+            stub.calls(),
+            [
+                "worktree.create",
+                "pane.send_input",
+                "pane.wait_for_output",
+                "pane.send_keys",
+                "pane.send_input",
+                "pane.wait_for_output",
+                "pane.send_keys",
+                "pane.send_input",
+                "pane.wait_for_output",
+                "pane.send_input",
+                "agent.start",
+                "agent.wait",
+                "agent.prompt"
+            ]
+        );
+        assert!(result(&host).unwrap().ok);
+    }
+
     #[tokio::test]
     async fn agent_pane_busy_is_retried() {
         let dir = tempfile::tempdir().unwrap();
@@ -3428,8 +3562,12 @@ profile = "devin"
             stub.calls(),
             [
                 "worktree.create",
-                "pane.send_text",
+                "pane.send_input",
+                "pane.wait_for_output",
                 "pane.send_keys",
+                "pane.send_input",
+                "pane.wait_for_output",
+                "pane.send_input",
                 "agent.start",
                 "agent.wait",
                 "agent.prompt",
@@ -4189,10 +4327,13 @@ profile = "devin"
             stub.calls(),
             [
                 "worktree.create",
-                "pane.send_text",
+                "pane.send_input",
+                "pane.wait_for_output",
                 "pane.send_keys",
-                "pane.send_text",
-                "pane.send_keys",
+                "pane.send_input",
+                "pane.wait_for_output",
+                "pane.send_input",
+                "pane.send_input",
                 "agent.start",
                 "agent.wait",
                 "agent.prompt"
@@ -4201,8 +4342,9 @@ profile = "devin"
         let got = stub.calls.lock().unwrap().clone();
         let texts: Vec<String> = got
             .iter()
-            .filter(|(m, _)| m == "pane.send_text")
+            .filter(|(m, _)| m == "pane.send_input")
             .map(|(_, p)| p["text"].as_str().unwrap().to_string())
+            .filter(|line| !line.starts_with("printf "))
             .collect();
         assert_eq!(texts[0], "unset SCRUB_ME");
         for v in ["TMPDIR", "TMP", "TEMP"] {
@@ -4227,11 +4369,11 @@ profile = "devin"
         assert_eq!(start["args"], json!(["--model", "sonnet"]));
         let text = got
             .iter()
-            .find(|(m, _)| m == "pane.send_text")
-            .unwrap()
-            .1
-            .clone();
-        assert_eq!(text["text"], "unset SCRUB_ME");
+            .filter(|(m, _)| m == "pane.send_input")
+            .map(|(_, p)| p["text"].as_str().unwrap())
+            .find(|line| line.starts_with("unset "))
+            .unwrap();
+        assert_eq!(text, "unset SCRUB_ME");
         assert!(result(&host).unwrap().ok);
     }
 

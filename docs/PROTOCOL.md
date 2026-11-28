@@ -953,8 +953,14 @@ and answers `spawn.result` with that checkout as `worktree`; `in_place` with `wo
 refused. A retire of an in-place agent closes its pane and removes nothing (neither `retire`
 hook nor `git worktree remove` runs). `agent-fleet spawn --brief <file>` sends the file as
 `brief` as written: no token rendering, no coordinator prompt; an empty file is refused. Then
-`ready` runs (new worktrees only, 15 min), each `unset_env` is typed into the pane's shell,
-`TMPDIR`, `TMP` and `TEMP` are exported there as the agent's scratch dir, outside any checkout:
+`ready` runs (new worktrees only, 15 min). Before any real command is typed, the pane's shell
+proves it is reading complete input lines: the host sends disposable `printf` probes whose split
+marker is never whole in the echoed command, clears partial input with ctrl-c before every probe
+after the first, and requires two successful probes in a row (up to 30 probes, each waited on for
+2 s). The first probe can legitimately execute before a startup terminal-control reply that is
+still queued without a newline, so one success alone does not prove the queue is clean. Each
+`unset_env` is then typed into the pane's shell; `TMPDIR`, `TMP` and `TEMP` are exported there
+as the agent's scratch dir, outside any checkout:
 `<cache dir>/agent-fleet/tmp/<session>/<name>` (`~/.cache/agent-fleet/tmp/...` on Linux,
 `~/Library/Caches/agent-fleet/tmp/...` on macOS), created by the same line. The host removes it when the agent's pane or workspace closes (not when
 the agent only leaves its pane, nor when a pane it left closes later), so `agent-fleet retire`,
